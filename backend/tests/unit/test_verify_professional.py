@@ -209,14 +209,15 @@ def test_a_standard_without_stated_edition_says_so_and_a_professional_document_i
     assert "מסמך מקצועי" in head and "אינו שומה" in head
 
 
-def test_the_header_of_an_appraisal_source_is_byte_identical():
+def test_the_header_of_an_appraisal_source_is_byte_identical_except_in_a_file_of_several_contexts():
     ws = _ws("property")
     s2 = appraisal(ws)
     assert verify._source_parts(ws, s2) == ("שומה הרקפות 5 (סינתטי) — סעיף \"סיכום\"", APPRAISAL_TEXT, "context")
     plain = Workspace(ctx=None)
     plain.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="דוח", section="סיכום",
                      location="עמוד 2", kind="context", text="טקסט", context="שומה ב", subject="הנכס")
-    assert verify._source_parts(plain, "S1") == ("דוח — עמוד 2 — שומה ב", "טקסט", "context")
+    # a source of a file holding several reports names its own context first and the file's title as the file (round 18 U3)
+    assert verify._source_parts(plain, "S1") == ("שומה ב — עמוד 2 — קובץ: דוח", "טקסט", "context")
 
 
 def test_a_changed_limit_or_wording_is_a_new_verdict_key_and_an_appraisals_key_is_unchanged_by_it():
@@ -234,7 +235,7 @@ def test_a_changed_limit_or_wording_is_a_new_verdict_key_and_an_appraisals_key_i
 
 
 def test_the_judge_version_is_bumped_and_the_cache_does_not_reuse_an_older_contract(monkeypatch):
-    assert verify.JUDGE_VERSION == 13  # round 17 U5: defect `scope`; round 13 U9: server-held unit facts and derived computations; U11: the preceding text of a back-reference; round 15 U7: the declared unit in a source header; round 16 U1: the read passages and `support`; 12: every returned passage, items of a kind
+    assert verify.JUDGE_VERSION == 14  # round 18 U3: the source header of a multi-report file and a bold label over a statement (rule 33); round 17 U5: defect `scope`; round 13 U9: server-held unit facts and derived computations; U11: the preceding text of a back-reference; round 15 U7: the declared unit in a source header; round 16 U1: the read passages and `support`; 12: every returned passage, items of a kind
     ws = _ws()
     s1 = standard(ws, "על השמאי לבסס את הערכתו על עסקאות השוואה.", rules=RULES)
     seen: list[str] = []

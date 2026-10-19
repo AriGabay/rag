@@ -1586,16 +1586,16 @@ def test_the_judge_policy_names_the_server_held_line_and_the_derived_computation
     assert verify.SERVER_HELD in verify.JUDGE_POLICY and "derived" in verify.JUDGE_POLICY
 
 
-# --- the judge contract is version 13: a verdict of an older contract is not reused (round 13 U9, U11, KTD19; round 15 U7; round 16 U1) --
+# --- the judge contract is version 14: a verdict of an older contract is not reused (round 13 U9, U11, KTD19; round 15 U7; round 16 U1; round 18 U3) --
 
-def test_a_verdict_cached_under_judge_contract_12_misses_under_13(monkeypatch):
-    assert verify.JUDGE_VERSION == 13
+def test_a_verdict_cached_under_judge_contract_13_misses_under_14(monkeypatch):
+    assert verify.JUDGE_VERSION == 14
     ws, a, cache = _valued(), _answer("הנכס פנוי [S1]."), verify.VerdictCache()
     judge, seen = _recording_supported()
-    monkeypatch.setattr(verify, "JUDGE_VERSION", 12)
+    monkeypatch.setattr(verify, "JUDGE_VERSION", 13)
     verify_answer(judge, a, ws, "?", [], cache=cache)
     assert verify_answer(judge, a, ws, "?", [], cache=cache).reused == 1
-    monkeypatch.setattr(verify, "JUDGE_VERSION", 13)
+    monkeypatch.setattr(verify, "JUDGE_VERSION", 14)
     assert verify_answer(judge, a, ws, "?", [], cache=cache).reused == 0
     assert verify_answer(judge, a, ws, "?", [], cache=cache).reused == 1
 
@@ -1768,3 +1768,40 @@ def test_vat_of_an_amount_shown_in_millions_is_backed_by_the_full_amount_rounded
     assert verify._wrong_vat(unit, _ws(source)) == []
     other = split_units("שווי הנכס 122.8 מיליון ₪ כולל מע\"מ [S1].")[0]
     assert verify._wrong_vat(other, _ws(source))
+
+
+# --- a bold label followed by a statement is judged as the statement (round 18 U3, KTD3, R8) -----------------------------------
+
+LOCATION_SOURCE = "דוח: סעיף 5, פסקה 3 עוסק בזכויות הבנייה."
+
+
+@pytest.mark.parametrize("raw", ["**מיקום:** סעיף 5, פסקה 3 [S1]", "**מיקום**: סעיף 5, פסקה 3 [S1]",
+                                 "- **מיקום:** סעיף 5, פסקה 3 [S1]"])
+def test_a_bold_label_followed_by_a_statement_is_shown_to_the_judge_as_the_statement_and_is_not_removed_as_unclassified(raw):
+    seen: list[str] = []
+
+    def rule(text: str) -> str:
+        seen.append(text)
+        return "navigation" if text.lstrip("- ").startswith("**") else "supported"  # a bold label alone reads as navigation
+
+    report = verify_answer(_judge(rule), _answer(raw), _ws(LOCATION_SOURCE), "?", [])
+    assert report.ok and report.removals() == [], [(p.check, p.reason) for p in report.problems]
+    assert [t.lstrip("- ") for t in seen] == ["מיקום: סעיף 5, פסקה 3"]  # the label is a word of the statement, not markup
+
+
+def test_a_bare_bold_label_and_a_wholly_bold_statement_are_shown_as_they_were_written():
+    for raw in ("**הנתונים:**", "**השווי: 9,500 ₪**"):
+        seen: list[str] = []
+        verify_answer(_judge(lambda text, seen=seen: seen.append(text) or "supported"), _answer(raw), _ws(SOURCE), "?", [])
+        assert seen == [raw], raw
+
+
+def test_a_claim_span_the_judge_took_from_a_bold_labelled_statement_stays_a_substring_of_the_units_own_text():
+    (u,) = split_units("**שווי:** שטח 1,200 מ\"ר ודמי שכירות 55 ₪ [S1]")
+    shown = verify.label_as_statement(u.text)
+    assert shown == "שווי: שטח 1,200 מ\"ר ודמי שכירות 55 ₪"
+    for span, want in ((shown, u.text), ("שווי: שטח 1,200 מ\"ר", "**שווי:** שטח 1,200 מ\"ר"),
+                       ("שטח 1,200 מ\"ר", "שטח 1,200 מ\"ר"), ("ודמי שכירות 55 ₪", "ודמי שכירות 55 ₪")):
+        assert verify._claim_span(u, span) == want and verify._claim_span(u, span) in u.text, span
+    assert verify._claim_span(u, "שווי: ") is None  # a span that ends inside the label is no statement
+    assert verify._claim_span(u, "שטח אחר") is None

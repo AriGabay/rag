@@ -280,8 +280,10 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # it by handle and structural title (``_declared_head``). 11 (round 16 U1, KTD1): the requirements call carries the passages the
 # turn read (``<read_passages>``) and the judge may name ``support`` (a read passage and a verbatim quote) for a part the answer omits.
 # 13 (round 17 U5, KTD5): the verdict's ``defect`` gains ``scope`` and the verdict an optional ``scope`` phrase; rule (32) reads the
-# context parts a table read carries.
-JUDGE_VERSION = 13
+# context parts a table read carries. 14 (round 18 U3, KTD3): the header of a passage of a file holding several reports names the
+# unit's own context first and the file's title only as the file (``MSG_FILE``); a unit made of a bold label and a statement is shown
+# as the statement (``label_as_statement``); rule (33) reads it.
+JUDGE_VERSION = 14
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -423,7 +425,10 @@ JUDGE_POLICY = (
     "בה גם פגם אחר) עם defect scope, לעולם לא unsupported בגלל היקף בלבד; וב-scope כתוב את ביטוי ההיקף מילה במילה כפי "
     "שהוא כתוב בהקשר של המקור שהיחידה מצטטת (עד כמה מילים, בלי מראי מקום), כדי שהשרת יוסיף אותו ליד הערך. אם אינך בטוח "
     "שהמקור אומר היקף כזה, או שהביטוי אינו כתוב שם מילה במילה — scope ריק (השרת יכתוב שההיקף לא אומת). אל תחתוך ואל תבקש "
-    "להסיר את ההיקף שהיחידה כותבת כשההקשר אומר אותו."
+    "להסיר את ההיקף שהיחידה כותבת כשההקשר אומר אותו. "
+    "(33) יחידה שנפתחת בתווית קצרה ואחריה משפט (\"מיקום: סעיף 5, פסקה 3\") היא טענה ולא כותרת או תווית: סווג אותה לפי "
+    "המשפט שאחרי התווית ושפוט אותו מול המקור שהיא מצטטת. navigation ו-not_factual שמורים לכותרת, לתווית בלי משפט ולפתיח. "
+    "בכותרת של מקור, מה שנכתב אחרי «קובץ:» הוא שם הקובץ, ולא הנכס של הקטע: הנכס של הקטע הוא ההקשר שנכתב לפניו."
 )
 
 
@@ -2965,6 +2970,7 @@ def _professional_head(src) -> str:
 
 
 MSG_DECLARED_UNIT = "היחידה שהתשובה מצהירה עליה"
+MSG_FILE = "קובץ"  # the label of the file's title in the header of a passage of a file holding several reports
 
 
 def _declared_head(ws: Workspace, src) -> str:
@@ -3008,11 +3014,14 @@ def _source_parts(ws: Workspace, sid: str, *, dated: bool = True) -> tuple[str, 
         src = ws.sources[sid]
         # in a file holding several appraisals, the context the passage is in (round 7 U6, KTD7); in a file of one
         # subject unit, the identity the document states for itself, which a section need not repeat
-        head = f"{src.title} — {src.location}"
         if src.context:
-            head += f" — {src.context}"
-        elif src.subject:
-            head += f" — זיהוי מתוך המסמך: {src.subject}"
+            # a file may hold several reports: the header names the appraisal unit's own subject first, and the file's title only
+            # as the file (which names the first report), so a passage of the second is never read as the first's (round 18 U3)
+            head = f"{src.context} — {src.location} — {MSG_FILE}: {src.title}"
+        else:
+            head = f"{src.title} — {src.location}"
+            if src.subject:
+                head += f" — זיהוי מתוך המסמך: {src.subject}"
         if src.source_kind != source_kinds.APPRAISAL:  # an appraisal's header stays what it was
             head += " — " + _professional_head(src)
         # the facts the server holds about the unit the passage is in (round 13 U9, KTD10, R13), stated as the server's: the
@@ -4969,7 +4978,9 @@ def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
             asked = declared
         if not asked:  # no title or alias names the asked property: the unit the turn located for the question is it
             asked = located_contexts(ws, cx)
-        if asked and not numbers & asked:
+        # a context that only continues the one before it (the calculation pages of an appraisal) is that one's own: it is not
+        # "another property" (round 18 U3, KTD3); a different address or parcel stays another property
+        if asked and not {cx.owner(n) for n in numbers} & {cx.owner(n) for n in asked}:
             said = (", והתשובה הצהירה על " + ", ".join(cx.describe(n) for n in sorted(declared))
                     if distinctive and declared and not declared & asked else "")
             return (f"{what} כתוב ב" + ", ".join(cx.describe(n) for n in sorted(numbers)) + ", והטענה עוסקת ב"
@@ -5929,11 +5940,24 @@ def _reread_note(batch: _Batch, u: Unit) -> str:
                    f"{prompt_text(span)}</reread>\n" for span, kind, sid in batch.rereads.get(u.index, []))
 
 
+# a short bold label at the start of a unit, then a statement ("**מיקום:** סעיף 5, פסקה 3"): a list marker may stand before it,
+# the colon inside the bold or after it
+_BOLD_LABEL = re.compile(r"^(\s*(?:[-*+•]\s+|\d{1,2}[.)]\s+)?)\*\*([^*\n]{1,40}?):?\*\*\s*:?\s*(?=[^\s*])")
+
+
+def label_as_statement(text: str) -> str:
+    """``text`` with a short bold label that leads a statement written as a word of that statement (round 18 U3, KTD3, R8):
+    "**מיקום:** סעיף 5, פסקה 3" reads as "מיקום: סעיף 5, פסקה 3", so a judge classifies the unit by the statement and not as a label
+    or a heading. A bare label, or a unit that is bold throughout, is as written."""
+    m = _BOLD_LABEL.match(text)
+    return text if m is None else f"{m.group(1)}{m.group(2).rstrip()}: {text[m.end():]}"
+
+
 def _unit_text(u: Unit) -> str:
     """A unit's text for the judge, with its registered server spans marked ``<server>…</server>``: in place when the
     text holds the span, otherwise (an inserted citation) on a line after the text. The rest is escaped as any
-    document text."""
-    text = u.text
+    document text. A bold label that leads a statement is shown as a word of it (``label_as_statement``)."""
+    text = label_as_statement(u.text)
     out, appended = [], []
     pos = 0
     for span in u.server:
@@ -6825,7 +6849,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                     report.problems += [Problem(u, f"נתמך ב-{s}, שהתשובה לא ציטטה", kind="needs_citation", cite=s)
                                         for s in cite_ids]
         complete_records(report)
-        _remove_dependents(report, verdicts)
+        _remove_dependents(report, verdicts, ws)
     report.protect_question(answer)
     if coverage:
         report.computed = computed_ids(ws)
@@ -7064,7 +7088,23 @@ def _claim_span(u: Unit, span: str) -> str | None:
     if span in u.text:
         return span
     back = span.replace("‹", "<").replace("›", ">")
-    return back if back in u.text else None
+    if back in u.text:
+        return back
+    # the judge saw a bold label that leads a statement as a word of it (``label_as_statement``): a span that starts in the label
+    # is the unit's own text from the label's mark on
+    m = _BOLD_LABEL.match(u.text)
+    if m is None:
+        return None
+    shown = label_as_statement(u.text)
+    at = shown.find(back)
+    if at < 0:
+        return None
+    head, tail = len(m.group(1)), len(shown) - (len(u.text) - m.end())  # where the shown label starts and ends
+    end = at + len(back)
+    if end <= tail:  # a span that ends inside the label (or in the list marker) is no statement
+        return None
+    start = at if at < head else (head if at < tail else m.end() + at - tail)  # a span from inside the label starts at its mark
+    return u.text[start:m.end() + end - tail]
 
 
 def unit_claims(u: Unit, v: JudgeVerdict, ws: Workspace | None = None) -> list[UnitClaim]:
@@ -7389,11 +7429,27 @@ def _dependency_problem(unit: Unit, base: Problem, claim_id: str) -> Problem:
                    check="dependency", claim_id=claim_id, basis=base.claim_id, cause=base.cause)
 
 
-def _remove_dependents(report: VerifyReport, verdicts: dict[int, JudgeVerdict]) -> None:
+def _own_support(u: Unit, ws: Workspace | None, text: str | None = None) -> bool:
+    """Whether a unit (or its claim ``text``) that rests on a removed one stands on a cited source of its own (round 18 U3, KTD3,
+    R8): it cites, shows at least one number, refers back to nothing, and every number it shows is stated by what it cites
+    (``_unstated``, strict: the question and the turn's other sources are no support). What is judged supported by its own
+    source is not removed for the predecessor's sake; a unit with no number, one that refers back, or one whose number only the
+    removed unit's source states, needs its predecessor."""
+    if ws is None or not u.ids:
+        return False
+    trial = u if text is None else dataclasses.replace(u, text=text)
+    if has_back_reference(trial.text) or not numbers_in(_stated_text(trial)):
+        return False
+    return not _unstated(trial, ws, set(), set(), strict=True)
+
+
+def _remove_dependents(report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: Workspace | None = None) -> None:
     """What rests on a removed claim is removed too (KTD10, R15; round 8 R11), with that claim's failure kind (check
     ``dependency``), until nothing more rests on a removed one. At unit level: a unit whose verdict says it rests on a
     removed unit. At claim level: a claim whose ``depends_on`` names a failing claim of its unit, or a removed unit
-    (``_claim_cascade``) — the unit goes only when no claim of it stands (U4 cuts the span)."""
+    (``_claim_cascade``) — the unit goes only when no claim of it stands (U4 cuts the span). A supported unit or claim
+    that a cited source of its own states (``_own_support``, with ``ws``) is not removed for the removal of another unit
+    (round 18 U3)."""
     units = {u.index: u for u in report.units}
     while True:
         removed = {p.unit.index: p for p in reversed(report.removals())}
@@ -7402,10 +7458,12 @@ def _remove_dependents(report: VerifyReport, verdicts: dict[int, JudgeVerdict]) 
             base = next((removed[d] for d in v.depends_on if d in removed), None)
             if i in removed or i not in units or base is None:
                 continue
+            if v.verdict == "supported" and _own_support(units[i], ws):
+                continue
             report.problems.append(_dependency_problem(units[i], base, _primary_claim_id(report, i)))
             removed[i] = report.problems[-1]
             added = True
-        changed = _claim_cascade(report)
+        changed = _claim_cascade(report, ws)
         changed = _orphan_lead_ins(report) or changed
         if not (changed or added):
             return
@@ -7445,11 +7503,13 @@ def _ref_target(recs: list[ClaimRecord], ref: str, own: ClaimRecord) -> ClaimRec
     return (exact or sorted(found, key=lambda r: -len(r.text)) or [None])[0]
 
 
-def _claim_cascade(report: VerifyReport) -> bool:
+def _claim_cascade(report: VerifyReport, ws: Workspace | None = None) -> bool:
     """One pass of the claim-level cascade (R11, AE5): a claim that rests (``depends_on``) on a failing claim of its
     unit, or on a unit removed, loses its basis and fails with that claim's failure kind (check ``dependency``). When
     no claim of its unit stands the unit is removed; otherwise it stays, marked (a partial problem per such claim).
-    A computation over the turn's verified values rests on no claim, and stays. Whether anything was added."""
+    A computation over the turn's verified values rests on no claim, and stays. A supported claim that rests only on a
+    removed unit and that the unit's own cited sources state (``_own_support``, with ``ws``) stays (round 18 U3).
+    Whether anything was added."""
     units = {u.index: u for u in report.units}
     removed = {p.unit.index: p for p in report.removals()}
     added = False
@@ -7469,7 +7529,7 @@ def _claim_cascade(report: VerifyReport) -> bool:
                             None)
                 gone = next((removed[int(ref)] for ref in r.refs if ref.isdigit() and int(ref) != idx
                              and int(ref) in removed), None)
-                if base is None and gone is None:
+                if base is None and (gone is None or (r.verdict == "supported" and _own_support(units[idx], ws, r.text))):
                     continue
                 kind = base.failure_kind() if base is not None else (gone.failure_kind or "absent_from_source")
                 cause = base.cause if base is not None else gone.cause

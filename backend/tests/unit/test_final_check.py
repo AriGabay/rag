@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import re
 import time
 import uuid
@@ -1059,8 +1060,15 @@ def test_a_claim_a_re_read_rescued_survives_the_cut_of_the_claim_beside_it_when_
 def _fails_closed(agent) -> engine.ProviderFailure:
     with pytest.raises(engine.ProviderFailure) as raised:
         _turn(agent)
-    assert (raised.value.status, raised.value.detail) == ("verify_unavailable", "final_text")
+    # the user-facing status is unchanged; the detail keeps the cause (round 18 U3, KTD7, R13): the exception's text and the check's stats
+    assert raised.value.status == "verify_unavailable"
     assert isinstance(raised.value.__cause__, final_check.FinalCheckError)
+    cause = raised.value.__cause__
+    assert raised.value.detail.startswith(f"final_text: {cause}"), raised.value.detail
+    assert raised.value.trace["final_check"]["error"] == str(cause)
+    stats = raised.value.trace["final_check"]["stats"]
+    assert stats["passes"] >= 1 and {"units", "reused", "judged", "removed", "withheld"} <= set(stats), stats
+    assert all(f'"{k}": {json.dumps(v)}' in raised.value.detail for k, v in stats.items()), raised.value.detail
     return raised.value
 
 

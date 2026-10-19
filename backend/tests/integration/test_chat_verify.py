@@ -228,6 +228,32 @@ def test_a_text_that_is_not_the_one_the_final_check_verified_is_never_saved_as_a
     assert row.status == "failed" and row.answer is None and not row.content
 
 
+def test_a_final_check_that_fails_keeps_its_cause_in_the_diagnostics_and_the_user_sees_the_same_message(
+        client, setup, monkeypatch):
+    from app.chat import final_check
+
+    def broken(saved, again):
+        raise final_check.FinalCheckError("the server's spans are not a fixed point of the final state")
+
+    monkeypatch.setattr(final_check, "assert_fixed_point", broken)
+    answer = final(MIXED + " [S1].", documents=[setup.secret])
+    agent = ScriptedAgent([[call("search", query="דמי ניהול", document_ids=[setup.secret], limit=None)], answer, answer,
+                           answer])
+    cloud(monkeypatch, setup, agent)
+    login(client, "emp@example.test")
+    m = send(client, new_conversation(client), "מה דמי הניהול?")
+    # what the user sees is the failure's fixed message, with no cause in it
+    assert m["status"] == "failed" and m["error"] == chat_api.FAILURE_TEXT["verify_unavailable"] + " אפשר לנסות שוב.", m
+    assert "fixed point" not in json.dumps(m, ensure_ascii=False)
+    # what the owner reads in the diagnostics is the cause: the exception's text and the final check's counts
+    log = client.get(f"/api/chat/messages/{m['id']}/diagnostics")
+    assert log.status_code == 200, log.text
+    failure = log.json()["resolution"]["failure"]
+    assert failure["status"] == "verify_unavailable" and "fixed point" in failure["detail"], failure
+    assert failure["final_check"]["error"] == "the server's spans are not a fixed point of the final state"
+    assert failure["final_check"]["stats"]["passes"] >= 1 and "judged" in failure["final_check"]["stats"], failure
+
+
 def test_the_rows_of_the_normal_payload_name_the_claim_the_action_and_the_marker_in_the_texts_order(
         client, setup, monkeypatch):
     m = _handled_turn(client, setup, monkeypatch)

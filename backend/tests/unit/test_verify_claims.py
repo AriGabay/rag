@@ -710,3 +710,54 @@ def test_a_claim_resting_on_a_removed_unit_by_its_index_is_removed_with_that_uni
     inference = report.claims[1][0]
     assert inference.verdict == "unsupported" and inference.basis == report.claims[0][0].id
     assert inference.depends_on == [report.claims[0][0].id]
+
+
+# --- a dependent that its own cited source states survives the removal of its predecessor (round 18 U3, KTD3, R8) ---------
+
+def _dependency_report(second: str, source2: str, depends=(0,)) -> verify.VerifyReport:
+    """Unit 0 states an area the source contradicts (removed); unit 1 ``second`` is judged supported but resting on unit 0."""
+    answer = _answer(f"שטח הנכס הוא 1,000 מ\"ר [S1].\n{second}")
+
+    def respond(input: str) -> dict:
+        return {"verdicts": [
+            {"index": 0, "verdict": "contradicts", "reason": "x"},
+            {"index": 1, "verdict": "supported", "reason": "x", "depends_on": list(depends)}]}
+
+    return verify_answer(_judge(respond), answer, _salted("שטח הנכס 1,200 מ\"ר.", source2), "?", [])
+
+
+def test_a_unit_whose_own_cited_source_states_its_numbers_survives_the_removal_of_the_unit_it_rests_on():
+    report = _dependency_report("דמי השכירות החודשיים הם 55 ₪ למ\"ר [S2].", "דמי השכירות החודשיים הם 55 ₪ למ\"ר.")
+    assert report.removed_units() == {0}, [(p.unit.index, p.check, p.reason) for p in report.problems]
+    assert report.verdicts[1] == "supported"
+
+
+def test_a_unit_with_no_support_of_its_own_still_goes_with_the_unit_it_rests_on():
+    # it cites a source that does not state its number, so the number check removes it before any dependency; with no number
+    # at all, nothing but its own words stands for it
+    for second, source2 in (("הנכס גדול, כלומר הסף נחצה [S2].", "הנכס גדול."),
+                            ("דמי השכירות החודשיים הם 55 ₪ למ\"ר [S2].", "הנכס פנוי.")):
+        report = _dependency_report(second, source2)
+        assert report.removed_units() == {0, 1}, second
+    report = _dependency_report("הנכס גדול, כלומר הסף נחצה [S2].", "הנכס גדול.")
+    assert next(p for p in report.removals() if p.unit.index == 1).check == "dependency"
+
+
+def test_a_unit_that_refers_back_is_not_standing_on_its_own_source_even_when_its_number_is_stated():
+    report = _dependency_report("השטח האמור הוא 1,200 מ\"ר לפי המדידה [S2].", "השטח 1,200 מ\"ר.")
+    assert report.removed_units() == {0, 1}
+    assert next(p for p in report.removals() if p.unit.index == 1).check == "dependency"
+
+
+def test_a_claim_that_names_a_removed_unit_but_that_its_units_own_source_states_stays():
+    answer = _answer("שטח הנכס הוא 1,000 מ\"ר [S1].\nדמי השכירות החודשיים הם 55 ₪ למ\"ר [S2].")
+
+    def respond(input: str) -> dict:
+        return {"verdicts": [
+            {"index": 0, "verdict": "contradicts", "reason": "x"},
+            {"index": 1, "verdict": "supported", "reason": "x", "claims": [
+                {"span": "דמי השכירות החודשיים הם 55 ₪ למ\"ר", "verdict": "supported", "depends_on": ["0"]}]}]}
+
+    report = verify_answer(_judge(respond), answer, _salted("שטח הנכס 1,200 מ\"ר.", "דמי השכירות החודשיים הם 55 ₪ למ\"ר."),
+                           "?", [])
+    assert 1 not in report.removed_units() and report.claims[1][0].verdict == "supported"

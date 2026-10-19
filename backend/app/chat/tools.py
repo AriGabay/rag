@@ -1350,7 +1350,7 @@ def subject_from(cx, number: int | None, subject: str) -> str:
     if cx is None or not cx.multi or number is None or not (subject or "").strip():
         return ""
     named = cx.named(subject)
-    if number in named:
+    if cx.owner(number) in {cx.owner(n) for n in named}:  # the pages that only continue a context are its own (round 18 U3)
         return "context"
     return "contradicted" if named else "asserted"
 

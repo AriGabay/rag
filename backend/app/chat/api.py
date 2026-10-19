@@ -635,19 +635,7 @@ def _finish(ctx: TenantContext, message_id: UUID, status_: str, *, content: str 
                 conn.execute(text("UPDATE conversations SET updated_at = now() WHERE id = (SELECT conversation_id FROM"
                                   " messages WHERE id = :m)"), {"m": message_id})
                 if diagnostics is not None:
-                    conn.execute(text(
-                        "INSERT INTO message_diagnostics (message_id, office_id, user_id, rounds, removed, resolution,"
-                        " document_ids, limits_hit) VALUES (:m, app_office(), :u, CAST(:r AS jsonb), CAST(:x AS jsonb),"
-                        " CAST(:res AS jsonb), :d, CAST(:lim AS jsonb)) ON CONFLICT (message_id) DO UPDATE SET"
-                        " rounds = EXCLUDED.rounds, removed = EXCLUDED.removed, resolution = EXCLUDED.resolution,"
-                        " document_ids = EXCLUDED.document_ids, limits_hit = EXCLUDED.limits_hit"),
-                        {"m": message_id, "u": ctx.user_id,
-                         "r": json.dumps(diagnostics["rounds"], ensure_ascii=False, default=str),
-                         "x": json.dumps(diagnostics["removed"], ensure_ascii=False, default=str),
-                         "res": json.dumps(res, ensure_ascii=False, default=str)
-                         if (res := diagnostics.get("resolution")) else None,
-                         "d": sorted(diagnostics["document_ids"]),
-                         "lim": json.dumps(diagnostics.get("limits_hit") or [])})
+                    _store_diagnostics(conn, ctx, message_id, diagnostics)
                 return status_
             status_, content, answer, error = "cancelled", "", None, "העיבוד נעצר לבקשתך."
         conn.execute(text(
@@ -659,7 +647,39 @@ def _finish(ctx: TenantContext, message_id: UUID, status_: str, *, content: str 
              "dv": current_data_version(conn), "sh": scope_hash(ctx)})
         conn.execute(text("UPDATE conversations SET updated_at = now() WHERE id = (SELECT conversation_id FROM"
                           " messages WHERE id = :m)"), {"m": message_id})
+        if diagnostics is not None and status_ == "failed":  # a failed turn keeps its cause (round 18 U3, KTD7, R13)
+            try:  # the cause is for diagnosis: failing to keep it never changes how the turn ends
+                with conn.begin_nested():
+                    _store_diagnostics(conn, ctx, message_id, diagnostics)
+            except Exception:  # noqa: BLE001
+                logger.exception("could not record the cause of a failed turn")
     return status_
+
+
+def _store_diagnostics(conn: Connection, ctx: TenantContext, message_id: UUID, diagnostics: dict) -> None:
+    """Write (or replace) a message's diagnostics row: its rounds, removals, resolution, documents and limits."""
+    conn.execute(text(
+        "INSERT INTO message_diagnostics (message_id, office_id, user_id, rounds, removed, resolution,"
+        " document_ids, limits_hit) VALUES (:m, app_office(), :u, CAST(:r AS jsonb), CAST(:x AS jsonb),"
+        " CAST(:res AS jsonb), :d, CAST(:lim AS jsonb)) ON CONFLICT (message_id) DO UPDATE SET"
+        " rounds = EXCLUDED.rounds, removed = EXCLUDED.removed, resolution = EXCLUDED.resolution,"
+        " document_ids = EXCLUDED.document_ids, limits_hit = EXCLUDED.limits_hit"),
+        {"m": message_id, "u": ctx.user_id,
+         "r": json.dumps(diagnostics["rounds"], ensure_ascii=False, default=str),
+         "x": json.dumps(diagnostics["removed"], ensure_ascii=False, default=str),
+         "res": json.dumps(res, ensure_ascii=False, default=str) if (res := diagnostics.get("resolution")) else None,
+         "d": sorted(diagnostics["document_ids"]),
+         "lim": json.dumps(diagnostics.get("limits_hit") or [])})
+
+
+def _failure_diagnostics(e: engine.ProviderFailure) -> dict | None:
+    """The diagnostics of a turn that failed with a cause (``ProviderFailure.detail``, ``trace``): the status, the detail and the
+    structured parts, under the resolution's ``failure`` (no document text, so no document is behind it). None for a failure that
+    states no cause. The user's message is the status's fixed one either way."""
+    if not e.detail and not e.trace:
+        return None
+    return {"rounds": [], "removed": [], "document_ids": set(), "limits_hit": [],
+            "resolution": {"failure": {"status": e.status, "detail": e.detail} | (e.trace or {})}}
 
 
 def _summary_usable(conn: Connection, ctx: TenantContext, conv) -> bool:
@@ -1330,7 +1350,8 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
         usage = _log_turn_usage(ctx, provider, getattr(e, "usage", None))
         text_ = FAILURE_TEXT.get(e.status, "אירעה תקלה בספק המודל.")
         error = text_ if e.status == "output_limit" else f"{text_} אפשר לנסות שוב."
-        _finish(ctx, message_id, "failed", error=error, usage=usage, model=getattr(provider, "model", None))
+        _finish(ctx, message_id, "failed", error=error, usage=usage, model=getattr(provider, "model", None),
+                diagnostics=_failure_diagnostics(e))
     except Exception as e:  # noqa: BLE001 - the message must end in a state the user can act on
         logger.exception("chat turn failed")
         # a break after the turn returned comes after its calls were logged: they are only kept on the message

@@ -457,5 +457,6 @@ def test_a_source_of_a_single_subject_file_shows_the_judge_the_identity_the_docu
     assert _heading() == "דוח סינתטי — עמוד 2"
 
 
-def test_a_source_with_a_context_keeps_the_context_heading_and_no_subject():
-    assert _heading(context="הקשר 2: רחוב הדס 3", subject="רחוב הדס 3") == "דוח סינתטי — עמוד 2 — הקשר 2: רחוב הדס 3"
+def test_a_source_with_a_context_names_the_context_first_and_the_file_title_as_the_file_and_no_subject():
+    # round 18 U3: in a file of several reports the header names the unit's own context first (the file's title names the first report)
+    assert _heading(context="הקשר 2: רחוב הדס 3", subject="רחוב הדס 3") == "הקשר 2: רחוב הדס 3 — עמוד 2 — קובץ: דוח סינתטי"

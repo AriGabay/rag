@@ -16,9 +16,11 @@ sees (the final message and the server's lines in it), never on a call inside th
 4. VAT across number forms (U2). The source writes 16,070,000 with VAT, the answer 16.07 million with the same status: the
    VAT wording is not edited.
 5. Calculation pages that open with a short heading line ending in a colon (U3): their printed numbering restarts, which
-   opens a second context that names no property; their values are the appraisal's own, not "another property".
+   opens a second context that names no property; their values are the appraisal's own, not "another property" (the
+   context continues the one before it).
 6. A file of two reports (U3): a passage of the second report is not judged as the first report's subject because the
-   header the judge is shown carries the file's title, which names the first.
+   header the judge is shown names the second report's own context first and the file's title (which names the first) only
+   as the file.
 7. A condition on a single item (AE1, U5): "only by an approved plan" reaches the final answer with the value kept.
 8. A note after a table that points back to it (AE7, U4), with another table on the next page after unrelated blocks: the
    note scopes the first table (the read tags it "between two tables" and the server then refuses it).
@@ -200,9 +202,6 @@ CALCULATION_ANSWER = ("בחישוב ההיוון של מתחם גבעת הברו
                       "והשווי המהוון הוא 9,384,615 ₪ [S1].")
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "U3: the calculation pages (printed numbering restarts) are a second context with no identifier, and the claim, which"
-    " names the project, is removed as 'wrong_subject' ('נתון של נכס אחר באותו קובץ')"))
 def test_values_on_calculation_pages_that_open_with_a_colon_heading_are_the_appraisals_own_not_another_property(
         client, office, monkeypatch):
     m = ask(client, office, monkeypatch, CALCULATION, read_pages(3, 3), CALCULATION_ANSWER,
@@ -228,14 +227,22 @@ def head_of(input: str, source_id: str) -> str:
     return m.group(1) if m else ""
 
 
+def first_named_report(head: str) -> str:
+    """Which report a header line names first, reading it left to right: the first report's subject (``FIRST_SUBJECT`` or its
+    street) or the second's (``SECOND_SUBJECT`` or its street); "" when it names neither."""
+    at = {name: head.find(word) for name, word in (("first", "הכליל"), ("second", "הצבר")) if word in head}
+    return min(at, key=at.get) if at else ""
+
+
 def subject_head_judge(input: str) -> dict:
-    """A judge that reads a passage by the header line it is shown: a unit that cites a source whose header names the first
-    report's subject and not the asked report's own is a passage of another property (``wrong_subject``); else supported."""
+    """A judge that reads a passage by the header line it is shown, as a reader does: the subject the header names FIRST is the
+    passage's. A unit that cites a source whose header names the first report before the asked second one is a passage of
+    another property (``wrong_subject``); else supported."""
     cites = dict(re.findall(r'<unit index="(\d+)" cites="([^"]*)">', input))
     verdicts = []
     for i in units_of(input):
-        heads = " ".join(head_of(input, c) for c in re.split(r"[,\s]+", cites.get(str(i), "")) if c)
-        if FIRST_SUBJECT in heads and SECOND_SUBJECT not in heads:
+        heads = [head_of(input, c) for c in re.split(r"[,\s]+", cites.get(str(i), "")) if c]
+        if any(first_named_report(h) == "first" for h in heads):
             verdicts.append({"index": i, "verdict": "unsupported", "failure": "wrong_subject", "reason": "בדיקה",
                              "supported_by": []})
         else:
@@ -243,9 +250,6 @@ def subject_head_judge(input: str) -> dict:
     return scored(input, verdicts)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "U3: the header a source is shown in a file of two reports is the file's title (the first report's subject) plus a"
-    " street label, never the second report's own subject, so a passage of the second report is judged 'wrong_subject'"))
 def test_a_passage_of_the_second_report_is_not_judged_as_the_first_reports_subject(client, office, monkeypatch):
     m = ask(client, office, monkeypatch, MANIFEST["two_reports"], read_pages(3, 4), REPORTS_ANSWER,
             "מהו שווי הנכס בגישת ההשוואה בפרויקט נחל הצבר?", "שווי הנכס בגישת ההשוואה בפרויקט נחל הצבר",

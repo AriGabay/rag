@@ -102,7 +102,12 @@ _BULLET = re.compile(r"^[-*+•]\s+")  # a list marker: markup, not content (a s
 
 
 class FinalCheckError(Exception):
-    """The final text could not be made a fixed point of its own state: nothing unchecked is ever returned (R19)."""
+    """The final text could not be made a fixed point of its own state: nothing unchecked is ever returned (R19). ``stats``: the
+    check's counts when it failed (no content), kept with the failure so its cause is not lost (round 18 U3, KTD7, R13)."""
+
+    def __init__(self, message: str, stats: dict | None = None):
+        super().__init__(message)
+        self.stats = dict(stats or {})
 
 
 @dataclass
@@ -591,7 +596,7 @@ class _Final:
                                 basis=head.claim_id))
                             mark_claims(row.index)
         if gone != before:
-            _remove_dependents(report, report.unit_verdicts)
+            _remove_dependents(report, report.unit_verdicts, self.ws)
             report.assign_components()
         after = report.removed_units()
         for di in after - before:
@@ -604,6 +609,14 @@ class _Final:
     # --- the loop ---------------------------------------------------------------------------------------------------
 
     def run(self) -> Finalized:
+        try:
+            return self._run()
+        except FinalCheckError as exc:
+            exc.stats = exc.stats or dict(self.stats)
+            logger.error("final check failed: %s; stats=%s", exc, exc.stats)
+            raise
+
+    def _run(self) -> Finalized:
         comp = self.compose()
         removed = self.report.removed_units()
         self.passed = {self.draft_key(d) for d in self.report.units if d.index not in removed}

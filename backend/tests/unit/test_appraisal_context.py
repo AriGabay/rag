@@ -309,11 +309,13 @@ def test_a_page_without_usable_geometry_keeps_its_stored_block_top():
 # --- contexts built from stored units (round 9 U8: KTD6; R6, R10) ---------------------------------------------------------
 
 def _unit(no: int, kind: str, title: str | None, aliases: tuple = (), shown: tuple = (), first: int = 0, last: int = 0,
-          pages: tuple = (1, 1), identifiers: dict | None = None):
+          pages: tuple = (1, 1), identifiers: dict | None = None, signals: tuple | None = None):
+    """A synthetic stored unit; ``signals``: the signals of the cut that opens it (``evidence["boundary"]``), unknown by default."""
     from app.chat import units
 
+    evidence = {} if signals is None else {"boundary": {"block": first, "signals": list(signals)}}
     return units.Unit(no, kind, title, aliases, identifiers if identifiers is not None else {"shown": list(shown)},
-                      pages[0], pages[1], first, last, "certain")
+                      pages[0], pages[1], first, last, "certain", evidence)
 
 
 def _units_contexts(reading: str | None = "r1") -> contexts.Contexts:
@@ -785,3 +787,92 @@ def test_a_claim_naming_the_longer_name_of_a_unit_whose_only_name_is_its_running
     assert own is None   # unit 2's value, said of the property unit 2 is named after
     brand_only = _wrong(cx, {"V1": 2}, "מה ה-NOI?", claim=f"ה-NOI של {BRAND} הוא 14,850,000 ₪", sources={"S1": source})
     assert brand_only and cx.describe(1) in brand_only   # the brand phrase alone is still unit 1: the protection is kept
+
+
+# --- a context cut only at a restarted numbering continues the one before it (round 18 U3, KTD3, R8) -----------------------
+
+def _calc_pages_file(second: dict) -> contexts.Contexts:
+    """An appraisal of invented ``מתחם גבעת הברוש`` (unit 1, with its address) and the unit its calculation pages made when their
+    printed numbering restarted (unit 2): ``second`` are the fields of unit 2 (its kind, title, identifiers and cut signals)."""
+    parts = [_unit(1, "appraisal", "מתחם גבעת הברוש", ("גבעת הברוש",), ("רחוב הברוש 12",), first=0, last=7, pages=(1, 2),
+                   identifiers=_ident("הברוש 12", ("33410", "27"))),
+             _unit(2, **({"kind": "document", "title": None, "first": 8, "last": 12, "pages": (3, 4)} | second))]
+    first = {8: SimpleNamespace(block_index=8, page=3, bbox=[50.0, 40.0, 500.0, 52.0])}
+    return contexts.from_units(parts, first, [4, 9], "v", "r1")
+
+
+RESTART = {"signals": ("label_restart",)}
+ASK_CALC = "מה ההכנסה נטו השנתית של מתחם גבעת הברוש?"
+
+
+def test_calculation_pages_cut_only_at_a_restarted_numbering_are_the_appraisals_own_not_another_property(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _calc_pages_file(RESTART)
+    assert cx.subjects == [1, 2] and cx.named(ASK_CALC) == [1]  # the question names the appraisal, and the cut is a context
+    assert _wrong(cx, {"V1": 2}, ASK_CALC, claim="ההכנסה נטו השנתית היא 14,850,000 ₪") is None  # a value of the calculation pages
+    passage = SimpleNamespace(contexts=[2], version_id="v", text="הכנסה נטו שנתית 14,850,000 ₪.", document_id="d")
+    assert _wrong(cx, {}, ASK_CALC, claim="ההכנסה נטו השנתית היא 14,850,000 ₪", sources={"S1": passage}, ids=["S1"]) is None
+    assert cx.owner(2) == 1 and cx.owner(1) == 1
+
+
+@pytest.mark.parametrize(("why", "second"), [
+    ("an address of its own", {"identifiers": _ident("הצפצפה 7")}),
+    ("a parcel of its own", {"identifiers": _ident(parcel=("30874", "9"))}),
+    ("a subject line opens it", {"signals": ("subject_line", "label_restart")}),
+    ("a letter opening opens it", {"signals": ("letter_opening",)}),
+    ("a name of its own", {"title": "פרויקט נחל הצבר", "aliases": ("נחל הצבר",)}),
+    ("the signals of the cut are not known", {"signals": None}),
+], ids=lambda x: x if isinstance(x, str) else "")
+def test_a_value_of_a_context_that_is_not_a_mere_continuation_is_still_another_property(monkeypatch, why, second):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _calc_pages_file(RESTART | second)
+    removed = _wrong(cx, {"V1": 2}, ASK_CALC, claim="ההכנסה נטו השנתית היא 14,850,000 ₪")
+    assert removed and cx.describe(2) in removed, why
+    assert cx.owner(2) == 2, why
+
+
+def test_a_continuation_after_an_appendix_has_nothing_to_continue(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    parts = [_unit(1, "appraisal", "מתחם גבעת הברוש", ("גבעת הברוש",), first=0, last=3, pages=(1, 1)),
+             _unit(2, "appendix", "נספח", first=4, last=7, pages=(2, 2), signals=("label_restart",)),
+             _unit(3, "document", None, first=8, last=10, pages=(3, 3), signals=("label_restart",))]
+    cx = contexts.from_units(parts, {}, [], "v", "r1")
+    assert _wrong(cx, {"V1": 3}, ASK_CALC, claim="ההכנסה נטו השנתית היא 14,850,000 ₪")
+    assert cx.owner(3) == 3
+
+
+def test_a_second_continuation_continues_the_same_appraisal():
+    parts = [_unit(1, "appraisal", "מתחם גבעת הברוש", ("גבעת הברוש",), first=0, last=3, pages=(1, 1)),
+             _unit(2, "document", None, first=4, last=7, pages=(2, 2), signals=("label_restart",)),
+             _unit(3, "document", None, first=8, last=10, pages=(3, 3), signals=("label_restart", "running_line_change"))]
+    cx = contexts.from_units(parts, {}, [], "v", "r1")
+    assert (cx.owner(2), cx.owner(3)) == (1, 1)
+
+
+def test_the_header_of_a_passage_in_a_file_of_several_reports_names_its_own_unit_first_and_the_file_title_only_as_the_file():
+    import uuid
+
+    from app.chat import tools, verify
+
+    cx = _shared_word_contexts()
+    doc, ws = uuid.uuid4(), Workspace(ctx=None)
+    ws.contexts["v"] = cx
+    src = ws.add_source(document_id=doc, version_id="v", title="שומת מקרקעין — פרויקט הגפן א", section=None,
+                        location="עמוד 4", kind="context", text="שווי הנכס 14,850,000 ₪.")
+    tools._mark(src, cx, [3], ws)
+    head = verify._source_parts(ws, src.sid)[0]
+    assert head.startswith(cx.describe(3)), head  # the unit the passage is in, by its own subject
+    assert head.endswith(f" — {verify.MSG_FILE}: שומת מקרקעין — פרויקט הגפן א"), head  # the file title, as the file, last
+    # a file of one subject unit is shown as before: its title, its location and the identity the document states
+    cx1 = contexts.from_units([_unit(1, "appraisal", "מתחם הגפן", ("הגפן",), first=0, last=3)], {}, [], "v1", "r1")
+    one = ws.add_source(document_id=doc, version_id="v1", title="שומת מקרקעין", section=None, location="עמוד 1",
+                        kind="context", text="טקסט.")
+    ws.contexts["v1"] = cx1
+    tools._mark(one, cx1, [1], ws)
+    assert verify._source_parts(ws, one.sid)[0].startswith("שומת מקרקעין — עמוד 1 — זיהוי מתוך המסמך: מתחם הגפן")

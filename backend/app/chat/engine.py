@@ -502,11 +502,14 @@ class TurnCancelled(Exception):
 
 
 class ProviderFailure(Exception):
+    """A turn that failed with ``status`` (the user sees the status's fixed message only). ``detail``: the cause, for the log and the
+    diagnostics; ``trace``: structured parts of the cause (no content) that the turn's diagnostics keep (round 18 U3, KTD7)."""
+
     usage: list[dict] = []  # the model calls made before the failure (set by ``run_turn``)
 
-    def __init__(self, status: str, detail: str | None = None):
+    def __init__(self, status: str, detail: str | None = None, trace: dict | None = None):
         super().__init__(status)
-        self.status, self.detail = status, detail
+        self.status, self.detail, self.trace = status, detail, trace
 
 
 @dataclass
@@ -882,8 +885,9 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             done = finalize(provider, ws, answer, report, turn, question=inp.question,
                             request=request.standalone_question if request is not None else None, usage=usage,
                             deadline=allowance_end, limit_sentences=_limit_sentences(limits))
-        except FinalCheckError as exc:  # never an unchecked text (R19)
-            raise ProviderFailure("verify_unavailable", "final_text") from exc
+        except FinalCheckError as exc:  # never an unchecked text (R19); the failure keeps its cause (R13)
+            raise ProviderFailure("verify_unavailable", f"final_text: {exc}; final_check={json.dumps(exc.stats, sort_keys=True)}",
+                                  {"final_check": {"error": str(exc), "stats": exc.stats}}) from exc
         finally:
             ws.clock.add("final", time.monotonic() - final_started)
         composed = done.composition

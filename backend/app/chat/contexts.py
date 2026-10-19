@@ -246,6 +246,7 @@ class Segment:
     kind: str = "appraisal"  # a unit's kind (``units.KINDS``); the derivation below only finds appraisals
     certainty: str = "certain"  # the certainty of the boundary that opens it
     title: str | None = None  # a unit's title
+    signals: tuple[str, ...] | None = None  # the signals of the cut that opens it (``units.SIGNALS``); None: not known
 
 
 @dataclass(frozen=True)
@@ -278,6 +279,29 @@ class Contexts:
 
     def kind(self, number: int) -> str:
         return self.segment(number).kind
+
+    def owner(self, number: int) -> int:
+        """The subject context that context ``number`` belongs to when the check of a claim's property compares contexts (round 18
+        U3, KTD3, R8): itself, unless it only continues the subject context before it. The continuity rule of ``units`` (a new
+        unit that states no new address or parcel continues the previous one): a subject context whose cut rests only on a
+        restarted numbering, a running line or a repeated layout (no ``subject_line`` and no ``letter_opening``), that states
+        no address or parcel of its own and names nothing of its own (an appraisal's calculation pages), is a part of the
+        subject context right before it, and of that one's owner in turn. A context that states an address or a parcel, is
+        named, opens with a subject line or a letter opening, or whose cut signals are not known, is its own property."""
+        from app.chat.units import OPENING_SIGNALS
+
+        order = [s.number for i, s in enumerate(self.segments) if i == 0 or s.number != self.segments[i - 1].number]
+        seen: set[int] = set()
+        while number in order and number not in seen:
+            seen.add(number)
+            at = order.index(number)
+            seg = self.segment(number)
+            ident = seg.identity
+            if (at == 0 or seg.kind in NON_SUBJECT_KINDS or seg.signals is None or set(seg.signals) & OPENING_SIGNALS
+                    or ident.addresses or ident.parcels or ident.names or not self.is_subject(order[at - 1])):
+                return number
+            number = order[at - 1]
+        return number
 
     @property
     def numbers(self) -> list[int]:
@@ -675,6 +699,16 @@ def _unit_identity(u, card_fields: Sequence[dict] = ()) -> Identity:
     return base | _card_identity(card_fields) if card_fields else base
 
 
+def _cut_signals(u, n: int) -> tuple[str, ...] | None:
+    """The signals of the cut that opens unit ``u``, the ``n``-th of its reading (the first opens at the file's start: none); None
+    when its stored evidence does not say."""
+    if n == 0:
+        return ()
+    boundary = (getattr(u, "evidence", None) or {}).get("boundary")
+    found = boundary.get("signals") if isinstance(boundary, dict) else None
+    return tuple(found) if isinstance(found, list) else None
+
+
 def from_units(units: Sequence, first_blocks: dict, headings: Sequence[int], version_id: str,
                reading_id: str | None = None, tag: str | None = None,
                cards: dict[tuple[int, int], Sequence[dict]] | None = None) -> Contexts:
@@ -690,7 +724,7 @@ def from_units(units: Sequence, first_blocks: dict, headings: Sequence[int], ver
         start = (b.page or 0, top_of(b)) if n > 0 and b is not None else None
         segments.append(Segment(u.unit_no, _unit_identity(u, (cards or {}).get((u.block_first, u.block_last), ())),
                                 u.block_first, u.block_last, lead, start,
-                                u.page_first, u.page_last, u.kind, u.certainty, u.title))
+                                u.page_first, u.page_last, u.kind, u.certainty, u.title, _cut_signals(u, n)))
     return Contexts(version_id, tuple(segments), reading_id, tag)
 
 
