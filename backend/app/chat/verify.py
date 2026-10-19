@@ -2164,6 +2164,13 @@ class VerifyReport:
         spans = sorted((g.start - u.start, g.end - u.start) for g in self.cuts.get(u.index, [])) + sorted(
             (q.start - u.start, q.end - u.start) for q in self.qualifier_edits.get(u.index, []))
         spans = sorted((max(a, 0), min(b, len(u.raw))) for a, b in spans if a < len(u.raw) and b > 0)
+        # a citation the server attaches to the unit (``needs_citation``: the source the judge or the meaning check found for it) is one
+        # the user will see: the unit that states an item's value gives it by attribution to that source (round 18 U7, KTD6), not only
+        # once the repaired text cites it
+        attached = [p.cite for p in self.problems
+                    if p.kind == "needs_citation" and p.unit.index == u.index and p.uncited and p.cite not in u.ids]
+        if attached:
+            u = dataclasses.replace(u, ids=[*u.ids, *dict.fromkeys(attached)])
         if not spans:
             return u
         kept, at = [], 0
@@ -2175,7 +2182,7 @@ class VerifyReport:
                 at = max(at, b)
         kept.append(u.raw[at:])
         raw = "".join(kept)
-        return dataclasses.replace(u, raw=raw, text=_IDS.sub("", raw).strip(), ids=ids_in(raw))
+        return dataclasses.replace(u, raw=raw, text=_IDS.sub("", raw).strip(), ids=[*ids_in(raw), *attached])
 
     def item_listing(self, kept: set[int] | None = None, texts: dict[str, str] | None = None, *, ask: bool = True) -> list[dict]:
         """The ledger as the requirements call is shown it (``_Coverage.items``): each item's id, component, origin, label, source, quote,

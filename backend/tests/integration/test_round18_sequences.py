@@ -45,7 +45,8 @@ from app.platform import pipeline
 from tests.conftest import login
 from tests.factories import make_office
 from tests.integration.test_chat import cloud, new_conversation, send
-from tests.integration.test_chat_calculation import _outputs, handle_of
+from tests.integration.test_chat_calculation import _outputs, cell, handle_of
+from tests.integration.test_chat_timeline import ADOPTED
 from tests.integration.test_documents_api import ingest
 from tests.integration.test_round16_sequences import RecordingAgent, repair_calls, repair_prompt
 from tests.support.scripted_agent import ScriptedAgent, call, component, final, read, requirement
@@ -415,6 +416,71 @@ def test_the_method_a_numbered_heading_names_reaches_a_value_of_its_table_and_a_
     line = line_with(md, METHOD_VALUE)
     assert METHOD["method_phrase"] in line and re.search(r"\[S\d+\]", line), md
     assert "גישת ההשוואה" not in md, md
+
+
+# --- 9b. the same heading, the value cited through a registered value (V#) and the server's own citation (round 18 follow-up) -----
+
+METHOD_ROW = METHOD["rows"][1][0]
+METHOD_BOLD = f"השווי המהוון של הנכס הוא **{METHOD_VALUE} ₪**"
+
+
+def read_and_take(caption: str):
+    """A scripted step that reads the table captioned ``caption`` and registers its value cell (V1) in the same step, as the model does."""
+    def step(items):
+        return [read(table=handle_of(_outputs(items)[0], caption)),
+                call("take_value", source="S1", locator=cell(METHOD_ROW, None, METHOD_VALUE) | {"column_number": 2}, meaning=ADOPTED,
+                     label=METHOD_ROW)]
+    return step
+
+
+def test_a_value_cited_only_as_a_registered_value_is_checked_against_the_headings_method_and_gets_it(client, office, monkeypatch):
+    """c3 attempt 3 on the real model: the answer cites the table value as [V1] alone (the round-17 attribution rule: a registered value
+    cites the source it was read from). The V# is followed to its table's row and heading (``items.source_items``): the origin-``source``
+    item exists, its condition (the heading's method) is asked of the requirements call, and a ``missing`` outcome puts the method next to
+    the value. (That a silent call leaves the value as it is, is the contract: the heading is the call's to read, a generic label such as
+    "the valuation method" being no condition.)"""
+    bare = f"{METHOD_BOLD} [V1]."
+    seen: list[str] = []
+
+    def judge(input: str) -> dict:
+        seen.append(input)
+        return condition_judge("missing", METHOD["method_phrase"])(input)
+
+    m = ask(client, office, monkeypatch, METHOD, read_and_take(METHOD["caption"]), bare, "מהו השווי המהוון של הנכס?",
+            "השווי המהוון של הנכס", repaired=f"לפי {METHOD['method_phrase']} {bare}", judge=judge)
+    line = line_with(m["answer"]["markdown"], METHOD_VALUE)
+    assert METHOD["method_phrase"] in line and re.search(r"\[[SV]\d+\]", line), m["answer"]["markdown"]
+    assert "גישת ההשוואה" not in m["answer"]["markdown"]
+    first = next(x for x in seen if "<item_ledger>" in x)
+    ledger = first[first.index("<item_ledger>"):first.index("</item_ledger>")]  # the V# was followed to its table: item I1 of S1
+    assert '<item id="I1" source="S1"' in ledger and 'check="undecided"' in ledger and f'span="4. {METHOD["method_phrase"]}"' in ledger
+
+
+def candidate_and_source_judge(input: str) -> dict:
+    """A judge that names the table (S1) as the support of the sentence that states the value but cites nothing, assigns the capitalised
+    value's row as asked, and supports every unit."""
+    out = lenient_judge(input)
+    for v in out["verdicts"]:
+        if METHOD_VALUE in units_of(input)[v["index"]] and "[" not in units_of(input)[v["index"]]:
+            v["supported_by"] = ["S1"]
+    asks = [{"candidate": c, "words": METHOD_ROW} for c, label in re.findall(r'<candidate id="(K\d+)"[^>]*label="([^"]*)"', input)
+            if label == METHOD_ROW]
+    for r in out.get("requirements", []):
+        r["candidates"] = asks
+    return out
+
+
+def test_a_value_stated_in_a_sentence_the_server_cites_is_not_read_and_not_used(client, office, monkeypatch):
+    """c3 attempt 1 on the real model: the first sentence states the bold value without a citation, the next cites the table ([V1][S1]).
+    The server attaches the citation the judge named to the first sentence; the item of that row (a candidate the judge assigned) is
+    then given by it, and no line says it was read and not used."""
+    draft = (f"{METHOD_BOLD}; מועד הנתון לא ידוע. הוא מופיע בטבלת תוצאות החישוב בסעיף „{METHOD['method_phrase']}” [V1][S1].")
+    m = ask(client, office, monkeypatch, METHOD, read_and_take(METHOD["caption"]), draft, "מהו השווי המהוון של הנכס?",
+            "השווי המהוון של הנכס", judge=candidate_and_source_judge)
+    md = m["answer"]["markdown"]
+    assert "לא נעשה בו שימוש" not in md and METHOD_VALUE in md, md
+    ledger = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["resolution"]["item_ledger"]
+    assert [i["state"] for i in ledger["items"]] == ["covered"], ledger["items"]
 
 
 # --- 10. a per-use rate table of which the answer cites one row (AE5, AE6, U6) -----------------------------------------------

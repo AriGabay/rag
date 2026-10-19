@@ -16,8 +16,10 @@ round18``; the contents are the manifest's), ingested through the worker into a 
   section whose own note scopes its table to the comparison approach. Asked for a value of the first table, the heading's method
   stands next to the value with a citation and the later section's note is not applied to it;
 - ``c4`` candidate rows (AE6): R18i, a table of per-use parking rates with an annual-subscription row. Asked for the rates per
-  use, no row the question did not ask about (the subscription) is added, in the answer or in the item ledger. The number of
-  asked rows that reached the answer is reported, not asserted.
+  use, the SERVER adds no row the question did not ask about (the subscription): no candidate or origin-``source`` item of the
+  ledger holds it (and so no completion repair of one), and no span the server wrote states it. A row the AGENT wrote itself in its
+  draft (an agent item, an agent sentence) is the model's choice, not the candidate mechanism: it is reported as ``agent_added_unasked_rows``
+  (a count), not asserted. The number of asked rows that reached the answer is reported, not asserted.
 
 Each sequence is asked in a **new conversation, exactly three times**; every repetition is recorded before anything is asserted -
 a failure in any repetition is reported and a later pass never hides it - and a sequence passes only when all three repetitions
@@ -140,6 +142,22 @@ class Turn18(Turn):
     """The round-17 turn record plus the spans the server wrote in the answer (kind and text), the registry the stage of a part
     is read from."""
 
+    def __init__(self, c, m: dict, question: str, wall: float) -> None:
+        super().__init__(c, m, question, wall)
+        d = c.get(f"/api/chat/messages/{m['id']}/diagnostics")
+        body = d.json() if d.status_code == 200 else {}
+        resolution = body.get("resolution") or {}
+        # what the server asked of the requirements call about each item's condition, and what the call answered (the evidence of
+        # a condition that did not reach the answer: no item, no check, a check the call left undecided, or a judge outcome)
+        self.condition_trace = {
+            "items": [{"id": i.get("id"), "origin": i.get("origin"), "candidate": i.get("candidate"), "state": i.get("state"),
+                       "check": i.get("condition_check"), "unit": i.get("condition_unit"),
+                       "spans": [(sp.get("place"), (sp.get("text") or "")[:120]) for sp in i.get("condition_spans") or []]}
+                      for i in (resolution.get("item_ledger") or {}).get("items") or []],
+            "judge": [{"round": r.get("round"), "component": comp.get("id"), "conditions": v.get("conditions")}
+                      for r in resolution.get("requirements_trace") or [] for comp in r.get("components") or []
+                      for v in comp.get("votes") or [] if v.get("conditions")]}
+
     @property
     def spans(self) -> list[dict]:
         md = self.markdown
@@ -160,7 +178,7 @@ class Turn18(Turn):
         return "completion_repair" if asked else "agent_draft"
 
     def record(self) -> dict:
-        return super().record() | {"server_spans": self.spans}
+        return super().record() | {"server_spans": self.spans, "condition_trace": self.condition_trace}
 
 
 def ask(c, cid: str, question: str, rec: dict) -> Turn18:
@@ -320,6 +338,7 @@ def test_c3_the_headings_method_reaches_the_value_and_the_later_note_does_not_th
         reached = {"value": any(has(ln, CAPITALISED) for ln in lines), "method": any(has(ln, SCOPE) for ln in lines)}
         rec["info"] = base_info(t, reached, {"value": stage(t, reached["value"]), "method": t.part_stage(SCOPE)})
         rec["info"]["comparison_approach_anywhere_in_answer"] = any(has(ln, COMPARISON) for ln in lines)
+        rec["info"]["condition_trace"] = t.condition_trace
         check(rec, "answered", lambda: answered(t))
         check(rec, "value_kept", lambda: reached_all({"value": reached["value"]}))
         check(rec, "cited", lambda: cites_document(t, doc))
@@ -333,30 +352,42 @@ def test_c3_the_headings_method_reaches_the_value_and_the_later_note_does_not_th
 def test_c4_candidate_rows_add_no_row_the_question_did_not_ask_for_three_times(office, monkeypatch):
     doc = ingest_pdf(office, monkeypatch, RATE_TABLE)
 
-    def unasked_rows(t: Turn18) -> list:
-        """Where the annual-subscription row (not a per-use rate) appears: in the answer (its label with a number, or its
-        figure) or as an item of the ledger."""
-        in_answer = [ln for ln in t.lines if has(ln, UNASKED_VALUE) or (has(ln, UNASKED_LABEL) and re.search(r"\d", ln))]
-        in_ledger = [(i["label"], i["value"], i["state"], i["origin"]) for i in t.items
-                     if has(str(i["label"] or ""), UNASKED_LABEL) or has(str(i["value"] or ""), UNASKED_VALUE)]
-        return [("answer", ln) for ln in in_answer] + [("ledger", x) for x in in_ledger]
+    def unasked_rows(t: Turn18) -> dict:
+        """Where the annual-subscription row (not a per-use rate) appears, by who put it there: ``server`` - a ledger item that is
+        not the agent's (a candidate or a span-derived item, whose completion repair is the only way a candidate reaches the answer),
+        or a span the server wrote that states it; ``agent`` - a sentence of the answer outside the server's spans and the agent's own
+        ledger items, which are the model's choice and only counted."""
+        states_it = lambda text: has(text, UNASKED_VALUE) or (has(text, UNASKED_LABEL) and re.search(r"\d", text))  # noqa: E731
+        ledger = [(i["label"], i["value"], i["state"], i["origin"]) for i in t.items
+                  if has(str(i["label"] or ""), UNASKED_LABEL) or has(str(i["value"] or ""), UNASKED_VALUE)]
+        server = [("ledger", x) for x in ledger if x[3] != "agent"]
+        server += [("span", sp["kind"], sp["text"].strip()) for sp in t.spans if sp["kind"] != "citation" and states_it(sp["text"])]
+        in_spans = [sp["text"] for sp in t.spans if sp["kind"] != "citation"]
+        written = [ln for ln in t.lines if states_it(ln) and not any(ln in " ".join(sp.split()) for sp in in_spans)]
+        declared = [x for x in ledger if x[3] == "agent"]
+        # one row, once: the sentence that states it and the ledger item that declares it are the same row
+        return {"server": server, "agent": [("answer", ln) for ln in written] + [("ledger", x) for x in declared],
+                "agent_count": max(len(written), len(declared))}
 
     def no_unasked(t: Turn18) -> None:
-        added = unasked_rows(t)
-        assert not added, ("a row the question did not ask about was added", added[:3])
+        added = unasked_rows(t)["server"]
+        assert not added, ("the server added a row the question did not ask about", added[:3])
 
     def body(o, c, cid, rec):
         t = ask(c, cid, "מהם התעריפים לשימוש בחניון ברחוב התמר?", rec)
         lines = t.lines
         reached = {n: any(has(ln, label) and has(ln, value) for ln in lines) for n, (label, value) in ASKED_ROWS.items()}
+        unasked = unasked_rows(t)
         rec["info"] = base_info(t, reached, {n: stage(t, r) for n, r in reached.items()})
         rec["info"] |= {"asked_rows_reached": sum(reached.values()), "asked_rows_total": len(ASKED_ROWS),
-                        "unasked_rows_added": unasked_rows(t), "unasked_label_mentioned": any(has(ln, UNASKED_LABEL) for ln in lines)}
+                        "unasked_rows_added_by_server": unasked["server"],
+                        "agent_added_unasked_rows": unasked["agent_count"], "agent_added_unasked_rows_detail": unasked["agent"],
+                        "unasked_label_mentioned": any(has(ln, UNASKED_LABEL) for ln in lines)}
         check(rec, "answered", lambda: answered(t))
         check(rec, "cited", lambda: cites_document(t, doc))
-        check(rec, "no_unasked_row", lambda: no_unasked(t))
+        check(rec, "no_unasked_row_added_by_server", lambda: no_unasked(t))
 
-    run_sequence("c4_candidates_asked_and_unasked_rows", ("answered", "cited", "no_unasked_row"), office, body)
+    run_sequence("c4_candidates_asked_and_unasked_rows", ("answered", "cited", "no_unasked_row_added_by_server"), office, body)
 
 
 # --- the summary ----------------------------------------------------------------------------------------------------------
