@@ -176,7 +176,14 @@ from app.chat import dates as chat_dates
 from app.chat import units as unit_store
 from app.chat import unread as unread_text
 from app.chat.contexts import MSG_NO_TITLE
-from app.chat.evidence import TABLE_AFTER, TABLE_BEFORE, TABLE_BETWEEN, TABLE_PATH_PREFIX, TABLE_SIZE_PREFIX
+from app.chat.evidence import (
+    PART_REASON_MARKS,
+    TABLE_AFTER,
+    TABLE_BEFORE,
+    TABLE_HEADING_LIKE,
+    TABLE_PATH_PREFIX,
+    TABLE_SIZE_PREFIX,
+)
 from app.chat.intent import MIXED, PROFESSIONAL
 from app.chat.property import (
     REASON_ADDRESS_CITY,
@@ -395,6 +402,10 @@ class Source:
     # a source the server made for its own checks during verification (a re-read's context, an expansion, a trial): the agent was
     # never shown it, so it is no read passage and no support for the requirements judge (round 16 follow-up)
     server_made: bool = False
+    # the context parts a table read carries, as data (round 18 U4, KTD5): the blocks before and after the table with the evidence
+    # that attributes each to it (``TablePart``); empty for a source that is not a table read. Verification reads them from here,
+    # not from the tags in ``text``, and needs no database read for it
+    table_parts: list = field(default_factory=list)
 
     @property
     def is_listing(self) -> bool:
@@ -3359,6 +3370,7 @@ TABLE_CONTEXT_BEFORE_CHARS = 700  # the paragraph above a table is a part only w
 TABLE_CONTEXT_AFTER_CHARS = 1200  # the paragraphs after a table, together
 TABLE_CONTEXT_SCAN = 12  # the blocks read after a table to find its parts and what follows
 TABLE_FOLLOWS = 4  # the blocks after the parts that the "what follows" line names
+TABLE_HEADING_SCAN = 4  # the blocks above a table searched for the paragraph before it and for the labels of its section
 _BLOCK_KINDS = {"paragraph": "פסקה", "textbox": "תיבת טקסט", "heading": "כותרת", "table": "טבלה", "image": "תמונה"}
 _UNREAD_REGION = "אזור שלא נקרא"
 MSG_TABLE_PART = "[{side}{between} · {kind} · בלוק {block}] {text}"
@@ -3374,13 +3386,76 @@ TABLE_STATUS_LABELS = {"complete": "הטבלה נקראה במלואה (כל ש�
 
 class TablePart(NamedTuple):
     """A block beside a table that its read carries: ``side`` is ``before`` or ``after``; ``between``: a paragraph that
-    lies between two tables, which belongs to neither one's own text more than to the other's."""
+    lies between two tables, which belongs to neither one's own text more than to the other's.
+
+    The evidence that attributes it to the table (round 18 U4, KTD5), recorded when the table is read: ``page`` (the block's page),
+    ``gap`` (the blocks that stand between it and the table, other than the table's own), ``page_gap`` (the pages between it and
+    the table's nearest edge: 0 the same page, 1 the next; None when a page is unknown), ``reference`` (what its wording points to:
+    ``back``, ``forward``, ``both`` or empty, by ``reference_of``; None when it was not read from a table), and ``heading_like``
+    (a short label the extractor stored as a paragraph, which is part of the heading scope of the table below it)."""
 
     side: str
     kind: str
     block_index: int
     text: str
     between: bool
+    page: int | None = None
+    gap: int = 0
+    page_gap: int | None = None
+    reference: str | None = None
+    heading_like: bool = False
+
+    @property
+    def reasons(self) -> tuple[str, ...]:
+        """Why the part is NOT attributed to the table: ``between`` (it lies between two tables), ``not_adjacent`` (another block
+        stands between it and the table, or its page is not the table's or the one next to it) and ``no_reference`` (its wording does
+        not point to the table from where it stands: a paragraph after the table points back, one before it points forward). A
+        paragraph between two tables is attributed all the same when it is adjacent and points to this one. Empty: attributed. A part
+        made without evidence (``reference`` None) has only ``between``. A heading-like label is the heading scope: always attributed."""
+        if self.heading_like:
+            return ()
+        if self.reference is None:
+            return ("between",) if self.between else ()
+        far = self.gap > 0 or (self.page_gap is not None and self.page_gap > 1)
+        expected = "back" if self.side == "after" else "forward"
+        silent = self.reference not in (expected, "both")
+        if not (far or silent):
+            return ()
+        return tuple(r for r, on in (("between", self.between), ("not_adjacent", far), ("no_reference", silent)) if on)
+
+    @property
+    def attributed(self) -> bool:
+        return not self.reasons
+
+
+# the words with which a paragraph points to a table beside it: a closed set, used only together with a table word and with the
+# paragraph's place beside the table (``TablePart.reasons``), never alone (round 18 U4, KTD5)
+_TABLE_WORD = re.compile(r"(?<![א-ת])[הבלמכש]{0,2}טבל(?:ה|ת|אות)(?![א-ת])")
+_POINTS_BACK = re.compile(r"(?<![א-ת])(?:ש?לעיל|הנ[\"״׳']ל|האמור(?:ה|ות))(?![א-ת])")
+_POINTS_FORWARD = re.compile(r"(?<![א-ת])(?:ש?להלן|הבא(?:ה|ות)|כדלקמן)(?![א-ת])")
+_LABEL_NUMBER = re.compile(r"^(?:\d+(?:\.\d+)*[.)]?|[א-תA-Za-z][.)])\s+\S")
+TABLE_LABEL_WORDS = 12  # a label the extractor stored as a paragraph has at most this many words, and
+TABLE_LABEL_SHORT = 6  # ... without a number in front of it at most these
+
+
+def reference_of(text: str) -> str:
+    """What a paragraph's wording points to: ``back`` (a table with a word like «לעיל»), ``forward`` («להלן», «הבאה»), ``both`` or
+    empty. A reference word counts only beside a word for a table."""
+    flat = _flat(text)
+    if not _TABLE_WORD.search(flat):
+        return ""
+    back, forward = bool(_POINTS_BACK.search(flat)), bool(_POINTS_FORWARD.search(flat))
+    return "both" if back and forward else "back" if back else "forward" if forward else ""
+
+
+def heading_like(text: str) -> bool:
+    """A short label that stands alone, which an extraction that took it for a paragraph left out of the heading path: a number and a
+    few words (``4. גישת היוון``), or at most ``TABLE_LABEL_SHORT`` words, with a letter and no sentence or colon at its end."""
+    flat = _flat(text)
+    words = len(flat.split())
+    if not flat or words > TABLE_LABEL_WORDS or flat[-1] in ".!?:;,…" or not re.search(r"[א-תA-Za-z]", flat):
+        return False
+    return words <= TABLE_LABEL_SHORT or bool(_LABEL_NUMBER.match(flat))
 
 
 @dataclass
@@ -3412,13 +3487,22 @@ def _kind_of(r) -> str:
     return _UNREAD_REGION if r.status == reader.UNREAD else _BLOCK_KINDS.get(r.kind, "קטע")
 
 
+def _page_gap(page: int | None, edge: int | None, *, after: bool) -> int | None:
+    """The pages between a block and the nearest edge of its table (0: the same page), or None when a page is unknown."""
+    if page is None or edge is None:
+        return None
+    return max(0, page - edge if after else edge - page)
+
+
 def _table_context(ws: Workspace, conn: Connection, v: reader.Version, table_index: int, st: dict, block, cx
                    ) -> TableContext:
     """The context of a table (``TableContext``) from the blocks around its first block ``block``, within its appraisal unit:
     the paragraph just above it when that is not its caption, and the paragraphs just after it up to the next heading, table
     or picture, within ``TABLE_CONTEXT_AFTER_CHARS`` (a paragraph that does not fit ends the parts: none is cut). A paragraph
     between two tables is tagged as such. Nothing is taken from another unit. The blocks after the parts are named, with
-    the position that reads on from the first of them."""
+    the position that reads on from the first of them. Each part records the evidence that attributes it to the table
+    (``TablePart``: the blocks between, the page, the wording); the short labels of the table's own section that stand above it
+    as paragraphs (``heading_like``) are parts of its heading scope (round 18 U4, KTD5)."""
     if block is None:
         return TableContext()
     first = block.block_index
@@ -3428,18 +3512,37 @@ def _table_context(ws: Workspace, conn: Connection, v: reader.Version, table_ind
         return not cx.multi or (seg is not None and seg.first <= index <= seg.last)
 
     ctx = TableContext(path=reader.effective_path(cx, first, tuple(block.section_path or ())))
-    captions = {_flat(x) for x in [st.get("caption"), *(st.get("title") or []), block.text] if x}
-    above = reader.blocks_above(conn, v.version_id, first, lo=seg.first if seg is not None else 0, limit=2)
+    captions = {_flat(x) for x in [st.get("caption"), *(st.get("title") or []), block.text, *ctx.path] if x}
+    above = reader.blocks_above(conn, v.version_id, first, lo=seg.first if seg is not None else 0,
+                                limit=TABLE_HEADING_SCAN)
     near = above[-1] if above else None
+    section = tuple(block.section_path or ())
+    labels = []  # the labels of the table's own section above it, nearest first, up to the first heading, table or picture
+    for r in reversed(above):
+        if r.status == "decorative":
+            continue
+        if not _is_prose(r):
+            break
+        if tuple(r.section_path or ()) == section and heading_like(r.text) and _flat(r.text) not in captions:
+            labels.append(r)
+
+    def before_part(r, *, label: bool) -> TablePart:
+        text_ = r.text.strip()
+        gap = sum(1 for x in above if x.block_index > r.block_index and x.status != "decorative")
+        return TablePart("before", r.kind, r.block_index, text_,
+                         len(above) >= 2 and above[-2].kind == "table" and r is near, r.page, gap,
+                         _page_gap(r.page, block.page, after=False), reference_of(text_), label)
+
+    ctx.parts += [before_part(r, label=True) for r in reversed(labels)]
     if near is not None and _is_prose(near) and _flat(near.text) not in captions \
-            and len(near.text) <= TABLE_CONTEXT_BEFORE_CHARS:
-        ctx.parts.append(TablePart("before", near.kind, near.block_index, near.text.strip(),
-                                   len(above) == 2 and above[0].kind == "table"))
+            and len(near.text) <= TABLE_CONTEXT_BEFORE_CHARS and not any(r is near for r in labels):
+        ctx.parts.append(before_part(near, label=False))
     rows = reader.blocks_between(conn, v.version_id, first, first + TABLE_CONTEXT_SCAN, limit=TABLE_CONTEXT_SCAN + 1)
     lead = 0
     while lead < len(rows) and rows[lead].table_index == table_index:  # the table's own blocks come first
         ctx.table_blocks.append(rows[lead].block_index)
         lead += 1
+    last_page = rows[lead - 1].page if lead else block.page  # the page the table ends on
     run, end = [], None  # the paragraphs after the table, and the block that ends them
     # the window was not filled, or no block (of this unit) lies beyond it: nothing was left unscanned
     ctx.ended = bool(rows) and (rows[-1].block_index < first + TABLE_CONTEXT_SCAN or not any(
@@ -3463,7 +3566,9 @@ def _table_context(ws: Workspace, conn: Connection, v: reader.Version, table_ind
             break
         used += len(r.text.strip())
         shown.append(r)
-    ctx.parts += [TablePart("after", r.kind, r.block_index, r.text.strip(), between) for r in shown]
+    ctx.parts += [TablePart("after", r.kind, r.block_index, r.text.strip(), between, r.page, gap,
+                            _page_gap(r.page, last_page, after=True), reference_of(r.text))
+                  for gap, r in enumerate(shown)]  # the blocks between a paragraph and the table: those of the run before it
     last = shown[-1].block_index if shown else (ctx.table_blocks[-1] if ctx.table_blocks else first)
     tail = [r for r in rows[lead:] if r.block_index > last and inside(r.block_index) and r.status != "decorative"]
     ctx.follows = [(_kind_of(r), r.block_index) for r in tail[:TABLE_FOLLOWS]]
@@ -3476,10 +3581,11 @@ def _table_context(ws: Workspace, conn: Connection, v: reader.Version, table_ind
 
 def _part_line(p: TablePart, sent: dict[int, str] | None = None) -> str:
     """A part as one line, with its kind and block reference; as a pointer to the source that returned it when ``sent``
-    (the blocks the turn returned whole) holds it."""
-    fields = {"side": TABLE_BEFORE if p.side == "before" else TABLE_AFTER,
-              "between": f" · {TABLE_BETWEEN}" if p.between else "", "kind": _BLOCK_KINDS.get(p.kind, "קטע"),
-              "block": p.block_index}
+    (the blocks the turn returned whole) holds it. The tag carries the marks of why the part is not attributed to the table
+    (``TablePart.reasons``), or the mark of a heading-like label."""
+    marks = [TABLE_HEADING_LIKE] if p.heading_like else [PART_REASON_MARKS[r] for r in p.reasons]
+    fields = {"side": TABLE_BEFORE if p.side == "before" else TABLE_AFTER, "between": "".join(f" · {m}" for m in marks),
+              "kind": _BLOCK_KINDS.get(p.kind, "קטע"), "block": p.block_index}
     if sent is not None and p.block_index in sent:
         return MSG_TABLE_PART_SENT.format(sid=sent[p.block_index], **fields)
     return MSG_TABLE_PART.format(text=_flat(p.text), **fields)
@@ -4100,7 +4206,7 @@ def _read_table_once(ws: Workspace, conn: Connection, v: reader.Version, table_i
                       kind="table", text=body, block_start=index, block_end=index, table_index=table_index,
                       page_list=[page] if page else None, partial_document=v.partial, reading_id=v.reading_id,
                       status=status, clipped=nxt is not None, more=more, resume=_target_json(target, nxt),
-                      table_part=len(window) < len(rows),
+                      table_part=len(window) < len(rows), table_parts=list(ctx.parts),
                       body="\n".join(head) + "\n" + sent,
                       tags={"document": ws.doc_handle(v.document_id),
                             "table": _table_handle(ws, v.document_id, vid, v.reading_id, table_index)})

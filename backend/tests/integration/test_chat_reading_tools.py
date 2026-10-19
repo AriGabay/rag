@@ -483,7 +483,7 @@ def test_a_prior_reference_opens_while_its_reading_is_current_and_is_stale_after
 PATH4 = ["4. שיטות"]
 PATH5 = ["5. סיכום"]
 SENSITIVITY = "טבלת רגישות לשיעור ההיוון"
-SCOPE_NOTE = "הערה: הנתונים בטבלה מתייחסים לגישת ההיוון בלבד, ולא לשווי הנכס כולו."
+SCOPE_NOTE = "הערה: הנתונים בטבלה שלעיל מתייחסים לגישת ההיוון בלבד, ולא לשווי הנכס כולו."
 LAID_OUT_TITLE = "שומה רחוב הצפצפה 3"
 
 
@@ -502,12 +502,13 @@ def add_laid_out(office, blocks: list[tuple], tables: dict[int, dict] | None = N
     with tenant_tx(office.system) as conn:
         conn.execute(text("UPDATE document_versions SET page_count = :n, ingestion = CAST(:i AS jsonb) WHERE id = :v"),
                      {"v": ver, "n": 4 if pages else None, "i": json.dumps({"reading_id": "reading-1"})})
-        for i, (kind, path, body, table) in enumerate(blocks):
+        for i, (kind, path, body, table, *at) in enumerate(blocks):
+            page = at[0] if at else 1  # a fifth element is the block's page
             conn.execute(text(
                 "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
                 " section_path, page, text, status, table_index) VALUES (app_office(), :d, :v, :b, :k, :s, :sp, :pg,"
                 " :t, 'read', :ti)"),
-                {"d": doc, "v": ver, "b": i, "k": kind, "s": path[-1], "sp": path, "pg": 1 if pages else None, "t": body,
+                {"d": doc, "v": ver, "b": i, "k": kind, "s": path[-1], "sp": path, "pg": page if pages else None, "t": body,
                  "ti": table})
         for index, structure in (tables or {}).items():
             conn.execute(text("INSERT INTO extracted_tables (office_id, document_id, version_id, table_index,"
@@ -554,8 +555,8 @@ def test_a_table_followed_by_long_paragraphs_takes_only_those_within_the_cap_and
     ws = T.Workspace(ctx=office.ctx())
     out = read_table(ws, doc)
     s = the_source(ws, out)
-    assert "[אחרי הטבלה · פסקה · בלוק 1]" in s.text and "[אחרי הטבלה · פסקה · בלוק 2]" in s.text
-    assert "פסקה 3:" not in s.text and "[אחרי הטבלה · פסקה · בלוק 3]" not in s.text
+    assert re.search(r"\[אחרי הטבלה[^\]]*בלוק 1\] פסקה 1:", s.text) and re.search(r"\[אחרי הטבלה[^\]]*בלוק 2\] פסקה 2:", s.text)
+    assert "פסקה 3:" not in s.text and not re.search(r"\[אחרי הטבלה[^\]]*בלוק 3\]", s.text)
     pointer = re.search(r"\[אחרי הטבלה: פסקה \(בלוק 3\) — .*read\(cursor=(K\d+)\)\]", out)
     assert pointer
     assert "פסקה 3:" in T.tool_read(ws, {"cursor": pointer.group(1)})
@@ -584,7 +585,7 @@ def test_the_paragraph_before_a_table_is_a_part_unless_it_is_the_tables_caption(
     # the block above the second table is its caption, written as a paragraph here: not a part, not repeated
     assert "[לפני הטבלה ·" not in second.text
     # and the first table's trailing paragraph is that caption: between the two tables
-    assert "[אחרי הטבלה · בין שתי טבלאות · פסקה · בלוק 2] טבלת מדדים" in first.text
+    assert "[אחרי הטבלה · בין שתי טבלאות · בלי הפניה לטבלה · פסקה · בלוק 2] טבלת מדדים" in first.text
 
 
 @pytest.mark.parametrize("pages", [True, False], ids=["pdf-shaped", "docx-shaped"])
@@ -604,8 +605,137 @@ def test_a_paragraph_between_two_tables_is_a_part_of_both_tagged_as_between_tabl
     ws = T.Workspace(ctx=office.ctx())
     a = the_source(ws, read_table(ws, doc))
     b = the_source(ws, read_table(ws, doc, "טבלת מדדים"))
-    assert f"[אחרי הטבלה · בין שתי טבלאות · פסקה · בלוק 1] {between}" in a.text
-    assert f"[לפני הטבלה · בין שתי טבלאות · פסקה · בלוק 1] {between}" in b.text
+    # it names no table, so it is attributed to neither (round 18 U4): the tag also says so
+    assert f"[אחרי הטבלה · בין שתי טבלאות · בלי הפניה לטבלה · פסקה · בלוק 1] {between}" in a.text
+    assert f"[לפני הטבלה · בין שתי טבלאות · בלי הפניה לטבלה · פסקה · בלוק 1] {between}" in b.text
+
+
+# --- round 18 U4: a paragraph beside a table is attributed to it by adjacency, page and wording (KTD5, R9; AE7, AE8) -----------
+
+NOTE_BACK = "הטבלה שלעיל מתייחסת לגישת היוון ההכנסות בלבד, ואינה משקפת את שווי הנכס בגישת ההשוואה."
+UNRELATED = ["הנתונים נאספו מדוחות השוק האחרונים.", "הבדיקה נערכה לפני מועד השומה.", "לא נמצאו חריגות בנתוני הקלט."]
+OTHER = "טבלת רגישות לדמי השכירות"
+
+
+def two_tables(office, middle: list[tuple], *, sha: str):
+    """The sensitivity table (block 0, page 1), the ``middle`` blocks, then another table: a document of the AE7 shape."""
+    last = len(middle) + 1
+    doc, _ = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0, 1), *middle, ("table", PATH4, OTHER, 1, 2)],
+                          {0: _sensitivity(block_index=0), 1: _sensitivity(OTHER, last)}, sha=sha)
+    ws = T.Workspace(ctx=office.ctx())
+    return ws, the_source(ws, read_table(ws, doc)), the_source(ws, read_table(ws, doc, OTHER))
+
+
+def test_ae7_a_note_that_points_back_and_follows_the_table_directly_is_attributed_though_another_table_comes_later(office):
+    middle = [("paragraph", PATH4, NOTE_BACK, None, 1), *[("paragraph", PATH4, u, None, 2) for u in UNRELATED]]
+    ws, first, second = two_tables(office, middle, sha="b1" * 32)
+    assert f"[אחרי הטבלה · פסקה · בלוק 1] {NOTE_BACK}" in first.text  # no mark: attributed, though a table follows
+    assert all(f"[אחרי הטבלה · בין שתי טבלאות · לא צמוד לטבלה · בלי הפניה לטבלה · פסקה · בלוק {n}] {u}" in first.text
+               for n, u in zip((2, 3, 4), UNRELATED, strict=True))  # the unrelated paragraphs of the next page are not
+    assert [p.reasons for p in first.table_parts if p.side == "after"] == [(), ("between", "not_adjacent", "no_reference"),
+                                                                           ("between", "not_adjacent", "no_reference"),
+                                                                           ("between", "not_adjacent", "no_reference")]
+    assert first.table_parts[0].reference == "back" and first.table_parts[0].page == 1 and first.table_parts[0].gap == 0
+
+
+def test_ae7_the_same_note_without_the_reference_word_is_not_attributed(office):
+    plain = NOTE_BACK.replace(" שלעיל", "")
+    ws, first, _ = two_tables(office, [("paragraph", PATH4, plain, None, 1)], sha="b2" * 32)
+    assert f"[אחרי הטבלה · בין שתי טבלאות · בלי הפניה לטבלה · פסקה · בלוק 1] {plain}" in first.text
+    assert first.table_parts[0].reasons == ("between", "no_reference") and not first.table_parts[0].attributed
+
+
+def test_ae7_the_same_note_with_an_unrelated_block_between_it_and_the_table_is_not_attributed(office):
+    middle = [("paragraph", PATH4, UNRELATED[0], None, 1), ("paragraph", PATH4, NOTE_BACK, None, 1)]
+    ws, first, _ = two_tables(office, middle, sha="b3" * 32)
+    assert f"[אחרי הטבלה · בין שתי טבלאות · לא צמוד לטבלה · פסקה · בלוק 2] {NOTE_BACK}" in first.text
+    assert first.table_parts[1].reasons == ("between", "not_adjacent") and first.table_parts[1].gap == 1
+
+
+@pytest.mark.parametrize("page, attributed", [(1, True), (2, True), (3, False)])
+def test_a_note_on_the_tables_page_or_the_top_of_the_next_is_adjacent_and_one_two_pages_on_is_not(office, page, attributed):
+    doc, _ = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0, 1), ("paragraph", PATH4, NOTE_BACK, None, page)],
+                          {0: _sensitivity(block_index=0)}, sha=f"b4{page}" * 21 + "b")
+    ws = T.Workspace(ctx=office.ctx())
+    s = the_source(ws, read_table(ws, doc))
+    (part,) = s.table_parts
+    assert part.attributed is attributed and part.page == page and part.page_gap == page - 1
+    assert (f"[אחרי הטבלה · פסקה · בלוק 1] {NOTE_BACK}" in s.text) is attributed
+
+
+def test_a_paragraph_with_a_forward_reference_scopes_the_table_it_precedes_and_not_the_table_above(office):
+    forward = "הטבלה הבאה מתייחסת לגישת היוון ההכנסות בלבד."
+    ws, first, second = two_tables(office, [("paragraph", PATH4, forward, None, 1)], sha="b5" * 32)
+    assert f"[לפני הטבלה · פסקה · בלוק 1] {forward}" in second.text  # no mark: attributed to the table below
+    assert f"[אחרי הטבלה · בין שתי טבלאות · בלי הפניה לטבלה · פסקה · בלוק 1] {forward}" in first.text  # and not to the one above
+    assert second.table_parts[0].attributed and not first.table_parts[0].attributed
+
+
+def test_a_paragraph_before_a_table_that_points_back_to_the_table_above_is_not_attributed_to_the_one_below(office):
+    ws, first, second = two_tables(office, [("paragraph", PATH4, NOTE_BACK, None, 1)], sha="b6" * 32)
+    assert first.table_parts[0].attributed  # the table above it
+    assert second.table_parts[0].reasons == ("between", "no_reference")
+
+
+def test_ae8_a_numbered_label_stored_as_a_paragraph_is_part_of_the_tables_heading_scope(office):
+    method = "4. גישת היוון ההכנסות"
+    lead = "הטבלה שלהלן מציגה את תוצאות החישוב."
+    doc, _ = add_laid_out(office, [("heading", PATH4, PATH4[0], None), ("paragraph", PATH4, method, None),
+                                   ("paragraph", PATH4, lead, None), ("table", PATH4, SENSITIVITY, 0)],
+                          {0: _sensitivity(block_index=3)}, sha="b7" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    s = the_source(ws, read_table(ws, doc))
+    assert f"[לפני הטבלה · כותרת בסעיף · פסקה · בלוק 1] {method}" in s.text
+    assert f"[לפני הטבלה · פסקה · בלוק 2] {lead}" in s.text
+    assert [(p.heading_like, p.reasons) for p in s.table_parts] == [(True, ()), (False, ())]
+    from app.chat import verify
+
+    assert [(p.place, p.text) for p in verify.context_of_source(s)[0] if p.place == "heading"][-1] == ("heading", method)
+
+
+@pytest.mark.parametrize("label, path, why", [
+    ("4. הערכת השווי נעשתה לפי גישת ההכנסות.", PATH4, "ends with a period: a sentence"),
+    ("הערה:", PATH4, "ends with a colon"),
+    ("4. גישת ההשוואה", PATH5, "another section"),
+    ("הנתונים בטבלה שלהלן נאספו מדוחות השוק האחרונים בלי שנעשתה בהם כל התאמה נוספת בשום שלב", PATH4, "too long"),
+])
+def test_a_paragraph_that_is_not_a_short_label_of_the_same_section_is_not_a_heading_part(office, label, path, why):
+    doc, _ = add_laid_out(office, [("heading", PATH4, PATH4[0], None), ("paragraph", path, label, None),
+                                   ("table", PATH4, SENSITIVITY, 0)], {0: _sensitivity(block_index=2)}, sha="b8" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    s = the_source(ws, read_table(ws, doc))
+    assert "כותרת בסעיף" not in s.text, why
+    assert not any(p.heading_like for p in s.table_parts), why
+
+
+def test_a_label_above_another_table_is_not_the_heading_scope_of_the_table_below_it(office):
+    label = "4. גישת היוון ההכנסות"
+    doc, _ = add_laid_out(office, [("paragraph", PATH4, label, None), ("table", PATH4, SENSITIVITY, 0),
+                                   ("table", PATH4, OTHER, 1)], {0: _sensitivity(block_index=1), 1: _sensitivity(OTHER, 2)},
+                          sha="b9" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    first = the_source(ws, read_table(ws, doc))
+    second = the_source(ws, read_table(ws, doc, OTHER))
+    assert any(p.heading_like for p in first.table_parts) and not any(p.heading_like for p in second.table_parts)
+
+
+def test_a_later_sections_note_is_never_a_part_of_the_table_above_its_heading(office):
+    doc, _ = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0), ("heading", PATH5, PATH5[0], None),
+                                   ("paragraph", PATH5, "הערה: הטבלה שלעיל מתייחסת לגישת ההשוואה בלבד.", None)],
+                          {0: _sensitivity(block_index=0)}, sha="c1" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    s = the_source(ws, read_table(ws, doc))
+    assert s.table_parts == [] and "גישת ההשוואה" not in s.text
+
+
+def test_the_memoized_copy_of_a_table_read_carries_the_same_structured_parts(office):
+    doc, _ = add_laid_out(office, [("table", PATH4, SENSITIVITY, 0), ("paragraph", PATH4, SCOPE_NOTE, None)],
+                          {0: _sensitivity(block_index=0)}, sha="c2" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    handle = handle_of(T.tool_outline(ws, str(doc)), SENSITIVITY)
+    T.tool_read(ws, {"table": handle})
+    T.tool_read(ws, {"table": handle})
+    assert ws.sources["S2"].table_parts == ws.sources["S1"].table_parts != []
 
 
 def test_a_table_at_the_end_of_a_unit_takes_no_trailing_part_from_the_next_units_untitled_paragraph(office):
@@ -645,7 +775,7 @@ def test_a_hebrew_note_with_quotation_marks_and_numbers_reaches_the_read_context
                           {0: _sensitivity(block_index=0)}, sha="8" * 64)
     ws = T.Workspace(ctx=office.ctx())
     out = read_table(ws, doc)
-    assert f"[אחרי הטבלה · פסקה · בלוק 1] {note}" in the_source(ws, out).text and note in out
+    assert f"[אחרי הטבלה · בלי הפניה לטבלה · פסקה · בלוק 1] {note}" in the_source(ws, out).text and note in out
 
 
 def test_a_table_read_twice_returns_the_memoized_copy_with_the_same_context_parts(office):

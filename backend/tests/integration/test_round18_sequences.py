@@ -321,11 +321,9 @@ def shown_scope_judge(input: str) -> dict:
 
 
 @pytest.mark.parametrize("first", [
-    "the_agent_writes_the_scope",  # holds today: the judge is shown the note, tagged as lying between two tables
-    pytest.param("the_agent_omits_the_scope", marks=pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-        "U4: the note is tagged 'בין שתי טבלאות' because another table follows within the scan, so the server does not"
-        " attribute it to the table above even though it says 'הטבלה שלעיל': the value is shown with"
-        " 'היקף הערך במקור לא אומת (הפסקה שליד הטבלה משותפת לשתי טבלאות)' instead of the scope")))])
+    "the_agent_writes_the_scope",  # the judge is shown the note, attributed to the table above it
+    "the_agent_omits_the_scope",  # the note is adjacent and points back to its table: the server attributes it (U4)
+])
 def test_a_note_that_points_back_to_the_table_above_scopes_its_values_though_another_table_follows_on_the_next_page(
         client, office, monkeypatch, first):
     m = ask(client, office, monkeypatch, NOTE, read_table(NOTE["caption"]),
@@ -348,8 +346,8 @@ METHOD_WITH = f"לפי {METHOD['method_phrase']} השווי המהוון של ה
 
 
 @pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "U4/U5: the heading '4. גישת היוון ההכנסות' is not a condition of the value under it: nothing asks for the method, so the"
-    " final answer gives 9,384,615 with no method"))
+    "U5: the heading '4. גישת היוון ההכנסות' is in the table's context (U4) but is not a condition of the value under it: nothing"
+    " asks for the method, so the final answer gives 9,384,615 with no method"))
 def test_the_method_a_numbered_heading_names_reaches_a_value_of_its_table_and_a_later_sections_note_does_not(
         client, office, monkeypatch):
     m = ask(client, office, monkeypatch, METHOD, read_table(METHOD["caption"]), METHOD_BARE,

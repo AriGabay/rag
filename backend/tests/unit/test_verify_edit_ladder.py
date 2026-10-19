@@ -13,7 +13,15 @@ import uuid
 import pytest
 
 from app.chat import coverage, final_check, verify
-from app.chat.evidence import TABLE_AFTER, TABLE_BEFORE, TABLE_BETWEEN, TABLE_PATH_PREFIX
+from app.chat.evidence import (
+    TABLE_AFTER,
+    TABLE_BEFORE,
+    TABLE_BETWEEN,
+    TABLE_HEADING_LIKE,
+    TABLE_NO_REFERENCE,
+    TABLE_NOT_ADJACENT,
+    TABLE_PATH_PREFIX,
+)
 from app.chat.tools import Workspace
 from app.chat.verify import Expansion, TurnRequirements, split_units, verify_answer
 from app.providers.llm import Purpose
@@ -565,13 +573,15 @@ SCOPE_WHERE = "טבלה 5.1 בעמוד 12"
 
 def _table(*, heading: str = "5. ניתוח רגישות לשיעור ההיוון", before: str | None = "הטבלה שלהלן מציגה את שווי הנכס.",
            caption: str = "רגישות השווי לשיעור ההיוון", rows: str = SCOPE_ROWS, notes: tuple = (),
-           after: str | None = SCOPE_NOTE, between: bool = False) -> str:
-    """A table read as the verifier holds it (round 17 U4): the heading path, the block before, the caption and size lines, the
-    rows, the table's notes, and the block after (tagged between tables when ``between``)."""
+           after: str | None = SCOPE_NOTE, between: bool = False, marks: tuple = (), label: str | None = None) -> str:
+    """A table read as the verifier holds it (round 17 U4, round 18 U4): the heading path, the heading-like label before it (``label``),
+    the block before, the caption and size lines, the rows, the table's notes, and the block after (tagged between tables when
+    ``between``, and with ``marks``: the reasons it is not attributed)."""
     lines = [f"{TABLE_PATH_PREFIX} {heading}"] if heading else []
+    lines += [f"[{TABLE_BEFORE} · {TABLE_HEADING_LIKE} · פסקה · בלוק 38] {label}"] if label else []
     lines += [f"[{TABLE_BEFORE} · פסקה · בלוק 40] {before}"] if before else []
     lines += [caption, "הטבלה: 3 שורות", rows, *notes]
-    mid = f" · {TABLE_BETWEEN}" if between else ""
+    mid = "".join(f" · {m}" for m in [*([TABLE_BETWEEN] if between else []), *marks])
     lines += [f"[{TABLE_AFTER}{mid} · פסקה · בלוק 47] {after}"] if after else []
     return "\n".join(lines)
 
@@ -709,6 +719,89 @@ def test_a_phrase_that_stands_only_in_a_paragraph_between_two_tables_is_never_as
     assert [p.check for p in r.problems] == [verify.SCOPE_LIMIT_CHECK] and r.removed_units() == set()
     first = r.edit(a).doc.text.split("\n")[0]
     assert SCOPE not in first and "משותפת לשתי טבלאות" in first and "הערך נקרא ב-S1" in first
+
+
+def test_a_phrase_from_a_paragraph_with_other_blocks_between_it_and_the_table_is_not_asserted_and_the_note_says_why():
+    """AE7: the same paragraph with an unrelated block between it and the table is not attributed."""
+    a, r = _scoped(SCOPE_UNIT, _tables(_table(marks=(TABLE_NOT_ADJACENT,))), _scope_judge())
+    assert [p.check for p in r.problems] == [verify.SCOPE_LIMIT_CHECK] and r.removed_units() == set()
+    first = r.edit(a).doc.text.split("\n")[0]
+    assert SCOPE not in first and "בין הפסקה לטבלה יש בלוקים אחרים" in first and "משותפת לשתי טבלאות" not in first
+    assert f"הערך נקרא ב-S1 ({SCOPE_WHERE})" in first
+
+
+def test_a_phrase_from_a_paragraph_that_does_not_point_to_the_table_is_not_asserted_and_the_note_says_why():
+    """AE7: the same paragraph without the reference word is not attributed, whether or not it lies between two tables."""
+    for between in (False, True):
+        a, r = _scoped(SCOPE_UNIT, _tables(_table(marks=(TABLE_NO_REFERENCE,), between=between)), _scope_judge())
+        assert [p.check for p in r.problems] == [verify.SCOPE_LIMIT_CHECK] and r.removed_units() == set()
+        first = r.edit(a).doc.text.split("\n")[0]
+        assert SCOPE not in first and "אינה מפנה אליה במילותיה" in first and "משותפת לשתי טבלאות" not in first
+
+
+def test_the_note_names_the_adjacency_before_the_wording_when_a_paragraph_lacks_both():
+    a, r = _scoped(SCOPE_UNIT, _tables(_table(marks=(TABLE_NOT_ADJACENT, TABLE_NO_REFERENCE), between=True)), _scope_judge())
+    first = r.edit(a).doc.text.split("\n")[0]
+    assert "בין הפסקה לטבלה יש בלוקים אחרים" in first and "אינה מפנה" not in first
+
+
+def test_a_value_of_two_cited_tables_is_noted_for_the_reason_the_paragraph_of_each_fails():
+    ws = _tables(_table(marks=(TABLE_NO_REFERENCE,)), _table(marks=(TABLE_NOT_ADJACENT,)))
+    a, r = _scoped(SCOPE_UNIT.replace("[S1]", "[S1][S2]"), ws, _scope_judge())
+    assert [p.check for p in r.problems] == [verify.SCOPE_LIMIT_CHECK]
+    assert "בין הפסקה לטבלה יש בלוקים אחרים" in r.edit(a).doc.text
+
+
+def test_a_heading_like_label_before_the_table_is_the_tables_heading_scope_for_a_judge_that_names_it():
+    method = "4. גישת היוון ההכנסות"
+    ws = _tables(_table(heading="", label=method, before="הטבלה שלהלן מציגה את תוצאות החישוב.", after=None))
+    a, r = _scoped(SCOPE_UNIT, ws, _scope_judge("גישת היוון ההכנסות"))
+    assert [p.check for p in r.problems] == [verify.SCOPE_CHECK] and r.removed_units() == set()
+    assert "(היקף הערך לפי המקור: גישת היוון ההכנסות)" in r.edit(a).doc.text
+    parts, _ = verify.source_context(ws.sources["S1"].text, True)
+    assert [(p.place, p.text) for p in parts][:2] == [("heading", method), ("before", "הטבלה שלהלן מציגה את תוצאות החישוב.")]
+
+
+def test_the_marks_of_a_part_tag_are_read_back_as_the_reason_it_is_not_attributed():
+    text = _table(label="4. גישת היוון", marks=(TABLE_NOT_ADJACENT, TABLE_NO_REFERENCE), between=True)
+    parts, _ = verify.source_context(text, True)
+    assert [(p.place, p.reason, p.between) for p in parts] == [
+        ("heading", "", False), ("heading", "", False), ("before", "", False), ("caption", "", False),
+        ("after", "not_adjacent", True)]
+    plain = verify.source_context(_table(marks=(TABLE_NO_REFERENCE,)), True)[0]
+    assert plain[-1].reason == "no_reference" and not plain[-1].between
+    legacy = verify.source_context(_table(between=True), True)[0]
+    assert legacy[-1].reason == "between" and legacy[-1].between
+
+
+def test_the_structured_parts_of_a_table_read_decide_the_standing_not_a_tag_in_its_text():
+    """KTD5: the evidence travels as fields of the source, so verification needs no database read and no tag parsing."""
+    from app.chat import tools as T
+
+    ws = _tables(_table())
+    src = ws.sources["S1"]
+    assert verify._scope_standing(SCOPE, src) == "ok"  # the tags carry no mark: attributed
+    src.table_parts = [T.TablePart("after", "paragraph", 47, SCOPE_NOTE, False, 1, 1, 0, "back")]  # but one block lies between
+    assert verify._scope_standing(SCOPE, src) == "not_adjacent"
+    src.table_parts = [T.TablePart("after", "paragraph", 47, SCOPE_NOTE, False, 1, 0, 0, "back")]
+    assert verify._scope_standing(SCOPE, src) == "ok"
+    src.table_parts = [T.TablePart("after", "paragraph", 47, SCOPE_NOTE, False, 1, 0, 0, "")]
+    assert verify._scope_standing(SCOPE, src) == "no_reference"
+
+
+@pytest.mark.parametrize("raw, clean", [
+    ("(גישת היוון ההכנסות בלבד)", "גישת היוון ההכנסות בלבד"),
+    ("גישת היוון ההכנסות (לפי תקן 17)", "גישת היוון ההכנסות (לפי תקן 17)"),
+    ("גישת היוון ההכנסות (לפי תקן 17", ""),
+    ("גישת היוון ההכנסות לפי תקן 17)", ""),
+    ("(גישת היוון ההכנסות", ""),
+    ("[גישת היוון ההכנסות בלבד]", "גישת היוון ההכנסות בלבד"),
+    ("גישת היוון [הכנסות בלבד", ""),
+    ("«גישת היוון ההכנסות בלבד».", "גישת היוון ההכנסות בלבד"),
+    ("גישת היוון ההכנסות בלבד, [S1].", "גישת היוון ההכנסות בלבד"),
+])
+def test_a_judge_phrase_cut_inside_a_parenthesis_is_returned_balanced_or_rejected(raw, clean):
+    assert verify._clean_scope(raw) == clean
 
 
 def test_a_phrase_from_a_between_tables_paragraph_loses_to_the_same_phrase_in_the_tables_own_note():

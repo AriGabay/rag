@@ -1014,7 +1014,7 @@ def test_a_sentence_that_moves_to_the_front_of_its_line_keeps_its_key(monkeypatc
 # --- round 16 U1: the judge contract is version 11 and the verdict cache key moves with it --------------------------------------
 
 def test_the_judge_version_is_14_and_the_verdict_cache_key_changes_with_it(monkeypatch):
-    assert verify.JUDGE_VERSION == 14  # 11: round 16 U1 (the read passages, `support`); 12: every returned passage, items of a kind; 13: round 17 U5 (defect `scope`); 14: round 18 U3 (a multi-report source header names the unit first; a bold label over a statement is shown as the statement)
+    assert verify.JUDGE_VERSION == 15  # 11: round 16 U1 (the read passages, `support`); 12: every returned passage, items of a kind; 13: round 17 U5 (defect `scope`); 14: round 18 U3 (a multi-report source header names the unit first; a bold label over a statement is shown as the statement); 15: round 18 U4 (the marks of a table part's attribution, rule 32)
     ws = _ws()
     unit = verify.split_units("השווי למ\"ר הוא 9,500 ₪ [S1].")[0]
     now = verify.unit_key(unit, ws, "?", "", {})

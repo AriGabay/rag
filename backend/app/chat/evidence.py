@@ -37,7 +37,15 @@ TABLE_SIZE_PREFIX = "הטבלה:"  # the size line a table source starts with (t
 TABLE_BEFORE = "לפני הטבלה"
 TABLE_AFTER = "אחרי הטבלה"
 TABLE_PATH_PREFIX = "כותרות מעל הטבלה:"
-TABLE_BETWEEN = "בין שתי טבלאות"  # the tag a context part has when it lies between two tables (``tools._part_line``)
+# the marks a context part carries in its tag (``tools._part_line``), each one a reason the part is NOT attributed to the table it
+# stands beside (KTD5, R9): it lies between two tables, other blocks stand between it and the table (or it is not on the table's page or
+# the page next to it), or its wording does not point to the table. A part with none of them is attributed. ``TABLE_HEADING_LIKE``
+# marks a short label the extractor stored as a paragraph, which is part of the table's heading scope
+TABLE_BETWEEN = "בין שתי טבלאות"
+TABLE_NOT_ADJACENT = "לא צמוד לטבלה"
+TABLE_NO_REFERENCE = "בלי הפניה לטבלה"
+TABLE_HEADING_LIKE = "כותרת בסעיף"
+PART_REASON_MARKS = {"between": TABLE_BETWEEN, "not_adjacent": TABLE_NOT_ADJACENT, "no_reference": TABLE_NO_REFERENCE}
 CONTEXT_MARKS = (f"[{TABLE_BEFORE}", f"[{TABLE_AFTER}", TABLE_PATH_PREFIX)
 
 _SENTENCE = re.compile(r"(?<=[.!?:;])\s+(?=\S)")

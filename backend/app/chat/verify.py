@@ -211,9 +211,11 @@ from app.chat import dates as chat_dates
 from app.chat import meaning
 from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut
 from app.chat.evidence import (
+    PART_REASON_MARKS,
     TABLE_AFTER,
     TABLE_BEFORE,
     TABLE_BETWEEN,
+    TABLE_HEADING_LIKE,
     TABLE_PATH_PREFIX,
     TABLE_SIZE_PREFIX,
     Segment,
@@ -282,8 +284,10 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # 13 (round 17 U5, KTD5): the verdict's ``defect`` gains ``scope`` and the verdict an optional ``scope`` phrase; rule (32) reads the
 # context parts a table read carries. 14 (round 18 U3, KTD3): the header of a passage of a file holding several reports names the
 # unit's own context first and the file's title only as the file (``MSG_FILE``); a unit made of a bold label and a statement is shown
-# as the statement (``label_as_statement``); rule (33) reads it.
-JUDGE_VERSION = 14
+# as the statement (``label_as_statement``); rule (33) reads it. 15 (round 18 U4, KTD5): a context part of a table read carries the marks
+# of why it is not attributed to the table («לא צמוד לטבלה», «בלי הפניה לטבלה») or that it is a heading-like label («כותרת בסעיף»);
+# rule (32) reads them.
+JUDGE_VERSION = 15
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -420,7 +424,9 @@ JUDGE_POLICY = (
     "(32) היקף: מה שהמקור המצוטט אומר על הערך סביבו הוא חלק מהמקור — כותרות הסעיף, כותרת הטבלה והערותיה, ופסקאות לפני הטבלה "
     "ואחריה (שורות שמתחילות ב-[לפני הטבלה …] או ב-[אחרי הטבלה …] ובמספר הבלוק שלהן), ופסקה אחרת של אותו קטע. הסתייגות "
     "או היקף שהיחידה כותבת נתמכים כשההקשר הזה אומר אותם, גם כשאינם בשורת הערך עצמה. פסקה שמסומנת «בין שתי טבלאות» "
-    "משותפת לשתי טבלאות ואינה ראיה להיקף של אחת מהן. ערך שהיחידה מציגה רחב מההיקף שהמקור אומר לו (\"שווי הנכס\" או \"סך "
+    "משותפת לשתי טבלאות ואינה ראיה להיקף של אחת מהן; כך גם פסקה שמסומנת «לא צמוד לטבלה» (יש בלוקים אחרים בינה לבין "
+    "הטבלה) או «בלי הפניה לטבלה» (מילותיה אינן מפנות אליה); פסקה שמסומנת «כותרת בסעיף» היא כותרת של הטבלה, והיקף שהיא "
+    "אומרת הוא היקף הטבלה. ערך שהיחידה מציגה רחב מההיקף שהמקור אומר לו (\"שווי הנכס\" או \"סך "
     "הכול\" כשההקשר אומר שהטבלה מתייחסת לגישה אחת בלבד, \"לשנה\" כשההערה אומרת אחרת) — verdict supported (או partial אם יש "
     "בה גם פגם אחר) עם defect scope, לעולם לא unsupported בגלל היקף בלבד; וב-scope כתוב את ביטוי ההיקף מילה במילה כפי "
     "שהוא כתוב בהקשר של המקור שהיחידה מצטטת (עד כמה מילים, בלי מראי מקום), כדי שהשרת יוסיף אותו ליד הערך. אם אינך בטוח "
@@ -3913,19 +3919,36 @@ MSG_SCOPE_ADDED = "היקף הערך לפי המקור: {phrase}"
 MSG_SCOPE_FOUND = "הערך מוצג בלי ההיקף ש-{sid} מציין לו («{phrase}»); ההיקף נכתב ליד הערך"
 MSG_SCOPE_LIMIT = "היקף הערך במקור לא אומת; הערך נקרא ב-{where}"
 MSG_SCOPE_LIMIT_BETWEEN = "היקף הערך במקור לא אומת (הפסקה שליד הטבלה משותפת לשתי טבלאות); הערך נקרא ב-{where}"
+MSG_SCOPE_LIMIT_NOT_ADJACENT = "היקף הערך במקור לא אומת (בין הפסקה לטבלה יש בלוקים אחרים, ולכן אינה מיוחסת לה); הערך נקרא ב-{where}"
+MSG_SCOPE_LIMIT_NO_REFERENCE = ("היקף הערך במקור לא אומת (הפסקה שליד הטבלה אינה מפנה אליה במילותיה, כמו «לעיל» או «להלן»); "
+                                "הערך נקרא ב-{where}")
+# why a paragraph beside a table is not attributed to it (``tools.TablePart.reasons``), the most telling first: the note names the
+# first that a source of the value has, and the message for it
+SCOPE_REASONS = ("not_adjacent", "no_reference", "between")
+SCOPE_LIMIT_NOTES = {"not_adjacent": MSG_SCOPE_LIMIT_NOT_ADJACENT, "no_reference": MSG_SCOPE_LIMIT_NO_REFERENCE,
+                     "between": MSG_SCOPE_LIMIT_BETWEEN}
 MSG_SCOPE_UNVERIFIED = "הבדיקה סימנה שהערך מוצג רחב מההיקף שהמקור מציין לו, וההיקף לא אומת בהקשר של {sid}; ליד הערך נכתב שההיקף לא אומת"
-_PART_LINE = re.compile(rf"^\[(?P<side>{TABLE_BEFORE}|{TABLE_AFTER})(?P<mid>[^\]\n]*?) · בלוק\s*\d+\]\s*(?P<text>\S.*)$")
+_PART_LINE = re.compile(rf"^\[(?P<side>{TABLE_BEFORE}|{TABLE_AFTER})(?P<mid>[^\]\n]*?) · בלוק\s*(?P<block>\d+)\]\s*(?P<text>\S.*)$")
 _ROW_LINE = re.compile(r"\s\|\s|^\|")
 
 
 class ContextPart(NamedTuple):
-    """A place a source states the context of its values: ``place`` is ``heading`` (the heading path of the table, or the section of a
-    passage), ``before``/``after`` (a block before or after the table), ``caption`` or ``note`` (the table's own); ``between``: the block
-    lies between two tables, so it belongs to neither more than to the other."""
+    """A place a source states the context of its values: ``place`` is ``heading`` (the heading path of the table, a heading-like label
+    above it, or the section of a passage), ``before``/``after`` (a block before or after the table), ``caption`` or ``note`` (the
+    table's own); ``between``: the block lies between two tables, so it belongs to neither more than to the other; ``reason``: why a
+    block beside the table is not attributed to it (``SCOPE_REASONS``; empty: it is, and so is every other place); ``block``: the
+    block number of a part of a table read."""
 
     place: str
     text: str
     between: bool = False
+    reason: str = ""
+    block: int | None = None
+
+
+def _reason_of(reasons) -> str:
+    """The reason a part is not attributed that the note names (``SCOPE_REASONS``), from all of them; empty when there is none."""
+    return next((r for r in SCOPE_REASONS if r in reasons), "")
 
 
 def source_context(text: str, tabular: bool) -> tuple[list[ContextPart], list[str]]:
@@ -3948,8 +3971,11 @@ def _source_context(text: str, tabular: bool) -> tuple[tuple[ContextPart, ...], 
         if ln.startswith(TABLE_PATH_PREFIX):
             parts += [ContextPart("heading", h.strip()) for h in ln[len(TABLE_PATH_PREFIX):].split("›") if h.strip()]
         elif m := _PART_LINE.match(ln):
-            parts.append(ContextPart("before" if m["side"] == TABLE_BEFORE else "after", m["text"].strip(),
-                                     TABLE_BETWEEN in m["mid"]))
+            marks = m["mid"].split(" · ")
+            reasons = [r for r, mark in PART_REASON_MARKS.items() if mark in marks]
+            place = "heading" if TABLE_HEADING_LIKE in marks else "before" if m["side"] == TABLE_BEFORE else "after"
+            parts.append(ContextPart(place, m["text"].strip(), TABLE_BETWEEN in marks,
+                                     "" if place == "heading" else _reason_of(reasons), int(m["block"])))
         elif ln.startswith((f"[{TABLE_BEFORE}", f"[{TABLE_AFTER}")):
             continue  # a pointer to a part returned before, or the line that says what follows the table: no text of its own
         elif tabular and ln.startswith(TABLE_SIZE_PREFIX):
@@ -3965,10 +3991,20 @@ def _is_tabular(src: Source) -> bool:
     return src.kind == "table" or any(ln.lstrip().startswith(TABLE_SIZE_PREFIX) for ln in (src.text or "").splitlines())
 
 
+def _structured_part(p) -> ContextPart:
+    """The context part a table read's ``tools.TablePart`` stands for."""
+    place = "heading" if p.heading_like else p.side
+    return ContextPart(place, " ".join(p.text.split()), "between" in p.reasons, _reason_of(p.reasons), p.block_index)
+
+
 def context_of_source(src: Source) -> tuple[list[ContextPart], list[str]]:
     """``source_context`` of a source, with the section of a passage as its heading."""
     text = src.text or ""
     parts, body = source_context(text, _is_tabular(src))
+    if src.table_parts:  # the table read's own record of its parts decides, not the tags in the text (KTD5)
+        held = {p.block_index: p for p in src.table_parts}
+        parts = [_structured_part(held.pop(p.block)) if p.block in held else p for p in parts]
+        parts += [_structured_part(p) for p in held.values()]
     section = _norm(src.section or "")
     if section and not any(p.place == "heading" and p.text == section for p in parts):
         parts.insert(0, ContextPart("heading", section))
@@ -4020,24 +4056,41 @@ def _value_number(u: Unit, sources: list[tuple[str, Source]]) -> str | None:
     return pick
 
 
+def _balanced(text: str) -> bool:
+    """Whether every parenthesis and bracket of ``text`` is closed, and closes the one it opened."""
+    stack: list[str] = []
+    for ch in text:
+        if ch in "([":
+            stack.append(")" if ch == "(" else "]")
+        elif ch in ")]" and (not stack or stack.pop() != ch):
+            return False
+    return not stack
+
+
 def _clean_scope(phrase: str) -> str:
     """The judge's scope phrase as it can be compared: spaces normalised, citations and the punctuation around it taken off. Empty
-    when it is not a phrase (``SCOPE_PHRASE_WORDS``, ``SCOPE_PHRASE_CHARS``) or holds no letter."""
-    text = _norm(_IDS.sub("", phrase or "")).strip(" \t.,;:!?()[]\"'«»״׳")
+    when it is not a phrase (``SCOPE_PHRASE_WORDS``, ``SCOPE_PHRASE_CHARS``), holds no letter, or is cut inside a parenthesis or a
+    bracket (a phrase that opens one it does not close, or closes one it did not open, is a piece of the source's sentence: it
+    would be written as the value's scope with its end missing). A phrase the whole of which is in parentheses is taken out of them."""
+    text = _norm(_IDS.sub("", phrase or "")).strip(" \t.,;:!?\"'«»״׳")
+    while text[:1] in ("(", "[") and text[-1:] in (")", "]") and _balanced(text[1:-1]):
+        text = text[1:-1].strip(" \t.,;:!?\"'«»״׳")
     words = len(text.split())
-    if not (SCOPE_PHRASE_WORDS[0] <= words <= SCOPE_PHRASE_WORDS[1]) or len(text) > SCOPE_PHRASE_CHARS \
-            or not re.search(r"[א-תA-Za-z]", text):
+    if not _balanced(text) or not (SCOPE_PHRASE_WORDS[0] <= words <= SCOPE_PHRASE_WORDS[1]) \
+            or len(text) > SCOPE_PHRASE_CHARS or not re.search(r"[א-תA-Za-z]", text):
         return ""
     return text
 
 
 def _scope_standing(phrase: str, src: Source) -> str:
-    """Where a source's own context states the phrase, verbatim: ``ok`` (a heading, caption, note or a block beside its table),
-    ``between`` (only a block that lies between two tables) or ``absent``."""
+    """Where a source's own context states the phrase, verbatim: ``ok`` (a heading, a heading-like label, a caption, a note or a block
+    attributed to its table: adjacent, on its page or the next, and pointing to it), the reason the only blocks that state it are not
+    attributed (``SCOPE_REASONS``: they lie between two tables, other blocks stand between them and the table, their wording does not
+    point to it) or ``absent``."""
     found = [p for p in context_of_source(src)[0] if phrase in _norm(p.text)]
-    if any(not p.between for p in found):
+    if any(not p.reason for p in found):
         return "ok"
-    return "between" if found else "absent"
+    return min((p.reason for p in found), key=SCOPE_REASONS.index) if found else "absent"
 
 
 def _read_in(sources: list[tuple[str, Source]]) -> str:
@@ -4063,7 +4116,9 @@ def scope_outcome(u: Unit, phrase: str, ws: Workspace, text: str | None = None) 
     if all(x == "ok" for x in standing):
         return True, Problem(u, MSG_SCOPE_FOUND.format(sid=first, phrase=scope), kind="missing_qualifier", number=number,
                              annotation=scope, cite=first, defect="scope", check=SCOPE_CHECK)
-    note = MSG_SCOPE_LIMIT_BETWEEN if "absent" not in standing and "between" in standing else MSG_SCOPE_LIMIT
+    reasons = [x for x in standing if x in SCOPE_REASONS]
+    note = (SCOPE_LIMIT_NOTES[min(reasons, key=SCOPE_REASONS.index)] if reasons and "absent" not in standing
+            else MSG_SCOPE_LIMIT)
     return True, Problem(u, MSG_SCOPE_UNVERIFIED.format(sid=", ".join(k for k, _ in sources)), kind="missing_qualifier",
                          number=number, annotation=note.format(where=_read_in(sources)), defect="scope",
                          check=SCOPE_LIMIT_CHECK)
