@@ -2696,3 +2696,232 @@ def test_item_coverage_reads_the_unit_text_after_a_cut_so_an_item_stated_only_in
     assert o["status"] == "partial" and o["omitted_items"] == ["I3"] and unit.index == 0
     r.cuts.clear()
     assert [i["state"] for i in r.item_states()] == ["covered"] * 3  # without the cut the sentence covers it again
+
+
+# --- round 18 U5: the condition outcome of an item in the requirements call (KTD1, KTD8; R1-R4; AE1-AE4) ----------------------------
+
+PLAN_NOTE = "הזכויות חלות רק על פי תכנית מאושרת"
+PLAN_ROWS = ["סוג שטח | שטח (מ״ר) | הערה", f"שטח כולל לבנייה | 1,200 | {PLAN_NOTE}", "שטח למרתף | 340 | ללא הערה"]
+PLAN_ASK = "השטח הכולל לבנייה בנכס"
+PLAN_BARE = "השטח הכולל לבנייה בנכס הוא 1,200 מ״ר [S2]."
+PLAN_STATED = f"השטח הכולל לבנייה בנכס הוא 1,200 מ״ר, {PLAN_NOTE} [S2]."
+
+
+def _plan_file(*rows: str) -> Workspace:
+    ws = _file(SOURCE, "\n".join(rows or PLAN_ROWS), units=(1, 1), declared=(1,))
+    ws.sources["S2"].kind = "table"
+    return ws
+
+
+def _condition_judge(decide=None, seen: list | None = None) -> ScriptedProvider:
+    """A judge that gives every component full over the units shown and answers each item the call asks for its condition
+    (``check``) with ``decide(item_id, attrs, block)``: (outcome, quote), or None to say nothing about it."""
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        if seen is not None:
+            seen.append(input)
+        units = {int(i): t for i, t in re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S)}
+        block = (re.search(r"<item_ledger>.*?</item_ledger>", input, re.S) or [""])[0] if "<item_ledger>" in input else ""
+        conditions = []
+        for iid, attrs in re.findall(r'<item id="(I\d+)"([^>]*check="\w+"[^>]*)>', block):
+            got = decide(iid, attrs, block) if decide is not None else None
+            if got is not None:
+                conditions.append({"item": iid, "outcome": got[0], "quote": got[1]})
+        out = {"verdicts": [{"index": i, "verdict": "supported", "reason": "בדיקה"} for i in units]}
+        if "<requirements>" in input:
+            ids = re.findall(r'<requirement id="(N[\d.]+)"', input)
+            out["requirements"] = [_req("", "full", list(units), id=i) | {"conditions": conditions} for i in ids]
+        return out
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p
+
+
+def _plan_check(markdown: str, decide=None, *, rows=(), raw=(), ledger=None, seen=None, ask: str = PLAN_ASK):
+    from app.chat import items as ledger_items
+
+    ws = _plan_file(*rows)
+    turn = _turn({"id": "1", "text": ask})
+    answer = _answer(markdown).model_copy(update={"items": list(raw)})
+    ledger = ledger if ledger is not None else ledger_items.Ledger()
+    report = verify_answer(_condition_judge(decide, seen), answer, ws, "?", [], requirements=turn, ledger=ledger)
+    return report, ws, answer, ledger
+
+
+def _condition_problems(report) -> list:
+    return [p for p in report.problems if p.check in (verify.CONDITION_FOUND_CHECK, *verify.CONDITION_CHECKS,
+                                                      verify.CONDITION_CONTRADICTED_CHECK)]
+
+
+def test_an_old_reply_without_conditions_is_still_a_valid_requirement_score():
+    out = verify.JudgeCoverageOutput.model_validate({"verdicts": [], "requirements": [{"id": "N1", "status": "full"}]})
+    assert out.requirements[0].conditions == []
+    assert "conditions" in verify.JudgeRequirement.model_json_schema()["properties"]
+
+
+def test_ae1_an_undecided_condition_is_asked_in_the_ledger_block_with_its_span_and_unit_and_a_stated_one_is_not():
+    seen: list[str] = []
+    r, *_ = _plan_check(PLAN_BARE, seen=seen)  # the agent declared no item: the cited row makes one
+    block = re.search(r"<item_ledger>.*?</item_ledger>", seen[0], re.S).group()
+    assert 'check="undecided"' in block and f'span="{PLAN_NOTE}"' in block and 'unit="0"' in block and 'origin="' not in block
+    assert 'state="covered"' in block and "1,200" in block
+    assert "<item_ledger>" in verify.JUDGE_REQUIREMENTS_POLICY and "conditions" in verify.JUDGE_REQUIREMENTS_POLICY
+    assert [p for p in r.problems if p.severity == "error"] == [] and r.requirement_outcomes()[0]["status"] == "full"
+    seen.clear()
+    _plan_check(PLAN_STATED, seen=seen)  # the sentence states it: decided by the server, nothing is asked, nothing is rendered
+    assert "<item_ledger>" not in seen[0]
+
+
+def test_the_render_size_of_the_ledger_block_grows_only_by_the_asked_items_condition():
+    asked: list[str] = []
+    _plan_check(PLAN_BARE, seen=asked)
+    block = re.search(r"<item_ledger>.*?</item_ledger>", asked[0], re.S).group()
+    assert 0 < len(block) <= 480, len(block)  # one asked item: its id, label, value, state, check, unit, span and quote
+    # three agent items of a table with no condition: the block is what it was before this round, and no longer
+    plain: list[str] = []
+    _ledger_check(_adj_file(), TWO_ADJ, _adj_items(), seen=plain)
+    plain_block = re.search(r"<item_ledger>.*?</item_ledger>", plain[0], re.S).group()
+    assert "check=" not in plain_block and "span=" not in plain_block and len(plain_block) < 1200
+    # one of the three carries a condition the answer leaves out: only that item grows, by its check, unit and span
+    ws = _file(SOURCE, "\n".join(["התאמות לנכס להשוואה", "סוג התאמה | שיעור | הערה", "מיקום | 5% | ", "קומה | 3% | ",
+                                   "גיל הבניין | 2% | חל רק על בניינים שנבנו לפני שנת 1990"]), units=(1, 1), declared=(1,))
+    grown: list[str] = []
+    _ledger_check(ws, THREE_ADJ, _adj_items(), seen=grown)
+    grown_block = re.search(r"<item_ledger>.*?</item_ledger>", grown[0], re.S).group()
+    assert grown_block.count("check=") == 1 and 0 < len(grown_block) - len(plain_block) <= 260, (len(grown_block), len(plain_block))
+
+
+def test_ae1_a_missing_condition_is_a_repair_request_with_the_source_quote_and_a_server_note_and_the_value_stays():
+    r, ws, answer, _ = _plan_check(PLAN_BARE, lambda iid, attrs, block: ("missing", PLAN_NOTE))
+    (ask,) = [p for p in r.problems if p.check == verify.CONDITION_FOUND_CHECK]
+    assert ask.kind == "requirement" and ask.component == "N1" and ask.repairable and not ask.removes_unit
+    assert "S2" in ask.reason and PLAN_NOTE in ask.reason and "חיפוש" in ask.reason  # the source quote; no new search
+    assert r.text_completion_only() is True  # the repair round runs with its tools off, as for a text completion
+    (note,) = [p for p in r.problems if p.check == verify.CONDITION_CHECK]
+    assert note.annotatable and not note.repairable and note.annotation == PLAN_NOTE and note.cite == "S2" and note.number == "1,200"
+    assert r.removed_units() == set() and r.counts()["removed"] == 0
+    out = r.edit(answer)
+    line = out.doc.text.split("\n")[0]
+    assert line == f"השטח הכולל לבנייה בנכס הוא 1,200 מ״ר (התנאי לפי המקור: {PLAN_NOTE}) [S2]."  # the value stays, the condition joins
+    assert [s.kind for s in out.doc.spans()] == ["qualifier"] and r.counts()["scoped"] == 1
+
+
+def test_ae1_after_the_repair_states_the_condition_the_same_ledger_asks_nothing_and_the_server_writes_nothing():
+    from app.chat import items as ledger_items
+
+    ledger = ledger_items.Ledger()
+    _plan_check(PLAN_BARE, lambda iid, attrs, block: ("missing", PLAN_NOTE), ledger=ledger)
+    r, ws, answer, _ = _plan_check(PLAN_STATED, lambda iid, attrs, block: ("missing", PLAN_NOTE), ledger=ledger)
+    assert _condition_problems(r) == [] and r.ok
+    assert r.edit(answer).doc.text.split("\n")[0] == PLAN_STATED
+
+
+def test_a_missing_outcome_whose_quote_is_not_in_the_items_own_span_is_rejected_and_the_trace_says_why():
+    r, *_ = _plan_check(PLAN_BARE, lambda iid, attrs, block: ("missing", "ללא הערה"))  # the other row's cell
+    assert _condition_problems(r) == []
+    (vote,) = r.requirements_trace()[0]["votes"]
+    assert [(c["item"], c["accepted"], c["why"]) for c in vote["conditions"]] == [("I1", False, "not_in_item_span")]
+    r, *_ = _plan_check(PLAN_BARE, lambda iid, attrs, block: ("missing", "x"))
+    assert _condition_problems(r) == [] and r.requirements_trace()[0]["votes"][0]["conditions"][0]["why"] == "too_short"
+
+
+def test_an_outcome_for_an_item_the_call_did_not_ask_is_dropped():
+    r, *_ = _plan_check(PLAN_STATED, lambda iid, attrs, block: ("missing", PLAN_NOTE))
+    assert _condition_problems(r) == []  # nothing was asked, so there is nothing to answer
+    from app.chat.verify import ConditionVerdict, JudgeRequirement
+
+    cov = verify._Coverage(_turn({"id": "1", "text": PLAN_ASK}), [], "?", items=[
+        {"id": "I1", "check": "undecided", "unit": 3, "spans": [PLAN_NOTE], "foreign": [], "hint": []}])
+    vote = JudgeRequirement(status="full", conditions=[ConditionVerdict(item="I1", outcome="missing", quote=PLAN_NOTE),
+                                                      ConditionVerdict(item="I9", outcome="kept")])
+    assert cov.valid_conditions(vote, {0, 1}) == []  # the item's unit was not in this call; the other id was never asked
+    assert [c.item for c in cov.valid_conditions(vote, {3})] == ["I1"]
+
+
+def test_ae2_a_rephrased_condition_the_judge_keeps_leaves_everything_as_it_was():
+    markdown = "השטח הכולל לבנייה בנכס הוא 1,200 מ״ר והוא חל על פי תכנית שאושרה בלבד [S2]."
+    r, *_ = _plan_check(markdown, lambda iid, attrs, block: ("kept", ""))
+    assert _condition_problems(r) == [] and r.ok
+
+
+def test_ae3_a_lost_exclusion_confirmed_by_the_judge_follows_the_contradicted_claim_path_and_not_a_missing_condition_note():
+    rows = ("סוג שטח | שטח (מ״ר) | הערה", "מבנה ראשי | 900 | השטח אינו כולל קומות החניה")
+    markdown = "המבנה הראשי הוא 900 מ״ר וכולל קומות החניה [S2]."
+    seen: list[str] = []
+    r, ws, answer, _ = _plan_check(markdown, lambda iid, attrs, block: ("contradicted", "השטח אינו כולל קומות החניה"), rows=rows,
+                                   seen=seen, ask="המבנה הראשי")
+    assert 'check="hint"' in seen[0] and 'hint="contradicted"' in seen[0]
+    (p,) = _condition_problems(r)
+    assert p.check == verify.CONDITION_CONTRADICTED_CHECK and p.failure_kind == "contradicts_source" and p.removes_unit
+    assert r.removed_units() == {0} and not [x for x in r.problems if x.check == verify.CONDITION_FOUND_CHECK]
+    assert [rec.verdict for rec in r.claims[0]] == ["contradicts"]
+
+
+def test_an_unconfirmed_contradiction_hint_leaves_the_value_and_changes_nothing():
+    rows = ("סוג שטח | שטח (מ״ר) | הערה", "מבנה ראשי | 900 | השטח אינו כולל קומות החניה")
+    markdown = "המבנה הראשי הוא 900 מ״ר וכולל קומות החניה [S2]."
+    for decide in (None, lambda iid, attrs, block: ("kept", "")):
+        r, ws, answer, _ = _plan_check(markdown, decide, rows=rows, ask="המבנה הראשי")
+        assert _condition_problems(r) == [] and r.removed_units() == set() and r.ok
+        assert r.edit(answer).doc.text.split("\n")[0] == markdown
+
+
+def test_ae4_a_time_limit_of_the_neighbouring_row_is_a_condition_from_another_item_that_goes_to_repair_and_never_removes_the_value():
+    rows = ("סוג | שכירות | הערה", "דירה קטנה | 3,000 | עד שנה מהמסירה", "דירה גדולה | 5,000 |")
+    raw = [_adj_item("שכירות דירה קטנה", "דירה קטנה | 3,000", "3,000"), _adj_item("שכירות דירה גדולה", "דירה גדולה | 5,000", "5,000")]
+    markdown = ("השכירות לדירה גדולה היא 5,000 עד שנה מהמסירה [S2]. השכירות לדירה קטנה היא 3,000 עד שנה מהמסירה [S2].")
+    seen: list[str] = []
+    r, ws, answer, _ = _plan_check(markdown, lambda iid, attrs, block: ("other_item", "עד שנה מהמסירה") if iid == "I2" else None,
+                                   rows=rows, raw=raw, seen=seen, ask="שכירות הדירות")
+    assert 'hint="other_item:I1"' in seen[0] and seen[0].count('span="עד שנה מהמסירה"') == 1  # the named item shows its span
+    (p,) = _condition_problems(r)
+    assert p.check == verify.CONDITION_FOUND_CHECK and p.kind == "requirement" and "דירה גדולה" in p.reason
+    assert "עד שנה מהמסירה" in p.reason and r.removed_units() == set() and r.edit(answer).doc.text.startswith(markdown[:40])
+    # the judge's quote must stand in ANOTHER item's span: one from nowhere, and a hint it does not confirm, change nothing
+    r, *_ = _plan_check(markdown, lambda iid, attrs, block: ("other_item", "תקופה אחרת") if iid == "I2" else None,
+                        rows=rows, raw=raw, ask="שכירות הדירות")
+    assert _condition_problems(r) == []
+
+
+def test_a_condition_span_with_no_compact_form_gets_a_precise_not_verified_note_and_not_the_whole_paragraph():
+    long_note = "הזכויות חלות רק על פי תכנית מאושרת " + "ובכפוף לתנאי " * 20 + "המופיעים בנספח"
+    assert len(long_note) > verify.SPAN_CHARS
+    rows = ("סוג שטח | שטח (מ״ר) | הערה", f"שטח כולל לבנייה | 1,200 | {long_note}")
+    r, ws, answer, _ = _plan_check(PLAN_BARE, lambda iid, attrs, block: ("missing", long_note), rows=rows)
+    (note,) = [p for p in r.problems if p.check == verify.CONDITION_LIMIT_CHECK]
+    assert note.annotatable and "לא אומת" in note.annotation and "S2" in note.annotation
+    out = r.edit(answer)
+    assert "1,200" in out.doc.text and long_note not in out.doc.text and [s.kind for s in out.doc.spans()] == ["scope_note"]
+
+
+def test_an_item_the_server_built_from_a_cited_span_is_never_a_read_and_not_used_line():
+    r, ws, answer, ledger = _plan_check(PLAN_BARE, lambda iid, attrs, block: ("missing", PLAN_NOTE))
+    (item,) = ledger.items.values()
+    assert item.origin == "source" and item.state == "included" and item.component == "N1"
+    assert coverage.item_gap_lines(ws, r, r.requirement_outcomes()) == []
+    (o,) = r.requirement_outcomes()
+    assert o["status"] == "full" and not o.get("omitted_items")
+    # the sentence that cited the span removed: no item is open, and no line is written for it
+    gone, ws2, _, _ = _plan_check("לא נמצא מידע על השטח.")
+    assert gone.item_states() == [] and coverage.item_gap_lines(ws2, gone, gone.requirement_outcomes()) == []
+
+
+def test_the_final_check_listing_asks_no_condition():
+    r, *_ = _plan_check(PLAN_BARE)
+    assert [i["check"] for i in r.item_listing()] == ["undecided"] and [i["check"] for i in r.item_listing(ask=False)] == [""]
+
+
+def test_an_agent_condition_that_stands_only_in_another_row_is_recorded_in_the_diagnostics_and_never_drops_the_item():
+    from app.chat import api
+    from app.chat.engine import TurnOutcome
+
+    rows = ("סוג | שיעור | הערה", "מגורים | 4% | חל עד שנה מהמסירה", "מסחר | 6% | חל על כל תקופת החוזה")
+    raw = [_adj_item("שיעור למסחר", "מסחר | 6%", "6%", condition="חל עד שנה מהמסירה")]
+    r, ws, answer, ledger = _plan_check("השיעור למסחר הוא 6% [S2].", rows=rows, raw=raw, ask="שיעור למסחר")
+    (item,) = [i for i in ledger.items.values() if i.origin == "agent"]
+    assert item.condition == "" and [m["condition"] for m in ledger.misattributed] == ["חל עד שנה מהמסירה"]
+    diag = r.item_diagnostics()
+    assert [(m["quote"], m["version"]) for m in diag["misattributed"]] == [("מסחר | 6%", 0)] and diag["items"]
+    out = api._diagnostics(TurnOutcome(answer, ws, r, 1, item_ledger=diag), {})
+    assert out["resolution"]["item_ledger"]["misattributed"] and str(ws.sources["S2"].document_id) in out["document_ids"]

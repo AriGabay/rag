@@ -2,10 +2,10 @@
 AE7, AE8, AE9; KTD1, KTD3, KTD4, KTD5).
 
 Each sequence is a ScriptedAgent turn over a synthetic document (office B): the model and the judge are scripted, so a test
-proves what the server does with an answer that is CORRECT for its fixture, not the judgement of a model. Each is marked
-``xfail(strict=True)`` with the unit that owns the fix and what fails; the owning unit removes the marker when its fix lands
-(a strict xfail that starts passing fails the suite, so the marker cannot be forgotten). Every assertion is on what the user
-sees (the final message and the server's lines in it), never on a call inside the server.
+proves what the server does with an answer that is CORRECT for its fixture, not the judgement of a model. Each was
+marked ``xfail(strict=True)`` with the unit that owned the fix and what failed, and the owning unit removed the marker when its
+fix landed (a strict xfail that starts passing fails the suite, so the marker could not be forgotten). Every assertion is on what
+the user sees (the final message and the server's lines in it), never on a call inside the server.
 
 1. A split period word (AE9, U1). The text layer holds "36 חודשי ם" (the plural noun split) and "לחוד ש" (the monthly word
    split): the 36 is a duration and carries no period note, and the monthly rent is not edited or removed.
@@ -273,17 +273,39 @@ def plan_items() -> list[dict]:
              "value": PLAN_MAIN[1], "condition": PLAN_MAIN[2], "state": "included", "reason": ""}]
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "U5: a condition is asked only to tell apart items that share a value, so the one item's 'רק על פי תכנית מאושרת' is"
-    " never checked, no repair is asked and the final answer gives 1,200 with no limit"))
+def condition_judge(outcome: str, quote: str):
+    """A judge that supports every unit, scores every component full over them and answers each item a call asks for its
+    condition (``check`` in the item ledger) with ``outcome`` and ``quote``, a verbatim part of the item's span (round 18 U5)."""
+    def judge(input: str) -> dict:
+        out = lenient_judge(input)
+        asked = re.findall(r'<item id="(I\d+)"[^>]*check="\w+"', input)
+        for r in out.get("requirements", []):
+            r["conditions"] = [{"item": i, "outcome": outcome, "quote": quote} for i in asked]
+        return out
+    return judge
+
+
 def test_a_single_items_approved_plan_condition_reaches_the_final_answer_and_its_value_is_kept(
         client, office, monkeypatch):
     m = ask(client, office, monkeypatch, PLAN, read_table(PLAN["caption"]), PLAN_BARE, "מהו השטח הכולל לבנייה בנכס?",
-            "השטח הכולל לבנייה בנכס", repaired=PLAN_WITH_CONDITION, items=plan_items())
+            "השטח הכולל לבנייה בנכס", repaired=PLAN_WITH_CONDITION, items=plan_items(),
+            judge=condition_judge("missing", PLAN["condition_phrase"]))
     md = m["answer"]["markdown"]
     # AE1: the value stays, and the line that gives it carries the limit (written by the repair or attached by the server)
     line = line_with(md, "1,200")
     assert "תכנית מאושרת" in line and re.search(r"\[S\d+\]", line), md
+
+
+def test_a_condition_the_repair_does_not_write_is_attached_by_the_server_with_its_citation_and_the_value_is_kept(
+        client, office, monkeypatch):
+    m = ask(client, office, monkeypatch, PLAN, read_table(PLAN["caption"]), PLAN_BARE, "מהו השטח הכולל לבנייה בנכס?",
+            "השטח הכולל לבנייה בנכס", repaired=PLAN_BARE, items=plan_items(),
+            judge=condition_judge("missing", PLAN["condition_phrase"]))
+    md = m["answer"]["markdown"]
+    line = line_with(md, "1,200")
+    # the verbatim span of the row's note (the sentence that holds the judge's quote), written next to the value with its citation
+    assert f"(התנאי לפי המקור: {PLAN['rows'][0][2]})" in line and re.search(r"\[S\d+\]", line), md
+    assert "הוסר" not in md and "לא נמצא" not in md, md
 
 
 # --- 8. a note after a table that points back to it, then another table on the next page (AE7, U4) ----------------------
@@ -345,13 +367,12 @@ METHOD_BARE = f"השווי המהוון של הנכס הוא {METHOD_VALUE} ₪ 
 METHOD_WITH = f"לפי {METHOD['method_phrase']} השווי המהוון של הנכס הוא {METHOD_VALUE} ₪ [S1]."
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "U5: the heading '4. גישת היוון ההכנסות' is in the table's context (U4) but is not a condition of the value under it: nothing"
-    " asks for the method, so the final answer gives 9,384,615 with no method"))
 def test_the_method_a_numbered_heading_names_reaches_a_value_of_its_table_and_a_later_sections_note_does_not(
         client, office, monkeypatch):
+    # the agent declares no item: the cited row makes one (origin source), and the heading above its table is its condition
     m = ask(client, office, monkeypatch, METHOD, read_table(METHOD["caption"]), METHOD_BARE,
-            "מהו השווי המהוון של הנכס?", "השווי המהוון של הנכס", repaired=METHOD_WITH)
+            "מהו השווי המהוון של הנכס?", "השווי המהוון של הנכס", repaired=METHOD_WITH,
+            judge=condition_judge("missing", METHOD["method_phrase"]))
     md = m["answer"]["markdown"]
     # AE8: the method of the heading above the table is a condition of its value, and the later section's method is not
     line = line_with(md, METHOD_VALUE)

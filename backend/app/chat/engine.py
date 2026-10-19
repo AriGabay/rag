@@ -94,7 +94,10 @@ steps before the step bound, an appended item tells the model to register what i
 
 A repair round whose only problems are completions from text the turn already read (``verify.REQ_TEXT_FOUND``: a part a
 passage states and the answer omits, round 16 U2, KTD3) runs with the same tools and ``tool_choice`` "none", like the last
-step: it adds the part from the passage it names and searches nothing. Any other problem in the round keeps its tools.
+step: it adds the part from the passage it names and searches nothing. So does a round whose only problems are a condition of an item
+the answer gives without it, or with another item's (``verify.CONDITION_FOUND_CHECK``, round 18 U5): the problem carries the source
+quote of the condition, and the round adds it to the sentence that gives the value; the value is never the repair's to drop. Any other
+problem in the round keeps its tools.
 
 Prompt caching. The policy, the tools and the turn's first message are the same at every step and carry nothing
 of the moment the turn runs; each step only appends to the items the previous step sent, and a tool output is

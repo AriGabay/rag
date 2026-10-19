@@ -235,7 +235,7 @@ def test_a_changed_limit_or_wording_is_a_new_verdict_key_and_an_appraisals_key_i
 
 
 def test_the_judge_version_is_bumped_and_the_cache_does_not_reuse_an_older_contract(monkeypatch):
-    assert verify.JUDGE_VERSION == 15  # round 18 U3: the source header of a multi-report file and a bold label over a statement (rule 33); round 17 U5: defect `scope`; round 13 U9: server-held unit facts and derived computations; U11: the preceding text of a back-reference; round 15 U7: the declared unit in a source header; round 16 U1: the read passages and `support`; 12: every returned passage, items of a kind; 15: round 18 U4 (the marks of a table part's attribution, rule 32)
+    assert verify.JUDGE_VERSION == 16  # round 18 U3: the source header of a multi-report file and a bold label over a statement (rule 33); round 17 U5: defect `scope`; round 13 U9: server-held unit facts and derived computations; U11: the preceding text of a back-reference; round 15 U7: the declared unit in a source header; round 16 U1: the read passages and `support`; 12: every returned passage, items of a kind; 15: round 18 U4 (the marks of a table part's attribution, rule 32); 16: round 18 U5 (the condition outcome of an item in the requirements call, `conditions`)
     ws = _ws()
     s1 = standard(ws, "על השמאי לבסס את הערכתו על עסקאות השוואה.", rules=RULES)
     seen: list[str] = []

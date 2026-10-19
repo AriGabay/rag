@@ -1226,6 +1226,7 @@ def _diagnostics(outcome: engine.TurnOutcome, payload: dict, removals: _Removals
     item_ledger = {"item_ledger": outcome.item_ledger} if outcome.item_ledger else {}
     checked |= {str(i["document_id"]) for i in outcome.item_ledger.get("items", []) if i.get("document_id")}
     checked |= documents_of(e.get("source") for e in outcome.item_ledger.get("excluded", []))
+    checked |= documents_of(m.get("source") for m in outcome.item_ledger.get("misattributed", []))  # round 18 U5
     return {"rounds": outcome.rounds, "removed": removed,
             "resolution": (resolution or {}) | {"timing": timing} | registrations | trace | item_ledger,
             "document_ids": _answer_documents(payload) | found | checked,

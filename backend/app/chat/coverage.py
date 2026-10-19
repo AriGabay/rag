@@ -822,13 +822,21 @@ def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict]) -> list[dict
     """The lines for the ledger's items that stand open in the saved answer: those the agent listed and no surviving unit gives
     (still omitted) and those declared ``not_verifiable`` or ``not_applicable`` with a reason (``item_line``), in the ledger's order, at most
     ``ITEM_GAP_LINES`` (one more line counts the rest). An item of a component the request made not relevant is not stated."""
-    from app.chat.verify import ITEM_NOT_APPLICABLE, ITEM_NOT_VERIFIABLE, ITEM_OMITTED, ORIGIN_JUDGE_SUPPORT
+    from app.chat.verify import (
+        ITEM_NOT_APPLICABLE,
+        ITEM_NOT_VERIFIABLE,
+        ITEM_OMITTED,
+        ORIGIN_JUDGE_SUPPORT,
+        ORIGIN_SOURCE,
+    )
 
     skip = {o["id"] for o in outcomes if o.get("status") == "not_relevant"}
-    # a part only the judge named is stated by its component's own line (round 16: ``read_not_used``), not twice
+    # a part only the judge named is stated by its component's own line (round 16: ``read_not_used``), not twice; an item the server
+    # built from a span a sentence cites (round 18 U5) is covered by that sentence and is never "read and not used"
     lines = [item_line(ws, st) for st in report.item_states()
-             if st["component"] not in skip and (st["state"] in (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)
-                                                 or (st["state"] == ITEM_OMITTED and st["origin"] != ORIGIN_JUDGE_SUPPORT))]
+             if st["component"] not in skip and st["origin"] != ORIGIN_SOURCE
+             and (st["state"] in (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)
+                  or (st["state"] == ITEM_OMITTED and st["origin"] != ORIGIN_JUDGE_SUPPORT))]
     if len(lines) <= ITEM_GAP_LINES:
         return lines
     rest = len(lines) - ITEM_GAP_LINES

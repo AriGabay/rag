@@ -22,7 +22,21 @@ This module is what the server does with that list. It never takes the agent's w
   unit covers it or a later version declares it ``not_verifiable`` or ``not_applicable`` with a valid reason. The agent not
   listing an item again closes nothing.
 
-The wiring into the requirements call, the outcomes and the repair is round 17 U3's."""
+The wiring into the requirements call, the outcomes and the repair is round 17 U3's.
+
+Round 18 U5 (KTD1; R1-R4) adds the item's CONDITION as a check of its own, separate from the ``shared`` words above that tell
+similar items apart:
+
+- ``condition_spans`` reads what limits an item from its own source context: a closed-class operator clause of its quote or of its
+  row or sentence, its row's note, a paragraph attributed to its table (U4's ``TablePart.attributed``) and its heading when that
+  names a method, a status, a component or a time. ``validate`` checks the agent's condition against that context: one that stands
+  only in another row's context is recorded as misattributed (never silent, never a reason to drop the item).
+- ``source_items`` builds an origin ``source`` item from a source span an answer sentence cites when the span carries such a
+  condition and no item covers it, so the condition is checked on a turn whose agent declared nothing.
+- ``Ledger.outcomes`` gives every covered item a ``condition_check`` against the sentence that covers it (``conditions.outcome``):
+  ``kept``, ``undecided`` or ``hint``, apart from the coverage above. A condition is read only from the source's own spans; what
+  the server cannot decide goes to the requirements call (``verify._item_ledger_block``). A sentence that carries a condition of
+  another item's span, and none of its own, is a ``hint`` from another item."""
 
 from __future__ import annotations
 
@@ -34,7 +48,9 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 from app.answering.verify import numbers_in
+from app.chat import conditions
 from app.chat.evidence import claim_terms
+from app.chat.meaning import _row_cells
 from app.chat.verify import (
     ITEM_COVERED,
     ITEM_INCLUDED,
@@ -43,9 +59,13 @@ from app.chat.verify import (
     ITEM_OMITTED,
     ORIGIN_AGENT,
     ORIGIN_JUDGE_SUPPORT,
+    ORIGIN_SOURCE,
     SUPPORT_QUOTE_MAX,
     SupportScope,
     Unit,
+    _cited_sources,
+    _is_tabular,
+    context_of_source,
 )
 from app.platform import dates as shared_dates
 
@@ -91,6 +111,8 @@ class Item:
 class Validation(NamedTuple):
     kept: list[Item]
     excluded: list[dict]  # [{"component", "source", "quote", "state", "reason": why it was excluded}]
+    # [{"source", "quote", "condition"}]: items kept whose agent-written condition stands only in another row's context (R3)
+    misattributed: list[dict]
 
 
 class Coverage(NamedTuple):
@@ -149,6 +171,7 @@ def validate(raw: Iterable[object], ws, units: Sequence[Unit], components: Seque
     frozen = {c["id"]: c.get("text") or "" for c in components}
     kept: list[Item] = []
     excluded: list[dict] = []
+    misattributed: list[dict] = []
     seen: set[tuple[str, str, str]] = set()
     numbers = iter(range(1, 10**6))
     for entry in raw:
@@ -172,14 +195,18 @@ def validate(raw: Iterable[object], ws, units: Sequence[Unit], components: Seque
             if why is None:
                 seen.add(key)
                 document_id, unit_id = _site_of(src)
-                item = Item(component, f["label"], sid, f["quote"], f["value"], f["condition"], f["state"], f["reason"],
+                condition = f["condition"]
+                if condition and _foreign_condition(condition, src, f["quote"]):
+                    misattributed.append({"source": sid, "quote": f["quote"][:SUPPORT_QUOTE_MAX], "condition": condition})
+                    condition = ""  # the item is checked against its own context (``condition_spans``), not the agent's words
+                item = Item(component, f["label"], sid, f["quote"], f["value"], condition, f["state"], f["reason"],
                             document_id=document_id, unit_id=unit_id)
                 item.id = ledger.id_for(item.key) if ledger is not None else f"I{next(numbers)}"
                 kept.append(item)
                 continue
         excluded.append({"component": f["component"], "source": f["source"], "quote": f["quote"][:SUPPORT_QUOTE_MAX],
                          "state": f["state"], "reason": why})
-    return Validation(kept, excluded)
+    return Validation(kept, excluded, misattributed)
 
 
 def support_item(component: str, source: str, quote: str, ledger: Ledger, *, label: str = "", value: str = "",
@@ -191,6 +218,195 @@ def support_item(component: str, source: str, quote: str, ledger: Ledger, *, lab
         item.document_id, item.unit_id = _site_of(src)
     item.id = ledger.id_for(item.key)
     return item
+
+
+# --- the condition of an item: its span in its own source context (round 18 U5, KTD1; R1-R4) ---------------------------------
+
+ROWS_PER_UNIT = 5  # the cited rows of one source a sentence builds items from, at most
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?%?")
+
+
+class Span(NamedTuple):
+    """One span of an item's own source context that states a condition: ``place`` — ``quote`` (a closed-class operator clause of the
+    item's quote), ``row`` (such a clause of its row or sentence), ``note`` (its row's note cell), ``paragraph`` (a paragraph
+    attributed to its table, or one of its notes) or ``heading`` (a heading that names a method, a status, a component or a time) —
+    and ``text`` as the source writes it."""
+
+    place: str
+    text: str
+
+    def public(self) -> dict:
+        return {"place": self.place, "text": self.text}
+
+
+def _row_of(body: Sequence[str], flat: str) -> str | None:
+    """The line of a source's body (a table row, a paragraph) that holds the quote ``flat``."""
+    return next((ln for ln in body if flat in _flat_text(ln)), None)
+
+
+def _header_cells(body: Sequence[str]) -> list[str]:
+    """The cells of the table's header row: its first row, when it holds no digit."""
+    first = next((ln for ln in body if "|" in ln), None)
+    return _row_cells(first) if first is not None and not re.search(r"\d", first) else []
+
+
+def _placeholder(cell: str, header: str) -> bool:
+    """Whether a cell holds no more than the header's own words ("ללא הערה" under "הערה", or an operator alone): it states nothing."""
+    need = conditions.operand_of(cell).groups
+    have = conditions.operand_of(header).groups
+    return not need or all(any(g & h for h in have) for g in need)
+
+
+def _row_conditions(row: str, body: Sequence[str], flat: str) -> Iterable[tuple[str, str]]:
+    """(place, text) of what a row or sentence says that limits its value: the note cell of a table row (its last cell, with three
+    words or more that are not the header's own), an operator clause of its other cells, or an operator clause of the sentence
+    that holds the quote."""
+    cells = _row_cells(row) if "|" in row else []
+    if len(cells) >= 2:
+        head = _header_cells(body)
+        for i, cell in enumerate(cells[1:], 1):
+            last = i == len(cells) - 1 and len(cells) >= 3
+            if last and _placeholder(cell, head[i] if len(head) == len(cells) else ""):
+                continue
+            if last and len(re.findall(r"[^\W\d_]+", cell)) >= 3:
+                yield "note", cell
+            else:
+                yield from (("row", c) for c in conditions.material_clauses(cell))
+        return
+    sentence = next((x for x in _SENTENCE_END.split(row) if flat in _flat_text(x)), "")
+    yield from (("row", c) for c in conditions.material_clauses(sentence))
+
+
+def condition_spans(src, quote: str) -> list[Span]:
+    """The condition spans of the item whose quote is ``quote`` in ``src``, from its own context only: an operator clause of the
+    quote, the clauses and note of its row (or its sentence), the headings that name a method, a status, a component or a time, and
+    the paragraphs and notes attributed to its table (``TablePart.attributed``: a paragraph that is not attributed is no condition
+    of its values). Each span once, in that order."""
+    parts, body = context_of_source(src)
+    flat = SupportScope.flat(quote)
+    out: list[Span] = []
+    seen: set[str] = set()
+
+    def add(place: str, text: str) -> None:
+        key = _flat_text(text)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(Span(place, " ".join(text.split())))
+
+    row = _row_of(body, flat)
+    if row is None or "|" not in row:  # a table row is read cell by cell below: its placeholder cells say nothing
+        for clause in conditions.material_clauses(quote):
+            add("quote", clause)
+    if row is not None:
+        for place, text in _row_conditions(row, body, flat):
+            add(place, text)
+    for part in parts:
+        if part.place == "heading":
+            if conditions.material(part.text):
+                add("heading", part.text)
+        elif part.place in ("before", "after", "note") and not part.reason:
+            for sentence in _SENTENCE_END.split(part.text):
+                if conditions.material(sentence):
+                    add("paragraph", sentence)
+    return out
+
+
+def _contexts(src, quote: str) -> tuple[str, str]:
+    """(the text of the item's own context, the text of the other rows of its table): its quote and row, the paragraphs attributed
+    to the table and its headings; and, for a table, the rows beside it and the paragraphs not attributed to it."""
+    parts, body = context_of_source(src)
+    row = _row_of(body, SupportScope.flat(quote))
+    own = [quote, row or "", *(p.text for p in parts if not p.reason)]
+    other = [ln for ln in body if ln != row] + [p.text for p in parts if p.reason] if _is_tabular(src) else []
+    return "\n".join(own), "\n".join(other)
+
+
+def _foreign_condition(condition: str, src, quote: str) -> bool:
+    """Whether an agent-written condition stands only in another item's context: most of its words are not in the item's own
+    context and are in a row beside it (R3)."""
+    own, other = _contexts(src, quote)
+    return not conditions.stated_in(condition, own) and conditions.stated_in(condition, other)
+
+
+def _clip_row(line: str) -> str:
+    """A row as an item's quote: the whole row, else its cells up to ``SUPPORT_QUOTE_MAX`` characters."""
+    if len(line) <= SUPPORT_QUOTE_MAX:
+        return line
+    kept: list[str] = []
+    for cell in _row_cells(line):
+        if len(" | ".join([*kept, cell])) > SUPPORT_QUOTE_MAX:
+            break
+        kept.append(cell)
+    return " | ".join(kept)
+
+
+def _cited_spans(src, wanted: set[str]) -> Iterable[tuple[str, str, str]]:
+    """(quote, label, value) of each table row of the source whose value cells state a number of ``wanted``, or each sentence of a
+    passage that does: the spans an answer sentence stating those numbers draws on."""
+    for line in context_of_source(src)[1]:
+        cells = _row_cells(line) if "|" in line else []
+        if len(cells) >= 2:
+            values = [c for c in cells[1:] if re.search(r"\d", c)]
+            if values and wanted & numbers_in(_outside_dates(" ".join(values))):
+                yield _clip_row(line), cells[0], values[0]
+            continue
+        for sentence in _SENTENCE_END.split(line):
+            hits = [m.group(0) for m in _NUMBER.finditer(_outside_dates(sentence)) if numbers_in(m.group(0)) & wanted]
+            if hits:
+                yield sentence.strip(), " ".join(sentence.split()[:6]), hits[0]
+
+
+def _component_of(asked: Sequence[Mapping], text: str) -> str:
+    """The component a sentence gives: the one asked component, else the one whose words the sentence shares the most (the first
+    on a tie); "" in a turn with none."""
+    if not asked:
+        return ""
+    words = claim_terms(text)[1]
+    return max(asked, key=lambda c: len(claim_terms(c.get("text") or "")[1] & words))["id"]
+
+
+def _holds(item: Item, sid: str, ws, flat: str) -> bool:
+    """Whether the ledger item already covers the span ``flat`` of source ``sid``: the same source (or its re-read) and a quote
+    that holds or is held by the span."""
+    held = ws.sources.get(item.source)
+    same = item.source == sid or (held is not None and held.same_as == sid) or ws.sources[sid].same_as == item.source
+    mine = SupportScope.flat(item.quote)
+    return same and (mine in flat or flat in mine)
+
+
+def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledger: Ledger) -> list[Item]:
+    """The origin ``source`` items for the spans the answer cites (round 18 U5, KTD1): for each surviving unit and each source it
+    cites, each table row or sentence stating a number of the unit whose own context carries a condition (``condition_spans``) and
+    that no item of the ledger covers becomes an item whose label, value and condition the server builds from the source. A cited
+    span with no condition makes none. The source must pass the checks the agent's items pass (``SupportScope``); at most
+    ``ROWS_PER_UNIT`` rows of one source per unit."""
+    scope = SupportScope(ws, list(units))
+    asked = [c for c in components if c.get("kind") != "instruction"]
+    held = list(ledger.items.values())
+    built: list[Item] = []
+    for unit in units:
+        wanted = numbers_in(_outside_dates(unit.text))
+        if not wanted:
+            continue
+        for sid, src in _cited_sources(unit, ws):
+            made = 0
+            for quote, label, value in _cited_spans(src, wanted):
+                flat = SupportScope.flat(quote)
+                if (made >= ROWS_PER_UNIT or scope.source_problem(sid, flat) or scope.place_problem(src)
+                        or any(_holds(i, sid, ws, flat) for i in [*held, *built])):
+                    continue
+                spans = condition_spans(src, quote)
+                if not spans:
+                    continue
+                made += 1
+                document_id, unit_id = _site_of(src)
+                item = Item(_component_of(asked, f"{unit.text} {label}"), label, sid, quote, value,
+                            " ; ".join(sp.text for sp in spans), ITEM_INCLUDED, "", ORIGIN_SOURCE,
+                            document_id=document_id, unit_id=unit_id)
+                item.id = ledger.id_for(item.key)
+                built.append(item)
+    return built
 
 
 # --- coverage by attribution (R5) --------------------------------------------------------------------------------------------
@@ -340,41 +556,128 @@ class Ledger:
     def __init__(self) -> None:
         self.items: dict[tuple[str, str, str], Item] = {}
         self.excluded: list[dict] = []
+        self.misattributed: list[dict] = []
         self._ids: dict[tuple[str, str, str], str] = {}
 
     def id_for(self, key: tuple[str, str, str]) -> str:
         """The I# of a key: the same for the same key in every version."""
         return self._ids.setdefault(key, f"I{len(self._ids) + 1}")
 
-    def merge(self, kept: Iterable[Item], *, excluded: Iterable[dict] = (), version: int = 0) -> list[Item]:
-        """Merge one answer version's valid items (and record what it excluded); the ledger's items, in the order first seen.
-        An item already in the ledger takes its new declaration from the agent (state, reason, label, value, condition) — a
-        later version may close it with a valid ``not_verifiable`` or ``not_applicable``, or state it ``included`` again; the
-        judge's support never changes an item the ledger already holds. An item not listed again stays."""
+    def merge(self, kept: Iterable[Item], *, excluded: Iterable[dict] = (), version: int = 0,
+              misattributed: Iterable[dict] = ()) -> list[Item]:
+        """Merge one answer version's valid items (and record what it excluded and the conditions it misattributed); the ledger's
+        items, in the order first seen. An item already in the ledger takes its new declaration from the agent (state, reason,
+        label, value, condition) — a later version may close it with a valid ``not_verifiable`` or ``not_applicable``, or state it
+        ``included`` again; the judge's support and the server's source spans never change an item the ledger already holds. An item
+        not listed again stays. An item the agent declares replaces the origin ``source`` items that hold the same span (round 18
+        U5): the span's condition is then checked once, as the agent's item."""
         for item in kept:
             item.id = item.id or self.id_for(item.key)
             old = self.items.get(item.key)
+            if item.origin == ORIGIN_AGENT:
+                for key in [k for k, i in self.items.items()
+                            if i.origin == ORIGIN_SOURCE and k != item.key and k[1] == item.key[1]
+                            and (k[2] in item.key[2] or item.key[2] in k[2])]:
+                    del self.items[key]
             if old is None:
                 self.items[item.key] = item
             elif item.origin == ORIGIN_AGENT:
                 old.label, old.value, old.condition = item.label or old.label, item.value or old.value, item.condition or old.condition
                 old.state, old.reason = item.state, item.reason
+                if old.origin == ORIGIN_SOURCE:
+                    old.origin = ORIGIN_AGENT
         self.excluded += [{"version": version, **e} for e in excluded]
+        self.misattributed += [{"version": version, **m} for m in misattributed]
         return list(self.items.values())
 
     def outcomes(self, units: Sequence[Unit], ws) -> list[dict]:
         """Every item with its state against these surviving units: ``covered`` (a unit gives it), ``omitted`` (an included or
-        judge-added item no unit gives), or the ``not_verifiable`` / ``not_applicable`` the agent declared with a reason."""
+        judge-added item no unit gives), or the ``not_verifiable`` / ``not_applicable`` the agent declared with a reason. Round 18
+        U5: a covered item also has its condition check against the unit that gives it (``condition_check``: "" without a
+        material condition, else ``kept``, ``undecided`` or ``hint``; ``condition_hint``: ``contradicted`` and/or ``other_item``;
+        ``condition_spans``: its spans; ``condition_foreign``: the items whose condition the sentence states; ``condition_unit``:
+        the unit checked). An origin ``source`` item no surviving unit gives is not an open item: the sentence that cited its span
+        is gone, so it is left out."""
         out = []
         # each item's signature is computed once, and the items of a component that share one are counted: an item's condition is
         # asked when another item of its component has its signature (``_coverage``)
         signatures = {id(i): _signature(i) for i in self.items.values()}
         alike = Counter((i.component, signatures[id(i)]) for i in self.items.values())
+        by_index = {u.index: u for u in units}
+        spans = {i.key: _spans_of(ws, i) for i in self.items.values()}
+        rows: list[tuple[Item, Coverage | None, bool]] = []
         for item in self.items.values():
             sig = signatures[id(item)]
-            got = (_coverage(item, units, ws, bool(sig) and alike[(item.component, sig)] > 1)
-                   if item.state in (ITEM_INCLUDED, OMITTED) else None)
+            shared = bool(sig) and alike[(item.component, sig)] > 1
+            got = _coverage(item, units, ws, shared) if item.state in (ITEM_INCLUDED, OMITTED) else None
+            if item.origin == ORIGIN_SOURCE and (got is None or not got.ok):
+                continue
+            rows.append((item, got, shared))
+        # the units that give each covered item (the first is the covering unit above), and each item's own context text
+        gave = {i.key: {u.index for u in units if not _unit_covers(i, u, ws, shared)} for i, g, shared in rows if g is not None and g.ok}
+        owns = {i.key: _own_text(ws, i) for i, _, _ in rows}
+        for item, got, _ in rows:
             state = item.state if got is None else (COVERED if got.ok else OMITTED)
+            check = _condition_check(item, got, spans, gave, owns, by_index, [i for i, _, _ in rows])
             out.append({**item.public(), "state": state, "declared": item.state, "covered_by": got.unit if got else None,
-                        "why": got.why if got else ""})
+                        "why": got.why if got else "", **check})
         return out
+
+
+# --- the condition outcome of a covered item (round 18 U5) ---------------------------------------------------------------------
+
+_NO_CHECK = {"condition_check": "", "condition_hint": [], "condition_spans": [], "condition_foreign": [], "condition_unit": None}
+_RANK = {conditions.KEPT: 0, conditions.UNDECIDED: 1, conditions.HINT: 2}
+
+
+def _spans_of(ws, item: Item) -> list[Span]:
+    src = ws.sources.get(item.source)
+    return condition_spans(src, item.quote) if src is not None else []
+
+
+def _own_text(ws, item: Item) -> str:
+    src = ws.sources.get(item.source)
+    return _contexts(src, item.quote)[0] if src is not None else item.quote
+
+
+def _condition_check(item: Item, got: Coverage | None, spans: dict, gave: dict, owns: dict, by_index: dict[int, Unit],
+                     others: list[Item]) -> dict:
+    """The condition check of a covered item (``Ledger.outcomes``): each of its spans against the sentence that gives it
+    (``conditions.outcome``) — the worst of them, a hint over an undecided over a kept; a sentence that states an operator clause
+    of another item's span that the item's own context does not hold is a hint from that item. Among several units that give the
+    item the one that keeps its condition wins, else the first."""
+    mine = spans[item.key]
+    if got is None or not got.ok:
+        return dict(_NO_CHECK)
+    best = None
+    for index in sorted(gave.get(item.key, {got.unit})):
+        unit = by_index[index]
+        results = [conditions.outcome(sp.text, unit.text) for sp in mine]
+        hints = ["contradicted"] if conditions.HINT in results else []
+        foreign = _foreign_items(item, unit, spans, gave, owns, others)
+        if foreign:
+            hints.append("other_item")
+        check = (conditions.HINT if hints else "" if not mine else
+                 conditions.UNDECIDED if conditions.UNDECIDED in results else conditions.KEPT)
+        row = {"condition_check": check, "condition_hint": hints, "condition_foreign": foreign,
+               "condition_spans": [sp.public() for sp in mine], "condition_unit": index}
+        if best is None or _RANK.get(check, 0) < _RANK.get(best["condition_check"], 0):
+            best = row
+        if check in ("", conditions.KEPT):
+            break
+    return best or dict(_NO_CHECK)
+
+
+def _foreign_items(item: Item, unit: Unit, spans: dict, gave: dict, owns: dict, others: list[Item]) -> list[str]:
+    """The items whose operator clauses the sentence states and the item's own context does not hold: the sentence gives this item
+    a condition of another item. Another item the same sentence gives itself is no source of one."""
+    found = []
+    for other in others:
+        if other.key == item.key or unit.index in gave.get(other.key, ()):
+            continue
+        for sp in spans[other.key]:
+            if (conditions.material_clauses(sp.text) and conditions.outcome(sp.text, unit.text) == conditions.KEPT
+                    and not conditions.stated_in(sp.text, owns[item.key])):
+                found.append(other.id)
+                break
+    return found

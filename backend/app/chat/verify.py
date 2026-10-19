@@ -197,7 +197,7 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, get_args
@@ -286,8 +286,10 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # unit's own context first and the file's title only as the file (``MSG_FILE``); a unit made of a bold label and a statement is shown
 # as the statement (``label_as_statement``); rule (33) reads it. 15 (round 18 U4, KTD5): a context part of a table read carries the marks
 # of why it is not attributed to the table («לא צמוד לטבלה», «בלי הפניה לטבלה») or that it is a heading-like label («כותרת בסעיף»);
-# rule (32) reads them.
-JUDGE_VERSION = 15
+# rule (32) reads them. 16 (round 18 U5, KTD1): the requirements call's ``<item_ledger>`` asks the condition outcome of an item whose
+# condition the server could not decide (``check``, ``span``, ``unit``, ``hint``), and a requirement carries per-item ``conditions``
+# (kept, missing, contradicted or from another item, each with a quote in the right span).
+JUDGE_VERSION = 16
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -503,7 +505,15 @@ JUDGE_REQUIREMENTS_POLICY = (
     "source ו-state: covered — יחידה נותנת אותו עם מקורו; omitted — אף יחידה אינה נותנת אותו; not_verifiable או "
     "not_applicable — הוצהר עם סיבה; <more> — מספר פריטים נוספים שלא הוצגו). רכיב שיש לו פנקס הוא full רק כשכל פריט שלו ניתן "
     "ביחידות שבקלט, ו-<read_passages> והמקורות המצוטטים אינם אומרים חבר נוסף מאותו סוג לנכס שנשאל שהפנקס חסר; חבר כזה "
-    "הוא partial, וציין אותו ב-support לפי הכללים שלמעלה."
+    "הוא partial, וציין אותו ב-support לפי הכללים שלמעלה.\n"
+    "תנאי של פריט: פריט שמסומן check=\"undecided\" או check=\"hint\" נותן ערך שלמקור יש לו תנאי (span — התנאי כפי שהמקור כותב אותו לפריט הזה, "
+    "לא של פריט אחר), ו-unit היא היחידה שנותנת אותו. לכל פריט כזה החזר ב-conditions של הדרישה של הרכיב שלו רשומה "
+    "{item: I#, outcome, quote}: kept — היחידה אומרת את התנאי, גם בניסוח אחר ובמילים אחרות (quote ריק); missing — היחידה נותנת את "
+    "הערך בלי התנאי (quote — מילה במילה מתוך ה-span של הפריט, החלק שהיחידה לא אומרת); contradicted — היחידה אומרת את ההפך מהתנאי, "
+    "למשל «כולל» במקום «אינו כולל» (quote — מילה במילה מתוך ה-span של הפריט שהיא סותרת); other_item — היחידה נותנת לערך תנאי "
+    "שמקורו בפריט אחר (hint=\"other_item:I#\"; quote — מילה במילה מתוך ה-span של הפריט האחר). תנאי שהיחידה אומרת באותה משמעות "
+    "הוא kept גם כשהמילים שונות. hint=\"contradicted\" הוא חשד של השרת בלבד: אשר אותו רק אם היחידה באמת אומרת את ההפך. החזר רשומה "
+    "רק לפריט שמסומן check, ולכל היותר אחת לפריט; כשאינך בטוח אל תחזיר רשומה. תנאי חסר או שגוי אינו סיבה להסיר את הערך."
 )
 # the judge's scores of a requirement in one call
 REQUIREMENT_STATUSES = ("full", "partial", "missing", "undeterminable")
@@ -531,6 +541,8 @@ SUPPORT_PER_REQUIREMENT = 6  # a requirement names at most this many support quo
 # omitted items one REQ_TEXT_FOUND problem lists
 ITEMS_PER_COMPONENT = 12
 ITEM_QUOTE_CHARS = 160
+ITEM_SPAN_CHARS = 240  # round 18 U5: the most of a condition span the ledger block shows an asked item
+SPAN_CHARS = 160  # a condition span this short is compact: the server may write it next to the value (``_condition_span``)
 REQ_DATA_FOUND = ("חלק של הבקשה שהתשובה לא נתנה במלואו: «{text}». הנתונים שלו כבר נמצאו בתור הזה ({ids}): השלם "
                   "אותו בתשובה מהם, וחשב ב-calculate אם הוא דורש חישוב")
 # a part of the request the answer omits, that a passage the turn read states (round 16 U2, KTD3): the repair round adds it from
@@ -793,6 +805,18 @@ class SupportQuote(_Strict):
     quote: str
 
 
+class ConditionVerdict(_Strict):
+    """The judge's outcome for the condition of one ledger item the server could not decide (round 18 U5, KTD1): ``kept`` — the unit
+    that gives the item states its condition, in any wording; ``missing`` — it gives the value without it; ``contradicted`` — it
+    says the opposite; ``other_item`` — it gives the value a condition that belongs to another item. ``quote``: verbatim, from the
+    item's own span for ``missing`` and ``contradicted``, from another item's span for ``other_item`` (the server checks it;
+    ``_Coverage.valid_conditions``); empty for ``kept``."""
+
+    item: str
+    outcome: Literal["kept", "missing", "contradicted", "other_item"]
+    quote: str = ""
+
+
 class JudgeRequirement(_Strict):
     """A requirement of the request with its score in one judge call. A deriving call (the fallback) gives ``text``,
     ``kind``, ``calculation`` and ``conditional`` (the server assigns the id); a scoring call gives the frozen
@@ -820,6 +844,9 @@ class JudgeRequirement(_Strict):
     # the answer omits, each with the verbatim quote. Kept per vote and only for a read source (``_Coverage.accept``); the
     # server checks the quote and decides what it is evidence of (round 16 U2). Empty by default, so an older reply stays valid.
     support: list[SupportQuote] = Field(default_factory=list)
+    # the condition outcome of each ledger item the call asked (``<item_ledger>`` items with ``check``), kept per vote and only when
+    # its quote stands in the right span (``_Coverage.valid_conditions``, round 18 U5). Empty by default, so an older reply stays valid.
+    conditions: list[ConditionVerdict] = Field(default_factory=list)
     # diagnostics only, never in the provider's schema: the call this vote came from, its read passages and what became of each
     # support entry (``_Coverage.accept``, ``validated_support``); travels with the vote, also when a later round carries it
     _trace: dict | None = PrivateAttr(default=None)
@@ -881,6 +908,8 @@ QUALIFIER_LEXICON = frozenset("""
 ינואר פברואר מרץ אפריל מאי יוני יולי אוגוסט ספטמבר אוקטובר נובמבר דצמבר
 תשרי חשוון חשון כסלו טבת שבט אדר ניסן אייר סיוון תמוז אלול
 תאריך מתאריך שנת בשנת מיום
+בלבד כולל כוללת כוללים כוללות לרבות מעל מתחת עד לפחות מקסימום מינימום
+מעמ חודשי חודשית לחודש שנתית רבעוני רבעונית לשנה ליום לרבעון
 """.split())
 # a digit date, a year, and an approximation sign before a number ("כ-15", "כ־15")
 _QUALIFIER_PATTERN = re.compile(
@@ -1933,10 +1962,10 @@ class VerifyReport:
                "partial": len({p.unit.index for p in self.partial_problems()} - errors),
                # a qualifier written from the source; a result the server marked conditional is counted apart
                "annotated": sum(1 for p in self.problems if p.annotatable and not p.conditional
-                                and p.check not in SCOPE_CHECKS and p.unit.index not in errors),
+                                and p.check not in NOTE_CHECKS and p.unit.index not in errors),
                # a value's scope written next to it from the source, or the note that its scope was not verified (round 17 U5)
                "scoped": sum(1 for p in self.problems if p.annotatable and not p.conditional
-                             and p.check in SCOPE_CHECKS and p.unit.index not in errors),
+                             and p.check in NOTE_CHECKS and p.unit.index not in errors),
                "conditional": len(self.conditional_units()),
                # a qualifier the sources do not state, edited out of a number they back (round 12 U10): an edit, not a removal
                "edited": len(self.edits()),
@@ -1973,7 +2002,8 @@ class VerifyReport:
         component (it may need ``take_value`` or ``calculate``). False without a problem to fix."""
         open_ = [p for p in self.problems if p.repairable and p.resolution != "cut"]
         calculations = {r["id"] for r in self.requirements if r.get("kind") == "calculation"}
-        return bool(open_) and all(p.kind == "requirement" and p.check == TEXT_FOUND_CHECK and p.component not in calculations
+        return bool(open_) and all(p.kind == "requirement" and p.check in (TEXT_FOUND_CHECK, CONDITION_FOUND_CHECK)
+                                   and p.component not in calculations
                                    for p in open_)
 
     def _claims_note(self, index: int) -> str:
@@ -2029,7 +2059,8 @@ class VerifyReport:
         ``Ledger.outcomes`` — ``covered``, ``omitted`` (included or judge-added and given by no surviving unit), or the
         ``not_verifiable`` / ``not_applicable`` the agent declared with a reason. Empty without a ledger. ``texts``: the
         components' texts by id, when the report does not hold them yet (before the judge), so that the presence test of a
-        judge-added item reads the same words before and after the judge."""
+        judge-added item reads the same words before and after the judge. An origin ``source`` item (round 18 U5) is in the result only
+        while a surviving unit gives it, and the presence test below is for the judge's items alone."""
         ledger = self.item_ledger
         if ledger is None or not ledger.items:
             return []
@@ -2037,7 +2068,9 @@ class VerifyReport:
             gone = self.removed_units()
             kept = {u.index for u in self.units if u.index not in gone}
         units = [self._as_edited(u) for u in self.units if u.index in kept]
-        states = ledger.outcomes(units, self.item_ws)
+        # an origin ``source`` item exists only while a surviving unit gives it (the sentence that cited its span): otherwise it is no
+        # open item and no line (round 18 U5)
+        states = [st for st in ledger.outcomes(units, self.item_ws) if st["origin"] != ORIGIN_SOURCE or st["state"] == ITEM_COVERED]
         texts = texts if texts is not None else {r["id"]: r["text"] for r in self.requirements}
         for st in states:
             # the judge names a part by its quote alone: unit attribution is not enough for it, the round-16 presence test must
@@ -2068,11 +2101,20 @@ class VerifyReport:
         raw = "".join(kept)
         return dataclasses.replace(u, raw=raw, text=_IDS.sub("", raw).strip(), ids=ids_in(raw))
 
-    def item_listing(self, kept: set[int] | None = None, texts: dict[str, str] | None = None) -> list[dict]:
-        """The ledger as the requirements call is shown it (``_Coverage.items``): each item's id, component, label, source, quote,
-        value, condition and state (and the reason of a declared one). ``texts``: see ``item_states``."""
-        return [{k: s[k] for k in ("id", "component", "label", "source", "quote", "value", "condition", "state", "reason")}
-                for s in self.item_states(kept, texts)]
+    def item_listing(self, kept: set[int] | None = None, texts: dict[str, str] | None = None, *, ask: bool = True) -> list[dict]:
+        """The ledger as the requirements call is shown it (``_Coverage.items``): each item's id, component, origin, label, source, quote,
+        value, condition and state (and the reason of a declared one). Round 18 U5: also its condition check (``check``: "" when
+        the server decided it or there is none, else what the call is asked: ``undecided`` or ``hint``; ``ask=False``, the final
+        check, asks nothing), the unit that gives it (``unit``), the ``hint`` kinds and ``foreign`` items, and its condition spans
+        (``spans``, in full: the server checks a judge's quote against them). ``texts``: see ``item_states``."""
+        out = []
+        for s in self.item_states(kept, texts):
+            row = {k: s[k] for k in ("id", "component", "origin", "label", "source", "quote", "value", "condition", "state", "reason")}
+            asked = ask and s["condition_check"] in ASKED_CHECKS
+            out.append(row | {"check": s["condition_check"] if asked else "", "unit": s["condition_unit"],
+                              "hint": s["condition_hint"], "foreign": s["condition_foreign"],
+                              "spans": [x["text"] for x in s["condition_spans"]]})
+        return out
 
     def add_support_items(self, support: dict[str, list[dict]]) -> None:
         """The judge's validated support (``validated_support``) enters the turn's ledger as items with origin ``judge_support`` and
@@ -2090,9 +2132,11 @@ class VerifyReport:
         """The turn's ledger for the diagnostics: each item with its state against the units that stand, and what validation
         excluded (``{}`` without items)."""
         ledger = self.item_ledger
-        if ledger is None or not (ledger.items or ledger.excluded):
+        if ledger is None or not (ledger.items or ledger.excluded or ledger.misattributed):
             return {}
-        return {"items": self.item_states(), "excluded": list(ledger.excluded)}
+        # round 18 U5: the conditions an agent wrote that stand only in another item's context are recorded, never silent
+        return {"items": self.item_states(), "excluded": list(ledger.excluded)} | (
+            {"misattributed": list(ledger.misattributed)} if ledger.misattributed else {})
 
     @staticmethod
     def _score_row(v: JudgeRequirement) -> dict:
@@ -2185,7 +2229,8 @@ class VerifyReport:
                                    "declared": i["declared"], "why": i["why"], "covered_by": i["covered_by"],
                                    "label": i["label"][:TRACE_QUOTE_CHARS], "quote": i["quote"][:TRACE_QUOTE_CHARS],
                                    "value": i["value"], "condition": i["condition"][:TRACE_QUOTE_CHARS],
-                                   "reason": i["reason"][:TRACE_QUOTE_CHARS]} for i in mine[:TRACE_ITEMS_PER_COMPONENT]]
+                                   "reason": i["reason"][:TRACE_QUOTE_CHARS], "condition_check": i["condition_check"],
+                                   "condition_hint": i["condition_hint"]} for i in mine[:TRACE_ITEMS_PER_COMPONENT]]
             out.append(entry)
         return out
 
@@ -2240,6 +2285,8 @@ class VerifyReport:
         omitted_by: dict[str, list[dict]] = {}
         closed: set[tuple[str, str, str]] = set()
         for st in self.item_states(kept) if states is None else states:
+            if st["origin"] == ORIGIN_SOURCE:
+                continue  # an item the server built from a cited span is given by the sentence that cites it: it never caps a component
             if st["state"] == ITEM_OMITTED:
                 omitted_by.setdefault(st["component"], []).append(st)
             else:
@@ -2497,7 +2544,7 @@ class VerifyReport:
         tagged: set[tuple[int, int]] = set()
         for p in notes:
             at = _after_number(p.unit, p.number or "", p.at) if p.number else None
-            if at is None and (p.conditional or p.check in SCOPE_CHECKS):
+            if at is None and (p.conditional or p.check in NOTE_CHECKS):
                 at = _citation_point(markdown, p.unit)
             if at is not None and not any(a <= at < b for a, b in blocked):
                 if p.conditional:
@@ -2508,8 +2555,10 @@ class VerifyReport:
                         tagged.add((at, p.unit.index))
                     continue
                 cite = f" [{p.cite}]" if p.uncited else ""
-                if p.check == SCOPE_LIMIT_CHECK:  # the scope was not verified: said, with where the value was read (R11)
+                if p.check in (SCOPE_LIMIT_CHECK, CONDITION_LIMIT_CHECK):  # not verified: said, with where the value was read (R11)
                     edits.append((at, at, f" ({p.annotation})", "scope_note", ()))
+                elif p.check == CONDITION_CHECK:  # the condition the source states, written next to the value with its citation (R4)
+                    edits.append((at, at, f" ({MSG_CONDITION_ADDED.format(phrase=p.annotation)}{cite})", "qualifier", ()))
                 elif p.check == SCOPE_CHECK:  # the scope the source states, written next to the value with its citation (R10)
                     edits.append((at, at, f" ({MSG_SCOPE_ADDED.format(phrase=p.annotation)}{cite})", "qualifier", ()))
                 elif not _is_duration_or_count(p.unit, p.number or "", p.at):  # a source's period is never a duration's
@@ -3913,6 +3962,15 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
 SCOPE_CHECK = "scope"  # the check of a validated scope written next to a value
 SCOPE_LIMIT_CHECK = "scope_limit"  # ... and of the limitation note written when the scope could not be verified
 SCOPE_CHECKS = (SCOPE_CHECK, SCOPE_LIMIT_CHECK)
+# the condition of an item (round 18 U5, KTD1): its source's verbatim span written next to the value with its citation (``missing``
+# after the repair round: add, never cut), the note that it was not verified when no compact span exists, the confirmed contradiction
+# (the existing contradicted-claim path) and the repair request that carries the condition's source quote
+CONDITION_CHECK = "condition"
+CONDITION_LIMIT_CHECK = "condition_limit"
+CONDITION_CHECKS = (CONDITION_CHECK, CONDITION_LIMIT_CHECK)
+CONDITION_FOUND_CHECK = "condition_found"  # a repair request about a condition: the repair step turns its tools off for it
+CONDITION_CONTRADICTED_CHECK = "condition_contradicted"
+NOTE_CHECKS = SCOPE_CHECKS + CONDITION_CHECKS  # the checks of a server note written next to a value, where a citation would join
 SCOPE_PHRASE_WORDS = (2, 16)  # the words a scope phrase has: a phrase, not one word and not a paragraph
 SCOPE_PHRASE_CHARS = 160
 MSG_SCOPE_ADDED = "היקף הערך לפי המקור: {phrase}"
@@ -3922,6 +3980,17 @@ MSG_SCOPE_LIMIT_BETWEEN = "היקף הערך במקור לא אומת (הפסק�
 MSG_SCOPE_LIMIT_NOT_ADJACENT = "היקף הערך במקור לא אומת (בין הפסקה לטבלה יש בלוקים אחרים, ולכן אינה מיוחסת לה); הערך נקרא ב-{where}"
 MSG_SCOPE_LIMIT_NO_REFERENCE = ("היקף הערך במקור לא אומת (הפסקה שליד הטבלה אינה מפנה אליה במילותיה, כמו «לעיל» או «להלן»); "
                                 "הערך נקרא ב-{where}")
+# the condition of an item (round 18 U5): what the repair request says, and what the server writes next to the value
+REQ_CONDITION_FOUND = ("התנאי של הפריט «{name}» חסר בתשובה: המקור קובע לערך: {where}. הוסף אותו למשפט שנותן את הערך, עם מראה המקום שלו, "
+                       "והשאר את הערך; אין צורך בחיפוש חדש")
+REQ_CONDITION_OTHER = ("המשפט שנותן את הפריט «{name}» מייחס לערך תנאי של פריט אחר: {where}. הסר ממנו את התנאי הזה, כתוב רק את התנאי "
+                       "של הפריט עצמו (אם יש לו) והשאר את הערך")
+MSG_CONDITION_FOUND = "הערך מוצג בלי התנאי ש-{sid} מציין לו («{phrase}»); אם התשובה לא תכלול אותו, התנאי ייכתב ליד הערך"
+MSG_CONDITION_ADDED = "התנאי לפי המקור: {phrase}"
+MSG_CONDITION_UNVERIFIED = "התנאי של הערך אינו כתוב בתשובה ולא אומת ({sid}); אם התשובה לא תכלול אותו, ייכתב ליד הערך שהתנאי לא אומת"
+MSG_CONDITION_LIMIT = "התנאי של הערך במקור לא נכלל בתשובה ולא אומת; הערך נקרא ב-{where}"
+MSG_CONDITION_CONTRADICTS = "התנאי של הפריט «{name}» סותר את המקור: {where}"
+_CONDITION_RANK = {"contradicted": 0, "other_item": 1, "missing": 2, "kept": 3}
 # why a paragraph beside a table is not attributed to it (``tools.TablePart.reasons``), the most telling first: the note names the
 # first that a source of the value has, and the message for it
 SCOPE_REASONS = ("not_adjacent", "no_reference", "between")
@@ -4122,6 +4191,86 @@ def scope_outcome(u: Unit, phrase: str, ws: Workspace, text: str | None = None) 
     return True, Problem(u, MSG_SCOPE_UNVERIFIED.format(sid=", ".join(k for k, _ in sources)), kind="missing_qualifier",
                          number=number, annotation=note.format(where=_read_in(sources)), defect="scope",
                          check=SCOPE_LIMIT_CHECK)
+
+
+def _condition_verdicts(votes: Iterable[JudgeRequirement]) -> dict[str, ConditionVerdict]:
+    """The judge's accepted condition outcomes (``_Coverage.valid_conditions``) by item id, over every call: the most serious of them
+    for an item (a contradiction, then another item's condition, then a missing one, then kept)."""
+    out: dict[str, ConditionVerdict] = {}
+    for v in votes:
+        for c in v.conditions:
+            if c.item not in out or _CONDITION_RANK[c.outcome] < _CONDITION_RANK[out[c.item].outcome]:
+                out[c.item] = c
+    return out
+
+
+def _condition_span(spans: list[str], quote: str) -> str:
+    """The text the server writes for a missing condition: the span of the item's source that holds the judge's quote when it is
+    compact (``items.SPAN_CHARS``), else the quote itself when it is; empty when neither is (a precise note says so instead)."""
+    flat = _flat_quote(_read_back(quote))
+    holding = next((t for t in spans if flat in _flat_quote(t)), "")
+    return next((t for t in (holding, quote.strip()) if t and len(_norm(t)) <= SPAN_CHARS), "")
+
+
+def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequirement]) -> None:
+    """What the server does with the condition of each covered item whose check the requirements call decided (round 18 U5, KTD1;
+    R1-R4). Only a CONFIRMED contradiction can remove a statement; an undecided or hinted item the judge did not decide, and
+    a ``kept`` one, change nothing, and a missing or misattributed condition never removes the value:
+
+    - ``missing`` (a quote in this item's span): a repair request that carries the source quote (``CONDITION_FOUND_CHECK``, tools
+      off), and, beside it, the server's own note — the verbatim span with its citation, or a precise "not verified" note when no
+      compact span exists — which the final text carries only if the repair did not write the condition (the next verification
+      no longer finds it missing);
+    - ``other_item`` (a quote in another item's span): a repair request to take the foreign condition out;
+    - ``contradicted`` (a quote in this item's span): the existing contradicted-claim path (``contradicts_source``)."""
+    if report.item_ledger is None:
+        return
+    said = _condition_verdicts(votes)
+    units = {u.index: u for u in report.units}
+    removed = report.removed_units()
+    names = {st["id"]: st for st in report.item_states()}
+    for st in names.values():
+        verdict = said.get(st["id"])
+        unit = units.get(st["condition_unit"])
+        if (verdict is None or verdict.outcome == "kept" or st["state"] != ITEM_COVERED
+                or st["condition_check"] not in ASKED_CHECKS or unit is None or unit.index in removed):
+            continue
+        name = _plain_label(st)
+        source = ws.sources.get(st["source"])
+        if verdict.outcome == "contradicted":
+            report.problems.append(Problem(unit, MSG_CONDITION_CONTRADICTS.format(
+                name=name, where=f"{st['source']} «{prompt_text(verdict.quote)}»"), failure_kind="contradicts_source",
+                check=CONDITION_CONTRADICTED_CHECK, component=st["component"] or None))
+            for r in report.claims.get(unit.index, []):
+                if r.verdict in RECORD_VERDICTS and r.verdict not in FAILING_VERDICTS:
+                    r.verdict, r.failure = "contradicts", "none"
+            removed.add(unit.index)
+        elif verdict.outcome == "other_item":
+            report.problems.append(Problem(Unit(-1, "", "", []), REQ_CONDITION_OTHER.format(
+                name=name, where=f"«{prompt_text(verdict.quote)}»"), kind="requirement", component=st["component"],
+                check=CONDITION_FOUND_CHECK))
+        else:
+            report.problems.append(Problem(Unit(-1, "", "", []), REQ_CONDITION_FOUND.format(
+                name=name, where=f"{st['source']} «{prompt_text(verdict.quote)}»"), kind="requirement",
+                component=st["component"], check=CONDITION_FOUND_CHECK))
+            if source is None:
+                continue
+            phrase = _condition_span([x["text"] for x in st["condition_spans"]], verdict.quote)
+            cited = [(st["source"], source)]
+            number = _value_number(unit, cited)
+            if phrase:
+                report.problems.append(Problem(unit, MSG_CONDITION_FOUND.format(sid=st["source"], phrase=phrase),
+                                               kind="missing_qualifier", number=number, annotation=phrase, cite=st["source"],
+                                               check=CONDITION_CHECK))
+            else:
+                report.problems.append(Problem(unit, MSG_CONDITION_UNVERIFIED.format(sid=st["source"]), kind="missing_qualifier",
+                                               number=number, annotation=MSG_CONDITION_LIMIT.format(where=_read_in(cited)),
+                                               check=CONDITION_LIMIT_CHECK))
+
+
+def _plain_label(st: dict) -> str:
+    """An item's name for a server line: its label or its quote, on one line, without square brackets."""
+    return " ".join(re.sub(r"[\[\]\r\n]+", " ", st["label"] or st["quote"]).split())[:120]
 
 
 def _scoped_verdicts(verdicts: dict[int, JudgeVerdict]) -> dict[int, JudgeVerdict]:
@@ -5639,6 +5788,7 @@ class _VoteTrace:
         self.entries: list[dict] = []
         self.index: dict[tuple[str, str], int] = {}  # (id, quote) -> its entry, for the entries still undecided
         self.omitted = 0
+        self.conditions: list[dict] = []  # the condition outcomes the judge returned, each with whether the server accepted it
 
     def note(self, sid: str, quote: str, outcome: str | None) -> None:
         if len(self.entries) >= TRACE_SUPPORT_PER_VOTE:
@@ -5656,7 +5806,7 @@ class _VoteTrace:
     def as_dict(self, missing: str, judged_missing: str) -> dict:
         out = {"call": self.call, "reused": False, "status": self.status, "missing": missing[:TRACE_MISSING_CHARS],
                "passages": self.passages, "support": self.entries, "support_omitted": self.omitted,
-               "_index": self.index}
+               "conditions": self.conditions[:TRACE_SUPPORT_PER_VOTE], "_index": self.index}
         if judged_missing.strip() and judged_missing.strip() != missing:
             out["missing_dropped"] = judged_missing.strip()[:TRACE_MISSING_CHARS]  # the judge's words the server did not keep
         return out
@@ -5712,9 +5862,9 @@ class _Evidence:
         self.ws = ws
         self.texts = {r["id"]: r["text"] for r in requirements}
         self.answer_ids = answer_ids
-        self._items: dict[str, list[tuple[str, str]]] = {}
+        self._items: dict[str, list[tuple[str, str, str]]] = {}
         for i in items or ():
-            self._items.setdefault(i["component"], []).append((i["id"], i["state"]))
+            self._items.setdefault(i["component"], []).append((i["id"], i["state"], i.get("check", "")))
         self._pool: list[tuple[str, str, tuple[Segment, ...]]] | None = None
         self._signatures: dict[tuple, dict] = {}
 
@@ -5852,7 +6002,8 @@ class _Coverage:
             v = r.model_copy(update={"units": [i for i in r.units if i in indexes],
                                      "absent": [i for i in r.absent if i in indexes],
                                      "related": [x for x in dict.fromkeys(r.related) if x in self.known],
-                                     "missing": missing, "support": self.valid_support(r, trace)})
+                                     "missing": missing, "support": self.valid_support(r, trace),
+                                     "conditions": self.valid_conditions(r, indexes, trace)})
             v._trace = trace.as_dict(missing, r.missing)
             v._stamp = {"call_units": sorted(indexes)}
             out.append(v)
@@ -5885,27 +6036,84 @@ class _Coverage:
             trace.settle(x.id, x.quote, "over_cap")
         return kept
 
+    def valid_conditions(self, r: JudgeRequirement, indexes: set[int], trace: _VoteTrace | None = None) -> list[ConditionVerdict]:
+        """The condition outcomes a vote keeps (round 18 U5, KTD1): only for an item this call asked (``check`` ``undecided`` or
+        ``hint``) whose condition unit the call showed, each item once. ``kept`` needs no quote. ``missing`` and ``contradicted`` need
+        a quote (``SUPPORT_QUOTE_MIN``) that is a verbatim part of one of THIS item's condition spans; ``other_item`` one that is a
+        verbatim part of a span of ANOTHER item and of none of its own. An outcome that fails its check is dropped (the trace says
+        why) and the item stays undecided: the value is never touched for it."""
+        trace = trace or _VoteTrace(0, r.status, None)
+        by_id = {i["id"]: i for i in self.items}
+        out: dict[str, ConditionVerdict] = {}
+        for c in r.conditions:
+            item = by_id.get(c.item.strip())
+            quote = _flat_quote(_read_back(c.quote.strip()))
+            if item is None or item.get("check") not in ASKED_CHECKS:
+                why = "not_asked"
+            elif item["unit"] not in indexes:
+                why = "unit_not_shown"
+            elif c.item.strip() in out:
+                why = "duplicate"
+            elif c.outcome == "kept":
+                why = None
+            elif len(quote) < SUPPORT_QUOTE_MIN:
+                why = "too_short"
+            elif c.outcome == "other_item":
+                mine = _span_flat(item["spans"])
+                others = [s for o in self.items if o["id"] != item["id"] for s in _span_flat(o["spans"])]
+                why = None if any(quote in s for s in others) and not any(quote in s for s in mine) else "not_in_other_span"
+            else:
+                why = None if any(quote in s for s in _span_flat(item["spans"])) else "not_in_item_span"
+            trace.conditions.append({"item": c.item.strip(), "outcome": c.outcome, "quote": quote[:TRACE_QUOTE_CHARS],
+                                     "accepted": why is None, "why": why or ""})
+            if why is None:
+                out[c.item.strip()] = ConditionVerdict(item=c.item.strip(), outcome=c.outcome, quote=c.quote.strip())
+        return list(out.values())
+
+
+ASKED_CHECKS = ("undecided", "hint")  # the condition checks the requirements call is asked to decide (``Ledger.outcomes``)
+
+
+def _span_flat(texts: Sequence[str]) -> list[str]:
+    return [_flat_quote(t) for t in texts]
+
 
 def _item_ledger_block(items: list[dict]) -> str:
     """The ``<item_ledger>`` block of a requirements call (round 17 U3, KTD3, KTD7): per component the items the answer declared
     from the read sources, each with its I#, source and state (``covered``, ``omitted``, or the ``not_verifiable`` /
     ``not_applicable`` it was declared with its reason), its label, value and condition when it has them, and its quote (at most
     ``ITEM_QUOTE_CHARS``). At most ``ITEMS_PER_COMPONENT`` items per component, the uncovered first (shown in the ledger's order);
-    ``<more count=…/>`` counts the rest. Empty when the ledger holds no item."""
+    ``<more count=…/>`` counts the rest. Empty when the ledger holds no item.
+
+    Round 18 U5 (KTD1): an item whose condition the server could not decide (``check`` ``undecided`` or ``hint``) also carries the
+    condition span its source states (``span``), the unit that gives it (``unit``) and, for a hint, what the server suspects
+    (``hint``: ``contradicted``, or ``other_item:I#``); the items a hint names carry their spans too, so the judge can quote them.
+    An item whose condition the server decided, or that has none, is rendered as before, and an origin ``source`` item the judge
+    is not asked about is not rendered: a turn with no undecided condition is shown exactly the ledger it was."""
+    asked = {i["id"] for i in items if i.get("check") in ASKED_CHECKS}
+    named = {x for i in items if i["id"] in asked for x in i.get("foreign", ())}
     by_component: dict[str, list[dict]] = {}
     for i in items:
+        if i.get("origin") == ORIGIN_SOURCE and i["id"] not in asked | named:
+            continue
         by_component.setdefault(i["component"], []).append(i)
     blocks = []
     for cid, mine in by_component.items():
-        shown = {i["id"] for i in sorted(mine, key=lambda i: i["state"] == ITEM_COVERED)[:ITEMS_PER_COMPONENT]}
+        ranked = sorted(mine, key=lambda i: i["state"] == ITEM_COVERED and i["id"] not in asked)
+        shown = {i["id"] for i in ranked[:ITEMS_PER_COMPONENT]} | {i["id"] for i in mine if i["id"] in named}
         lines = []
         for i in mine:
             if i["id"] not in shown:
                 continue
             attrs = f'id="{prompt_attr(i["id"])}" source="{prompt_attr(i["source"])}" state="{prompt_attr(i["state"])}"'
             for name in ("label", "value", "condition", "reason"):
-                if i.get(name):
+                if i.get(name) and not (name == "condition" and i["id"] in asked and i.get("origin") == ORIGIN_SOURCE):
                     attrs += f' {name}="{prompt_attr(i[name])}"'
+            if i["id"] in asked:
+                hint = [h if h != "other_item" else "other_item:" + ",".join(i.get("foreign", ())) for h in i.get("hint", ())]
+                attrs += f' check="{i["check"]}" unit="{i["unit"]}"' + (f' hint="{prompt_attr(" ".join(hint))}"' if hint else "")
+            if i["id"] in asked | named and i.get("spans"):
+                attrs += f' span="{prompt_attr(" ; ".join(i["spans"])[:ITEM_SPAN_CHARS])}"'
             lines.append(f"<item {attrs}>{prompt_text(i['quote'][:ITEM_QUOTE_CHARS])}</item>")
         if len(mine) > len(shown):
             lines.append(f'<more count="{len(mine) - len(shown)}"/>')
@@ -6715,7 +6923,10 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
 
         stand = [u for u in units if u.index not in failed]
         valid = item_ledger.validate(getattr(answer, "items", None) or [], ws, stand, requirements.items, ledger)
-        ledger.merge(valid.kept, excluded=valid.excluded, version=item_version)
+        ledger.merge(valid.kept, excluded=valid.excluded, version=item_version, misattributed=valid.misattributed)
+        # a source span the surviving sentences cite, that carries a condition no item covers, joins the ledger so that its condition
+        # is checked also when the agent declared nothing (round 18 U5, KTD1)
+        ledger.merge(item_ledger.source_items(stand, ws, requirements.items, ledger), version=item_version)
         report.item_ledger, report.item_ws = ledger, ws
         coverage.items = report.item_listing({u.index for u in stand}, {r["id"]: r["text"] for r in requirements.items})
     # a missing qualifier does not keep the unit from the judge: it is annotated only if the unit is supported
@@ -6778,7 +6989,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         signature = (tuple((keys[u.index], u.index in failed) for u in units),
                      coverage.workspace if coverage else "", request or question,
                      tuple(r["id"] for r in requirements.items) if requirements is not None else (),
-                     tuple((i["id"], i["state"]) for i in coverage.items) if coverage else ())
+                     tuple((i["id"], i["state"], i["check"], i["unit"]) for i in coverage.items) if coverage else ())
     # a lead-in before list items is structure (round 13 U10, KTD12, R15): the judge is not asked, it is recorded as navigation,
     # and its numbers are read by the deterministic checks above like any unit's
     for u in to_judge:
@@ -6903,6 +7114,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 else:
                     report.problems += [Problem(u, f"נתמך ב-{s}, שהתשובה לא ציטטה", kind="needs_citation", cite=s)
                                         for s in cite_ids]
+        if coverage is not None:
+            _check_conditions(report, ws, votes)  # the condition outcome of each covered item (round 18 U5)
         complete_records(report)
         _remove_dependents(report, verdicts, ws)
     report.protect_question(answer)
@@ -7671,8 +7884,11 @@ def _in_answer(quote: str, units: list[Unit], component: str = "") -> bool:
 # the states of a ledger item (``app.chat.items``): what the agent declares, and ``omitted`` / ``covered``, which the server assigns
 ITEM_INCLUDED, ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE = "included", "not_verifiable", "not_applicable"
 ITEM_OMITTED, ITEM_COVERED = "omitted", "covered"
-# who put an item in the ledger: the answering agent, or the server from the judge's validated support
-ORIGIN_AGENT, ORIGIN_JUDGE_SUPPORT = "agent", "judge_support"
+# who put an item in the ledger: the answering agent, the server from the judge's validated support, or the server from a source span
+# an answer sentence cites and no item covers (round 18 U5, KTD1: a span that carries a material condition, so the condition is
+# checked on turns where the agent declared nothing). A source item is covered by the sentence that cites it: it is checked for its
+# condition only, and is never "read and not used" (``coverage.item_gap_lines``)
+ORIGIN_AGENT, ORIGIN_JUDGE_SUPPORT, ORIGIN_SOURCE = "agent", "judge_support", "source"
 # whether a score was cast by this round's call or carried from an earlier round of the turn (a score's ``_stamp["origin"]``)
 FRESH, CARRIED = "fresh", "carried"
 

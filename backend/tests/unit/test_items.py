@@ -10,12 +10,14 @@ from decimal import Decimal
 
 from app.chat import calc, items
 from app.chat.engine import FINAL_SCHEMA, POLICY, FinalAnswer, LedgerItem
-from app.chat.tools import Workspace, unit_info
+from app.chat.tools import TABLE_PATH_PREFIX, Workspace, unit_info
 from app.chat.verify import split_units
 
 PROV = {"unit": "source", "vat": "source"}
 ADJUSTMENTS = "\n".join(["התאמות לנכס להשוואה", "סוג התאמה | שיעור", "מיקום | 5%", "קומה | 3%", "גיל הבניין | 2%"])
 COMPONENTS = [{"id": "N1", "text": "ההתאמות שהשומה יישמה"}]
+AGE_TABLE = "\n".join(["התאמות לנכס להשוואה", "סוג התאמה | שיעור | הערה", "קומה | 3% | התאמה לפי קומה",
+                       "גיל הבניין | 2% | כאשר הבניין מעל גיל 30 שנה"])
 
 
 def _ws(*texts: str, same_file: bool = False) -> Workspace:
@@ -198,6 +200,14 @@ def _covered(ws: Workspace, markdown: str, item: items.Item | None = None, sibli
     return items.Coverage(got["state"] == items.COVERED, got["covered_by"], got["why"])
 
 
+def _condition(ws: Workspace, markdown: str, item: items.Item | None = None, siblings=()) -> dict:
+    """The outcome ``Ledger.outcomes`` gives ``item`` (with its condition check) against the answer ``markdown``."""
+    item = item or _item()
+    ledger = items.Ledger()
+    ledger.merge([item, *(s for s in siblings if s.key != item.key)])
+    return next(o for o in ledger.outcomes(_units(markdown), ws) if o["id"] == ledger.items[item.key].id)
+
+
 def _open(ledger: items.Ledger, markdown: str, ws: Workspace) -> list[items.Item]:
     """The items of the ledger still omitted against these surviving units."""
     state = {o["id"]: o["state"] for o in ledger.outcomes(_units(markdown), ws)}
@@ -285,19 +295,38 @@ def test_items_that_share_a_value_need_their_own_condition_words():
     assert _covered(ws, "השיעור לחנויות בקומת קרקע הוא 7% [S1].", ground, both).ok
 
 
-def test_an_item_whose_value_no_sibling_shares_does_not_need_its_condition_words():
-    ws = _ws(ADJUSTMENTS)
+def test_an_item_whose_value_no_sibling_shares_is_covered_without_its_condition_words_and_its_condition_is_asked_apart():
+    # round 18 U5 (KTD1): the disambiguation check (``shared``) is not the condition check. The item is still covered by its
+    # attribution and value, as before, but its condition is no longer free: it has an outcome of its own — undecided here, because
+    # the sentence leaves the threshold out — that the requirements call decides. The old test pinned that nothing asked it.
+    ws = _ws(AGE_TABLE)
     item = _item(condition="כאשר הבניין מעל גיל 30 שנה")
-    assert _covered(ws, "ההתאמה לגיל הבניין היא 2% [S1].", item, (item, _item(quote="קומה | 3%", value="3%"))).ok
+    sibling = _item(quote="קומה | 3%", value="3%")
+    assert _covered(ws, "ההתאמה לגיל הבניין היא 2% [S1].", item, (item, sibling)).ok
+    assert _condition(ws, "ההתאמה לגיל הבניין היא 2% [S1].", item, (item, sibling))["condition_check"] == "undecided"
+    stated = "ההתאמה לגיל הבניין היא 2% כאשר הבניין מעל גיל 30 שנה [S1]."
+    assert _condition(ws, stated, item, (item, sibling))["condition_check"] == "kept"
 
 
-def test_a_paraphrased_condition_with_the_right_source_value_and_date_still_covers_the_item():
-    text = "\n".join(["שיעורי היוון", "שימוש | שיעור", "משרדים | 7%", "חנויות | 7%"])
+def test_a_paraphrased_condition_with_the_right_source_value_and_date_still_covers_the_item_and_its_words_settle_the_outcome():
+    # round 18 U5: the paraphrase still passes the disambiguation words (a shared value needs half of them), and the same words
+    # settle the condition outcome (most of the note's content words are stated). A rephrasing with other words is undecided and
+    # goes to the requirements call (the next test). The old test pinned only the first half.
+    text = "\n".join(["שיעורי היוון", "שימוש | שיעור | הערה", "משרדים | 7% | נכס מושכר לתקופה של חמש שנים", "חנויות | 7% | נכס פנוי"])
     ws = _ws(text)
     offices = _item(label="שיעור למשרדים", quote="משרדים | 7%", value="7%", condition="נכס מושכר לתקופה של חמש שנים")
     shops = _item(label="שיעור לחנויות", quote="חנויות | 7%", value="7%", condition="נכס פנוי")
-    got = _covered(ws, "שיעור של 7% חל על נכס שהושכר לחמש שנים [S1].", offices, (offices, shops))
-    assert got.ok
+    markdown = "שיעור של 7% חל על נכס שהושכר לחמש שנים [S1]."
+    assert _covered(ws, markdown, offices, (offices, shops)).ok
+    assert _condition(ws, markdown, offices, (offices, shops))["condition_check"] == "kept"
+
+
+def test_a_rephrasing_with_other_words_is_undecided_not_kept_and_not_a_contradiction():
+    text = "\n".join(["שיעורי היוון", "שימוש | שיעור | הערה", "משרדים | 7% | נכס מושכר לתקופה של חמש שנים", "חנויות | 7% | נכס פנוי"])
+    ws = _ws(text)
+    offices = _item(label="שיעור למשרדים", quote="משרדים | 7%", value="7%", condition="נכס מושכר לתקופה של חמש שנים")
+    got = _condition(ws, "שיעור המשרדים הוא 7% בנכס שהוחכר ל-60 חודשים [S1].", offices)
+    assert got["condition_check"] == "undecided" and got["condition_hint"] == []
 
 
 def test_an_item_with_a_date_needs_that_date_stated_and_another_date_does_not_cover_it():
@@ -442,3 +471,157 @@ def test_the_policy_describes_the_ledger_and_no_longer_says_one_search_is_enough
     assert "חיפוש אחד ממוקד בדרך כלל מספיק" not in POLICY
     for word in ("items", "included", "not_verifiable", "not_applicable"):
         assert word in POLICY
+
+
+# --- round 18 U5: the condition of an item, its span, its origin and its outcome (KTD1; R1-R4; AE1-AE4, AE8) ---------------------
+
+PLAN_ROWS = ["סוג שטח | שטח (מ״ר) | הערה", "שטח כולל לבנייה | 1,200 | הזכויות חלות רק על פי תכנית מאושרת", "שטח למרתף | 340 | ללא הערה"]
+PLAN_HEAD = [f"{TABLE_PATH_PREFIX} 3. זכויות הבנייה", "טבלה 3.1 — זכויות הבנייה בנכס", "הטבלה: 2 שורות"]
+PLAN_TABLE = "\n".join([*PLAN_HEAD, *PLAN_ROWS])
+PLAN_QUOTE = "שטח כולל לבנייה | 1,200"
+PLAN_NOTE = "הזכויות חלות רק על פי תכנית מאושרת"
+PLAN_BARE = "השטח הכולל לבנייה בנכס הוא 1,200 מ״ר [S1]."
+PLAN_ASK = [{"id": "N1", "text": "השטח הכולל לבנייה בנכס"}]
+
+
+def _spans(ws: Workspace, quote: str, source: str = "S1") -> list[tuple[str, str]]:
+    return [(s.place, s.text) for s in items.condition_spans(ws.sources[source], quote)]
+
+
+def test_a_row_note_is_the_condition_span_of_its_item_and_a_no_note_placeholder_is_none():
+    ws = _ws(PLAN_TABLE)
+    assert _spans(ws, PLAN_QUOTE) == [("note", PLAN_NOTE)]
+    assert _spans(ws, "שטח למרתף | 340") == []  # the cell holds the header's own word with a negation: no condition
+
+
+def test_an_operator_clause_of_the_quote_or_its_sentence_is_a_span_and_a_plain_total_is_not():
+    ws = _ws("הזכויות במגרש הן 800 מ״ר, למעט שטחי השירות. השטח הכולל לבנייה הוא 900 מ״ר.")
+    assert _spans(ws, "הזכויות במגרש הן 800 מ״ר") == [("row", "הזכויות במגרש הן 800 מ״ר, למעט שטחי השירות")]
+    assert _spans(ws, "השטח הכולל לבנייה הוא 900 מ״ר") == []
+
+
+def test_ae8_a_heading_that_names_a_method_is_a_span_of_the_values_under_it_and_a_plain_heading_is_not():
+    method = _ws("\n".join([f"{TABLE_PATH_PREFIX} 4. גישת היוון ההכנסות", "טבלה 4.1 — תוצאות החישוב", "רכיב | סכום (₪)",
+                            "הכנסה נטו שנתית | 610,000", "שווי מהוון | 9,384,615"]))
+    assert _spans(method, "שווי מהוון | 9,384,615") == [("heading", "4. גישת היוון ההכנסות")]
+    assert _spans(_ws(PLAN_TABLE.replace("שטח כולל לבנייה | 1,200 | " + PLAN_NOTE, "שטח כולל לבנייה | 1,200 | ")), PLAN_QUOTE) == []
+
+
+def test_a_paragraph_attributed_to_the_table_is_a_span_and_one_that_is_not_attributed_is_not():
+    from app.chat.tools import TablePart
+
+    ws = _ws("\n".join([*PLAN_HEAD, "סוג שטח | שטח (מ״ר)", "שטח כולל לבנייה | 1,200"]))
+    note = "הטבלה שלעיל מתייחסת לשטח מעל הקרקע בלבד"
+    ws.sources["S1"].table_parts = [TablePart("after", "paragraph", 47, note, False, 1, 0, 0, "back")]
+    assert _spans(ws, PLAN_QUOTE) == [("paragraph", note)]
+    ws.sources["S1"].table_parts = [TablePart("after", "paragraph", 47, note, False, 1, 3, 0, "back")]  # blocks stand between
+    assert _spans(ws, PLAN_QUOTE) == []
+
+
+def test_an_agent_condition_found_only_in_another_items_context_is_recorded_as_misattributed_and_the_item_stays():
+    text = "\n".join(["סוג | שיעור | הערה", "מגורים | 4% | חל עד שנה מהמסירה", "מסחר | 6% | חל על כל תקופת החוזה"])
+    ws = _ws(text)
+    res = _validate(ws, "השיעור למסחר הוא 6% [S1].", _raw(label="שיעור למסחר", quote="מסחר | 6%", value="6%",
+                                                           condition="חל עד שנה מהמסירה"))
+    (kept,) = res.kept
+    assert kept.condition == "" and kept.quote == "מסחר | 6%"  # checked against its own context: the foreign words are gone
+    assert [(m["quote"], m["condition"]) for m in res.misattributed] == [("מסחר | 6%", "חל עד שנה מהמסירה")]
+    assert res.excluded == []  # never silent, and never a reason to drop the item
+
+
+def test_an_agent_condition_that_stands_in_the_items_own_context_or_in_none_is_kept_as_written():
+    ws = _ws(PLAN_TABLE)
+    own = _validate(ws, PLAN_BARE, _raw(label="שטח כולל", quote=PLAN_QUOTE, value="1,200", condition=PLAN_NOTE),
+                    components=PLAN_ASK)
+    assert own.kept[0].condition == PLAN_NOTE and own.misattributed == []
+    paraphrase = _validate(ws, PLAN_BARE, _raw(label="שטח כולל", quote=PLAN_QUOTE, value="1,200", condition="אושרה תוכנית בניין עיר"),
+                           components=PLAN_ASK)
+    assert paraphrase.kept[0].condition == "אושרה תוכנית בניין עיר" and paraphrase.misattributed == []
+
+
+def test_an_empty_agent_ledger_with_a_cited_row_that_carries_a_condition_gets_an_origin_source_item():
+    ws = _ws(PLAN_TABLE)
+    ledger = items.Ledger()
+    built = items.source_items(_units(PLAN_BARE), ws, PLAN_ASK, ledger)
+    (item,) = built
+    assert (item.origin, item.component, item.source, item.state) == ("source", "N1", "S1", "included")
+    assert item.quote == "שטח כולל לבנייה | 1,200 | " + PLAN_NOTE and item.label == "שטח כולל לבנייה"
+    assert item.value == "1,200" and item.condition == PLAN_NOTE and item.id == "I1"
+
+
+def test_a_cited_row_with_no_material_condition_creates_no_item_and_neither_does_a_row_the_unit_does_not_state():
+    ws = _ws(ADJUSTMENTS)
+    assert items.source_items(_units("ההתאמה לגיל הבניין היא 2% [S1]."), ws, COMPONENTS, items.Ledger()) == []
+    plan = _ws(PLAN_TABLE)
+    assert items.source_items(_units("שטח המרתף הוא 340 מ״ר [S1]."), plan, PLAN_ASK, items.Ledger()) == []  # its note is a placeholder
+    assert items.source_items(_units("שטח של 500 מ״ר [S1]."), plan, PLAN_ASK, items.Ledger()) == []
+
+
+def test_a_row_an_agent_item_already_covers_creates_no_source_item():
+    ws = _ws(PLAN_TABLE)
+    ledger = items.Ledger()
+    declared = _validate(ws, PLAN_BARE, _raw(label="שטח כולל", quote=PLAN_QUOTE, value="1,200"), components=PLAN_ASK, ledger=ledger)
+    ledger.merge(declared.kept)
+    assert items.source_items(_units(PLAN_BARE), ws, PLAN_ASK, ledger) == []
+
+
+def test_a_source_item_is_covered_by_the_sentence_that_cites_it_and_never_stands_open():
+    ws = _ws(PLAN_TABLE)
+    ledger = items.Ledger()
+    ledger.merge(items.source_items(_units(PLAN_BARE), ws, PLAN_ASK, ledger))
+    (out,) = ledger.outcomes(_units(PLAN_BARE), ws)
+    assert out["state"] == "covered" and out["origin"] == "source"
+    assert ledger.outcomes(_units("אין כאן מידע על השטח."), ws) == []  # the sentence that cited the row is gone: nothing to check
+    # an agent that declares the same row later takes the span over: one item, the agent's (``Ledger.merge`` handles the new origin)
+    declared = _validate(ws, PLAN_BARE, _raw(label="שטח כולל", quote=PLAN_QUOTE, value="1,200", reason=""), components=PLAN_ASK)
+    assert [i.origin for i in ledger.merge(declared.kept, version=2)] == ["agent"]
+
+
+def test_ae1_a_single_item_whose_row_says_approved_plan_only_is_undecided_when_the_answer_omits_it_and_kept_when_it_states_it():
+    ws = _ws(PLAN_TABLE)
+    item = _item(label="שטח כולל", quote=PLAN_QUOTE, value="1,200")
+    got = _condition(ws, PLAN_BARE, item)
+    assert got["state"] == "covered" and got["condition_check"] == "undecided"  # covered by its value; the condition is not given
+    assert got["condition_spans"] == [{"place": "note", "text": PLAN_NOTE}]
+    assert _condition(ws, f"השטח הכולל לבנייה הוא 1,200 מ״ר, {PLAN_NOTE} [S1].", item)["condition_check"] == "kept"
+
+
+def test_an_item_with_no_material_condition_has_no_condition_check():
+    ws = _ws(ADJUSTMENTS)
+    got = _condition(ws, "ההתאמה לגיל הבניין היא 2% [S1].")
+    assert got["condition_check"] == "" and got["condition_spans"] == []
+
+
+def test_ae3_a_row_note_with_an_exclusion_that_the_sentence_states_as_including_is_a_contradiction_hint():
+    text = "\n".join(["סוג שטח | שטח (מ״ר) | הערה", "שטח עיקרי | 900 | השטח אינו כולל קומות החניה"])
+    ws = _ws(text)
+    item = _item(label="שטח עיקרי", quote="שטח עיקרי | 900", value="900")
+    got = _condition(ws, "השטח העיקרי הוא 900 מ״ר וכולל קומות החניה [S1].", item)
+    assert got["condition_check"] == "hint" and got["condition_hint"] == ["contradicted"]
+    assert _condition(ws, "השטח העיקרי הוא 900 מ״ר ואינו כולל את קומות החניה [S1].", item)["condition_check"] == "kept"
+
+
+def test_ae4_a_time_limit_of_the_neighbouring_row_in_the_sentence_is_a_hint_from_another_item():
+    text = "\n".join(["סוג | שכירות | הערה", "דירה קטנה | 3,000 | עד שנה מהמסירה", "דירה גדולה | 5,000 |"])
+    ws = _ws(text)
+    small = _item(label="שכירות דירה קטנה", quote="דירה קטנה | 3,000", value="3,000")
+    large = _item(label="שכירות דירה גדולה", quote="דירה גדולה | 5,000", value="5,000")
+    markdown = "השכירות לדירה גדולה היא 5,000 עד שנה מהמסירה [S1]. השכירות לדירה קטנה היא 3,000 עד שנה מהמסירה [S1]."
+    ledger = items.Ledger()
+    ledger.merge([small, large])
+    out = {o["quote"]: o for o in ledger.outcomes(_units(markdown), ws)}
+    assert out["דירה קטנה | 3,000"]["condition_check"] == "kept"
+    big = out["דירה גדולה | 5,000"]
+    assert big["condition_check"] == "hint" and big["condition_hint"] == ["other_item"]
+    assert big["condition_foreign"] == [ledger.items[small.key].id] and big["condition_spans"] == []
+
+
+def test_a_sentence_that_gives_both_values_does_not_make_either_a_hint_from_the_other():
+    text = "\n".join(["סוג | שכירות | הערה", "דירה קטנה | 3,000 | עד שנה מהמסירה", "דירה גדולה | 5,000 |"])
+    ws = _ws(text)
+    small = _item(label="שכירות דירה קטנה", quote="דירה קטנה | 3,000", value="3,000")
+    large = _item(label="שכירות דירה גדולה", quote="דירה גדולה | 5,000", value="5,000")
+    ledger = items.Ledger()
+    ledger.merge([small, large])
+    out = ledger.outcomes(_units("השכירות היא 3,000 עד שנה מהמסירה ו-5,000 לדירה גדולה [S1]."), ws)
+    assert {o["condition_check"] for o in out} <= {"", "kept"}

@@ -836,6 +836,25 @@ def test_a_negation_that_qualifies_a_positive_claim_is_protected_but_an_absence_
         assert verify.states_absence(text) == (text != "הקומה אינה כלולה בשטח")
 
 
+def test_a_repair_that_drops_a_threshold_a_period_or_a_vat_word_of_a_verified_claim_restores_the_earlier_sentence():
+    # round 18 U5 (KTD1, repair guard): the lexicon holds the condition, threshold, period and VAT words, so a rewrite that keeps the
+    # number and loses the word that limits it is a loss, and the verified sentence is put back (``restore_lost``)
+    ws = _ws(SOURCE + " השיעור חל עד 30 שנה. דמי הניהול הם 12 ₪ למ\"ר לחודש. המחיר 55 ₪ כולל מע״מ. זכויות מעל 100 מ\"ר.")
+    first = ("השיעור חל עד 30 שנה [S1].\nדמי הניהול הם 12 ₪ למ\"ר לחודש [S1].\nהמחיר הוא 55 ₪ כולל מע״מ [S1].\n"
+             "הזכויות מעל 100 מ\"ר [S1].")
+    report = verify_answer(_judge(), _answer(first), ws, "?", [])
+    for dropped, word in (("השיעור חל 30 שנה [S1].", "עד"), ("דמי הניהול הם 12 ₪ למ\"ר [S1].", "לחודש"),
+                          ("המחיר הוא 55 ₪ [S1].", "מע״מ"), ("הזכויות 100 מ\"ר [S1].", "מעל")):
+        others = [ln for ln in first.split("\n") if word not in ln]
+        repaired = "\n".join([dropped, *others])
+        lost = report.lost_supported(repaired)
+        assert [word in r.text for _, r in lost] == [True], word
+        merged, back = report.restore_lost(repaired, lost)
+        assert len(back) == 1 and word in merged, word
+    keeps = "\n".join(first.split("\n"))
+    assert not report.lost_supported(keeps)
+
+
 def test_a_qualified_or_cited_supported_claim_is_protected_like_a_kept_one():
     ws = _ws()
     report = verify_answer(_judge(), _answer("השווי למ\"ר הוא 9,500 ₪ [S1].\nהנכס פנוי."), ws, "?", [])
@@ -1014,7 +1033,7 @@ def test_a_sentence_that_moves_to_the_front_of_its_line_keeps_its_key(monkeypatc
 # --- round 16 U1: the judge contract is version 11 and the verdict cache key moves with it --------------------------------------
 
 def test_the_judge_version_is_14_and_the_verdict_cache_key_changes_with_it(monkeypatch):
-    assert verify.JUDGE_VERSION == 15  # 11: round 16 U1 (the read passages, `support`); 12: every returned passage, items of a kind; 13: round 17 U5 (defect `scope`); 14: round 18 U3 (a multi-report source header names the unit first; a bold label over a statement is shown as the statement); 15: round 18 U4 (the marks of a table part's attribution, rule 32)
+    assert verify.JUDGE_VERSION == 16  # 11: round 16 U1 (the read passages, `support`); 12: every returned passage, items of a kind; 13: round 17 U5 (defect `scope`); 14: round 18 U3 (a multi-report source header names the unit first; a bold label over a statement is shown as the statement); 15: round 18 U4 (the marks of a table part's attribution, rule 32); 16: round 18 U5 (the condition outcome of an item in the requirements call, `conditions`)
     ws = _ws()
     unit = verify.split_units("השווי למ\"ר הוא 9,500 ₪ [S1].")[0]
     now = verify.unit_key(unit, ws, "?", "", {})
