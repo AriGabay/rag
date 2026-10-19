@@ -7710,11 +7710,272 @@ def write_round17(out: Path, font_dir: Path) -> None:
     print(f"wrote {ROUND17_DIR}/{ROUND17_MANIFEST}")
 
 
+# --------------------------------------------------------------------------- round 18 (meaning kept, wrong removals)
+#
+# Synthetic appraisals for the round-18 reproductions of failures the diagnosis found: a lease whose period words the text
+# layer splits (R18a); a page whose second table has a two-row header (R18b); a valuation with a comma-joined list of
+# years, a per-unit amount in a thousands abbreviation and VAT (R18c); an appraisal whose calculation pages open with a
+# short heading line that ends in a colon (R18d); a file of two reports (R18e); a table row whose value holds only for an
+# approved plan (R18f); a note after a table that points back to it, with another table on the next page (R18g); and a
+# numbered method heading over a table (R18h). Every name, street and figure is invented.
+
+ROUND18_DIR = "round18"
+ROUND18_MANIFEST = "manifest.json"
+ROUND18_FILES = {
+    "lease": "R18a_synthetic_lease_split_period_words.pdf",
+    "two_row_header": "R18b_synthetic_two_row_header_second_table.pdf",
+    "numbers": "R18c_synthetic_years_scale_and_vat.pdf",
+    "calculation_pages": "R18d_synthetic_calculation_pages_colon_heading.pdf",
+    "two_reports": "R18e_synthetic_two_reports_in_one_file.pdf",
+    "approved_plan": "R18f_synthetic_row_note_approved_plan_only.pdf",
+    "deictic_note": "R18g_synthetic_note_after_table_next_page_table.pdf",
+    "method_heading": "R18h_synthetic_method_heading_over_table.pdf",
+}
+ROUND18_INTRO = ("1. מטרת השומה", "שומה זו נערכה לצורך הדגמה בלבד (מסמך סינתטי).")
+ROUND18_LEASE = {
+    "title": "שומת הדגמה למשרדים במגדל הברוש — שכירות", "intro": ROUND18_INTRO, "heading": "2. הסכם השכירות",
+    # each line is drawn in pieces: the text layer then holds a space inside the word that ends the first piece
+    "duration_pieces": ["תקופת השכירות בהסכם היא 36 חודשי", "ם."],
+    "rent_pieces": ["דמי השכירות בהסכם הם 50 ₪ למ״ר לחוד", "ש."],
+}
+ROUND18_TWO_ROW_HEADER = {
+    "title": "שומת הדגמה לבניין המשרדים ברחוב הדקל — הכנסות", "intro": ROUND18_INTRO,
+    "areas_heading": "3. שטחי הנכס", "areas_caption": "טבלה 3.1 — שטחי הנכס",
+    "areas_headers": ["רכיב", "שטח (מ״ר)"], "areas_rows": [["משרדים", "820"], ["מסחר", "440"]],
+    "income_heading": "4. הכנסות מהנכס", "income_lead": "הטבלה שלהלן מפרטת את ההכנסות לפי רכיב ושימוש.",
+    "income_caption": "טבלה 4.1 — פירוט ההכנסות",
+    "income_upper": ["", "הכנסה שנתית (₪)", ""], "income_lower": ["רכיב", "משרדים", "מסחר"],
+    "income_rows": [["דמי שכירות", "1,240,000", "860,000"], ["דמי ניהול", "96,000", "64,000"]],
+}
+ROUND18_NUMBERS = {
+    "title": "שומת הדגמה למתחם גבעת האורן — מספרים", "intro": ROUND18_INTRO,
+    "years_heading": "2. שיטת ההערכה",
+    "years_line": "שווי הנכס נקבע לפי ממוצע שנות הבסיס 2021,2022,2023 ועומד על 4,800,000 ₪.",
+    "unit_line": "מחיר ליחידת דיור בפרויקט הוא 50K ₪ לפי נתוני היזם.",
+    "vat_heading": "3. שווי הנכס", "vat_line": "שווי הנכס בגישת ההשוואה הוא 16,070,000 ₪ כולל מע״מ.",
+}
+ROUND18_CALCULATION = {
+    "title": "שומת מקרקעין — מתחם גבעת הברוש", "street": "רחוב הברוש 12", "block": "33410", "parcel": "27",
+    "intro": ROUND18_INTRO, "value_heading": "2. הערכת השווי", "value_line": "שווי הנכס בגישת ההשוואה: 9,400,000 ₪.",
+    "calculation_heading": "חישוב ההיוון:", "calculation_lead": "החישוב מבוסס על נתוני השומה.",
+    "calculation_caption": "טבלה 1 — חישוב ההיוון",
+    "calculation_headers": ["פריט", "ערך"],
+    "calculation_rows": [["הכנסה נטו שנתית", "610,000 ₪"], ["שיעור היוון", "6.5%"], ["שווי מהוון", "9,384,615 ₪"]],
+}
+ROUND18_REPORTS = [
+    {"key": "first", "subject": "שומת מקרקעין — מתחם גבעת הכליל", "street": "רחוב הכליל 7", "value": "7,300,000"},
+    {"key": "second", "subject": "שומת מקרקעין — פרויקט נחל הצבר", "street": "דרך הצבר 2", "value": "9,150,000"},
+]
+ROUND18_APPROVED_PLAN = {
+    "title": "שומת הדגמה לנכס ברחוב הגפן — זכויות בנייה", "intro": ROUND18_INTRO,
+    "heading": "3. זכויות הבנייה", "lead": "הטבלה שלהלן מפרטת את זכויות הבנייה בנכס.",
+    "caption": "טבלה 3.1 — זכויות הבנייה בנכס", "headers": ["סוג שטח", "שטח (מ״ר)", "הערה"],
+    "rows": [["שטח כולל לבנייה", "1,200", "הזכויות חלות רק על פי תכנית מאושרת"], ["שטח למרתף", "340", "ללא הערה"]],
+    "condition_phrase": "רק על פי תכנית מאושרת",
+}
+ROUND18_DEICTIC = {
+    "title": "שומת הדגמה למתחם גבעת הנחל — רגישות", "intro": ROUND18_INTRO,
+    "heading": "5. ניתוח רגישות לשיעור ההיוון", "lead": "הטבלה שלהלן מציגה את שווי הנכס בשינוי שיעור ההיוון.",
+    "caption": "טבלה 5.1 — רגישות השווי לשיעור ההיוון", "headers": ["שיעור היוון", "שווי הנכס (אלפי ₪)"],
+    "rows": [["5.5%", "12,400"], ["6.0%", "11,800"], ["6.5%", "11,300"]],
+    "scope_note": "הטבלה שלעיל מתייחסת לגישת היוון ההכנסות בלבד, ואינה משקפת את שווי הנכס בגישת ההשוואה.",
+    "scope_phrase": "גישת היוון ההכנסות בלבד",
+    "unrelated": ["הנתונים נאספו מדוחות השוק האחרונים (מסמך סינתטי).", "הבדיקה נערכה לפני מועד השומה.",
+                  "לא נמצאו חריגות בנתוני הקלט של הניתוח."],
+    "other_caption": "טבלה 5.2 — רגישות השווי לדמי השכירות", "other_headers": ["שינוי בדמי השכירות", "שווי הנכס (אלפי ₪)"],
+    "other_rows": [["-10%", "10,900"], ["0%", "11,800"], ["+10%", "12,700"]],
+}
+ROUND18_METHOD = {
+    "title": "שומת הדגמה למשרדים ברחוב האלון — שווי", "intro": ROUND18_INTRO,
+    "heading": "4. גישת היוון ההכנסות", "lead": "הטבלה שלהלן מציגה את תוצאות החישוב.",
+    "caption": "טבלה 4.1 — תוצאות החישוב", "headers": ["רכיב", "סכום (₪)"],
+    "rows": [["הכנסה נטו שנתית", "610,000"], ["שווי מהוון", "9,384,615"]],
+    "method_phrase": "גישת היוון ההכנסות",
+    "later_heading": "6. גישת ההשוואה", "later_note": "הערה: השווי בסעיף זה נקבע לפי גישת ההשוואה בלבד.",
+    "later_caption": "טבלה 6.1 — עסקאות השוואה", "later_headers": ["כתובת", "מחיר (₪)"],
+    "later_rows": [["רחוב הצאלון 3", "8,900,000"], ["רחוב הערבה 9", "9,700,000"]],
+}
+
+
+class Round18PdfRenderer(Round15PdfRenderer):
+    """The round-18 documents: a title block, an introduction and sections of lines, ruled tables and, where a shape needs
+    it, a line drawn in pieces (the text layer then splits a word) or a page whose printed number restarts."""
+
+    def _table(self, caption: str, headers: list[list[str]], rows: list[list[str]], widths: list[int]) -> None:
+        """A caption line, the header rows (shaded) and the data rows of a ruled table."""
+        self.placed(None, caption, bold=True)
+        self.pdf.set_fill_color(225, 225, 225)
+        for header in headers:
+            self.ruled_row(header, widths, bold=True)
+        for row in rows:
+            self.ruled_row(row, widths)
+        self.pdf.ln(2)
+
+    def pieces_line(self, pieces: list[str], gap: float = 2.4) -> None:
+        """One body line drawn as separate pieces on one baseline, the first piece rightmost, with ``gap`` millimetres
+        between them: the text layer reads the gap as a space, so a word cut between two pieces is split in the text."""
+        pdf = self.pdf
+        if pdf.get_y() + self.LINE_H > pdf.page_break_trigger:
+            pdf.add_page()
+        pdf.set_font("DejaVu", "", 10.5)
+        y = pdf.get_y()
+        x = pdf.w - pdf.r_margin - pdf.c_margin
+        for piece in pieces:
+            width = pdf.get_string_width(piece)
+            pdf.set_xy(x - width - pdf.c_margin, y)
+            pdf.cell(width + 2 * pdf.c_margin, self.LINE_H, piece, align="C")
+            x -= width + gap
+        pdf.set_xy(pdf.l_margin, y + self.LINE_H)
+        pdf.ln(2)
+
+    def _opening(self, spec: dict[str, Any]) -> None:
+        self.header(spec["title"])
+        self.heading_line(None, spec["intro"][0])
+        self.body_line(None, spec["intro"][1])
+
+    def render_lease(self) -> bytes:
+        spec = ROUND18_LEASE
+        self.pdf.add_page()
+        self._opening(spec)
+        self.heading_line(None, spec["heading"])
+        self.pieces_line(spec["duration_pieces"])
+        self.pieces_line(spec["rent_pieces"])
+        return bytes(self.pdf.output())
+
+    def render_two_row_header(self) -> bytes:
+        spec = ROUND18_TWO_ROW_HEADER
+        self.pdf.add_page()
+        self._opening(spec)
+        self.heading_line(None, spec["areas_heading"])
+        self._table(spec["areas_caption"], [spec["areas_headers"]], spec["areas_rows"], [90, 90])
+        self.heading_line(None, spec["income_heading"])
+        self.body_line(None, spec["income_lead"])
+        self._table(spec["income_caption"], [spec["income_upper"], spec["income_lower"]], spec["income_rows"],
+                    [60, 60, 60])
+        return bytes(self.pdf.output())
+
+    def render_numbers(self) -> bytes:
+        spec = ROUND18_NUMBERS
+        self.pdf.add_page()
+        self._opening(spec)
+        self.heading_line(None, spec["years_heading"])
+        self.body_line(None, spec["years_line"])
+        self.body_line(None, spec["unit_line"])
+        self.heading_line(None, spec["vat_heading"])
+        self.body_line(None, spec["vat_line"])
+        return bytes(self.pdf.output())
+
+    def render_calculation_pages(self) -> bytes:
+        """Two report pages (printed 1, 2), then calculation pages (printed numbering restarts) that open with a short
+        heading line ending in a colon and name no address or parcel."""
+        spec = ROUND18_CALCULATION
+        self._page(1)
+        self.title_block(spec["title"], f"{spec['street']}, {ROUND9_PLACE}", spec["block"], spec["parcel"])
+        self.heading_line(None, spec["intro"][0])
+        self.body_line(None, spec["intro"][1])
+        self._page(2)
+        self.heading_line(None, spec["value_heading"])
+        self.body_line(None, spec["value_line"])
+        self._page(1)
+        self.heading_line(None, spec["calculation_heading"])
+        self.body_line(None, spec["calculation_lead"])
+        self._table(spec["calculation_caption"], [spec["calculation_headers"]], spec["calculation_rows"], [90, 90])
+        self._page(2)
+        self.body_line(None, "החישוב לעיל נערך לצורך הדגמה בלבד (מסמך סינתטי).")
+        return bytes(self.pdf.output())
+
+    def render_two_reports(self) -> bytes:
+        """Two reports in one file, each opening with a letter and a subject line, printed numbering restarting."""
+        self.chapter = 0
+        for r in ROUND18_REPORTS:
+            self.begin_unit(r["key"], "appraisal", r["subject"], [])
+            self.opening({"subject": r["subject"], "street": r["street"], "in_table": False})
+            self.chapter_heading("מבוא", restart=True)
+            self.fact(None, f"פרק זה בשומה של {r['street']} נערך לצורך הדגמה (מסמך סינתטי).")
+            self.next_page()
+            self.chapter_heading("הערכת שווי")
+            self.fact(None, f"שווי הנכס בגישת ההשוואה הוא {r['value']} ₪.")
+            self.placed(None, f"{SYNTHETIC_MARKER} — כל הנתונים בדויים", size=10, bold=True)
+            self.end_unit()
+        return bytes(self.pdf.output())
+
+    def render_approved_plan(self) -> bytes:
+        spec = ROUND18_APPROVED_PLAN
+        self.pdf.add_page()
+        self._opening(spec)
+        self.heading_line(None, spec["heading"])
+        self.body_line(None, spec["lead"])
+        self._table(spec["caption"], [spec["headers"]], spec["rows"], [50, 40, 90])
+        return bytes(self.pdf.output())
+
+    def render_deictic_note(self) -> bytes:
+        """The table and the note that points back to it share page 1; page 2 holds three unrelated paragraphs and then
+        another table."""
+        spec = ROUND18_DEICTIC
+        self._page(1)
+        self._opening(spec)
+        self.heading_line(None, spec["heading"])
+        self.body_line(None, spec["lead"])
+        self._table(spec["caption"], [spec["headers"]], spec["rows"], [90, 90])
+        self.body_line(None, spec["scope_note"])
+        self._page(2)
+        for line in spec["unrelated"]:
+            self.body_line(None, line)
+        self._table(spec["other_caption"], [spec["other_headers"]], spec["other_rows"], [90, 90])
+        return bytes(self.pdf.output())
+
+    def render_method_heading(self) -> bytes:
+        spec = ROUND18_METHOD
+        self.pdf.add_page()
+        self._opening(spec)
+        self.heading_line(None, spec["heading"])
+        self.body_line(None, spec["lead"])
+        self._table(spec["caption"], [spec["headers"]], spec["rows"], [90, 90])
+        self.heading_line(None, spec["later_heading"])
+        self.body_line(None, spec["later_note"])
+        self._table(spec["later_caption"], [spec["later_headers"]], spec["later_rows"], [90, 90])
+        return bytes(self.pdf.output())
+
+
+def write_round18(out: Path, font_dir: Path) -> None:
+    """Writes the round-18 PDFs and their ``manifest.json`` (the texts the tests check against)."""
+    rdir = out / ROUND18_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    specs = {"lease": ("render_lease", ROUND18_LEASE), "two_row_header": ("render_two_row_header", ROUND18_TWO_ROW_HEADER),
+             "numbers": ("render_numbers", ROUND18_NUMBERS),
+             "calculation_pages": ("render_calculation_pages", ROUND18_CALCULATION),
+             "two_reports": ("render_two_reports", {"reports": ROUND18_REPORTS}),
+             "approved_plan": ("render_approved_plan", ROUND18_APPROVED_PLAN),
+             "deictic_note": ("render_deictic_note", ROUND18_DEICTIC),
+             "method_heading": ("render_method_heading", ROUND18_METHOD)}
+    documents = {}
+    for key, (render, spec) in specs.items():
+        data = getattr(Round18PdfRenderer(font_dir), render)()
+        name = ROUND18_FILES[key]
+        assert "synthetic" in name
+        (rdir / name).write_bytes(data)
+        documents[key] = {"file": f"{ROUND18_DIR}/{name}"} | spec
+        print(f"wrote {ROUND18_DIR}/{name} ({len(data):,} bytes)")
+    manifest = {
+        "about": f"{SYNTHETIC_MARKER}. Known contents of the round-18 fixtures (R18a: a lease whose period words the text "
+                 "layer splits; R18b: a page whose second table has a two-row header; R18c: a comma-joined list of years, "
+                 "a per-unit amount in a thousands abbreviation and VAT; R18d: calculation pages that open with a "
+                 "heading line ending in a colon; R18e: two reports in one file; R18f: a row note that limits a value to "
+                 "an approved plan; R18g: a note after a table that points back to it, then another table on the next "
+                 "page; R18h: a numbered method heading over a table): generated by scripts/generate_fixtures.py "
+                 "--only round18 - do not edit by hand. Every name and figure is invented.",
+        "synthetic_marker": SYNTHETIC_MARKER,
+        "documents": documents,
+    }
+    (rdir / ROUND18_MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {ROUND18_DIR}/{ROUND18_MANIFEST}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
-    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11", "round12", "round13", "round14", "round15", "round16", "round17"],
+    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11", "round12", "round13", "round14", "round15", "round16", "round17", "round18"],
                         default="all",
                         help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
                              "positions: only the page-position fixtures (tests/fixtures/positions/); "
@@ -7737,7 +7998,9 @@ def main() -> None:
                              "round16: only the round-16 running-line compendium (PDF) and its manifest "
                              "(tests/fixtures/round16/); "
                              "round17: only the round-17 sensitivity-note and three-adjustments fixtures (PDF) and "
-                             "their manifest (tests/fixtures/round17/)")
+                             "their manifest (tests/fixtures/round17/); "
+                             "round18: only the round-18 meaning, condition and removal fixtures (PDF) and their "
+                             "manifest (tests/fixtures/round18/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
@@ -7783,6 +8046,9 @@ def main() -> None:
         return
     if args.only == "round17":
         write_round17(out, font_dir)
+        return
+    if args.only == "round18":
+        write_round18(out, font_dir)
         return
 
     docs: dict[str, dict[str, Any]] = {}

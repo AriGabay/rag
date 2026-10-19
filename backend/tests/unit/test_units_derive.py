@@ -557,7 +557,10 @@ def no_ocr(monkeypatch):
 # files that hold several appraisals; every other fixture is one appraisal (or part of one) and must stay one unit
 MULTI = {"R7b_synthetic_two_appraisals_one_file.pdf": 2, "R9a_synthetic_compendium_three_appraisals.pdf": 4,
          "R9b_synthetic_two_similar_names.pdf": 2, "R15a_synthetic_compendium_letter_openings.pdf": 3,
-         "R16a_synthetic_compendium_running_lines.pdf": 3}
+         "R16a_synthetic_compendium_running_lines.pdf": 3,
+         # one appraisal whose calculation pages restart their printed numbering: derivation cuts them into a second,
+         # unnamed unit; verification treats that unit as the appraisal's own (round 18 U3), derivation stays as it is
+         "R18d_synthetic_calculation_pages_colon_heading.pdf": 2, "R18e_synthetic_two_reports_in_one_file.pdf": 2}
 SKIPPED = {"R9d_synthetic_long_file_1000_pages.pdf"}  # a thousand pages: its first 50 are read below
 
 
