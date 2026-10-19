@@ -32,7 +32,7 @@ def _problems(markdown: str, ws: Workspace) -> list[meaning.MeaningProblem]:
 
 
 def _answer(markdown: str) -> FinalAnswer:
-    return FinalAnswer(status="answered", answer_markdown=markdown, claims=[], clarification_question="",
+    return FinalAnswer(status="answered", answer_markdown=markdown, items=[], claims=[], clarification_question="",
                        missing_info="", referenced_document_ids=[], scope_kind="focused", scope_query="", omitted=[],
                        focus=None, requested=[], parts=[])
 

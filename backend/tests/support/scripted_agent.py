@@ -43,8 +43,9 @@ def read(**locator) -> dict:
 def final(markdown: str, status: str = "answered", claims: list | None = None, clarification: str = "",
           missing: str = "", documents: list[str] | None = None, scope: str = "focused", scope_query: str = "",
           omitted: list | None = None, focus: dict | None = None, requested: list | None = None,
-          parts: list | None = None) -> dict:
-    return {"final": {"status": status, "answer_markdown": markdown, "claims": claims or [],
+          parts: list | None = None, items: list | None = None) -> dict:
+    # the strict schema has the model send every field: an answer that lists no items says ``items: []`` (round 17 U2)
+    return {"final": {"status": status, "items": items or [], "answer_markdown": markdown, "claims": claims or [],
                       "clarification_question": clarification, "missing_info": missing,
                       "referenced_document_ids": documents or [], "scope_kind": scope, "scope_query": scope_query,
                       "omitted": omitted or [],

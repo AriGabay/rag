@@ -201,7 +201,16 @@ from app.answering.verify import not_an_amount, numbers_in
 from app.chat import dates as chat_dates
 from app.chat import meaning
 from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut
-from app.chat.evidence import Segment, claim_terms, fit, fit_segments, segments_of, select
+from app.chat.evidence import (
+    TABLE_AFTER,
+    TABLE_BEFORE,
+    Segment,
+    claim_terms,
+    fit,
+    fit_segments,
+    segments_of,
+    select,
+)
 from app.chat.request import ID_PREFIX, Aspect, Kind
 from app.config import get_settings
 from app.measurements.extract import VAT_TERM, stance_label
@@ -2653,11 +2662,26 @@ def _declared_head(ws: Workspace, src) -> str:
     return f" — {MSG_DECLARED_UNIT}: {handle}" + (f" «{title}»" if title else "")
 
 
+# the tag of a context part of a table read (round 17 U4: ``[לפני הטבלה · פסקה · בלוק 47] text``, or the pointer
+# ``[… · בלוק 47: כבר הוחזר ב-S3]`` to a part already returned) and the line that says what follows the table
+# (``[אחרי הטבלה: … read(cursor=K3)]``): server-written labels in the source's text whose digits (the block number, a handle) are
+# no number the source states. The part's own text after the tag is.
+_PART_TAG = re.compile(rf"\[(?:{TABLE_BEFORE}|{TABLE_AFTER})[^\]\n]*?בלוק\s*\d+(?::[^\]\n]*)?\]"
+                       rf"|\[{TABLE_AFTER}:[^\]\n]*\]")
+
+
+def without_part_tags(text: str) -> str:
+    """``text`` with the tags of a table read's context parts taken out (``_PART_TAG``): what the numbers of a source are read
+    from, so that a block number never backs a number of the answer (round 17 U2). The judge reads the source with its tags."""
+    return _PART_TAG.sub(" ", text) if text else text
+
+
 def _source_parts(ws: Workspace, sid: str, *, dated: bool = True) -> tuple[str, str, str] | None:
     """(heading, body, kind) of a cited id: a passage's title and location and its text; a measurement or a
     computation as one short statement of its meaning. ``dated``: a value's or measurement's record carries the date the
     server resolved for it (`_date_text`); the number check reads the record without it (`_date_backed` settles which
-    dates the record states), so that a date line never lends its digits to a number it does not state."""
+    dates the record states), so that a date line never lends its digits to a number it does not state. Nor does a table read's
+    part tag: a source's text for the number check is read without them (``without_part_tags``)."""
     if sid in ws.sources:
         src = ws.sources[sid]
         # in a file holding several appraisals, the context the passage is in (round 7 U6, KTD7); in a file of one
@@ -2677,7 +2701,7 @@ def _source_parts(ws: Workspace, sid: str, *, dated: bool = True) -> tuple[str, 
         if dated:
             head += "".join(f" — {SERVER_HELD}: {fact}" for fact in (src.date_line, src.link) if fact)
             head += _declared_head(ws, src)
-        return head, src.text, src.kind
+        return head, src.text if dated else without_part_tags(src.text), src.kind
     if sid in ws.measurements:
         m = ws.measurements[sid].public()
         return (m["title"], f"נתון: {m['metric']} = {m['value_text']} (סוג: {m['metric_kind']}, יחידה: {m['unit']},"
@@ -3063,7 +3087,7 @@ def _all_numbers(ws: Workspace) -> set[str]:
     nums: set[str] = set()
     for s in ws.sources.values():
         if not s.is_listing:
-            nums |= numbers_in(s.text, words=True)
+            nums |= numbers_in(without_part_tags(s.text), words=True)
     for m in ws.measurements.values():
         nums |= numbers_in(f"{m.row.value_text} {m.row.quote}", words=True)
     for v in ws.values.values():
@@ -3863,11 +3887,11 @@ def _value_origin(ws: Workspace, v) -> str:
     if src is None or not src.text:
         return ""
     forms = numbers_in(v.written)
-    lines = [x for x in src.text.splitlines() if forms & numbers_in(x)]
+    lines = [x for x in without_part_tags(src.text).splitlines() if forms & numbers_in(x)]
     label = (v.locator.get("row") or "").strip() if isinstance(v.locator, dict) else ""
     if label:
         lines = [x for x in lines if label in x] or lines
-    return "\n".join(lines) if lines else src.text
+    return "\n".join(lines) if lines else without_part_tags(src.text)
 
 
 def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: set[str],
@@ -4204,7 +4228,7 @@ def _evidence_contexts(u: Unit, ws: Workspace) -> list[tuple[str, set[int], str,
             out += [(version, numbers, i, i) for version, numbers in by_version.items()]
         elif i in ws.sources:
             src = ws.sources[i]
-            if len(src.contexts) == 1 and numbers_in(src.text or "") & shown:
+            if len(src.contexts) == 1 and numbers_in(without_part_tags(src.text or "")) & shown:
                 out.append((str(src.version_id), set(src.contexts), i, i))
     return out
 
@@ -4677,7 +4701,7 @@ def _source_terms(ws: Workspace, sid: str, body: str) -> tuple[set[str], set[str
     changed)."""
     cached = ws.source_terms.get(sid)
     if cached is None or cached[0] != body:
-        cached = ws.source_terms[sid] = (body, numbers_in(body), set(_WORD.findall(body)))
+        cached = ws.source_terms[sid] = (body, numbers_in(without_part_tags(body)), set(_WORD.findall(body)))
     return cached[1], cached[2]
 
 
@@ -6666,6 +6690,46 @@ def _in_answer(quote: str, units: list[Unit], component: str = "") -> bool:
     return any(nums <= n and len(words & w) >= need for n, w in map(claim_terms, [u.text for u in units]))
 
 
+class SupportScope:
+    """Where a quoted part of a read passage may come from to count as evidence of a part the answer gives or omits (round 16 U2,
+    KTD2): a source returned to the agent with text, a quote of a sensible length, a document the answer is about, a block in an
+    asked unit and not across a probable edge, and a verbatim substring of the source after normalisation. One scope is built
+    from the surviving ``units`` of an answer and serves both the judge's support (``validated_support``) and the item ledger's
+    items (``app.chat.items``, round 17 U2); each check returns the first condition it fails, as the trace records it."""
+
+    def __init__(self, ws: Workspace, units: list[Unit]):
+        self.ws = ws
+        self.readable = returned_text_sources(ws)
+        self.asked = _asked_unit_ids(ws, {i for u in units for i in u.ids})
+        self.documents = _answer_documents(ws, units)
+        self._flat: dict[str, str] = {}
+
+    @staticmethod
+    def flat(quote: str) -> str:
+        """A quote in the spelling of the verbatim test (the look-alike angle brackets read back, ``_flat_quote``)."""
+        return _flat_quote(_read_back(quote))
+
+    def source_problem(self, sid: str, flat: str) -> str | None:
+        """Why ``sid`` with the quote ``flat`` (``_flat_quote``) cannot be evidence, from what needs no reading of the source."""
+        if self.ws.sources.get(sid) is None or sid not in self.readable:
+            return "not_returned_source"
+        if len(flat) < SUPPORT_QUOTE_MIN:
+            return "too_short"
+        return "too_long" if len(flat) > SUPPORT_QUOTE_MAX else None
+
+    def place_problem(self, src: Source) -> str | None:
+        """Why the source's place is no evidence: another document than the answer's, or a block outside the asked units."""
+        if str(src.document_id) not in self.documents:
+            return "other_document"
+        return None if _support_in_asked_units(self.ws, src, self.asked) else "outside_asked_unit"
+
+    def verbatim(self, sid: str, src: Source, flat: str) -> bool:
+        """Whether the quote ``flat`` is a substring of the source's text (flattened once per source)."""
+        if sid not in self._flat:
+            self._flat[sid] = _flat_quote(src.text)
+        return flat in self._flat[sid]
+
+
 def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> dict[str, list[dict]]:
     """The judge's ``support`` (round 16 U1) that the server accepts as evidence of a part the answer omits (KTD2), by
     component id, merged across the judge calls: for a ``partial`` or ``missing`` vote, an entry [{"id", "quote"}] is kept
@@ -6681,19 +6745,8 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
     if not any(votes.values()):
         return {}
     units = [u for u in report.units if u.index not in failed]
-    cited = {i for u in units for i in u.ids}
-    readable = returned_text_sources(ws)
-    asked = _asked_unit_ids(ws, cited)
-    documents = _answer_documents(ws, units)
+    scope = SupportScope(ws, units)
     components = {r["id"]: r["text"] for r in report.requirements}
-    flat_texts: dict[str, str] = {}
-
-    def flat_text(sid: str, src: Source) -> str:
-        """The source's text in the spelling of the verbatim test, flattened once per source."""
-        if sid not in flat_texts:
-            flat_texts[sid] = _flat_quote(src.text)
-        return flat_texts[sid]
-
     out: dict[str, list[dict]] = {}
     for cid, vs in votes.items():
         seen: set[tuple[str, str]] = set()
@@ -6703,28 +6756,18 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
             given = x.quote.strip()
             sid, quote = x.id.strip(), _read_back(given)
             flat = _flat_quote(quote)
-            src = ws.sources.get(sid)
             # the first condition the entry fails, in the order the decision is made: the cheap ones first and the substring
             # test, which reads the whole source, last
-            if (sid, flat) in seen:
-                why = "duplicate"
-            elif src is None or sid not in readable:
-                why = "not_returned_source"
-            elif len(flat) < SUPPORT_QUOTE_MIN:
-                why = "too_short"
-            elif len(flat) > SUPPORT_QUOTE_MAX:
-                why = "too_long"
-            else:
+            why = "duplicate" if (sid, flat) in seen else scope.source_problem(sid, flat)
+            if why is None:
                 seen.add((sid, flat))
-                if str(src.document_id) not in documents:
-                    why = "other_document"
-                elif not _support_in_asked_units(ws, src, asked):
-                    why = "outside_asked_unit"
-                elif _in_answer(quote, units, components.get(cid, "")):
+                src = ws.sources[sid]
+                why = scope.place_problem(src)
+                if why is None and _in_answer(quote, units, components.get(cid, "")):
                     why = "already_in_answer"
-                elif flat not in flat_text(sid, src):
+                elif why is None and not scope.verbatim(sid, src, flat):
                     why = "not_verbatim"
-                else:
+                elif why is None:
                     why = "accepted"
                     kept.append({"id": sid, "quote": quote})
                     notes.append((v, sid, given))

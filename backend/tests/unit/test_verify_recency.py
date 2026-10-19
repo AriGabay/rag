@@ -159,7 +159,7 @@ def test_a_newer_rate_whose_cash_flow_is_undecided_keeps_the_latest_claim_qualif
 # --- inside the verification: the unit is judged, kept and repaired, never removed -----------------------------------------
 
 def _answer(markdown: str) -> FinalAnswer:
-    return FinalAnswer(status="answered", answer_markdown=markdown, claims=[], clarification_question="",
+    return FinalAnswer(status="answered", answer_markdown=markdown, items=[], claims=[], clarification_question="",
                        missing_info="", referenced_document_ids=[], scope_kind="focused", scope_query="", omitted=[],
                        focus=None, requested=[], parts=[])
 

@@ -1037,7 +1037,7 @@ LIMIT_SPAN = (0, 4, "limit_sentence")
 
 
 def _composition(markdown: str = VALUE, status: str = "answered", spans: list[ServerSpan] | None = None) -> Composition:
-    answer = FinalAnswer(status=status, answer_markdown=markdown, claims=[], clarification_question="", missing_info="",
+    answer = FinalAnswer(status=status, answer_markdown=markdown, items=[], claims=[], clarification_question="", missing_info="",
                          referenced_document_ids=[], scope_kind="focused", scope_query="", omitted=[], focus=None,
                          requested=[], parts=[])
     return Composition(answer, spans or [])

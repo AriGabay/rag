@@ -180,8 +180,9 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
   אחרת — בצעד הבא (calculate על V#/A# שנרשמים עכשיו). קרא ל-calculate מיד כשכל הקלטים שלו רשומים.
 - מקור עם same_as הוא אותו טקסט כמו המקור שהוא מפנה אליו (לא נשלח שוב); מותר לצטט כל אחד מהם. קטעים שכבר הוחזרו
   בתור לא נשלחים שוב בקריאה חדשה: במקומם מופיעה הפניה ל-S# שבו הם נמצאים, והמקור החדש כולל אותם ומותר לצטט אותו.
-  התאם את היקף הקריאה לשאלה: לנתון ממוקד — חיפוש אחד ממוקד בדרך כלל מספיק; פתח הקשר רק כשמשמעות המספר אינה ברורה
-  מהקטע.
+  התאם את היקף הקריאה לשאלה: לנתון ממוקד — פתח הקשר רק כשמשמעות המספר אינה ברורה מהקטע. בבקשה לפריטים מסוג מסוים
+  (items): ענה פעם אחת, כשהפריטים של כל רכיב שנשאל נמצאים בקטעים שקיבלת; חפש רק פריטים שעדיין לא אותרו, ופריט שמקורו כבר
+  בידך — השלם אותו מאותו מקור, בלי חיפוש כללי חדש.
 - קריאה בלי חיפוש (read, מיקום אחד בדיוק): source=S#/P# — ההקשר סביב מקור (קטע מטבלה: הטבלה כולה); outline עם
   document=D# מחזיר סעיפים (§#) וטבלאות (T#) עם עמודים, גודל ואזורים שלא נקראו, ואז section=§# או table=T#; pages
   פותח עמודים של מסמך PDF. כל תוצאה מציינת status: complete — נקרא במלואו; clipped — נקרא רק חלק, וההמשך ב-more
@@ -280,6 +281,13 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
   את הנתונים שכבר נמצאו עם מראי המקום שלהם ושואלת שאלה אחת. בעמימות אחרת — ענה עם הסתייגות ברורה.
 - אל תכתוב בתשובה שנתון או חלק של הבקשה "לא נמצא", "לא מופיע" או "לא נבדק": השרת מציין כל פער פעם אחת, אחרי
   התשובה, עם הסיבה לפי מה שהתור עשה בפועל. במקום זה הצהר על כל רכיב בשדות המובנים:
+- items: פנקס הפריטים. נכתב לפני answer_markdown, מתוך הקטעים שקראת, והתשובה נכתבת מהפריטים included שבו. לכל רכיב של
+  הבקשה שמבקש פריטים מסוג מסוים (התאמות, שיעורים, תנאים, סיבות, חברי רשימה) של הנכס שנשאל עליו: פריט אחד לכל חבר מהסוג
+  שהקטעים שקראת קובעים לאותו נכס. component = ה-id של הרכיב (N#); label = שם הפריט; source = ה-S# (או V#/T#) שבו הוא כתוב;
+  quote = ציטוט מילולי קצר מהמקור (שורת טבלה או משפט אחד); value = הערך כפי שנכתב ("" אם אין); condition = התנאי, ההסתייגות
+  או החריג שהמקור אומר על הפריט ("" אם אין). state: included — הפריט בתשובה עם מראה המקום שלו; not_verifiable — אי אפשר
+  לאמת אותו (reason: למה); not_applicable — אינו חל לפי תנאי שבבקשה (reason: התנאי). אל תוסיף פריט שהבקשה לא ביקשה או פרט
+  אחר של המסמך; בבקשה לנתון בודד — items ריק. השרת בודק כל פריט מול הקטעים שהוחזרו לך ופוסל פריט שאינו נתמך.
 - requested: לכל רכיב של הבקשה (כשרכיבי הבקשה מופיעים — component = ה-id שלו, N#; label במילות הבקשה), עם המסמכים
   שבהם חיפשת אותו ו-status: found — נמצא; not_found_search — לא נמצא בחיפוש; source_partial — המסמך שבו הוא אמור
   להיות נקרא חלקית; section_checked_absent — פתחת (read: section או table) את הסעיף או הטבלה שבהם הוא אמור להופיע,
@@ -295,7 +303,7 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
 
 ניסוח התשובה (answer_markdown):
 - התשובה הישירה קודם, בקצרה. אחר כך פרטים רלוונטיים בלבד. Markdown: פסקאות קצרות, רשימות, טבלה כשמשווים.
-- כשהבקשה מבקשת פריטים מסוג מסוים (ערכים, שיעורים, תנאים, סיבות, חברי רשימה) של הנכס שנשאל עליו — התשובה נותנת כל פריט כזה שהקטעים שקראת קובעים לאותו נכס, כולל תנאי, הסתייגות או חריג שנאמרו על הפריט, כל אחד עם מראה המקום שלו; קיצור אינו מוריד פריט שנשאל, ופריטים של נכס אחר אינם מתווספים.
+- כשהבקשה מבקשת פריטים מסוג מסוים (ערכים, שיעורים, תנאים, סיבות, חברי רשימה) של הנכס שנשאל עליו — התשובה נותנת כל פריט כזה שהקטעים שקראת קובעים לאותו נכס, כולל תנאי, הסתייגות או חריג שנאמרו על הפריט, כל אחד עם מראה המקום שלו; קיצור אינו מוריד פריט שנשאל, ופריטים של נכס אחר אינם מתווספים. התשובה נכתבת מהפריטים included ב-items, כל אחד במשפט שמצטט את מקורו ואומר את ערכו.
 - בכל משפט עובדתי — מראה מקום בסוגריים מרובעים לפני סוף המשפט: "... 55 ₪ למ"ר לחודש [S3]." (אפשר כמה: [S3][M2]);
   ערך שנרשם [V#], הנחת משתמש [A#], תוצאת חישוב [C#].
   רק מזהים שקיבלת בתור הזה.
@@ -450,8 +458,28 @@ class Omitted(_Strict):
     why: str
 
 
+class LedgerItem(_Strict):
+    """One member of the asked kind that a read source states (round 17 U2, KTD2; R4): ``component`` its N# id, ``label`` its
+    name, ``source`` the handle (S#, V# or T#) of the text that states it and ``quote`` a short verbatim part of that text,
+    ``value`` and ``condition`` as the source writes them ("" when it writes none), ``state`` the model's declaration
+    (``included`` in the answer; ``not_verifiable`` or ``not_applicable``, each with a ``reason``). A claim, not a statement: the
+    server keeps only the items it can check against what the turn returned, and decides coverage itself (``app.chat.items``)."""
+
+    component: str
+    label: str
+    source: str
+    quote: str
+    value: str
+    condition: str
+    state: Literal["included", "not_verifiable", "not_applicable"]
+    reason: str
+
+
 class FinalAnswer(_Strict):
     status: Literal["answered", "partial", "not_found", "clarification"]
+    # round 17 U2 (KTD2): the item ledger comes first, so that the strict schema makes the model write it from the sources it
+    # read and then the answer from its ``included`` items; a ledger written after the prose would only mirror it
+    items: list[LedgerItem]
     answer_markdown: str
     claims: list[Claim]
     clarification_question: str
@@ -765,7 +793,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     def asked_by_server(asking: resolve.Request) -> TurnOutcome:
         """The turn that ends in the clarification ``asking`` carries: the server's own words, nothing of the model's to
         check, so no judge call; saved with its digest."""
-        answer = FinalAnswer(status="clarification", answer_markdown=asking.clarify, claims=[],
+        answer = FinalAnswer(status="clarification", items=[], answer_markdown=asking.clarify, claims=[],
                              clarification_question=asking.clarify, missing_info="", referenced_document_ids=[],
                              scope_kind="focused", scope_query="", omitted=[], focus=None, requested=[],
                              parts=[])

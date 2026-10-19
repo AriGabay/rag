@@ -24,7 +24,7 @@ def _ws() -> Workspace:
 
 
 def _answer(markdown: str, *requested: Requested, status: str = "answered") -> FinalAnswer:
-    return FinalAnswer(status=status, answer_markdown=markdown, claims=[], clarification_question="",
+    return FinalAnswer(status=status, answer_markdown=markdown, items=[], claims=[], clarification_question="",
                        missing_info="", referenced_document_ids=[], scope_kind="focused", scope_query="", omitted=[],
                        focus=None, requested=list(requested), parts=[])
 
