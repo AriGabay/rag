@@ -116,6 +116,12 @@ A report's own subject line, or the letter opening that introduces it, starts a 
 
 A part of the request that a passage the turn read states, with the exact quote checked against that passage, but that the answer left out. It is completed from that passage in the repair round, without a new search; if it still is not given, the answer says where it was read and that it was not used — never that it was not found. Opening a source is not enough: only a verified quote inside the asked appraisal counts.
 
+### Item ledger
+
+The items, listed under each component of the frozen request, that the sources a turn read give for that component: each with its source, a verbatim quote, its value and condition when it has them, and an explicit state (given in the answer, cannot be verified with a reason, or does not apply under the request's conditions). An item counts as given only when an answer sentence states it with attribution to its own source, appraisal and date; the same words or number elsewhere in the answer do not count.
+
+A component with an item that is neither given nor stated with a reason is not complete: it is completed from the source already read, and an item still missing is named in the answer as read and not used. The ledger never adds a requirement the user did not ask for. A component's completeness is decided on the answer version the user will see; an earlier verdict counts only while the sentences and the evidence it rested on are unchanged.
+
 ### Identity card
 
 What an appraisal unit says about its own subject, read once at ingestion from the unit's opening (its first pages) and kept for every unit of a file that holds several appraisals. A card holds only fields about the subject property: its name, address and city, block and parcel, property type, and the dates the opening writes as labelled text. Each field is stored together with a verbatim quote of the unit's blocks, and a field whose quote is not in those blocks is discarded, never the whole card.
