@@ -46,6 +46,11 @@ INCOME_ASK, PROFIT_ASK, RATE_ASK = "ההכנסות הכוללות", "הרווח 
 FIRST = ("ההכנסות הכוללות הן 12,450,000 ₪ [V1]. לפי הנחתך שהעלויות יעלו ב-5% [A1], הרווח בתרחיש יהיה "
          "1,530,000 ₪ [C1].")
 COMPLETE = FIRST + " שיעור הרווח מההכנסות הוא 12.3% [C2]."
+# The table's own note says the amounts are without VAT (``add_document``), a status the sentences above leave out. The
+# server therefore completes the sentence that gives the income with that note, verbatim and cited (round 18 U5, KTD1, R4);
+# the value and its citation stay.
+VAT_NOTE = "(התנאי לפי המקור: הסכומים ללא מע\"מ. [S1])"
+INCOME_SENTENCE = f"ההכנסות הכוללות הן 12,450,000 ₪ {VAT_NOTE} [V1]."
 
 
 def _judge(asks: list[tuple[str, str, tuple[str, ...]]], absent: dict[str, str] | None = None, seen: list | None = None):
@@ -126,7 +131,7 @@ def test_a_calculation_that_still_fails_is_stated_as_not_completed_not_as_not_fo
     assert agent.tool_outputs(6)[-1].startswith("שגיאה")
     assert a["status"] == "partial"
     # the answer as verified, then the server's one gap paragraph (KTD4): the reason is said once, after it
-    assert a["markdown"].startswith("ההכנסות הכוללות הן 12,450,000 ₪ [V1].")
+    assert a["markdown"].startswith(INCOME_SENTENCE)
     assert [line for line in a["markdown"].splitlines() if RATE_ASK in line] == [
         "**שיעור הרווח מההכנסות**: החישוב נכשל על הנתונים שנמצאו, ולכן התוצאה לא הושלמה."]
     assert "לא נמצא בחיפוש" not in a["markdown"]
@@ -219,7 +224,8 @@ def test_an_unmet_style_instruction_triggers_a_repair_round_that_changes_the_ans
                   and "בדיקת האימות" in str(i.get("content")))
     assert style in repair and "לחפש" not in repair
     assert len(agent.seen) == 5  # the repair round answered at once: no tool was called, no search
-    assert a["markdown"] == tabled and a["status"] == "answered"
+    # the table's note on VAT is written next to the amount the table gives: the style instruction is met and the value stays
+    assert a["markdown"] == tabled.replace("₪ [V1]", f"₪ {VAT_NOTE} [V1]") and a["status"] == "answered"
     assert a["verification"]["completeness"] == {"status": "full", "requirements": 2, "missing": []}
 
 

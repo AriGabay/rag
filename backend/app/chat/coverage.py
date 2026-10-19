@@ -49,7 +49,9 @@ table, first match wins (``reason_of``):
    and a facet the decision joins (``datum.relation``) — two components of one appraisal, or two values whose facets cannot be
    compared, never conflict;
 9. the judge's "undeterminable" (an evidence state, not a status) — found, not verifiable (or sources conflict, 8);
-10. data found that the verified answer does not present — found, not verifiable;
+10. data found that the verified answer does not present — found, not verifiable; data the answer cites in full, which only its kind
+    being asserted made uncertain, gives no reason at all (round 18 U7): the component keeps the judge's status, is listed in
+    completeness and has no line;
 10-text. a part of a partly given or missing component that a passage the turn read states, with a verbatim quote the
     server validated (``verify.validated_support``, round 16 U2, KTD2) and the answer still omits — found, not verifiable,
     variant ``read_not_used``: the part was read at that place (the document, the section or pages, the S#) and not used.
@@ -555,6 +557,12 @@ def _uncertain_value(ws: Workspace, ids: list[str], shown: Collection[str] = ())
     return any(reading_unclear(ws, i) if i in shown else value_uncertain(ws, i) for i in ids if i in ws.values)
 
 
+def _shown_with_unasserted_kind(ws: Workspace, ids: list[str], shown: Collection[str]) -> bool:
+    """Every id of ``ids`` is cited by the final answer (``shown``) and one of them is a value that would be uncertain only by its
+    kind (``_uncertain_value`` without ``shown``): the answer gives the data, so no line may say it was not presented."""
+    return bool(ids) and all(i in shown for i in ids) and _uncertain_value(ws, ids) and not _uncertain_value(ws, ids, shown)
+
+
 def _openings(ws: Workspace, documents: Collection[str] | None = None) -> dict[str, tuple[str, dict]]:
     """S# of each section, table or page range the turn opened -> (its document, the opening it counts as). A read of
     paragraphs or pages that returned whole sections (``tools._whole_sections``, ``covers``) is an opening of those
@@ -725,6 +733,11 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
         # also when related data was found: it is the omitted part's place
         return out | _read_not_used(ws, ev["text"][0]["id"], ev["text"][0].get("quote") or "")
     if ev["data"]:
+        if _shown_with_unasserted_kind(ws, ev["data"], shown):
+            # the only thing that made these values uncertain was that their kind was asserted, and the answer shows every one of them:
+            # neither "uncertain" nor "not presented" is true, so the component keeps the judge's status with no reason and no line of
+            # the server's (round 18 U7, KTD6)
+            return out | {"reason": None}
         return out | {"reason": "not_verifiable", "variant": "not_presented"}
     # a professional question whose pool was empty: the repository holds no standard or professional document (U8, KTD15,
     # R29). It says what the repository lacks — never that a search found nothing in a standard
@@ -908,7 +921,8 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
     gap paragraph (a leaf not answered or needing clarification, and an instruction not met; a partly given leaf only
     for its ``missing_part`` — the part the judge named as not given, validated against the request: its line names
     that part with the component's reason (R20), the status staying partial, and a conditional requirement is never
-    stated (R21); a partly given leaf with none is listed in completeness only)."""
+    stated (R21); a partly given leaf with none is listed in completeness only, and so is a leaf with no reason
+    at all: ``limitation`` None, when the answer shows all its data and only the kind of a value was asserted)."""
     opened = _openings(ws)  # the turn's openings, for every claim and component
     claims, _ = _claims_by_component(ws, requested, opened)
     outcomes = report.requirement_outcomes(applied)
@@ -924,7 +938,7 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
         if signal is None:
             signal = unit_signal(ws)
         why = reason_of(ws, o, turn, claims.get(o["id"]), opened, signal, shown)
-        o |= {"limitation": why["reason"], "limitation_text": REASONS[why["reason"]], "place": why.get("place"),
+        o |= {"limitation": why["reason"], "limitation_text": REASONS.get(why["reason"]), "place": why.get("place"),
               "document": why.get("document"), "document_id": why.get("document_id"), "searched": why["searched"],
               "detail": why.get("detail") or "", "variant": why.get("variant") or "", "read_part": why.get("part") or ""}
         if o["document_id"]:
@@ -940,6 +954,9 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
                        or (o["variant"] == "read_not_used" and datum))
         if o["status"] == "partial" and o.get("omitted_items") and not o.get("judge_items") and not o["missing_part"]:
             o["stated"] = False  # a partly given component's omitted agent items are stated one by one, in the item lines (``item_gap_lines``)
+        if why["reason"] is None:  # no reason the turn supports: listed in completeness, no line of the server's
+            o["stated"] = False
+            continue
         o["gap"] = gap_sentence(why["reason"], o["variant"], [gap_label(o)], o["place"], o["document"], o["detail"])
     return outcomes
 

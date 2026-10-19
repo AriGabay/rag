@@ -3338,3 +3338,35 @@ def test_a_value_the_answer_does_not_show_stays_uncertain():
     ws = _ws()
     vid = _value(ws, "12", "דמי הניהול", asserted=True)
     assert coverage._uncertain_value(ws, [vid]) and not coverage._uncertain_value(ws, [vid], shown={vid})
+
+
+def test_a_component_whose_only_gap_reason_was_the_uncertainty_of_a_value_the_answer_shows_gets_no_false_line():
+    """Round 18 U7 (KTD6): the cited sentence stands, so the value is not "uncertain" - and it is not "found, not presented as
+    verified" either, which would say the answer does not show it. The component keeps its status from the judge and is listed in
+    completeness, and the server writes no line about it; the value the answer shows is untouched."""
+    ws = _ws()
+    vid = _value(ws, "12", "דמי הניהול", asserted=True)  # its kind was asserted, not found in its quote
+    a = _answer(f"דמי ניהול 12 ₪ [{vid}]. השווי למ\"ר הוא 9,500 ₪ [S1].")
+    turn = TurnRequirements()
+    r = verify_answer(_judge(_by_words({"השווי למ\"ר": {}, "דמי הניהול": {"related": [vid]}}, missing_status="missing")), a,
+                      ws, "?", [], requirements=turn)
+    final, outcomes = _finish(ws, a, r, turn)
+    o = outcomes[1]
+    assert o["status"] == "not_answered" and o["limitation"] is None and o["limitation_text"] is None
+    assert o["stated"] is False and o["gap"] is None
+    assert "לא הוצגו" not in final.answer_markdown and "אינן ודאיות" not in final.answer_markdown
+    assert f"[{vid}]" in final.answer_markdown  # the shown value stays
+    assert coverage.completeness(outcomes)["missing"][0]["reason"] is None
+
+
+def test_a_value_the_answer_does_not_show_is_still_found_but_not_presented():
+    """The protection: the same unmet component with the value left out of the answer keeps its line."""
+    ws = _ws()
+    vid = _value(ws, "12", "דמי הניהול", asserted=False)
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].")
+    turn = TurnRequirements()
+    r = verify_answer(_judge(_by_words({"השווי למ\"ר": {}, "דמי הניהול": {"related": [vid]}}, missing_status="missing")), a,
+                      ws, "?", [], requirements=turn)
+    final, outcomes = _finish(ws, a, r, turn)
+    assert outcomes[1]["limitation"] == "not_verifiable" and outcomes[1]["variant"] == "not_presented"
+    assert "לא הוצגו בתשובה" in final.answer_markdown
