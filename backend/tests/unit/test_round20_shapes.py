@@ -41,9 +41,11 @@ def strict_xfail(unit: str, what: str):
 # --- 4-6. the final check of a table row (AE4, AE5; U2) -------------------------------------------------------------------------
 
 TABLE_SOURCE = "השווי למ\"ר הוא 9,500 ₪. דמי השכירות הם 55 ₪ למ\"ר לחודש."
-TABLE_INTRO = "הטבלה מציגה את הנתונים העיקריים של הנכס [S1]."
+# the line above the table names a plan, so the rows are judged again once it is gone; a line that names none is no ground to judge them
+# again (round 20 U2, KTD2, R7), and ``test_a_line_above_the_table_that_names_no_scope...`` below keeps their verdict
+TABLE_INTRO = "הטבלה מציגה את הנתונים העיקריים של הנכס לפי תכנית א׳ [S1]."
 TABLE_HEAD = "| נתון בנכס | ערך | הערה |\n|---|---|---|\n"
-NOTE = "הערכה שמרנית של המודל"
+NOTE = "הערת המודל על הנתון"  # a cut cell holds no qualifier word (KTD2)
 ROW_A = f"| השווי למ\"ר | 9,500 ₪ [S1] | {NOTE} |"
 ROW_B = "| דמי השכירות | 55 ₪ למ\"ר לחודש [S1] | — |"
 TABLE_QUESTION = "מהם השווי למ\"ר ודמי השכירות בנכס?"
@@ -81,7 +83,6 @@ def removed_intro_rule(row_a_reply: dict):
     return rule
 
 
-@strict_xfail("U2", "row A is removed whole by the final check although only its note cell is unsupported: the whole row is judged again because the line above the table went")
 def test_ae4_a_row_with_one_unsupported_note_cell_keeps_its_supported_cells_when_the_line_above_the_table_is_removed(offline):
     reply = {"verdict": "partial", "defect": "part", "claims": [
         {"span": "9,500 ₪", "verdict": "supported"},
@@ -94,7 +95,6 @@ def test_ae4_a_row_with_one_unsupported_note_cell_keeps_its_supported_cells_when
     assert out.final_digest == text_digest(md)
 
 
-@strict_xfail("U2", "the partial mark of a table row is written after the closing bar, as an extra cell, instead of inside the row's last cell")
 def test_a_partly_verified_table_row_gets_its_mark_inside_the_last_cell_and_no_extra_cell(offline):
     def rule(text, input, n):
         return {"verdict": "partial", "defect": "none"} if NOTE in text else "supported"
@@ -130,7 +130,6 @@ def test_protection_ae5_a_row_whose_key_cell_names_the_wrong_unit_is_still_remov
     assert [p.check for p in gone] == ["final"], md
 
 
-@strict_xfail("U2", "a key cell the judge finds unsupported in the draft verification is cut to the marker and the row stays: its figure then stands under no label")
 def test_ae5_a_key_cell_the_draft_judge_finds_unsupported_removes_the_row_whole_and_does_not_leave_its_figure_under_a_marker(offline):
     wrong = "| השווי למ\"ר בדירה האחורית | 9,500 ₪ [S1] | הערה |"
 

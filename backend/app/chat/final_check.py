@@ -30,6 +30,14 @@ as a whole, within the verification allowance, and returns it with its digest. T
    header goes with it, a result with its removed input). The server spans are recomputed from that state, the fixed
    point is asserted once more, and only that text, with the digest of its bytes, is returned.
 
+A table row that fails in one cell is not removed whole when the rest of it stands (round 20 U2, KTD2, R5-R8; ``_Final.cells``): the judge
+gives a row's claims per cell (rule 35); a cell that is independent — not the row's key cell, nothing else rests on it, no defect that changes
+how the other cells read, no qualifier word in what is cut, a supported data cell left — is cut to the marker (``report.cuts``, an exact
+claim record) when it is unsupported, and keeps the "partly verified" mark, written inside it, when it is partly supported. Any other row is
+removed as before. A verdict is reused when the row, its sources, its header row, its headings and the scope its lead line names are the
+same (``verify.key_context``): the removal of a line that carries none of them elsewhere in the answer does not judge a row again, and a cut
+made here is accepted without a new judgment when what stays was judged supported (``cell_cut_stands``): no judge call is added per cell.
+
 The check costs no judge call when ``compose`` changed only server spans. A technical failure of the check is never a
 contradiction (R14): the unit is withheld with the cause ``check_failed``. A check with no time left to judge (round 9
 R19, KTD10) keeps what the draft judged and the cut left standing — a cut sentence whose supported remainder is its
@@ -52,8 +60,10 @@ from app.chat.verify import (
     _MISSING_TOKEN,
     DEFECT_FAILURES,
     DEPENDS_ON_REMOVED,
+    FAILING_VERDICTS,
     GONE_ACTIONS,
     NOT_CLASSIFIED,
+    CutGroup,
     JudgeRequirement,
     JudgeVerdict,
     Problem,
@@ -62,22 +72,28 @@ from app.chat.verify import (
     VerificationUnavailable,
     VerifyReport,
     _Coverage,
+    _cut_groups,
     _Evidence,
     _headings_above,
     _judge_all,
     _judged_failure,
+    _leaves_words,
     _named_support,
     _non_claim_accepted,
     _norm,
     _primary_claim_id,
     _remove_dependents,
     _workspace_listing,
+    cell_bounds,
+    claim_records,
     clarification_question,
     exempt_without_verdict,
     has_back_reference,
     has_qualifier,
     ids_in,
+    key_context,
     rescued_expansions,
+    row_cut_safe,
     scope_outcome,
     split_units,
     unit_claims,
@@ -154,6 +170,17 @@ class Checked:
         return not self.failures and not self.mutated
 
 
+@dataclass(frozen=True)
+class CellCut:
+    """A table row the final check cut cell by cell (round 20 U2, KTD2): the heading chain and the reuse context (``verify.key_context``)
+    of the row as the judge read it, and the cuts made in it (the report's, in draft offsets). The cut row is the judged row with
+    the cells that failed taken out, so it is accepted without a new judgment while those are what it is (``cell_cut_stands``)."""
+
+    heading: str
+    context: str
+    groups: tuple[CutGroup, ...]
+
+
 @dataclass
 class Finalized:
     """The checked text with the registry of the server's spans in it (``composition``), the digest of its bytes
@@ -190,8 +217,9 @@ class _Final:
         self.limit_sentences = limit_sentences
         self.digests: dict[str, str] = {}
         self.passed: set[str] = set()  # the reuse keys that have a verdict: the draft's, and the final check's own
+        self.cell_cuts: dict[int, CellCut] = {}  # the rows this check cut cell by cell, by draft unit (round 20 U2)
         self.stats = {"passes": 0, "units": 0, "reused": 0, "judged": 0, "removed": 0, "withheld": 0,
-                      "unjudged_kept": 0, "unavailable": False}
+                      "unjudged_kept": 0, "unavailable": False, "cell_cuts": 0, "cell_marks": 0}
         self.drafts = {d.index: d for d in report.units}
         self.draft_starts = [d.start for d in report.units]
         self._evidence: _Evidence | None = None
@@ -290,6 +318,11 @@ class _Final:
         todo = [f for f in units if not f.protected and not f.exempt and (f.key not in self.passed
                                                                            or set(f.drafts) & stale)]
         self.stats["reused"] += len(units) - len(todo)
+        for f in [f for f in todo if f.key not in self.passed and self.cell_cut_stands(f, may_judge)]:
+            # a row this check cut cell by cell, as it was judged without the cells that failed: nothing new to judge (R8)
+            self.passed.add(f.key)
+            self.stats["unjudged_kept"] += 1
+            todo.remove(f)
         if not todo:
             return res
         if not may_judge:
@@ -355,20 +388,44 @@ class _Final:
         if not standing or any(r.verdict != "supported" for r in standing):
             return False
         u = f.unit
-        if u.heading != d.heading or u.table_header != d.table_header or _norm(u.context) != _norm(d.context):
+        if u.heading != d.heading or u.table_header != d.table_header or _norm(key_context(u)) != _norm(key_context(d)):
             return False
         spans = [(g.start - d.start, g.end - d.start) for g in groups]
         if any(has_qualifier(d.raw[a:b]) for a, b in spans):
             return False
+        return self.leaves_the_text(d, groups, f)
+
+    @staticmethod
+    def leaves_the_text(d: Unit, groups, f: FinalUnit) -> bool:
+        """Whether the draft unit ``d`` with the cut ``groups`` taken out has the words of the saved unit ``f`` and no others."""
         left, at = [], 0
-        for a, b in spans:
-            left.append(d.raw[at:a])
-            at = b
+        for g in sorted(groups, key=lambda g: g.start):
+            left.append(d.raw[at:g.start - d.start])
+            at = g.end - d.start
         left.append(d.raw[at:])
+
         def words(text: str) -> list[str]:
             return _MISSING_TOKEN.findall(_IDS.sub("", text))
 
         return words("".join(left)) == words(f.text)
+
+    def cell_cut_stands(self, f: FinalUnit, may_judge: bool = False) -> bool:
+        """Whether a saved row is a row this check cut cell by cell (``cells``) and nothing else changed (round 20 U2, KTD2, R8): its
+        words are the draft's with the cut cells taken out, and its heading chain, its table header and the context its verdict is reused
+        under are what the judge read. The cells that stay were judged supported (or partly, and marked) in that verdict. A row that voted
+        for a component is judged again while there is a call to make (``may_judge``), as every changed voter is (KTD9): the component is
+        scored again over the row without the cell; with no call left it stands as cut."""
+        if len(f.drafts) != 1 or not f.text or f.drafts[0] not in self.cell_cuts:
+            return False
+        if may_judge and self.turn.derived and self.report.requirements and f.drafts[0] in self.voters():
+            return False
+        cut, d, groups = self.cell_cuts[f.drafts[0]], self.drafts.get(f.drafts[0]), self.report.cuts.get(f.drafts[0])
+        if d is None or not groups or tuple(groups) != cut.groups:
+            return False
+        u = f.unit
+        if u.heading != cut.heading or u.table_header != d.table_header or _norm(key_context(u)) != _norm(cut.context):
+            return False
+        return self.leaves_the_text(d, groups, f)
 
     def evidence(self) -> _Evidence:
         """What the requirements calls could see (``_Evidence``), built once for the whole check: the workspace's sources, the
@@ -473,6 +530,8 @@ class _Final:
             return
         if v.verdict == "partial" and (failing or v.defect != "none") and not self.attribute_only(f, v, failing) or (
                 v.verdict == "supported" and any(c.verdict in ("unsupported", "contradicts") for c in claims)):
+            if self.cells(f, v, claims, res):  # only the failing cell goes, or is marked, when the rest of the row stands (R5, R6)
+                return
             res.failures.append(Failure(f.drafts, DEFECT_FAILURES.get(v.defect) or "absent_from_source",
                                         FINAL_UNSUPPORTED.format(reason=v.reason), record="partial"))
             return
@@ -494,6 +553,61 @@ class _Final:
                     res.mutated |= self.mark(Problem(d, FINAL_ATTACH.format(source=s), kind="needs_citation",
                                                      cite=s, check="final"))
         self.accept(f, v.verdict)
+
+    def cells(self, f: FinalUnit, v: JudgeVerdict, claims: list, res: Checked) -> bool:
+        """A table row that fails in some of its cells keeps the others (round 20 U2, KTD2, R5-R8, AE4, AE5): the judge's claims of the
+        row are its cells (rule 35), each found once in the draft row and placed in one cell. When every cell that fails is independent
+        (``verify.row_cut_safe``: not the key cell, nothing else rests on it, no defect that changes how the other cells read, no
+        qualifier word in what is cut, a supported data cell left), an unsupported cell is cut to the marker — a cut group of the
+        report with an exact claim record, as ``plan_edits`` makes it — and a partly supported one keeps the "partly verified" mark,
+        written inside it. The judge's claims replace the draft's records of the row, so the log, the markers and the coverage
+        decision read the cells. False — and nothing changed — for anything else: the caller removes the row, as before. No judge call."""
+        u = f.unit
+        if len(f.drafts) != 1 or u.table_span is None or u.table_header:
+            return False
+        d = self.drafts.get(f.drafts[0])
+        report = self.report
+        if d is None or d.table_span is None or d.table_header or d.index in report.protected or report.cuts.get(d.index):
+            return False
+        spans = [c.span for c in claims]
+        if any(c.whole_unit or c.fallback for c in claims) or len(set(spans)) != len(spans) \
+                or any(d.text.count(x) != 1 for x in spans):
+            return False
+        recs = claim_records(d, claims)
+        if not row_cut_safe(d, recs, v.defect):
+            return False
+        failing = [r for r in recs if r.verdict in FAILING_VERDICTS]
+        partial = [r for r in recs if r.verdict == "partial"]
+        groups = _cut_groups(d, recs) if failing else []
+        if (not failing and not partial) or groups is None or (groups and not _leaves_words(d, groups)):
+            return False
+        bounds = cell_bounds(d.raw)
+        for r in recs:
+            r.post_check, r.citation = r.verdict, "cited" if d.ids else "not_needed"
+            r.action = "cut" if r in failing else "qualified" if r in partial else "kept"
+        old = {r.id for r in report.claims.get(d.index, [])}
+        report.claims[d.index] = recs
+        primary = next((r.id for r in recs if r.verdict in FAILING_VERDICTS), recs[0].id)
+        for p in report.problems:  # a problem of the draft names a record of it that the cells replace
+            if p.unit.index == d.index and p.claim_id in old:
+                p.claim_id = primary
+        if groups:
+            report.cuts[d.index] = groups
+            for r in failing:
+                report.problems.append(Problem(d, FINAL_UNSUPPORTED.format(reason=v.reason), "partial", failure_kind=r.failure_kind(),
+                                               check="final", claim_id=r.id, resolution="cut"))
+            self.cell_cuts[d.index] = CellCut(f.unit.heading, key_context(f.unit), tuple(groups))
+            self.stats["cell_cuts"] += len(failing)
+        if partial:
+            r = partial[0]
+            cell = next(i for i, (a, b) in enumerate(bounds) if a < r.end - d.start and r.start - d.start < b)
+            end = d.start + bounds[cell][0] + len(d.raw[bounds[cell][0]:bounds[cell][1]].rstrip())
+            self.stats["cell_marks"] += self.mark(Problem(d, FINAL_PARTIAL, "partial", defect="none", check="final",
+                                                          claim_id=r.id, cell_end=end), keep_claim=True)
+        self.accept(f, "partial" if partial else "supported", records=False)
+        report.assign_components()
+        res.mutated = True
+        return True
 
     def scope(self, f: FinalUnit, v: JudgeVerdict, res: Checked) -> bool:
         """A sentence of the saved text shown wider than the scope its source states (defect ``scope``, round 17 U5, KTD5, R10, R11): it
@@ -544,19 +658,23 @@ class _Final:
                        DEPENDS_ON_REMOVED.format(text=base.unit.text[:120]), base.cause, check="dependency",
                        basis=base.claim_id)
 
-    def mark(self, problem: Problem) -> bool:
-        """Add a problem the composer turns into a server span (a partial mark, an attached citation), once."""
+    def mark(self, problem: Problem, keep_claim: bool = False) -> bool:
+        """Add a problem the composer turns into a server span (a partial mark, an attached citation), once. ``keep_claim``: the problem
+        already names the claim it is about (a cell of a row, round 20 U2)."""
         problems = self.report.problems
         if any(p.unit is problem.unit and p.check == "final" and p.kind == problem.kind and p.cite == problem.cite
-               for p in problems):
+               and p.severity == problem.severity and p.resolution == problem.resolution for p in problems):
             return False
-        problem.claim_id = _primary_claim_id(self.report, problem.unit.index)
+        if not keep_claim:
+            problem.claim_id = _primary_claim_id(self.report, problem.unit.index)
         problems.append(problem)
         return True
 
-    def accept(self, f: FinalUnit, post: str) -> None:
+    def accept(self, f: FinalUnit, post: str, records: bool = True) -> None:
+        """The unit passes under its key. ``records``: its claims record the verdict the check gave (``post_check``); a row cut by cells
+        has recorded each cell's own."""
         self.passed.add(f.key)
-        for d in f.drafts if len(f.drafts) == 1 else ():
+        for d in f.drafts if records and len(f.drafts) == 1 else ():
             for r in self.report.claims.get(d, []):
                 r.post_check = post
 

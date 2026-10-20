@@ -406,7 +406,7 @@ class _Remainder:
         self.final.report, self.final.drafts = report, {0: draft}
         self.final.stats = {"passes": 0, "units": 0, "reused": 0, "judged": 0, "removed": 0, "withheld": 0,
                             "unjudged_kept": 0, "unavailable": False}
-        self.final.passed = set()
+        self.final.passed, self.final.cell_cuts = set(), {}
         self.final.deadline = time.monotonic() + 5  # less than the final check's reserve: no time to judge the saved text
         monkeypatch.setattr(final_check, "FINAL_MIN_SECONDS", 10**6)
         text = self.SAVED if saved is None else saved
@@ -650,11 +650,11 @@ def test_what_rests_on_a_unit_the_final_check_removes_goes_with_it(offline):
 
 
 def test_a_table_left_without_its_header_goes_with_it(offline, monkeypatch):
-    """The intro line goes (nothing supports it); the header, judged again with no intro above it, fails in the last pass;
-    its rows go with it — one table is never left headless."""
+    """The intro line, which names a plan, goes (nothing supports it); the header, judged again with no intro above it, fails in the
+    last pass; its rows go with it — one table is never left headless."""
     monkeypatch.setattr(final_check, "FINAL_PASSES", 1)
     table = "| נתון בנכס | ערך בש״ח |\n|---|---|\n| השווי למ\"ר | 9,500 ₪ [S1] |"
-    answer = f"הטבלה מציגה את הנתונים העיקריים של הנכס [S1].\n{table}\n\n{VALUE}"
+    answer = f"הטבלה מציגה את הנתונים העיקריים של הנכס לפי תכנית א׳ [S1].\n{table}\n\n{VALUE}"  # the line names a plan (round 20 U2, KTD2)
 
     def rule(text, input, n):
         if text.startswith("הטבלה מציגה"):
@@ -1691,3 +1691,204 @@ def test_a_coverage_check_that_fails_technically_says_so_in_place_of_every_gap_m
     assert len(lines) == 2 and all("לא ניתן היה להשלים את הבדיקה" in ln for ln in lines), md
     assert not re.search(r"לא נעשה בו שימוש|לא נמצא|לא אותר", md) and {i["state"] for i in out.item_ledger["items"]} == {"unchecked"}
     assert out.final_digest == text_digest(md)
+
+
+# --- round 20 U2: cell-level outcomes in the final check (KTD2; R5-R8; AE4, AE5) ----------------------------------------------------
+
+CELL_SOURCE = "השווי למ\"ר הוא 9,500 ₪. דמי השכירות הם 55 ₪ למ\"ר לחודש. בנכס ב׳ השווי למ\"ר הוא 7,300 ₪."
+PLAN_LEAD = "הטבלה מציגה את הנתונים העיקריים של הנכס לפי תכנית א׳ [S1]."  # names a plan: the rows depend on it
+PLAIN_LEAD = "הטבלה מציגה את הנתונים העיקריים של הנכס [S1]."  # names no scope
+CELL_NOTE = "הערת המודל על הנתון"
+CELL_MORE = "פירוט נוסף של המודל"
+CELL_QUESTION = "מהם השווי למ\"ר ודמי השכירות בנכס?"
+RENT_ROW = "| דמי השכירות | 55 ₪ למ\"ר לחודש [S1] | — | — |"
+WIDE_HEAD = "| נתון | ערך | הערה | פירוט |\n|---|---|---|---|\n"
+
+
+def _cells(line: str) -> list[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _row(md: str, needle: str) -> str:
+    (line,) = [ln for ln in md.splitlines() if needle in ln and ln.startswith("|")]
+    return line
+
+
+def _after_lead_rule(needle: str, reply, lead: str = "הטבלה מציגה"):
+    """A judge that finds the line above the table unsupported (it goes), supports each unit the first time it reads it, and judges the
+    row that holds ``needle`` as ``reply`` once that line is gone (the table intro is no longer in its input)."""
+
+    def rule(text, input, n):
+        if text.startswith(lead):
+            return {"verdict": "unsupported", "failure": "absent_from_source"}
+        if needle in text and "<table_intro>" not in input:
+            return reply
+        return "supported"
+
+    return rule
+
+
+def _cell_turn(offline, rule, answer: str, *, texts: list[str] | None = None, question: str = CELL_QUESTION, **agent):
+    offline.texts = texts or [CELL_SOURCE]
+    judge = Judge(rule)
+    out = _turn(ScriptedAgent([SEARCH, *[final(answer) for _ in range(3)]], judge=judge, **agent), question)
+    return out, judge
+
+
+def _claims(*parts) -> dict:
+    """A partly supported row as the judge gives it under rule 35: one claim per cell, ``(span, verdict[, extra])``."""
+    return {"verdict": "partial", "defect": "part", "claims": [
+        {"span": s, "verdict": v} | (rest[0] if rest else {}) for s, v, *rest in parts]}
+
+
+ABSENT = {"failure": "absent_from_source"}
+
+
+def test_a_partly_supported_independent_cell_keeps_the_mark_inside_that_cell_and_adds_no_cell(offline):
+    """K3 (R5): the cell is partial, its row is not removed; the mark joins the cell it is about, not the end of the row."""
+    row = f"| השווי למ\"ר | 9,500 ₪ [S1] | {CELL_NOTE} | — |"
+    reply = {"verdict": "partial", "defect": "none", "claims": [
+        {"span": "9,500 ₪", "verdict": "supported"}, {"span": CELL_NOTE, "verdict": "partial"}]}
+    out, judge = _cell_turn(offline, _after_lead_rule(CELL_NOTE, reply), f"{PLAN_LEAD}\n{WIDE_HEAD}{row}\n{RENT_ROW}")
+    md = out.answer.answer_markdown
+    cells = _cells(_row(md, "9,500"))
+    assert len(cells) == 4 and cells[2].startswith(CELL_NOTE) and "אומת חלקית" in cells[2], md
+    assert "אומת חלקית" not in cells[3] and "55 ₪" in md and [p.unit.text.startswith("הטבלה מציגה") for p in out.report.removals()] == [True]
+    assert _kinds(out).count("partial_mark") == 1 and out.final_check["cell_marks"] == 1 and out.final_digest == text_digest(md)
+
+
+def test_two_failing_independent_cells_are_both_cut_and_the_row_stays_with_its_columns(offline):
+    row = f"| השווי למ\"ר | 9,500 ₪ [S1] | {CELL_NOTE} | {CELL_MORE} |"
+    reply = _claims(("9,500 ₪", "supported"), (CELL_NOTE, "unsupported", ABSENT), (CELL_MORE, "unsupported", ABSENT))
+    out, judge = _cell_turn(offline, _after_lead_rule(CELL_NOTE, reply), f"{PLAN_LEAD}\n{WIDE_HEAD}{row}\n{RENT_ROW}")
+    md = out.answer.answer_markdown
+    cells = _cells(_row(md, "9,500"))
+    assert len(cells) == 4 and cells[1] == "9,500 ₪ [S1]" and cells[2].startswith("«") and cells[3].startswith("«"), md
+    assert CELL_NOTE not in md and CELL_MORE not in md and "55 ₪" in md
+    assert _kinds(out).count("marker") == 2 and out.report.removals()[0].unit.text.startswith("הטבלה מציגה")
+    assert out.final_check["cell_cuts"] == 2 and out.final_check["judge_calls"] == 1, out.final_check  # the cut row is not judged again (R8)
+    assert [c.action for c in out.report.claims[2] if c.verdict == "unsupported"] == ["cut", "cut"]
+    assert out.final_digest == text_digest(md)
+
+
+def test_a_cut_made_in_the_last_pass_is_accepted_without_a_new_judgment(offline, monkeypatch):
+    monkeypatch.setattr(final_check, "FINAL_PASSES", 1)
+    row = f"| השווי למ\"ר | 9,500 ₪ [S1] | {CELL_NOTE} | — |"
+    reply = _claims(("9,500 ₪", "supported"), (CELL_NOTE, "unsupported", ABSENT))
+    out, judge = _cell_turn(offline, _after_lead_rule(CELL_NOTE, reply), f"{PLAN_LEAD}\n{WIDE_HEAD}{row}\n{RENT_ROW}")
+    cells = _cells(_row(out.answer.answer_markdown, "9,500"))
+    assert cells[1] == "9,500 ₪ [S1]" and cells[2].startswith("«") and out.report.removals()[0].unit.text.startswith("הטבלה מציגה")
+    assert out.final_check["judge_calls"] == 1 and out.final_check["passes"] == 1 and out.final_check["unjudged_kept"] == 1
+
+
+def test_a_comparison_whose_columns_are_the_sides_cuts_the_cell_of_the_side_the_sources_do_not_state(offline):
+    """The key cell is the first column (the datum the row is about); a wrong cell under one side's column goes and the other side stays."""
+    head = "| נתון | נכס א׳ | נכס ב׳ |\n|---|---|---|\n"
+    row = "| השווי למ\"ר | 9,500 ₪ [S1] | 7,800 ₪ [S1] |"
+    reply = _claims(("9,500 ₪", "supported"), ("7,800 ₪", "unsupported", ABSENT))
+    out, _ = _cell_turn(offline, _after_lead_rule("7,800", reply), f"{PLAN_LEAD}\n{head}{row}", texts=[CELL_SOURCE + " בנכס ב׳ 7,800 ₪."])
+    # (the figure is in the source; the final judge finds it under the wrong side)
+    cells = _cells(_row(out.answer.answer_markdown, "9,500"))
+    assert len(cells) == 3 and cells[1] == "9,500 ₪ [S1]" and cells[2].startswith("«"), out.answer.answer_markdown
+
+
+def test_a_comparison_whose_rows_are_the_sides_removes_the_row_whose_side_label_is_wrong(offline):
+    head = "| נכס | השווי למ\"ר |\n|---|---|\n"
+    wrong = "| נכס ג׳ | 9,500 ₪ [S1] |"
+    right = "| נכס ב׳ | 7,300 ₪ [S1] |"
+    reply = _claims(("נכס ג׳", "unsupported", {"failure": "wrong_subject"}), ("9,500 ₪", "supported"))
+    out, _ = _cell_turn(offline, _after_lead_rule("נכס ג׳", reply), f"{PLAN_LEAD}\n{head}{wrong}\n{right}")
+    md = out.answer.answer_markdown
+    assert "נכס ג׳" not in md and "9,500" not in md and "7,300 ₪" in md
+    assert [p.check for p in out.report.removals() if "נכס ג׳" in p.unit.text] == ["final"]
+
+
+def test_a_row_whose_only_data_cell_fails_is_removed(offline):
+    head = "| נתון | ערך |\n|---|---|\n"
+    row = "| השווי למ\"ר | 9,500 ₪ [S1] |"
+    reply = _claims(("השווי למ\"ר", "supported"), ("9,500 ₪", "unsupported", ABSENT))
+    out, _ = _cell_turn(offline, _after_lead_rule("השווי", reply), f"{PLAN_LEAD}\n{head}{row}\n| דמי השכירות | 55 ₪ למ\"ר לחודש [S1] |")
+    md = out.answer.answer_markdown
+    assert "9,500" not in md and "55 ₪" in md and out.final_check["cell_cuts"] == 0
+    assert [p.check for p in out.report.removals() if "השווי" in p.unit.text] == ["final"]
+
+
+@pytest.mark.parametrize("reply, why", [
+    (_claims(("9,500 ₪", "supported"), (CELL_NOTE, "unsupported", ABSENT), ("— ", "supported", {"depends_on": [CELL_NOTE]})),
+     "another claim of the row rests on the cell"),
+    ({**_claims(("9,500 ₪", "supported"), (CELL_NOTE, "partial")), "defect": "units"}, "a defect that changes how the row reads"),
+    (_claims(("9,500 ₪", "supported"), ("בכפוף לאישור הוועדה", "unsupported", ABSENT)), "a qualifier word in the cut text"),
+    (_claims(("השווי למ\"ר", "supported"), (CELL_NOTE, "unsupported", ABSENT)), "no supported data cell is left"),
+    (_claims(("9,500 ₪ [S1] | " + CELL_NOTE, "unsupported", ABSENT)), "a claim across two cells"),
+    ({"verdict": "partial", "defect": "part"}, "the judge gave no claims: one whole-row claim"),
+    ({"verdict": "partial", "defect": "none", "claims": [{"span": "השווי למ\"ר", "verdict": "supported"}, {"span": CELL_NOTE, "verdict": "partial"}]},
+     "the key cell is the only supported claim"),
+], ids=["dependent", "defect", "qualifier", "no-data-left", "across-cells", "whole-row", "key-only"])
+def test_the_row_goes_whole_when_no_safe_partial_keep_exists(offline, reply, why):
+    note = "בכפוף לאישור הוועדה" if "qualifier" in why else CELL_NOTE
+    row = f"| השווי למ\"ר | 9,500 ₪ [S1] | {note} | — |"
+    out, _ = _cell_turn(offline, _after_lead_rule("9,500", reply), f"{PLAN_LEAD}\n{WIDE_HEAD}{row}\n{RENT_ROW}")
+    md = out.answer.answer_markdown
+    assert "9,500" not in md and "55 ₪" in md, (why, md)
+    assert [p.check for p in out.report.removals() if "9,500" in p.unit.text] == ["final"], why
+    assert out.final_check["cell_cuts"] == out.final_check["cell_marks"] == 0, why
+
+
+def test_a_key_cell_the_judge_finds_wrong_is_removed_with_its_row_even_when_another_cell_also_fails(offline):
+    row = f"| השווי למ\"ר בדירה האחורית | 9,500 ₪ [S1] | {CELL_NOTE} | — |"
+    reply = _claims(("בדירה האחורית", "unsupported", {"failure": "wrong_subject"}), ("9,500 ₪", "supported"), (CELL_NOTE, "unsupported", ABSENT))
+    out, _ = _cell_turn(offline, _after_lead_rule("בדירה האחורית", reply), f"{PLAN_LEAD}\n{WIDE_HEAD}{row}\n{RENT_ROW}")
+    assert "9,500" not in out.answer.answer_markdown and "55 ₪" in out.answer.answer_markdown
+
+
+def test_a_line_above_the_table_that_names_no_scope_is_no_ground_to_judge_the_rows_again(offline):
+    """R7 (K3): the line goes for another reason; the rows' verdicts of the draft stand, and the final check calls the judge for neither."""
+    row = f"| השווי למ\"ר | 9,500 ₪ [S1] | {CELL_NOTE} | — |"
+
+    def rule(text, input, n):
+        if text.startswith("הטבלה מציגה"):
+            return {"verdict": "unsupported", "failure": "absent_from_source"}
+        return {"verdict": "partial", "defect": "none"} if CELL_NOTE in text else "supported"
+
+    out, judge = _cell_turn(offline, rule, f"{PLAIN_LEAD}\n{WIDE_HEAD}{row}\n{RENT_ROW}")
+    md = out.answer.answer_markdown
+    cells = _cells(_row(md, "9,500"))
+    assert len(cells) == 4 and "אומת חלקית" in cells[3] and CELL_NOTE in md and "55 ₪" in md, md
+    assert "verify_final" not in _purposes(out) and out.final_check["judge_calls"] == 0, out.final_check
+    assert [p.unit.text.startswith("הטבלה מציגה") for p in out.report.removals()] == [True]
+
+
+def test_a_line_above_the_table_that_names_the_rows_plan_is_removed_so_the_rows_are_judged_again(offline):
+    row = f"| השווי למ\"ר | 9,500 ₪ [S1] | {CELL_NOTE} | — |"
+    reply = _claims(("9,500 ₪", "supported"), (CELL_NOTE, "unsupported", ABSENT))
+    out, judge = _cell_turn(offline, _after_lead_rule(CELL_NOTE, reply), f"{PLAN_LEAD}\n{WIDE_HEAD}{row}\n{RENT_ROW}")
+    assert out.final_check["judge_calls"] == 1 and any(CELL_NOTE in i for i in judge.final_inputs), judge.final_inputs
+    assert CELL_NOTE not in out.answer.answer_markdown
+
+
+def test_a_cut_makes_the_item_the_cell_gave_an_omitted_item_and_a_true_omission_keeps_its_line(offline):
+    """R8 (the round-19 one decision): the coverage is read again over the text with the cell cut."""
+    texts = ["זכויות הבנייה\nרכיב | שטח | קומות\nשטח עיקרי | 1,200 | 6\nשטח מרתף | 340 | 2"]
+    head = "| רכיב | שטח | קומות |\n|---|---|---|\n"
+    row = "| שטח עיקרי | 1,200 מ״ר [S1] | 6 קומות [S1] |"
+    items = [{"component": RIGHTS_ASK, "label": "שטח עיקרי", "source": "S1", "quote": "שטח עיקרי | 1,200 | 6", "value": "1,200 מ״ר",
+              "condition": "", "state": "included", "reason": ""},
+             {"component": RIGHTS_ASK, "label": "קומות עיקרי", "source": "S1", "quote": "שטח עיקרי | 1,200 | 6", "value": "6 קומות",
+              "condition": "", "state": "included", "reason": ""},
+             {"component": RIGHTS_ASK, "label": "שטח מרתף", "source": "S1", "quote": "שטח מרתף | 340 | 2", "value": "340 מ״ר",
+              "condition": "", "state": "included", "reason": ""}]
+    reply = _claims(("1,200 מ״ר", "supported"), ("6 קומות", "unsupported", ABSENT))
+    answer = f"{PLAN_LEAD}\n{head}{row}"
+    offline.texts = texts
+    judge = Judge(_after_lead_rule("6 קומות", reply), asks={RIGHTS_ASK: "1,200"})
+    out = _turn(ScriptedAgent([SEARCH, *[final(answer, items=items) for _ in range(3)]], judge=judge, request=[component(RIGHTS_ASK)]),
+                RIGHTS_QUESTION)
+    md = out.answer.answer_markdown
+    assert "6 קומות" not in md and "1,200 מ״ר [S1]" in md and "«" in _row(md, "1,200"), md
+    states = {i["label"]: i["state"] for i in out.item_ledger["items"]}
+    assert states == {"שטח עיקרי": "covered", "קומות עיקרי": "omitted", "שטח מרתף": "omitted"}, states
+    lines = [x["text"] for x in out.report.item_gaps]  # (named as the source names their rows: the floors are the main row's)
+    assert len(lines) == 2 and lines[0].startswith("«שטח עיקרי»") and lines[1].startswith("«שטח מרתף»") and "6" not in lines[0], lines
+    assert [s["state"] for s in _sent_text_states(out)] == [i["state"] for i in out.item_ledger["items"]]
+    # the row voted for the component, so it is judged again like every changed voter (KTD9): one call, not one per cell
+    assert out.final_check["judge_calls"] == 2 and out.final_digest == text_digest(md)

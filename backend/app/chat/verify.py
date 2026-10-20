@@ -297,7 +297,8 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # value-bearing sentences) and a requirement names the ones it asks for with the request words they answer (``candidates``).
 # 18 (round 19 U2, KTD2): a unit whose evidence's owner the context check could not settle is shown with a neutral ``<ownership>`` fact line; rule (34) reads it.
 # 19 (round 19 U2, KTD2): the same line also says that a unit cites a source of another context beside sources of the asked one (``MSG_OWNER_MIXED``).
-JUDGE_VERSION = 19
+# 20 (round 20 U2, KTD2): rule (35) asks for the claims of a table row that holds a defect per cell, so that the final check can cut or mark one cell.
+JUDGE_VERSION = 20
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -448,7 +449,13 @@ JUDGE_POLICY = (
     "(34) <ownership unit=\"N\">…</ownership> לפני יחידה הוא עובדה ניטרלית שהשרת רושם כשלא הצליח להכריע אם הנתון שהיחידה מצטטת "
     "שייך לנכס שנשאל עליו: איפה הנתון כתוב ואיזה נכס נשאל. זו אינה טענה ואינה פסק דין. מספר ההקשר או הכותרת של היחידה שבה הנתון "
     "כתוב אינם מוכיחים שהוא של נכס אחר; שפוט לפי הקטע המצוטט עצמו: אם הוא מזהה (בשם, בחלקה או בכתובת) את הנכס שנשאל עליו, הנתון "
-    "שלו; אם הוא מזהה נכס אחר, wrong_subject; ואם אינו מזהה אף נכס, אל תסיק wrong_subject מההבדל בהקשר לבדו."
+    "שלו; אם הוא מזהה נכס אחר, wrong_subject; ואם אינו מזהה אף נכס, אל תסיק wrong_subject מההבדל בהקשר לבדו. "
+    "(35) שורת טבלה שיש בה תא שאינו נתמך במלואו: ה-claims שלה הם התאים (חריג לכלל 16). החזר claim אחד לכל תא שיש בו נתון או טענה, "
+    "ה-span שלו בתוך תא אחד תו בתו (בלי \"|\" ובלי חציית גבול תא), כולל התאים הנתמכים; פגם בתא אחד אינו הופך תא אחר ללא נתמך. "
+    "תא שהמקור תומך בו — supported; תא שחלקו נתמך (הנתון נתמך וההסתייגות או ההרחבה אינן) — partial; תא שהמקור אינו תומך בו — "
+    "unsupported. אל תפצל את הטענה של תא לכמה claims, ואל תחזיר claim אחד לכל השורה כשהפגם בתא אחד. פגם שמשנה את משמעות שאר "
+    "השורה (תא התווית שמזהה את הנכס, הצד או התכנית שהשורה מתארת הוא השגוי; יחידות, היקף או תכנית שגויים לכל השורה) — החזר אותו "
+    "כ-claim של אותו תא וקבע את ה-defect שלו (units, scope, framing, input, scenario, formula): השורה כולה נבדקת לפיו."
 )
 
 
@@ -1368,10 +1375,32 @@ def _headings_above(markdown: str, units: list[Unit]) -> dict[int, str]:
     return {u.index: chains[min(max(bisect.bisect_right(starts, u.start) - 1, 0), len(lines) - 1)] for u in units}
 
 
+# a line that names a scope below the property (round 20 U2, KTD2, KTD3): a plan, parcel, lot group, contract, alternative, stage or
+# comparison side with its identifier ("תכנית ב׳", "חלקה 12", "נכס A"), or an approved or proposed state ("מאושר", "מוצע")
+_SCOPE_NAMED = re.compile(
+    r"(?<![א-ת])[הולבמשכ]{0,2}(?:תכנית|תוכנית|תב[\"״]ע|חלקה|חלקות|מגרש|מגרשים|תא\s+שטח|קבוצת\s+מגרשים|חוזה|הסכם|חלופה|חלופת|"
+    r"שלב|מסלול|נכס|נכסים|דירה)\s+(?:מס(?:פר|['׳.])?\s*)?(?:[א-ת][\"'׳״]?(?![א-ת])|[A-Za-z](?![A-Za-z])|\d[\d./-]*)"
+    r"|(?<![א-ת])[הולבמשכ]{0,2}(?:מאושר|מוצע|בתוקף|מופקד)(?:ת|ים|ות)?(?![א-ת])")
+
+
+def names_scope(line: str) -> bool:
+    """Whether a line names a scope below the property (``_SCOPE_NAMED``): the lines above a table row that do are part of what its
+    verdict depends on (a plan, an alternative or a state the row is read under)."""
+    return bool(_SCOPE_NAMED.search(_IDS.sub("", line or "")))
+
+
+def key_context(unit: Unit) -> str:
+    """The context a table row's verdict is reused under (round 20 U2, KTD2, R7): the table's header row, and the line before the table
+    only when it names a scope (``names_scope``). A line that carries neither a header nor a scope is left out of that memory, so the
+    removal of such a line elsewhere in the answer does not by itself judge a row again. A unit that is no table row has no context."""
+    header, _, lead = unit.context.partition("\n")
+    return header + ("\n" + lead if names_scope(lead) else "")
+
+
 def unit_key(unit: Unit, ws: Workspace, request: str, heading: str, digests: dict[str, str]) -> str:
     """What a unit's verdict depends on: its text, the ids it cites with the content of each (``digests``, filled
-    per id), its context (a table row's header row and the line before its table; the heading chain above it), the
-    request and the judge contract's version (``JUDGE_VERSION``)."""
+    per id), its context (a table row's header row and the line before its table when that line names a scope — ``key_context``;
+    the heading chain above it), the request and the judge contract's version (``JUDGE_VERSION``)."""
     evidence = []
     for i in sorted(set(unit.ids)):
         if i not in digests:
@@ -1385,7 +1414,7 @@ def unit_key(unit: Unit, ws: Workspace, request: str, heading: str, digests: dic
             digests["*"] = hashlib.sha256("\x1f".join(
                 f"{sid}\x1e" + "\x1f".join(_source_parts(ws, sid) or ()) for sid in ws.sources).encode()).hexdigest()
         evidence.append(("*", digests["*"]))
-    key = [_norm(unit.text), evidence, unit.context, heading, unit.table_header, request, JUDGE_VERSION]
+    key = [_norm(unit.text), evidence, key_context(unit), heading, unit.table_header, request, JUDGE_VERSION]
     if fact := ws.ownership_facts.get(_fact_key(unit)):  # the judge reads it beside the unit (rule 34)
         key.append(fact)
     raw = json.dumps(key, ensure_ascii=False)
@@ -1571,6 +1600,12 @@ class Problem:
     named: str = ""
     result: str = ""
     defect: str | None = None  # for a judge's partial: the concrete defect it named ("none": none; None: not given)
+    # for a missing qualifier of a number: which one it is (``meaning.KIND_LABELS``: basis, period or approx); "" when not known. An
+    # approximation is written next to a count too (round 20 U2, KTD2): only a period is never written after a duration or a count
+    qualifier: str = ""
+    # for the "partly verified" mark of one cell of a table row (round 20 U2, KTD2): where the cell's content ends in the answer, the
+    # place of the mark; None — the mark joins the end of the unit (``_mark_point``)
+    cell_end: int | None = None
     # the structured decision (round 7 KTD5, R12): why (``FAILURE_KINDS``), the check that fired (a deterministic
     # check's name, ``judge`` or ``dependency``), the component the unit gave (``N#``, when known), the ids it was
     # checked against (its citations when the check fired), and whether a repair round was asked to fix it
@@ -2682,8 +2717,10 @@ class VerifyReport:
         blocked = cuts + spans  # a qualifier or a citation never lands inside a removed or replaced span
         edits: list[tuple[int, int, str, str | None, tuple]] = [(a, b, "", None, ()) for a, b in cuts]
         # a mark carries the claim ids of its unit (round 14 U7, KTD9)
-        edits += [(u.end, u.end, PARTIAL_MARK, "partial_mark", self.partial_claim_ids(u.index)) for u in self.units
-                  if u.index in partial and not any(a <= u.start < b for a, b in cuts)]
+        marks = {u.index: next((p.cell_end for p in self.partial_problems(u.index) if p.cell_end is not None),
+                               _mark_point(markdown, u)) for u in self.units if u.index in partial}
+        edits += [(marks[u.index], marks[u.index], PARTIAL_MARK, "partial_mark", self.partial_claim_ids(u.index))
+                  for u in self.units if u.index in partial and not any(a <= u.start < b for a, b in cuts)]
         edits += [(g.start, g.end, MARKER.format(n=0), "marker", g.claims) for groups in planned.values()
                   for g in groups if not any(a <= g.start < b for a, b in cuts)]
         edits += totals
@@ -2718,7 +2755,8 @@ class VerifyReport:
                     edits.append((at, at, f" ({MSG_CONDITION_ADDED.format(phrase=p.annotation)}{cite})", "qualifier", ()))
                 elif p.check == SCOPE_CHECK:  # the scope the source states, written next to the value with its citation (R10)
                     edits.append((at, at, f" ({MSG_SCOPE_ADDED.format(phrase=p.annotation)}{cite})", "qualifier", ()))
-                elif not _is_duration_or_count(p.unit, p.number or "", p.at):  # a source's period is never a duration's
+                elif p.qualifier == "approx" or not _is_duration_or_count(p.unit, p.number or "", p.at):
+                    # a source's period is never a duration's; its approximation is also a count's (round 20 U2, KTD2)
                     edits.append((at, at, f" ({p.annotation}, כפי שנכתב במקור{cite})", "qualifier", ()))
         # evidence the server found in the same calculation is cited with the unit it supports
         for u, ids in _cites_by_unit(cites):
@@ -2935,6 +2973,17 @@ def _cites_by_unit(problems: list[Problem]) -> list[tuple[Unit, list[str]]]:
     return list(out.values())
 
 
+def _mark_point(markdown: str, unit: Unit) -> int:
+    """Where the "partly verified" mark joins a unit (round 20 U2, KTD2, R5): at its end, and in a table row inside its last cell, before
+    the closing bar — after it the mark would be one more cell and the row would stop lining up with its header."""
+    if unit.table_span is None:
+        return unit.end
+    body = markdown[unit.start:unit.end].rstrip()
+    if body.endswith("|") and len(body) > 1:
+        return unit.start + len(body[:-1].rstrip())
+    return unit.end
+
+
 def _citation_point(markdown: str, unit: Unit) -> int:
     """Where a citation joins a unit: after its last citation, else before its final punctuation (in a table row,
     inside its last cell)."""
@@ -2986,7 +3035,12 @@ def _after_number(unit: Unit, written: str, at: int | None = None) -> int | None
         return None
     end = start + len(written)
     tail = _AFTER_NUMBER.match(unit.raw, scale_after(unit.raw, start, end)[1])
-    return unit.start + (tail.end() if tail else end)
+    at = tail.end() if tail else end
+    if meaning.after_kind(unit.raw, end):
+        # a count or a duration: its noun is part of the quantity ("59 דירות"), and a note belongs after it (round 20 U2, KTD2)
+        noun = meaning._COUNT_AFTER.match(unit.raw, end) or meaning._DURATION_AFTER.match(unit.raw, end)
+        at = max(at, noun.end() if noun else at)
+    return unit.start + at
 
 
 def _shown_result(unit: Unit, written: str | None) -> str | None:
@@ -7432,7 +7486,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 report.problems.append(Problem(u, m.reason, kind="needs_citation", cite=m.cite))
             elif not m.blocking:
                 report.problems.append(Problem(u, m.reason, kind="missing_qualifier", number=m.number, at=m.at,
-                                               annotation=m.annotation, cite=m.cite))
+                                               annotation=m.annotation, cite=m.cite, qualifier=m.kind))
         # a result of a conditional calculation: the server writes that it is conditional next to it (the judge
         # reads the unit with it), so an unhedged sentence is shown as conditional, never lost and never certain
         for cid, number, note in conditional_notes(u, ws):
@@ -7719,6 +7773,65 @@ def _cut_groups(u: Unit, recs: list[ClaimRecord]) -> list[CutGroup] | None:
     return [CutGroup(a, b, tuple(ids)) for a, b, ids in groups]
 
 
+# the defects of a partly supported row that leave the meaning of its other cells as it is (``JudgeVerdict.defect``): none named, or only
+# the part the cell itself holds. Any other defect (units, scope, framing, input, scenario, formula) changes how the whole row is read
+CELL_DEFECTS = (None, "none", "part")
+
+
+def cell_bounds(raw: str) -> list[tuple[int, int]]:
+    """The cells of a table row's text as ``(start, end)`` offsets in it, the bars that delimit them left out (round 20 U2, KTD2). A row
+    written without its outer bars keeps its first and last cell."""
+    bars = [i for i, c in enumerate(raw) if c == "|"]
+    if not bars:
+        return [(0, len(raw))]
+    out = [(a + 1, b) for a, b in zip(bars, bars[1:], strict=False)]
+    if bars[0] > 0 and raw[:bars[0]].strip():
+        out.insert(0, (0, bars[0]))
+    if raw[bars[-1] + 1:].strip():
+        out.append((bars[-1] + 1, len(raw)))
+    return out
+
+
+def _claim_cells(u: Unit, r: ClaimRecord, bounds: list[tuple[int, int]]) -> set[int]:
+    """The cells of the row ``u`` that the claim ``r`` overlaps (a claim of a whole row overlaps them all)."""
+    a, b = r.start - u.start, r.end - u.start
+    return {i for i, (x, y) in enumerate(bounds) if a < y and x < b}
+
+
+def _rests_on(s: ClaimRecord, r: ClaimRecord) -> bool:
+    """Whether the claim ``s`` rests on the claim ``r``: by its id (the verification's records) or by a span the judge gave."""
+    return r.id in s.depends_on or any(_same_span(r.text, ref) for ref in s.refs if not ref.isdigit())
+
+
+def row_cut_safe(u: Unit, recs: list[ClaimRecord], defect: str | None = None) -> bool:
+    """Whether a table row may lose only the cells whose claims fail, and keep the others (round 20 U2, KTD2, R5, R6, AE5): the row's
+    claims are its cells (one cell for each claim that does not stand in full), and each cell that is cut or marked is independent:
+    - it is not the row's key cell, the first column (the unit, the plan, the side or the property the row speaks of: with it wrong,
+      the other cells would describe the wrong thing, and the row goes whole);
+    - no other claim of the row rests on it, and the verdict names no defect that changes how the other cells read (``CELL_DEFECTS``);
+    - its cut text holds no qualifier word (a negation, a condition, a status, a date or a caveat that the other cells may rest on);
+    - at least one supported claim stands in a data cell (a cell other than the key cell; one a cut only takes a span from stays with it).
+    The table's cells must line up with its header row (else the cells cannot be told apart). True for anything but a table body row."""
+    if u.table_span is None or u.table_header:
+        return True
+    bounds = cell_bounds(u.raw)
+    heads = u.context.split("\n", 1)[0].strip()
+    if heads.startswith("|") and len(meaning._row_cells(heads)) != len(bounds):
+        return False
+    if defect not in CELL_DEFECTS or any(r.whole_unit or r.fallback or not r.exact for r in recs):
+        return False
+    bad = [r for r in recs if r.verdict in FAILING_VERDICTS or r.verdict == "partial"]
+    cells = {r.id: _claim_cells(u, r, bounds) for r in recs}
+    for r in bad:
+        if len(cells[r.id]) != 1 or 0 in cells[r.id]:
+            return False
+        if any(s is not r and s.verdict in STANDING_VERDICTS and _rests_on(s, r) for s in recs):
+            return False
+        if r.verdict in FAILING_VERDICTS and has_qualifier(u.raw[r.start - u.start:r.end - u.start]):
+            return False
+    return any(r.verdict == "supported" and cells[r.id] - {0} for r in recs)
+
+
 def plan_edits(report: VerifyReport) -> None:
     """The edit ladder, decided once the verdicts are settled (round 8 KTD4, R8–R10): for every unit that has a failing
     claim and is not removed, step 2 (cut the span, ``report.cuts``; the problems of those claims are resolved by the
@@ -7736,6 +7849,9 @@ def plan_edits(report: VerifyReport) -> None:
         if u is None or not failing or idx in removed:
             continue
         groups = _cut_groups(u, recs)
+        if groups is not None and u.table_span is not None and not u.table_header and not row_cut_safe(
+                u, recs, getattr(report.unit_verdicts.get(idx), "defect", None)):
+            groups = None  # a cell the rest of the row rests on, the key cell, or the last data cell: the row goes whole (round 20 U2, KTD2)
         mine = [p for p in report.problems if p.unit.index == idx and p.claim_id in failing]
         if groups is not None and not _leaves_words(u, groups):
             # the cut would leave a marker beside a number, a citation or a list marker and no word (round 13 U11, KTD13 rule 1):

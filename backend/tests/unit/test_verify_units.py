@@ -1368,12 +1368,27 @@ def test_a_removed_row_under_a_total_row_qualifies_the_total():
     assert [s.kind for s in edited.doc.spans()] == ["qualifier", "removal_note"]
 
 
+PARTS_NOTED = ("| רכיב | סכום | הערה |\n|---|---|---|\n| רכיב א | 100 ₪ [S1] | — |\n| רכיב ב | 200 ₪ [S1] | הנכס מושכר |\n"
+               "| רכיב ג | 50 ₪ [S1] | — |\n| סה״כ | 350 ₪ [S1] | — |")
+
+
 def test_a_cut_inside_a_component_row_qualifies_the_total_too():
+    """Round 20 U2 (KTD2): the cell that fails is the row's note, and the amount beside it stays; a cut of the amount, the row's only data
+    cell, would leave the label alone, and the row goes whole (the next test)."""
+    a = _answer(PARTS_NOTED)
+    r = verify_answer(_claims_judge(lambda t: [("200 ₪", "supported"), ("הנכס מושכר", "unsupported")] if "רכיב ב" in t
+                                    else None), a, _ws(PARTS_SOURCE), "?", [])
+    out = r.apply(a).answer_markdown
+    assert f"| רכיב ב | 200 ₪ [S1] | {MARKER_1} |" in out and "| סה״כ (הסכום כולל שורה שחלק ממנה הושמט) | 350 ₪" in out
+
+
+def test_a_component_row_whose_only_data_cell_fails_is_removed_whole_and_qualifies_the_total():
+    """Round 20 U2 (KTD2, R6): with the amount cut, the row would be a label over a marker: no safe partial keep, so the row goes."""
     a = _answer(PARTS)
     r = verify_answer(_claims_judge(lambda t: [("רכיב ב", "supported"), ("200 ₪", "unsupported")] if "רכיב ב" in t
                                     else None), a, _ws(PARTS_SOURCE), "?", [])
     out = r.apply(a).answer_markdown
-    assert f"| רכיב ב | {MARKER_1} [S1] |" in out and "| סה״כ (הסכום כולל שורה שחלק ממנה הושמט) | 350 ₪" in out
+    assert "רכיב ב" not in out and "| סה״כ (הסכום כולל שורה שהוסרה) | 350 ₪" in out and r.removed_units() == {2}
 
 
 def test_a_total_row_is_left_alone_when_every_component_row_stands():
@@ -1633,7 +1648,7 @@ def test_the_judge_policy_names_the_server_held_line_and_the_derived_computation
 # --- the judge contract is version 14: a verdict of an older contract is not reused (round 13 U9, U11, KTD19; round 15 U7; round 16 U1; round 18 U3) --
 
 def test_a_verdict_cached_under_judge_contract_13_misses_under_14(monkeypatch):
-    assert verify.JUDGE_VERSION == 19  # 15: round 18 U4 (the marks of a table part's attribution, rule 32); 16: round 18 U5 (the condition outcome of an item in the requirements call, `conditions`); 17: round 18 U6 (the candidates of the requirements call, `candidates`); 18: round 19 U2 (the `<ownership>` fact line of a unit whose evidence's owner is unknown, rule 34); 19: round 19 U2 (that line also tells of a source of another context cited beside the asked one's)
+    assert verify.JUDGE_VERSION == 20  # 15: round 18 U4 (the marks of a table part's attribution, rule 32); 16: round 18 U5 (the condition outcome of an item in the requirements call, `conditions`); 17: round 18 U6 (the candidates of the requirements call, `candidates`); 18: round 19 U2 (the `<ownership>` fact line of a unit whose evidence's owner is unknown, rule 34); 19: round 19 U2 (that line also tells of a source of another context cited beside the asked one's); 20: round 20 U2 (rule 35: the claims of a table row that holds a defect are its cells)
     ws, a, cache = _valued(), _answer("הנכס פנוי [S1]."), verify.VerdictCache()
     judge, seen = _recording_supported()
     monkeypatch.setattr(verify, "JUDGE_VERSION", 13)
@@ -2003,3 +2018,113 @@ def test_permissions_are_not_touched_a_citation_of_a_source_the_turn_does_not_ho
     (problem,) = verify.deterministic([unit], ws, ws.user_messages[0]["text"])
     assert problem.check == "unknown_id" and problem.failure_kind == "invalid_citation"
     assert not ws.ownership_facts  # no ownership was decided for a unit that cites what is not held
+
+
+# --- round 20 U2: cells of a table row, the reuse context, the mark inside the last cell (KTD2; R5-R7) ---------------------------
+
+@pytest.mark.parametrize("row, cells", [
+    ("| a | b | c |", ["a", "b", "c"]),
+    ("| a |  | c |", ["a", "", "c"]),
+    ("| a | b", ["a", "b"]),
+    ("a | b |", ["a", "b"]),
+    ("| a [S1] | 9,500 ₪ |", ["a [S1]", "9,500 ₪"]),
+])
+def test_the_cells_of_a_table_row_are_its_segments_between_the_bars(row, cells):
+    assert [row[a:b].strip() for a, b in verify.cell_bounds(row)] == cells
+
+
+@pytest.mark.parametrize("line, names", [
+    ("הטבלה מציגה את הנתונים העיקריים של הנכס [S1].", False),
+    ("תאריך השומה הוא 1.1.2020 [S1].", False),
+    ("זכויות הבנייה לפי תכנית ב׳ [S1].", True),
+    ("הנתונים בתכנית 4/ב", True),
+    ("הנתונים של חלקה 12", True),
+    ("השוואה בין נכס א׳ לנכס ב׳", True),
+    ("קבוצת מגרשים ב'", True),
+    ("חלופה 2 לפי ההסכם", True),
+    ("הנתונים במצב המוצע", True),
+    ("הנתונים המאושרים", True),
+    ("תכנית כללית ללא מספר", False),
+])
+def test_a_line_names_a_scope_when_it_gives_a_plan_parcel_contract_alternative_stage_side_or_state(line, names):
+    assert verify.names_scope(line) is names
+
+
+def _row_key(lead: str, header: str = "| נתון | ערך |", heading: str = "") -> str:
+    md = f"{heading}{lead}\n{header}\n|---|---|\n| השווי למ\"ר | 9,500 ₪ [S1] |"
+    row = next(u for u in split_units(md) if "9,500" in u.text)
+    ws = _ws(SOURCE)
+    return verify.unit_key(row, ws, "?", row.heading, {})
+
+
+def test_the_reuse_key_of_a_table_row_holds_its_header_and_the_scope_its_lead_line_names_and_no_other_line():
+    """R7: a verdict is reused when the row, its sources, the table header, the headings and the scope the lead names are the same."""
+    plain = _row_key("הטבלה מציגה את הנתונים העיקריים של הנכס [S1].")
+    assert plain == _row_key("") == _row_key("שורה אחרת לגמרי, בלי תכנית ובלי חלופה.")  # a line that names no scope is left out
+    plan_a, plan_b = _row_key("הנתונים לפי תכנית א׳."), _row_key("הנתונים לפי תכנית ב׳.")
+    assert len({plain, plan_a, plan_b}) == 3  # a lead line that names a plan is part of the key, and so is which plan
+    assert _row_key("הנתונים לפי תכנית א׳.") == _row_key("הנתונים לפי תכנית א׳.")
+    assert _row_key("הטבלה מציגה.", header="| נתון | שווי |") != plain  # the header row is
+    assert _row_key("הטבלה מציגה.", heading="## מצב קיים\n") != _row_key("הטבלה מציגה.", heading="## מצב מוצע\n")  # so is the heading chain
+
+
+def test_the_partial_mark_of_a_table_row_joins_its_last_cell_before_the_closing_bar():
+    md = "| נתון | ערך | הערה |\n|---|---|---|\n| השווי למ\"ר | 9,500 ₪ [S1] | פנוי |\n| דמי השכירות | 55 ₪ למ\"ר לחודש [S1] | — |"
+    a = _answer(md)
+    r = verify_answer(_judge(lambda t: "partial" if "9,500" in t else "supported"), a, _ws(SOURCE), "?", [])
+    edited = r.edit(a).doc.text
+    row = next(ln for ln in edited.splitlines() if "9,500" in ln)
+    assert row == "| השווי למ\"ר | 9,500 ₪ [S1] | פנוי *(אומת חלקית)* |"
+    assert len(verify.cell_bounds(row)) == 3
+    assert [s.kind for s in r.edit(a).doc.spans()] == ["partial_mark"]
+
+
+def test_the_partial_mark_of_a_sentence_still_joins_its_end():
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1].")
+    r = verify_answer(_judge(lambda t: "partial"), a, _ws(SOURCE), "?", [])
+    assert r.edit(a).doc.text == "השווי למ\"ר הוא 9,500 ₪ [S1]. *(אומת חלקית)*"
+
+
+COUNT_SOURCE = "בפרויקט כ-59 דירות. השווי למ\"ר הוא 9,500 ₪."
+
+
+def test_an_approximate_count_is_written_as_approximate_and_the_row_is_not_removed():
+    """Z08: the source writes a count with an approximation sign and the answer omits it; the server writes the qualifier beside the
+    count (it never wrote it for a count), so the judge reads "about 59" and does not find "59" overstated."""
+    md = "| נתון | ערך |\n|---|---|\n| מספר הדירות | 59 דירות [S1] |"
+    a = _answer(md)
+    r = verify_answer(_judge(lambda t: "supported"), a, _ws(COUNT_SOURCE), "?", [])
+    row = next(ln for ln in r.edit(a).doc.text.splitlines() if "59" in ln)
+    assert row == "| מספר הדירות | 59 דירות (מקורב, כפי שנכתב במקור) [S1] |", row
+    assert r.removed_units() == set()
+
+
+def test_a_period_is_still_never_written_after_a_count():
+    md = "| נתון | ערך |\n|---|---|\n| מספר הדירות | 59 דירות [S1] |"
+    a = _answer(md)
+    r = verify_answer(_judge(lambda t: "supported"), a, _ws("בפרויקט 59 דירות. הכנסה חודשית של 100 ₪."), "?", [])
+    assert "לחודש" not in r.edit(a).doc.text
+
+
+PART_SOURCE = "טבלת רכיבים: רכיב א 100 ₪, רכיב ב 200 ₪."
+
+
+def test_protection_an_unsupported_number_in_a_cell_of_a_row_that_stands_is_still_cut():
+    """A number no cited source states is cut with only its own cell's span; the supported cells stay."""
+    a = _answer("| רכיב | סכום | הערה |\n|---|---|---|\n| רכיב א | 100 ₪ [S1] | 777 ₪ [S1] |")
+    r = verify_answer(_claims_judge(lambda t: [("100 ₪", "supported"), ("777 ₪", "unsupported")] if "רכיב א" in t else None),
+                      a, _ws(PART_SOURCE), "?", [])
+    out = r.apply(a).answer_markdown
+    assert "777" not in out and f"| רכיב א | 100 ₪ [S1] | {MARKER_1} [S1] |" in out and r.removed_units() == set()
+
+
+def test_a_cut_of_the_key_cell_or_with_a_qualifier_word_or_a_defect_that_changes_the_row_removes_the_row_instead():
+    head = "| רכיב | סכום | הערה |\n|---|---|---|\n"
+    key = _answer(f"{head}| רכיב ז | 100 ₪ [S1] | תקין |")
+    r = verify_answer(_claims_judge(lambda t: [("רכיב ז", "unsupported"), ("100 ₪", "supported")] if "רכיב ז" in t else None),
+                      key, _ws(PART_SOURCE), "?", [])
+    assert r.removed_units() == {1} and "100" not in r.apply(key).answer_markdown
+    qual = _answer(f"{head}| רכיב א | 100 ₪ [S1] | בכפוף לאישור [S1] |")
+    r = verify_answer(_claims_judge(lambda t: [("100 ₪", "supported"), ("בכפוף לאישור", "unsupported")] if "רכיב א" in t else None),
+                      qual, _ws(PART_SOURCE), "?", [])
+    assert r.removed_units() == {1}
