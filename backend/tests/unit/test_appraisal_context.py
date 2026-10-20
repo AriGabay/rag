@@ -1221,3 +1221,117 @@ def test_the_value_hint_calls_a_value_another_propertys_only_when_the_identities
         value = SimpleNamespace(context={"described": cx.describe(number), "number": number}, subject_from="", subject="")
         lines = tools._context_lines(ws, cx, value)
         assert any("אינו ערך של הנכס שנשאל עליו" in x for x in lines) is said, (number, lines)
+
+
+# --- a unit whose own name contains the asked property's name is not another property (round 19 U2, KTD2) ----------------------
+
+ASKED_NAMES = ("ביג הדסים כרמים", "דרך השקד", "חלקה מספר 12 בגוש 34567")
+
+
+def _overlap_file(next_title: str, next_ident: dict | None = None, asked_ident: dict | None = None,
+                  aliases: tuple = ()) -> contexts.Contexts:
+    """Unit 1: the asked property (the invented «ביג הדסים כרמים»: its project name, its street and its parcel as names, plus
+    ``asked_ident``). Unit 2: a later appraisal context cut by a false subject line, named ``next_title`` (and ``aliases``) and
+    stating ``next_ident`` (the stored identification)."""
+    parts = [_unit(1, "appraisal", ASKED_NAMES[0], ASKED_NAMES[1:], first=0, last=7, pages=(1, 2),
+                   identifiers=asked_ident if asked_ident is not None else {}),
+             _unit(2, "appraisal", next_title, aliases, first=8, last=15, pages=(3, 4), signals=("subject_line",),
+                   identifiers=next_ident if next_ident is not None else {})]
+    first = {8: SimpleNamespace(block_index=8, page=3, bbox=[50.0, 40.0, 500.0, 52.0])}
+    return contexts.from_units(parts, first, [4, 9], "v", "r1")
+
+
+def test_a_unit_whose_own_name_contains_the_asked_propertys_whole_name_is_the_same_property(enforced):
+    cx = _overlap_file("מתחם ביג הדסים כרמים")
+    assert cx.identity(2).names == (contexts.name_key("מתחם ביג הדסים כרמים"),)
+    assert not cx._distinguishing[2].empty  # the name is no other unit's, so it used to be a conflicting identity
+    assert cx._overlaps(2, {1})
+    assert cx.compare(2, [1]) == contexts.SAME
+    assert cx.compare(2, [1], complete=False) == contexts.SAME
+    assert _overlap_file("פרויקט ביג הדסים כרמים").compare(2, [1]) == contexts.SAME  # another kind word, the same property
+    # a cited text that writes the unit's own name only (it names the unit, not the asked context) disagrees with the unit's identity
+    assert cx.compare(2, [1], spans=["מתחם ביג הדסים כרמים"]) == contexts.UNKNOWN
+    # the asked context also states a parcel: the unit's name overlapping the asked one's still conflicts with nothing
+    third = _overlap_file("מתחם ביג הדסים כרמים", asked_ident=_ident("", ("34567", "12")))
+    assert third.compare(2, [1]) == contexts.SAME
+
+
+def test_a_value_of_the_unit_naming_the_asked_property_inside_its_name_is_not_removed(enforced):
+    cx = _overlap_file("מתחם ביג הדסים כרמים")
+    found = _owned(cx, 2, "שווי הנכס בגישת ההשוואה 610,000 ₪.", claim="שווי הנכס ביג הדסים כרמים הוא 610,000 ₪",
+                   question="מה שווי ביג הדסים כרמים?")
+    assert found.reason is None and found.facts == []
+
+
+def test_protection_a_unit_sharing_only_a_brand_word_with_the_asked_property_is_still_another_property(enforced):
+    cx = _overlap_file("מרכז מסחרי ביג עמק הזית")
+    assert not cx._overlaps(2, {1})
+    assert cx.compare(2, [1]) == contexts.DIFFERENT
+    assert cx.compare(2, [1], complete=False) == contexts.UNKNOWN
+    # the asked name inside a longer one that adds a word naming something (a city, a stage) is another property, as is the reverse
+    assert _overlap_file("ביג הדסים כרמים נחל הזית").compare(2, [1]) == contexts.DIFFERENT
+    assert _overlap_file("ביג הדסים").compare(2, [1]) == contexts.DIFFERENT
+    # a single contained word never counts, whichever name holds it
+    assert _overlap_file("ביג").compare(2, [1]) == contexts.DIFFERENT
+    # the same two words in another order or with a word between them are no whole word sequence
+    assert _overlap_file("מתחם ביג כרמים הדסים").compare(2, [1]) == contexts.DIFFERENT
+    assert _overlap_file("מתחם ביג הדסים נחל כרמים").compare(2, [1]) == contexts.DIFFERENT
+
+
+def test_protection_a_unit_with_another_parcel_is_still_another_property(enforced):
+    cx = _overlap_file("פרויקט נחל הלוטם", _ident("הלוטם 9", ("34567", "31")), asked_ident=_ident("השקד 3", ("34567", "12")))
+    assert not cx._overlaps(2, {1})
+    assert cx.compare(2, [1]) == contexts.DIFFERENT
+    found = _owned(cx, 2, "שווי הנכס בגישת ההשוואה 610,000 ₪.", claim="שווי הנכס ביג הדסים כרמים הוא 610,000 ₪",
+                   question="מה שווי ביג הדסים כרמים?")
+    assert found.reason
+
+
+def test_a_unit_that_shares_the_asked_parcel_or_address_is_not_another_property(enforced):
+    asked = _ident("השקד 3", ("34567", "12"))
+    for ident in (_ident("", ("34567", "12")), _ident("השקד 3"), _ident("הלוטם 9", ("34567", "12"))):
+        cx = _overlap_file("פרויקט נחל הלוטם", ident, asked_ident=asked)
+        assert cx._overlaps(2, {1}), ident
+        assert cx.compare(2, [1]) == contexts.SAME, ident
+    # a street the buildings of a project share is no proof when each states another parcel
+    assert _overlap_file("פרויקט נחל הלוטם", _ident("השקד 3", ("34567", "30")), asked_ident=asked).compare(2, [1]) == contexts.DIFFERENT
+    # a name that is the unit's alone and no word sequence of the asked property's is still another property's
+    assert _overlap_file("פרויקט נחל הלוטם", _ident("", ("34567", "30")), asked_ident=asked).compare(2, [1]) == contexts.DIFFERENT
+
+
+# --- a claim that cites a source of its own side is not removed for another cited source of the other side (round 19 U2, KTD2) ----
+
+def _cites(cx, sources: dict[str, tuple[int, str]], claim: str = OWNER_CLAIM, question: str = ASK_OWNER):
+    """The context check of a claim citing the passages ``sources`` ({id: (context number, text)})."""
+    from app.chat import verify
+
+    ws = _declared_ws(cx, {}, question, sources={i: _passage(n, t) for i, (n, t) in sources.items()})
+    return verify._context_check(verify.Unit(0, f"{claim} [{', '.join(sources)}].", claim, list(sources)), ws, question)
+
+
+OWN_SOURCE = (1, "הכנסה נטו שנתית 610,000 ₪.")
+OTHER_SOURCE = (3, "גוש 40100 חלקה 31: הכנסה נטו שנתית 610,000 ₪.")
+
+
+def test_a_claim_citing_a_source_of_the_asked_property_and_one_of_another_is_kept_with_a_fact_for_the_judge(enforced):
+    cx = _ownership_file()
+    found = _cites(cx, {"S3": OTHER_SOURCE, "S25": OWN_SOURCE, "S23": OWN_SOURCE})
+    assert found.reason is None
+    assert len(found.facts) == 1  # one neutral line, no verdict
+    assert "S3" in found.facts[0] and cx.describe(3) in found.facts[0] and cx.describe(1) in found.facts[0]
+    assert "S25" in found.facts[0] and "S23" in found.facts[0]  # it names the sources of the asked side as well
+    # the order of the citations decides nothing
+    assert _cites(cx, {"S25": OWN_SOURCE, "S3": OTHER_SOURCE}).reason is None
+
+
+def test_protection_a_claim_citing_only_sources_of_another_property_is_still_removed(enforced):
+    cx = _ownership_file()
+    found = _cites(cx, {"S3": OTHER_SOURCE})
+    assert found.reason and cx.describe(3) in found.reason and cx.describe(1) in found.reason
+    assert _cites(cx, {"S3": OTHER_SOURCE, "S4": (3, "גוש 40100 חלקה 31: שכירות 610,000 ₪.")}).reason  # two sources, both the other's
+
+
+def test_a_claim_citing_only_a_source_of_the_asked_property_has_nothing_to_report(enforced):
+    cx = _ownership_file()
+    found = _cites(cx, {"S25": OWN_SOURCE})
+    assert found.reason is None and found.facts == []

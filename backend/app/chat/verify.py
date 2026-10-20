@@ -296,7 +296,8 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # ``<candidates>`` offers the siblings of what the answer draws on (a table's other rows, a list's other members, a passage's other
 # value-bearing sentences) and a requirement names the ones it asks for with the request words they answer (``candidates``).
 # 18 (round 19 U2, KTD2): a unit whose evidence's owner the context check could not settle is shown with a neutral ``<ownership>`` fact line; rule (34) reads it.
-JUDGE_VERSION = 18
+# 19 (round 19 U2, KTD2): the same line also says that a unit cites a source of another context beside sources of the asked one (``MSG_OWNER_MIXED``).
+JUDGE_VERSION = 19
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -5455,7 +5456,9 @@ def _context_check(u: Unit, ws: Workspace, question: str) -> ContextCheck:
     The evidence's owner is then compared with the asked set (``Contexts.compare``: the cited text's own names, parcels and
     addresses, the unit's identity — a noise heading is none —, a link, established continuity): only DIFFERENT removes. SAME keeps;
     UNKNOWN (no identity says whom it belongs to, or the asked side did not fully resolve) never removes deterministically and
-    adds a neutral fact line to the judge's input, which already judges the unit. A value, measurement or source of another context
+    adds a neutral fact line to the judge's input, which already judges the unit. Every cited evidence is evaluated before anything is
+    removed: a unit that cites a source of the asked property beside a source of another context is never removed deterministically
+    (``MSG_OWNER_MIXED`` tells the judge); it is removed only when ALL the evidence that reached a decision is DIFFERENT. A value, measurement or source of another context
     whose identity is another property's, or a calculation none of whose inputs is of the asked context, is another property's
     figure — the file, its title or the conversation's focus never prove otherwise. Only a subject context counts as elsewhere:
     evidence in an appendix or a comparables part belongs to the appraisal it serves and is left to the judge — except a value there
@@ -5490,12 +5493,17 @@ def _context_check(u: Unit, ws: Workspace, question: str) -> ContextCheck:
 
 def _check_evidence(u: Unit, names_from: str, ws: Workspace, question: str, heading: str = "") -> ContextCheck:
     """``_context_check`` of the evidence ``u`` cites; ``names_from``: the words of the claim that name its property (a table
-    row's, when ``u`` is one cell of it); ``heading``: the heading of the column of a cell (the side it is attributed to)."""
+    row's, when ``u`` is one cell of it); ``heading``: the heading of the column of a cell (the side it is attributed to). Removes only when
+    every cited evidence that reached a decision is another property's (round 19 U2, KTD2): the evidence is all looked at first."""
     from app.chat import contexts
     from app.chat.contexts import DIFFERENT, SAME, Identity
     from app.chat.tools import asked_subjects, located_contexts, resolved_sides
 
     out = ContextCheck()
+    # every cited evidence that reached a decision, as (its state, where it is written, what it is, the asked side): the claim is removed
+    # only when ALL of them are another property's — a source of the asked property among them keeps it (round 19 U2, KTD2)
+    decided: list[tuple[str, str, str, str]] = []
+    reasons: list[str] = []
     subjects, from_components = asked_subjects(ws)
     for version, numbers, what, i in _evidence_contexts(u, ws):
         cx = ws.contexts.get(version)
@@ -5547,24 +5555,42 @@ def _check_evidence(u: Unit, names_from: str, ws: Workspace, question: str, head
             if state != SAME and contradicted and not cx.is_subject(n):  # the source places this appendix value on another property
                 state = DIFFERENT if complete else contexts.UNKNOWN
             states.append(state)
+        where = ", ".join(cx.describe(n) for n in sorted(numbers))
         if SAME in states:
+            decided.append((SAME, where, what, ""))
             continue
         if all(x == DIFFERENT for x in states):
             said = (", והתשובה הצהירה על " + ", ".join(cx.describe(n) for n in sorted(declared))
                     if distinctive and declared and not declared & asked else "")
-            out.reason = (f"{what} כתוב ב" + ", ".join(cx.describe(n) for n in sorted(numbers)) + ", והטענה עוסקת ב"
-                          + ", ".join(cx.describe(n) for n in sorted(asked)) + said + ": זה נתון של נכס אחר באותו קובץ. קח את "
-                          "הנתון מההקשר של הנכס שנשאל עליו, או ייחס אותו לנכס שלו")
-            return out
+            asked_where = ", ".join(cx.describe(n) for n in sorted(asked))
+            reasons.append(f"{what} כתוב ב{where}, והטענה עוסקת ב{asked_where}{said}: זה נתון של נכס אחר באותו קובץ. קח את הנתון "
+                           "מההקשר של הנכס שנשאל עליו, או ייחס אותו לנכס שלו")
+            decided.append((DIFFERENT, where, what, asked_where))
+            continue
+        decided.append((contexts.UNKNOWN, where, what, ""))
         out.facts.append(MSG_OWNER_UNKNOWN.format(
-            what=what, where=", ".join(cx.describe(n) for n in sorted(numbers)), asked=", ".join(cx.describe(n) for n in sorted(asked)),
+            what=what, where=where, asked=", ".join(cx.describe(n) for n in sorted(asked)),
             partial=MSG_OWNER_PARTIAL if not complete else ""))
+    different = [d for d in decided if d[0] == DIFFERENT]
+    if not different:
+        return out
+    if len(different) == len(decided):  # every cited evidence that reached a decision is another property's
+        out.reason = reasons[0]
+        return out
+    # a source of the asked property beside one of another: the claim may rest on its own side, so the judge decides (round 19 U2, KTD2)
+    out.facts.append(MSG_OWNER_MIXED.format(
+        what=", ".join(dict.fromkeys(d[2] for d in different)), where="; ".join(dict.fromkeys(d[1] for d in different)),
+        asked=" ו".join(dict.fromkeys(d[3] for d in different)),
+        others=", ".join(dict.fromkeys(d[2] for d in decided if d[0] != DIFFERENT)),
+        elsewhere="; ".join(dict.fromkeys(d[1] for d in decided if d[0] != DIFFERENT))))
     return out
 
 
 MSG_OWNER_UNKNOWN = ("{what} כתוב ב{where}; הטענה עוסקת ב{asked}{partial}. השרת לא מצא בטקסט המצוטט ובזהות היחידה ראיה שמכריעה אם "
                      "הנתון שייך לנכס שנשאל עליו.")
 MSG_OWNER_PARTIAL = " (הנושא שנשאל מורכב, ורק חלקו זוהה בקובץ)"
+MSG_OWNER_MIXED = ("{what} כתוב ב{where}, והטענה עוסקת ב{asked}; אבל הטענה מצטטת גם {others}, שכתוב ב{elsewhere} ולא נקבע שהוא של נכס "
+                   "אחר. מקור אחד של הטענה הוא של הקשר אחר ומקור אחר שלה של הנכס שנשאל עליו, ולכן השרת לא הכריע.")
 
 
 # --- a number derived from the values a unit cites (round 13 U9, KTD9, R12, AE5) -------------------------------------------------

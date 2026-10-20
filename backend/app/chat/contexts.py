@@ -354,12 +354,42 @@ class Contexts:
         from_text = {self.owner(n) for t in spans for n in self.named(t)}
         by_text = SAME if from_text & asked_owners and not from_text - asked_owners else (
             DIFFERENT if from_text - asked_owners and not from_text & asked_owners else None)
-        by_unit = DIFFERENT if self._conflicts(mine, asked) else None
-        if by_text == SAME:
-            return UNKNOWN if by_unit == DIFFERENT else SAME
+        # the unit's own identity: a subject context that shares an address or a parcel with the asked property, or whose name holds the
+        # asked property's whole name (``_overlaps``), is positively the same property, whatever else it names (round 19 U2, KTD2)
+        by_unit = (SAME if self.is_subject(mine) and self._overlaps(mine, asked)
+                   else DIFFERENT if self._conflicts(mine, asked) else None)
+        if by_text == SAME and by_unit == DIFFERENT or by_text == DIFFERENT and by_unit == SAME:
+            return UNKNOWN  # the text and the unit identity disagree
+        if SAME in (by_text, by_unit):
+            return SAME
         if DIFFERENT in (by_text, by_unit):
             return DIFFERENT if complete else UNKNOWN
         return SAME if linked else UNKNOWN
+
+    def _overlaps(self, number: int, asked: Iterable[int]) -> bool:
+        """Whether the identity of context ``number`` (its own, as ``_conflicts`` reads it) overlaps that of any asked context: they share
+        a parcel (or an address, when they state no parcels that differ), or the word sequence of one name holds the other name's whole word sequence and the contained name has at
+        least two words (round 19 U2, KTD2). A unit named «מתחם <project> <town>» where the asked property is «<project> <town>» is the
+        same property, not another one, but «<brand> <city>» beside «<brand>» is (the extra words name something more than a kind of
+        property: ``_generic_word``); a single shared word (a brand) never counts, nor does the same words in another order, nor a name
+        two subject contexts of the file hold (a project word the siblings share; ``_distinguishing``)."""
+        own = self.identity(number) | self.segment(number).lead_identity
+        own_names = self._distinguishing[number].names if number in self.subjects else own.names
+        for n in asked:
+            held = self.identity(n)
+            if own.parcels & held.parcels:
+                return True
+            # a street is shared by the buildings of one project: a shared address overlaps only where the two do not state different parcels
+            if own.addresses & held.addresses and not (own.parcels and held.parcels):
+                return True
+            held_names = self._distinguishing[n].names if n in self.subjects else held.names
+            for mine, theirs in ((a.split(), b.split()) for a in own_names for b in held_names):
+                short, long = sorted((mine, theirs), key=len)
+                for i in range(len(long) - len(short) + 1):
+                    if len(short) >= 2 and long[i:i + len(short)] == short and all(
+                            _generic_word(w) for w in long[:i] + long[i + len(short):]):
+                        return True
+        return False
 
     def _conflicts(self, number: int, asked: set[int]) -> bool:
         """Whether context ``number`` states an identity of its own that conflicts with the asked property ``asked``: the positive
@@ -512,6 +542,15 @@ class Contexts:
         """Whether a free text names subject context ``n`` by one of its DISTINGUISHING addresses or parcels (what
         ``named`` tests before it tests names)."""
         return bool(words) and self.multi and n in self.subjects and self._distinguishing[n].identifier_in(words)
+
+
+# the words of the trade that name a kind of property, never a property: «מתחם» in «מתחם <project> <town>» adds nothing to the name
+GENERIC_DESIGNATORS = frozenset({"מתחם", "מתחמים", "פרויקט", "פרוייקט", "נכס", "שומה", "שומת", "בניין", "מגרש", "אתר", "קומפלקס", "דוח"})
+
+
+def _generic_word(word: str) -> bool:
+    """Whether a word of a name only says what kind of property it is (``GENERIC_DESIGNATORS``, with one prefix letter)."""
+    return word in GENERIC_DESIGNATORS or (len(word) > 2 and word[0] in "הבלמוש" and word[1:] in GENERIC_DESIGNATORS)
 
 
 def _street_key(street: tuple[tuple[str, ...], str, str]) -> tuple[str, str]:

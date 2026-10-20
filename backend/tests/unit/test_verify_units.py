@@ -1633,7 +1633,7 @@ def test_the_judge_policy_names_the_server_held_line_and_the_derived_computation
 # --- the judge contract is version 14: a verdict of an older contract is not reused (round 13 U9, U11, KTD19; round 15 U7; round 16 U1; round 18 U3) --
 
 def test_a_verdict_cached_under_judge_contract_13_misses_under_14(monkeypatch):
-    assert verify.JUDGE_VERSION == 18  # 15: round 18 U4 (the marks of a table part's attribution, rule 32); 16: round 18 U5 (the condition outcome of an item in the requirements call, `conditions`); 17: round 18 U6 (the candidates of the requirements call, `candidates`); 18: round 19 U2 (the `<ownership>` fact line of a unit whose evidence's owner is unknown, rule 34)
+    assert verify.JUDGE_VERSION == 19  # 15: round 18 U4 (the marks of a table part's attribution, rule 32); 16: round 18 U5 (the condition outcome of an item in the requirements call, `conditions`); 17: round 18 U6 (the candidates of the requirements call, `candidates`); 18: round 19 U2 (the `<ownership>` fact line of a unit whose evidence's owner is unknown, rule 34); 19: round 19 U2 (that line also tells of a source of another context cited beside the asked one's)
     ws, a, cache = _valued(), _answer("הנכס פנוי [S1]."), verify.VerdictCache()
     judge, seen = _recording_supported()
     monkeypatch.setattr(verify, "JUDGE_VERSION", 13)
