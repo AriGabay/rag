@@ -8186,11 +8186,269 @@ def write_round19(out: Path, font_dir: Path) -> None:
     print(f"wrote {ROUND19_DIR}/{ROUND19_MANIFEST}")
 
 
+# Synthetic appraisals for the round-20 reproductions of failures the diagnosis found (data attributed to the wrong plan, contract,
+# parcel or side inside the right property; a footnote of one lot group read as the condition of another; a qualifier written into
+# a sentence about two appraisals; a unit titled by name and labelled by address; and a cell order reversed on pages with no
+# Hebrew): a table of building rights of two plans (R20a), a table of lot groups with a footnote marked on one contract (R20b), two
+# parcels with a value each (R20c), two appraisals to compare of which the first states a condition (R20d), two appraisals titled
+# by name and address (R20e), and a Hebrew file written in visual order with pages in English and in numbers only (R20f).
+# Every name, street, parcel, plan, contract and figure is invented.
+
+ROUND20_DIR = "round20"
+ROUND20_MANIFEST = "manifest.json"
+ROUND20_FILES = {
+    "two_plans": "R20a_synthetic_building_rights_two_plans.pdf",
+    "lot_groups": "R20b_synthetic_lot_groups_footnote_on_one_contract.pdf",
+    "parcels": "R20c_synthetic_two_parcels_one_value_each.pdf",
+    "shared_sentence": "R20d_synthetic_two_appraisals_first_with_a_condition.pdf",
+    "name_address": "R20e_synthetic_two_appraisals_titled_by_name_and_address.pdf",
+    "hebrew_visual": "R20f_synthetic_hebrew_visual_order_with_english_and_number_pages.pdf",
+}
+ROUND20_INTRO = ROUND18_INTRO
+ROUND20_TWO_PLANS = {
+    "title": "שומת הדגמה למגרש ברחוב האלון — זכויות בנייה לפי תכנית", "intro": ROUND20_INTRO,
+    "heading": "3. זכויות הבנייה לפי תכנית",
+    "lead": "הטבלה שלהלן מפרטת את זכויות הבנייה בנכס לפי כל אחת משתי התכניות החלות עליו.",
+    "caption": "טבלה 3.1 — זכויות הבנייה לפי תכנית",
+    "headers": ["רכיב", "תכנית ג/11111", "תכנית ג/22222"],
+    # plan A's own figures (second column) and plan B's (third); the service area of plan B (450) is the figure the answer misplaces
+    "rows": [["שטח עיקרי (מ״ר)", "1,200", "1,800"], ["שטח שירות (מ״ר)", "300", "450"], ["מספר קומות", "4", "6"]],
+    "plans": {"a": "תכנית ג/11111", "b": "תכנית ג/22222"},
+}
+ROUND20_LOT_GROUPS = {
+    "title": "שומת הדגמה לשתי קבוצות מגרשים בשכונת הרימון — חוזי חכירה", "intro": ROUND20_INTRO,
+    "heading": "3. קבוצות המגרשים וחוזי החכירה",
+    "lead": "הטבלה שלהלן מפרטת את קבוצות המגרשים ואת חוזה החכירה של כל אחת.",
+    "caption": "טבלה 3.1 — קבוצות מגרשים וחוזי חכירה",
+    "headers": ["קבוצת מגרשים", "חוזה חכירה", "שטח (מ״ר)"],
+    # the footnote mark (a small superscript) stands after the contract of group A only; group B's contract has no mark
+    "rows": [["קבוצה א׳", "חוזה חכירה ראשון", "1,500"], ["קבוצה ב׳", "חוזה חכירה שני", "2,100"]],
+    "marked_row": 0, "marked_column": 1, "mark": "*",
+    "footnote": "התשלום לפי חוזה החכירה הראשון כפוף לאישור מינהל מקרקעי ישראל",
+}
+ROUND20_PARCELS = {
+    "title": "שומת הדגמה לשתי חלקות בגוש 33510 — שווי הקרקע", "intro": ROUND20_INTRO,
+    "heading": "3. שווי הקרקע לפי חלקה",
+    "lines": ["חלקה 12 — שטח 800 מ״ר, שווי הקרקע 3,100,000 ₪.", "חלקה 14 — שטח 950 מ״ר, שווי הקרקע 4,200,000 ₪."],
+    "parcels": [{"parcel": "12", "area": "800", "value": "3,100,000"}, {"parcel": "14", "area": "950", "value": "4,200,000"}],
+}
+ROUND20_SHARED_SENTENCE = {
+    "reports": [
+        {"key": "first", "subject": "שומת מקרקעין — מתחם גבעת האלה", "street": "רחוב האלה 5", "value": "7,300,000",
+         "condition": "בכפוף לאישור התכנית המפורטת"},
+        {"key": "second", "subject": "שומת מקרקעין — פרויקט נחל התלתן", "street": "דרך התלתן 8", "value": "9,150,000",
+         "condition": ""},
+    ],
+}
+ROUND20_NAME_ADDRESS = {
+    # the title restates the address, so a unit's label is its address; the name stays in the title block and the unit's identity
+    "reports": [
+        {"key": "first", "name": "מתחם גבעת הארז", "subject": "שומת מקרקעין — מתחם גבעת הארז, רחוב הארז 9",
+         "street": "רחוב הארז 9", "value": "6,800,000"},
+        {"key": "second", "name": "פרויקט נחל הדס", "subject": "שומת מקרקעין — פרויקט נחל הדס, דרך הדס 3",
+         "street": "דרך הדס 3", "value": "5,100,000"},
+    ],
+}
+ROUND20_HEBREW_VISUAL = {
+    # page 1: Hebrew lines (their final letters give the file its visual orientation); page 2: no Hebrew letter at all
+    "hebrew_lines": ["שומת מקרקעין — מתחם גבעת הדס", "כתובת הנכס: רחוב הדס 4, כפר הדמה", "שווי הנכס נקבע על פי גישת ההשוואה לנכסים דומים בסביבה.",
+                     "הנתונים שלהלן הוצגו בטבלאות לצורך הדגמה בלבד."],
+    "number_line": "1,200 1,450 1,600",
+    "english_heading": "Quarterly revenue by property",
+    "english_headers": ["Item", "Q1 2024", "Q2 2024", "Annual"],
+    "english_rows": [["Revenue", "100", "200", "300"], ["Costs", "40", "50", "90"]],
+    # page 3: a Hebrew table (columns in logical order, the first rightmost)
+    "hebrew_headers": ["סוג שטח", "שטח (מ״ר)", "שווי (₪)"],
+    "hebrew_rows": [["שטח עיקרי", "120", "1,500,000"], ["שטח מרתף", "40", "300,000"]],
+    # page 4: a table of numbers only, with no left-to-right cue
+    "numbers_rows": [["100", "200", "300", "400"], ["500", "600", "700", "800"]],
+}
+
+
+class Round20PdfRenderer(Round19PdfRenderer):
+    """The round-20 documents: the round-19 layouts (a title block, an introduction, ruled tables) and, where a shape needs it,
+    a footnote mark drawn small and raised, two parcels in lines, or a file written in visual order with pages in English."""
+
+    def _marked_row(self, cells: list[str], widths: list[int], column: int, mark: str) -> None:
+        """A ruled row whose cell ``column`` ends with ``mark``, drawn smaller and raised (a footnote mark): the first cell is
+        rightmost; the mark stands at the left end of the cell's text, where a Hebrew text ends."""
+        pdf = self.pdf
+        y = pdf.get_y()
+        x_right = pdf.w - pdf.r_margin
+        cell_x = 0.0
+        for n, (text, width) in enumerate(zip(cells, widths, strict=True)):
+            x_right -= width
+            pdf.set_xy(x_right, y)
+            self._cell_text_fit(text, width, False)
+            pdf.cell(width, self.ROW_H, text, border=1, align="C")
+            if n == column:
+                cell_x = x_right + width / 2 - pdf.get_string_width(text) / 2
+        pdf.set_font("DejaVu", "", 5.5)
+        pdf.text(cell_x - pdf.get_string_width(mark) - 0.4, y + 3.2, mark)
+        pdf.set_font("DejaVu", "", 10.5)
+        pdf.set_xy(pdf.l_margin, y + self.ROW_H)
+
+    def _footnote_line(self, mark: str, text: str) -> None:
+        """A note line under a table: its mark, a space and its text, in the size of a note."""
+        self.pdf.set_font("DejaVu", "", 8.5)
+        self.pdf.cell(0, self.LINE_H, f"{mark} {text}", align="R", new_x=self.XPos.LMARGIN, new_y=self.YPos.NEXT)
+        self.pdf.set_font("DejaVu", "", 10.5)
+
+    def render_two_plans(self) -> bytes:
+        return self._one_table(ROUND20_TWO_PLANS, [60, 60, 60])
+
+    def render_lot_groups(self) -> bytes:
+        spec = ROUND20_LOT_GROUPS
+        widths = [50, 80, 50]
+        self.pdf.add_page()
+        self._opening(spec)
+        self.heading_line(None, spec["heading"])
+        self.body_line(None, spec["lead"])
+        self.placed(None, spec["caption"], bold=True)
+        self.pdf.set_fill_color(225, 225, 225)
+        self.ruled_row(spec["headers"], widths, bold=True)
+        for n, row in enumerate(spec["rows"]):
+            if n == spec["marked_row"]:
+                self._marked_row(row, widths, spec["marked_column"], spec["mark"])
+            else:
+                self.ruled_row(row, widths)
+        self.pdf.ln(2)
+        self._footnote_line(spec["mark"], spec["footnote"])
+        return bytes(self.pdf.output())
+
+    def render_parcels(self) -> bytes:
+        spec = ROUND20_PARCELS
+        self.pdf.add_page()
+        self._opening(spec)
+        self.heading_line(None, spec["heading"])
+        for line in spec["lines"]:
+            self.body_line(None, line)
+        return bytes(self.pdf.output())
+
+    def render_shared_sentence(self) -> bytes:
+        """Two reports (a page each), each opening with a letter and a subject line; the first states its value with a condition."""
+        for r in ROUND20_SHARED_SENTENCE["reports"]:
+            self._page(1)
+            self.opening({"subject": r["subject"], "street": r["street"], "in_table": False})
+            self.heading_line(None, "1. הערכת שווי")
+            self.body_line(None, f"שווי הנכס בגישת ההשוואה הוא {r['value']} ₪" + (f", {r['condition']}." if r["condition"] else "."))
+            self.body_line(None, f"{SYNTHETIC_MARKER} — כל הנתונים בדויים")
+        return bytes(self.pdf.output())
+
+    def render_name_address(self) -> bytes:
+        for r in ROUND20_NAME_ADDRESS["reports"]:
+            self._page(1)
+            self.opening({"subject": r["subject"], "street": r["street"], "in_table": False})
+            self.heading_line(None, "1. הערכת שווי")
+            self.body_line(None, f"שווי הנכס בגישת ההשוואה הוא {r['value']} ₪.")
+            self.body_line(None, f"{SYNTHETIC_MARKER} — כל הנתונים בדויים")
+        return bytes(self.pdf.output())
+
+
+class Round20VisualRenderer(Round20PdfRenderer):
+    """A Hebrew file written in visual order (the text layer holds each Hebrew line reversed), with pages that hold no Hebrew
+    letter: a line of numbers and a table with Latin headers (drawn left to right), and a table of numbers only. Those pages carry
+    no footer, so they hold no Hebrew."""
+
+    def __init__(self, font_dir: Path) -> None:
+        super().__init__(font_dir)
+        self.visual = True
+        self.pdf.visual = True
+        self.pdf.set_text_shaping(use_shaping_engine=False)  # Hebrew is written pre-reversed; Latin and digits are drawn left to right
+
+    def _visual_row(self, cells: list[str], widths: list[int], bold: bool = False) -> None:
+        """A ruled row of Hebrew cells in visual order: the first cell is rightmost, each cell's text pre-reversed."""
+        pdf = self.pdf
+        y = pdf.get_y()
+        x_right = pdf.w - pdf.r_margin
+        for text, width in zip(cells, widths, strict=True):
+            x_right -= width
+            pdf.set_xy(x_right, y)
+            self._cell_text_fit(text, width, bold)
+            pdf.cell(width, self.ROW_H, self._t(text), border=1, align="C", fill=bold)
+        pdf.set_xy(pdf.l_margin, y + self.ROW_H)
+
+    def _left_to_right_row(self, cells: list[str], widths: list[int], bold: bool = False) -> None:
+        """A ruled row of Latin or number cells: the first cell is leftmost."""
+        pdf = self.pdf
+        y = pdf.get_y()
+        x = pdf.l_margin
+        for text, width in zip(cells, widths, strict=True):
+            pdf.set_xy(x, y)
+            self._cell_text_fit(text, width, bold)
+            pdf.cell(width, self.ROW_H, text, border=1, align="C", fill=bold)
+            x += width
+        pdf.set_xy(pdf.l_margin, y + self.ROW_H)
+
+    def _left_line(self, text: str, size: float = 10.5, bold: bool = False) -> None:
+        self.pdf.set_font("DejaVu", "B" if bold else "", size)
+        self.pdf.cell(0, self.LINE_H, text, align="L", new_x=self.XPos.LMARGIN, new_y=self.YPos.NEXT)
+
+    def render_hebrew_visual(self) -> bytes:
+        spec = ROUND20_HEBREW_VISUAL
+        pdf = self.pdf
+        pdf.no_footer_pages = (2, 4)
+        pdf.add_page()
+        for n, line in enumerate(spec["hebrew_lines"]):
+            self.placed(None, line, size=13 if n == 0 else 10.5, bold=n == 0)
+        pdf.add_page()  # page 2: no Hebrew letter
+        self._left_line(spec["english_heading"], bold=True)
+        self._left_line(spec["number_line"])
+        pdf.ln(2)
+        pdf.set_fill_color(225, 225, 225)
+        widths = [45, 45, 45, 45]
+        self._left_to_right_row(spec["english_headers"], widths, bold=True)
+        for row in spec["english_rows"]:
+            self._left_to_right_row(row, widths)
+        pdf.add_page()  # page 3: a Hebrew table
+        self.placed(None, "טבלת שטחים ושווי", bold=True)
+        pdf.set_fill_color(225, 225, 225)
+        self._visual_row(spec["hebrew_headers"], [60, 60, 60], bold=True)
+        for row in spec["hebrew_rows"]:
+            self._visual_row(row, [60, 60, 60])
+        pdf.add_page()  # page 4: numbers only
+        pdf.set_fill_color(225, 225, 225)
+        for row in spec["numbers_rows"]:
+            self._left_to_right_row(row, [45, 45, 45, 45])
+        return bytes(pdf.output())
+
+
+def write_round20(out: Path, font_dir: Path) -> None:
+    """Writes the round-20 PDFs and their ``manifest.json`` (the texts the tests check against)."""
+    rdir = out / ROUND20_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    specs = {"two_plans": (Round20PdfRenderer, "render_two_plans", ROUND20_TWO_PLANS),
+             "lot_groups": (Round20PdfRenderer, "render_lot_groups", ROUND20_LOT_GROUPS),
+             "parcels": (Round20PdfRenderer, "render_parcels", ROUND20_PARCELS),
+             "shared_sentence": (Round20PdfRenderer, "render_shared_sentence", ROUND20_SHARED_SENTENCE),
+             "name_address": (Round20PdfRenderer, "render_name_address", ROUND20_NAME_ADDRESS),
+             "hebrew_visual": (Round20VisualRenderer, "render_hebrew_visual", ROUND20_HEBREW_VISUAL)}
+    documents = {}
+    for key, (renderer, render, spec) in specs.items():
+        data = getattr(renderer(font_dir), render)()
+        name = ROUND20_FILES[key]
+        assert "synthetic" in name
+        (rdir / name).write_bytes(data)
+        documents[key] = {"file": f"{ROUND20_DIR}/{name}"} | spec
+        print(f"wrote {ROUND20_DIR}/{name} ({len(data):,} bytes)")
+    manifest = {
+        "about": f"{SYNTHETIC_MARKER}. Known contents of the round-20 fixtures (R20a: building rights of two plans in one table; "
+                 "R20b: lot groups and a footnote marked on the first contract; R20c: two parcels with a value each; R20d: two "
+                 "appraisals to compare, the first with a condition; R20e: two appraisals titled by name and address; R20f: a Hebrew "
+                 "file in visual order with a page of English and numbers and a page of numbers only): generated by "
+                 "scripts/generate_fixtures.py --only round20 - do not edit by hand. Every name and figure is invented.",
+        "synthetic_marker": SYNTHETIC_MARKER,
+        "documents": documents,
+    }
+    (rdir / ROUND20_MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {ROUND20_DIR}/{ROUND20_MANIFEST}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
-    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11", "round12", "round13", "round14", "round15", "round16", "round17", "round18", "round19"],
+    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11", "round12", "round13", "round14", "round15", "round16", "round17", "round18", "round19", "round20"],
                         default="all",
                         help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
                              "positions: only the page-position fixtures (tests/fixtures/positions/); "
@@ -8217,7 +8475,9 @@ def main() -> None:
                              "round18: only the round-18 meaning, condition and removal fixtures (PDF) and their "
                              "manifest (tests/fixtures/round18/); "
                              "round19: only the round-19 attribution, number-reading and coverage fixtures (PDF) and "
-                             "their manifest (tests/fixtures/round19/)")
+                             "their manifest (tests/fixtures/round19/); "
+                             "round20: only the round-20 attribution, footnote and cell-order fixtures (PDF) and "
+                             "their manifest (tests/fixtures/round20/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
@@ -8269,6 +8529,9 @@ def main() -> None:
         return
     if args.only == "round19":
         write_round19(out, font_dir)
+        return
+    if args.only == "round20":
+        write_round20(out, font_dir)
         return
 
     docs: dict[str, dict[str, Any]] = {}

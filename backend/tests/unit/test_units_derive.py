@@ -564,7 +564,10 @@ MULTI = {"R7b_synthetic_two_appraisals_one_file.pdf": 2, "R9a_synthetic_compendi
          # round 19: the same calculation pages with a title-sized first line (a colon sentence, digit noise) are a second unit,
          # and a third unit is another property of the file; two reports to compare derive two units
          "R19a_synthetic_calculation_pages_sentence_heading.pdf": 3,
-         "R19b_synthetic_calculation_pages_digit_noise_heading.pdf": 3, "R19c_synthetic_two_appraisals_to_compare.pdf": 2}
+         "R19b_synthetic_calculation_pages_digit_noise_heading.pdf": 3, "R19c_synthetic_two_appraisals_to_compare.pdf": 2,
+         # round 20: two appraisals to compare (the first states a condition), and two titled by name and address
+         "R20d_synthetic_two_appraisals_first_with_a_condition.pdf": 2,
+         "R20e_synthetic_two_appraisals_titled_by_name_and_address.pdf": 2}
 SKIPPED = {"R9d_synthetic_long_file_1000_pages.pdf"}  # a thousand pages: its first 50 are read below
 
 
