@@ -8,6 +8,8 @@ from __future__ import annotations
 import uuid
 from decimal import Decimal
 
+import pytest
+
 from app.chat import calc, items
 from app.chat.engine import FINAL_SCHEMA, POLICY, FinalAnswer, LedgerItem
 from app.chat.tools import TABLE_PATH_PREFIX, Workspace, unit_info
@@ -1100,12 +1102,13 @@ def test_a_wider_quote_of_the_same_row_is_one_fill_with_the_narrower_one_and_nev
     two = items.Ledger()
     two.merge([_item(label="שטח", quote=PLAN_QUOTE, value="1,200"), _item(label="שטח כולל", quote=ROW_QUOTE, value="1,200",
                                                                           condition=PLAN_NOTE)])
-    assert len(two.items) == 1
-    (out,) = two.outcomes(_units(markdown), ws)
-    assert out["state"] == "covered"  # not "shared": the row's condition words are not asked of the sentence
+    # round 20 U1 (KTD1): the wider quote adds the row's note as its condition, which the narrower item lacks — another datum, so two fills
+    assert len(two.items) == 2
+    assert {o["label"]: o["state"] for o in two.outcomes(_units(markdown), ws)} == {"שטח": "covered", "שטח כולל": "covered"}
+    # (not "shared": the row's condition words are not asked of the sentence)
 
 
-def test_a_narrower_covered_quote_carries_the_condition_check_and_the_wider_quote_adds_none():
+def test_a_narrower_covered_quote_of_another_component_does_not_carry_the_condition_check_of_the_wider_quote():
     ws = _ws(PLAN_TABLE)
     ledger = items.Ledger()
     # the agent's cell quote for N1 and the server's whole row for N2: two pieces of evidence of one row, checked once
@@ -1113,7 +1116,9 @@ def test_a_narrower_covered_quote_carries_the_condition_check_and_the_wider_quot
     ledger.merge(items.source_items(_units(ROW_BOTH), ws, ROW_ASK, ledger), version=1)
     by = _by_component(ledger, ROW_BOTH, ws)
     assert by["N1"]["evidence_id"] != by["N2"]["evidence_id"] and by["N2"]["quote"] == ROW_QUOTE
-    assert by["N1"]["condition_check"] == "kept" and by["N2"]["condition_check"] == ""  # the second sentence states the row's condition
+    # round 20 U1 (KTD1): a narrow item of another component defers nothing, so each checks the row's condition itself; the second
+    # sentence states it
+    assert by["N1"]["condition_check"] == "kept" and by["N2"]["condition_check"] == "kept"
 
 
 # --- round 19 U4: one coverage decision over the final answer, by block (KTD4; R13-R17; AE7) --------------------------------------
@@ -1416,3 +1421,222 @@ def test_twins_that_share_their_date_and_differ_by_a_word_still_need_that_word()
         ["תשלום עבור חניה", "תשלום עבור מחסן"], "covered")
     only_one = state("הדייר ישלם 5% ביום 1.1.2024 עבור חניה [S1].")
     assert only_one["תשלום עבור חניה"] == "covered" and only_one["תשלום עבור מחסן"] != "covered"
+
+
+# --- round 20 U1: the same-datum gate of the ledger (KTD1; R1-R4; AE1-AE3) ---------------------------------------------------------
+# Overlapping or nested quotes alone never make two items one: two overlapping fills are one only when they state the same datum
+# (headline values, dates, position and condition words). Synthetic text and figures only.
+
+FEES = "דמי הניהול הם 6.5% מהשכירות החל מיום 1.1.2025. דמי השיפוץ הם 7.0% מהשכירות החל מיום 1.7.2025."
+FEES_A = "דמי הניהול הם 6.5% מהשכירות החל מיום 1.1.2025"
+FEES_B = "דמי השיפוץ הם 7.0% מהשכירות החל מיום 1.7.2025"
+FEES_ANSWER = "דמי הניהול הם 6.5% החל מיום 1.1.2025 [S1]."
+
+
+def _fee(label: str, quote: str, value: str, condition: str = "", **kw) -> dict:
+    return _raw(label=label, quote=quote, value=value, condition=condition, **kw)
+
+
+def _fills(ledger: items.Ledger) -> dict[str, tuple[str, str]]:
+    """The fills of the ledger by label: (value, state)."""
+    return {i.label: (i.value, i.state) for i in ledger.items.values()}
+
+
+@pytest.mark.parametrize("narrow_first", [True, False], ids=["narrow-first", "wide-first"])
+def test_two_values_in_one_paragraph_declared_narrow_and_wide_in_one_batch_are_two_items_each_with_its_own_value(narrow_first):
+    ws = _ws(FEES, kind="paragraph")
+    ledger = items.Ledger()
+    narrow, wide = _fee("דמי הניהול", FEES_A, "6.5%"), _fee("דמי השיפוץ", FEES, "7.0%")
+    kept = _declared(ws, FEES_ANSWER, ledger, *((narrow, wide) if narrow_first else (wide, narrow)), components=COMPONENTS)
+    assert _fills(ledger) == {"דמי הניהול": ("6.5%", "included"), "דמי השיפוץ": ("7.0%", "included")}
+    assert len({i.id for i in kept}) == 2 == len({i.id for i in ledger.items.values()})  # two fills, two ids
+    by_label = {i.label: i for i in ledger.items.values()}
+    assert by_label["דמי הניהול"].quote == FEES_A and by_label["דמי השיפוץ"].quote == FEES  # no fill carries another datum's quote
+
+
+@pytest.mark.parametrize("order", [(0, 1, 2), (2, 1, 0), (1, 2, 0), (1, 0, 2)])
+def test_nested_quotes_in_the_same_batch_stay_separate_items_whatever_the_order(order):
+    ws = _ws(FEES, kind="paragraph")
+    ledger = items.Ledger()
+    given = [_fee("דמי הניהול", FEES_A, "6.5%"), _fee("דמי השיפוץ", FEES_B, "7.0%"), _fee("שני הדמים", FEES, "6.5%; 7.0%")]
+    _declared(ws, FEES_ANSWER, ledger, *(given[i] for i in order), components=COMPONENTS)
+    assert _fills(ledger) == {"דמי הניהול": ("6.5%", "included"), "דמי השיפוץ": ("7.0%", "included"),
+                              "שני הדמים": ("6.5%; 7.0%", "included")}
+
+
+def test_an_aggregate_item_beside_its_parts_does_not_absorb_a_part():
+    ws = _ws(FEES, kind="paragraph")
+    for parts_first in (True, False):
+        ledger = items.Ledger()
+        parts = [_fee("דמי הניהול", FEES_A, "6.5%"), _fee("דמי השיפוץ", FEES_B, "7.0%")]
+        total = _fee("סך הדמים", FEES, "6.5%; 7.0%")
+        _declared(ws, FEES_ANSWER, ledger, *((*parts, total) if parts_first else (total, *parts)), components=COMPONENTS)
+        assert len(ledger.items) == 3, (parts_first, _fills(ledger))
+
+
+def test_several_payments_in_one_quote_declared_separately_are_one_item_each_with_its_own_date():
+    ws = _ws(FEES, kind="paragraph")
+    ledger = items.Ledger()
+    kept = _declared(ws, FEES_ANSWER, ledger, _fee("דמי הניהול", FEES, "6.5% מהשכירות", "החל מיום 1.1.2025"),
+                     _fee("דמי השיפוץ", FEES, "7.0% מהשכירות", "החל מיום 1.7.2025"), components=COMPONENTS)
+    assert len(kept) == 2  # the same quote is no duplicate when the datum differs (value and date)
+    assert _fills(ledger) == {"דמי הניהול": ("6.5% מהשכירות", "included"), "דמי השיפוץ": ("7.0% מהשכירות", "included")}
+    assert len({i.id for i in ledger.items.values()}) == 2 and len({i.key for i in ledger.items.values()}) == 2
+    assert {i.evidence for i in ledger.items.values()} == {kept[0].evidence}  # one evidence, two fills
+
+
+def test_identical_values_with_different_conditions_are_two_items_and_a_closed_decision_does_not_move_to_the_other():
+    rights = "השטח העיקרי הוא 1,200 מ״ר רק על פי תכנית מאושרת, והשטח העיקרי הוא 1,200 מ״ר רק לאחר פינוי המגרש."
+    approved = "השטח העיקרי הוא 1,200 מ״ר רק על פי תכנית מאושרת"
+    ws = _ws(rights, kind="paragraph")
+    ledger = items.Ledger()
+    answer = "השטח העיקרי הוא 1,200 מ״ר [S1]."
+    _declared(ws, answer, ledger, _fee("לפי תכנית מאושרת", approved, "1,200 מ״ר", "רק על פי תכנית מאושרת", state="not_applicable",
+                                       reason="התכנית המאושרת אינה חלה"), components=COMPONENTS, version=1)
+    _declared(ws, answer, ledger, _fee("לאחר פינוי", rights, "1,200 מ״ר", "רק לאחר פינוי המגרש"), components=COMPONENTS, version=2)
+    assert sorted((i.condition, i.state) for i in ledger.items.values()) == [("רק לאחר פינוי המגרש", "included"),
+                                                                              ("רק על פי תכנית מאושרת", "not_applicable")]
+    # the same pair in one batch, in both orders
+    for order in (1, -1):
+        both = items.Ledger()
+        _declared(ws, answer, both, *[_fee("לפי תכנית מאושרת", approved, "1,200 מ״ר", "רק על פי תכנית מאושרת", state="not_applicable",
+                                          reason="התכנית המאושרת אינה חלה"),
+                                      _fee("לאחר פינוי", rights, "1,200 מ״ר", "רק לאחר פינוי המגרש")][::order], components=COMPONENTS)
+        assert sorted((i.condition, i.state) for i in both.items.values()) == [("רק לאחר פינוי המגרש", "included"),
+                                                                                ("רק על פי תכנית מאושרת", "not_applicable")]
+
+
+def test_a_later_version_that_rewords_the_same_datum_is_one_item_with_its_history_and_the_first_fingerprint():
+    ws = _ws(FEES, kind="paragraph")
+    ledger = items.Ledger()
+    _declared(ws, FEES_ANSWER, ledger, _fee("דמי הניהול", FEES_A, "6.5%", "רק לשנה הראשונה"), components=COMPONENTS, version=1)
+    (first,) = ledger.items.values()
+    frozen = first.datum
+    assert frozen is not None
+    reworded = "דמי הניהול הם 6.5% מהשכירות החל מיום 1.1.2025"
+    _declared(ws, FEES_ANSWER, ledger, _fee("שיעור דמי הניהול", reworded, "6.5% מהשכירות", "רק לשנה הראשונה"), components=COMPONENTS, version=2)
+    (only,) = ledger.items.values()
+    assert only is first and only.label == "שיעור דמי הניהול" and only.value == "6.5% מהשכירות"
+    assert [h["version"] for h in only.history] == [1, 2] and only.datum is frozen  # `_declare` never recomputes the fingerprint
+    assert only.superseded_by == ""
+
+
+def test_a_condition_added_in_version_two_leaves_one_open_item_and_version_ones_is_superseded_without_a_gap_line():
+    ws = _ws(FEES, kind="paragraph")
+    ledger = items.Ledger()
+    _declared(ws, FEES_ANSWER, ledger, _fee("דמי הניהול", FEES_A, "6.5%"), components=COMPONENTS, version=1)
+    _declared(ws, FEES_ANSWER, ledger, _fee("דמי הניהול", FEES_A, "6.5%", "רק לשנה הראשונה"), components=COMPONENTS, version=2)
+    assert len(ledger.items) == 2
+    older, newer = ledger.items.values()
+    assert older.superseded_by == newer.id and older.condition == "" and newer.condition == "רק לשנה הראשונה"
+    assert older.id != newer.id
+    # the answer states the figure: the one open (here covered) item is version two's, nothing is scored for version one's
+    rows = ledger.outcomes(_units(FEES_ANSWER), ws)
+    assert [(r["id"], r["state"]) for r in rows] == [(newer.id, "covered")]
+    # an answer that states neither: one gap, version two's
+    rows = ledger.outcomes(_units("השכירות נקבעת בחוזה [S1]."), ws)
+    assert [(r["id"], r["state"]) for r in rows] == [(newer.id, "omitted")]
+
+
+def test_an_item_the_latest_version_lists_with_the_same_datum_is_not_superseded_and_a_dropped_closed_decision_stays_closed():
+    ws = _ws(FEES, kind="paragraph")
+    ledger = items.Ledger()
+    _declared(ws, FEES_ANSWER, ledger, _fee("דמי הניהול", FEES_A, "6.5%"),
+              _fee("דמי השיפוץ", FEES_B, "7.0%", state="not_verifiable", reason="המקור נקרא בקריאה לא ודאית"), components=COMPONENTS, version=1)
+    _declared(ws, FEES_ANSWER, ledger, _fee("דמי הניהול", FEES, "6.5%; 7.0%"), components=COMPONENTS, version=2)
+    closed = [i for i in ledger.items.values() if i.state == "not_verifiable"]
+    assert len(closed) == 1 and closed[0].superseded_by == ""  # a closed decision is not scored away by a later wide item
+
+
+def test_the_same_value_date_and_condition_on_different_source_blocks_are_two_items():
+    row = "גיל הבניין | 2% | כאשר הבניין מעל גיל 30 שנה"
+    ws = _ws(row, row, same_file=True)
+    ws.sources["S1"].table_index, ws.sources["S2"].table_index = 1, 2
+    ledger = items.Ledger()
+    kept = _declared(ws, "ההתאמה לגיל הבניין היא 2% [S1] [S2].", ledger,
+                     _raw(quote="גיל הבניין | 2% | כאשר הבניין מעל גיל 30 שנה", value="2%", condition="כאשר הבניין מעל גיל 30 שנה"),
+                     _raw(source="S2", quote="גיל הבניין | 2% | כאשר הבניין מעל גיל 30 שנה", value="2%",
+                          condition="כאשר הבניין מעל גיל 30 שנה"), components=COMPONENTS)
+    assert len(kept) == 2 and len(ledger.items) == 2 and kept[0].id != kept[1].id
+    # on the same block, the same datum is one item
+    one = items.Ledger()
+    ws.sources["S2"].table_index = 1
+    _declared(ws, "ההתאמה לגיל הבניין היא 2% [S1] [S2].", one,
+              _raw(quote="גיל הבניין | 2%", value="2%"), _raw(source="S2", quote="גיל הבניין | 2%", value="2%"), components=COMPONENTS)
+    assert len(one.items) == 1
+
+
+def test_a_server_candidate_beside_an_agent_item_of_a_different_datum_is_kept_and_beside_the_same_datum_is_dropped():
+    ws = _ws(FEES, kind="paragraph")
+    ledger = items.Ledger()
+    _declared(ws, FEES_ANSWER, ledger, _fee("דמי הניהול", FEES, "6.5%"), components=COMPONENTS)
+    judged = items.support_item("N1", "S1", FEES_B, ledger, ws=ws)  # the judge's support: the other fee, 7.0%
+    ledger.merge([judged])
+    assert len(ledger.items) == 2 and judged.state == items.OMITTED  # a different datum is no echo of the agent's wide item
+    other = items.Ledger()
+    _declared(ws, FEES_ANSWER, other, _fee("דמי הניהול", FEES_A, "6.5%"), components=COMPONENTS)
+    other.merge([items.support_item("N1", "S1", FEES_B, other, ws=ws)])  # beside the narrow item: the other fee is kept as well
+    assert len(other.items) == 2
+    echo = items.Ledger()
+    _declared(ws, FEES_ANSWER, echo, _fee("דמי הניהול", FEES, "6.5%"), components=COMPONENTS)
+    echo.merge([items.support_item("N1", "S1", FEES_A, echo, ws=ws)])  # the same figure in the same passage
+    assert len(echo.items) == 1
+
+
+def test_a_narrow_covered_item_of_another_component_does_not_defer_the_wide_items_condition_check():
+    paragraph = "דמי הניהול הם 5% מהשכירות. השיעור חל רק על חוזה מעל 5 שנים."
+    ws = _ws(paragraph, kind="paragraph")
+    asked = [{"id": "N1", "text": "דמי הניהול"}, {"id": "N2", "text": "שיעור דמי הניהול"}]
+    answer = "דמי הניהול הם 5% [S1]."
+
+    def checks(narrow_component: str) -> dict[str, dict]:
+        ledger = items.Ledger()
+        _declared(ws, answer, ledger, _raw(label="דמי הניהול", quote=paragraph, value="5%", condition="חל רק על חוזה מעל 5 שנים"),
+                  _raw(component=narrow_component, label="שיעור", quote="דמי הניהול הם 5% מהשכירות", value="5%"), components=asked)
+        return {o["quote"]: o for o in ledger.outcomes(_units(answer), ws)}
+
+    other = checks("N2")
+    assert other[paragraph]["condition_check"] != "", other[paragraph]  # the wide item's condition is checked: not deferred across components
+    same = checks("N1")
+    assert same[paragraph]["condition_check"] != "", same[paragraph]  # nor to a narrow item of another datum (a condition the narrow lacks)
+
+
+def test_protection_a_true_duplicate_is_one_item_in_a_batch_and_across_versions():
+    ws = _ws(FEES, kind="paragraph")
+    ledger = items.Ledger()
+    res = _validate(ws, FEES_ANSWER, _fee("דמי הניהול", FEES_A, "6.5%"), _fee("דמי הניהול", FEES_A, "6.5%"), components=COMPONENTS, ledger=ledger)
+    assert len(res.kept) == 1 and [e["reason"] for e in res.excluded] == ["duplicate"]
+    ledger.merge(res.kept, version=1)
+    _declared(ws, FEES_ANSWER, ledger, _fee("דמי הניהול", FEES_A, "6.5%"), components=COMPONENTS, version=2)
+    (only,) = ledger.items.values()
+    assert only.id == "I1" and only.last_version == 2 and only.superseded_by == ""
+
+
+def test_a_wide_item_defers_its_condition_check_to_a_covered_narrow_item_of_the_same_component_datum_and_sentence():
+    narrow_quote = "דמי הניהול הם 5% מהשכירות רק בשנה הראשונה"
+    other_quote = "דמי הניהול בחוזה ארוך הם 6% מהשכירות"
+    paragraph = f"{narrow_quote}. {other_quote}."
+    ws = _ws(paragraph, kind="paragraph")
+    answer = "דמי הניהול הם 5% מהשכירות [S1]."
+    ledger = items.Ledger()
+    # two narrow fills inside the wide quote: the wide item has no single twin, but it states the first narrow item's datum
+    _declared(ws, answer, ledger, _raw(label="דמי הניהול", quote=narrow_quote, value="5%"),
+              _raw(label="דמי הניהול בחוזה ארוך", quote=other_quote, value="6%"),
+              _raw(label="דמי הניהול הכוללים", quote=paragraph, value="5%"), components=COMPONENTS)
+    assert len(ledger.items) == 3
+    checks = {o["label"]: o["condition_check"] for o in ledger.outcomes(_units(answer), ws)}
+    assert checks["דמי הניהול"] == "missing"  # the narrow item's span ("only in the first year") is left out of the sentence
+    assert checks["דמי הניהול הכוללים"] == ""  # the wide item adds no second check of the same span
+
+
+def test_a_superseded_item_a_later_version_lists_again_is_scored_again():
+    ws = _ws(FEES, kind="paragraph")
+    ledger = items.Ledger()
+    _declared(ws, FEES_ANSWER, ledger, _fee("דמי הניהול", FEES_A, "6.5%"), components=COMPONENTS, version=1)
+    _declared(ws, FEES_ANSWER, ledger, _fee("דמי הניהול", FEES_A, "6.5%", "רק לשנה הראשונה"), components=COMPONENTS, version=2)
+    older, newer = ledger.items.values()
+    assert older.superseded_by == newer.id
+    _declared(ws, "השכירות נקבעת בחוזה [S1].", ledger, _fee("דמי הניהול", FEES_A, "6.5%"), components=COMPONENTS, version=3)
+    assert older.superseded_by == "" and older.last_version == 3 and older.id == "I1"
+    # both are scored (omitted) now: version 2's item, not listed again, closes nothing
+    assert [r["id"] for r in ledger.outcomes(_units("השכירות נקבעת בחוזה [S1]."), ws)] == ["I1", "I2"]

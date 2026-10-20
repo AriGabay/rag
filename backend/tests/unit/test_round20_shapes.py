@@ -187,7 +187,6 @@ def ledger_ws(text: str):
     return ws
 
 
-@strict_xfail("U1", "two items with nested quotes in one batch merge into one fill: the wide quote holds the narrow one, and neither value, date nor position is compared")
 @pytest.mark.parametrize("narrow_first", [True, False], ids=["narrow-first", "wide-first"])
 def test_ae1_two_payments_in_one_quoted_sentence_declared_with_nested_quotes_in_one_batch_stay_two_items(narrow_first):
     from app.chat import items as ledger_items
@@ -198,10 +197,9 @@ def test_ae1_two_payments_in_one_quoted_sentence_declared_with_nested_quotes_in_
     ledger = ledger_items.Ledger()
     declared(ws, "התשלום הראשון הוא 400,000 ₪ [S1].", ledger, *((first, second) if narrow_first else (second, first)))
     got = sorted((i.label, i.value) for i in ledger.items.values())
-    assert got == [("התשלום השני", "650,000 ₪ ביום 01.09.2027"), ("התשלום הראשון", "400,000 ₪ ביום 01.03.2027")], got
+    assert got == [("התשלום הראשון", "400,000 ₪ ביום 01.03.2027"), ("התשלום השני", "650,000 ₪ ביום 01.09.2027")], got
 
 
-@strict_xfail("U1", "an item declared not_applicable and an item of the same value with another condition share a fill when their quotes nest: the decision is carried to the other item and its own condition is lost")
 def test_ae2_a_not_applicable_decision_on_one_of_two_items_with_the_same_value_is_not_carried_to_the_other():
     from app.chat import items as ledger_items
 

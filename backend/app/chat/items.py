@@ -64,6 +64,16 @@ sentence states no date of its own. ``source_name`` is how a server line names a
 agent's label. An item whose value an attributed sentence states but whose date it does not stays omitted for the repair round, and is
 never "read and not used" (``coverage.item_gap_lines``).
 
+Round 20 U1 (KTD1; R1-R4) makes the identity of an item the DATUM it states, not the overlap of its quote. Two fills of one component whose
+quotes are the same or nested are one fill only when ``same_datum`` holds: the same headline values (an aggregate never absorbs its parts),
+compatible dates, the same source block (``block_of``) and no condition of one with a word the other lacks. The datum fingerprint
+(``Datum``) is taken once, at a fill's first insertion, and kept: a later declaration is matched against it and never rewrites it. A second
+declaration of the same evidence with another datum is a fill of its own (its key adds the fingerprint, ``Item.variant``) and is no
+duplicate; a closed decision moves only through a twin that passed the gate; a server item is dropped only beside a same-datum fill; and a
+wide item defers its condition check only to a covered narrow item of its own component and datum (``_defers``). An item of an earlier version
+that the latest version does not list, when the latest declares another datum on the same or a nested quote of the component, is closed as
+superseded (``Ledger._supersede``): it is not scored and writes no gap line.
+
 Round 19 U4 (KTD4; R13-R17) makes coverage ONE pure function over the model-written text of the answer as it stands, by BLOCK. A block is a
 list item with all its sentences, a paragraph, a table row or a heading (``Unit.block``, ``blocks_of``); its text is the union of its
 sentences' and its citations the union of theirs, so an item's value, its plan number and its condition may stand in different sentences
@@ -80,6 +90,7 @@ that stand, computed at every compose pass, and the body's caps, the gap paragra
 from __future__ import annotations
 
 import functools
+import hashlib
 import logging
 import re
 from collections import Counter
@@ -126,12 +137,13 @@ OMITTED = ITEM_OMITTED  # what the server assigns: a member the judge's support 
 COVERED = ITEM_COVERED
 OUTCOME_PARTIAL = "partial"  # the block gives some of the item's headline values and leaves others out (``Ledger.outcomes``)
 NEEDS_REASON = (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)
+SUPERSEDED = "superseded"  # round 20 U1: the history mark of an item a later version's item of another datum corrected (``Ledger._supersede``)
 # the order of the coverage checks: a failure is reported by the furthest check a unit reached
 _WHY_ORDER = ("not_attributed", "value_not_stated", "date_not_stated", "condition_not_stated")
 
 
 Evidence = tuple[str, str, str]  # (document, appraisal unit, verbatim quote): ``verify.evidence_key``
-ItemKey = tuple[str, Evidence]  # (component, evidence): a fill
+ItemKey = tuple[str, Evidence, str]  # (component, evidence, variant): a fill; the variant is "" unless another datum rests on the same evidence
 
 
 @dataclass
@@ -160,6 +172,13 @@ class Item:
     first_version: int = 0
     last_version: int = 0
     history: list[dict] = field(default_factory=list)
+    # round 20 U1 (KTD1): where the quote stands in its source (``block_of``: the table and the row or paragraph holding it), the datum
+    # fingerprint frozen at the fill's first insertion (``datum_of``), the key suffix of a fill that shares its evidence with a fill of
+    # another datum, and the I# of the later item that corrected this one
+    block: tuple[int | None, str] = (None, "")
+    datum: Datum | None = field(default=None, repr=False, compare=False)
+    variant: str = ""
+    superseded_by: str = ""
 
     @property
     def evidence(self) -> Evidence:
@@ -168,8 +187,9 @@ class Item:
 
     @property
     def key(self) -> ItemKey:
-        """The fill's identity across answer versions: its component and its evidence."""
-        return self.component, self.evidence
+        """The fill's identity across answer versions: its component, its evidence and, only for a fill that shares its evidence with a
+        fill of another datum, that datum's fingerprint (round 20 U1, KTD1)."""
+        return self.component, self.evidence, self.variant
 
     def public(self) -> dict:
         return {"id": self.id, "component": self.component, "label": self.label, "source": self.source,
@@ -246,7 +266,7 @@ def validate(raw: Iterable[object], ws, units: Sequence[Unit], components: Seque
     kept: list[Item] = []
     excluded: list[dict] = []
     misattributed: list[dict] = []
-    seen: set[ItemKey] = set()
+    seen: dict[ItemKey, list[Item]] = {}
     numbers = iter(range(1, 10**6))
     for entry in raw:
         f = _fields(entry)
@@ -263,22 +283,28 @@ def validate(raw: Iterable[object], ws, units: Sequence[Unit], components: Seque
             sid = _resolve_source(ws, sid, flat, scope)
             src = ws.sources.get(sid)
             # the same evidence under one component is one item, whichever S# the agent cites it by (round 19 U3)
-            key = (component, evidence_key(*_site_of(src), sid, flat) if src is not None else (sid, "", flat))
-            why = "duplicate" if key in seen else scope.source_problem(sid, flat)
+            key = (component, evidence_key(*_site_of(src), sid, flat) if src is not None else (sid, "", flat), "")
+            why = scope.source_problem(sid, flat)
             if why is None:
                 why = scope.place_problem(src) or (None if scope.verbatim(sid, src, flat) else "not_verbatim")
             if why is None:
-                seen.add(key)
                 document_id, unit_id = _site_of(src)
                 condition = f["condition"]
-                if condition and _foreign_condition(condition, src, f["quote"]):
-                    misattributed.append({"source": sid, "quote": f["quote"][:SUPPORT_QUOTE_MAX], "condition": condition})
-                    condition = ""  # the item is checked against its own context (``condition_spans``), not the agent's words
-                item = Item(component, f["label"], sid, f["quote"], f["value"], condition, f["state"], f["reason"],
-                            document_id=document_id, unit_id=unit_id)
-                item.id = ledger.id_of(item) if ledger is not None else f"I{next(numbers)}"
-                kept.append(item)
-                continue
+                foreign = bool(condition) and _foreign_condition(condition, src, f["quote"])
+                item = Item(component, f["label"], sid, f["quote"], f["value"], "" if foreign else condition, f["state"], f["reason"],
+                            document_id=document_id, unit_id=unit_id, block=block_of(src, f["quote"]))
+                # a second declaration of the same evidence is a duplicate only when it states the same datum (round 20 U1, KTD1): the
+                # same quote with another value, date or condition is another item of the same passage
+                if any(same_datum(other, item) for other in seen.get(key, ())):
+                    why = "duplicate"
+                else:
+                    seen.setdefault(key, []).append(item)
+                    if foreign:
+                        misattributed.append({"source": sid, "quote": f["quote"][:SUPPORT_QUOTE_MAX], "condition": condition})
+                        # the item is checked against its own context (``condition_spans``), not the agent's words
+                    item.id = ledger.id_of(item) if ledger is not None else f"I{next(numbers)}"
+                    kept.append(item)
+                    continue
         excluded.append({"component": f["component"], "source": f["source"], "quote": f["quote"][:SUPPORT_QUOTE_MAX],
                          "state": f["state"], "reason": why})
     return Validation(kept, excluded, misattributed)
@@ -291,6 +317,7 @@ def support_item(component: str, source: str, quote: str, ledger: Ledger, *, lab
     item = Item(component, label, source, quote, value, condition, OMITTED, "", ORIGIN_JUDGE_SUPPORT)
     if ws is not None and (src := ws.sources.get(source)) is not None:
         item.document_id, item.unit_id = _site_of(src)
+        item.block = block_of(src, quote)
     item.id = ledger.id_of(item)
     return item
 
@@ -563,7 +590,7 @@ def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledge
                 document_id, unit_id = _site_of(src)
                 item = Item(component, label, sid, quote, value,
                             " ; ".join(sp.text for sp in spans), ITEM_INCLUDED, "", ORIGIN_SOURCE,
-                            document_id=document_id, unit_id=unit_id)
+                            document_id=document_id, unit_id=unit_id, block=block_of(src, quote))
                 item.id = ledger.id_of(item)
                 built.append(item)
     return built
@@ -1017,6 +1044,90 @@ def headline(value: str, quote: str) -> tuple[frozenset[str], ...]:
     return tuple(out)
 
 
+# --- the datum of an item: what two overlapping fills must share to be one (round 20 U1, KTD1; R1-R4) -----------------------------------
+
+class Datum(NamedTuple):
+    """The fingerprint of what an item states, taken once at its first insertion into the ledger and never recomputed (``Item.datum``): its
+    headline values (``values``; ``figures``: the numbers of its quote when it has none), its dates, its condition and label words, the
+    quote and the place of the quote in its source (``block``). ``declared``: the agent wrote the item, so its condition words are the
+    agent's reading of the datum; a server item's condition is built from the source and tells no datum apart."""
+
+    values: frozenset[frozenset[str]]
+    figures: frozenset[frozenset[str]]
+    valued: bool
+    dates: frozenset[str]
+    condition: str
+    label: str
+    quote: str
+    declared: bool
+    block: tuple[int | None, str]
+
+    def token(self) -> str:
+        """A short stable name of the datum, the suffix of the key of a fill that shares its evidence with another datum's."""
+        text = "|".join([";".join(sorted(",".join(sorted(v)) for v in self.values or self.figures)), ",".join(sorted(self.dates)),
+                         ";".join(sorted(",".join(sorted(g)) for g in _word_groups(self.condition))), str(self.block)])
+        return hashlib.blake2s(text.encode("utf-8"), digest_size=4).hexdigest()
+
+
+def block_of(src, quote: str) -> tuple[int | None, str]:
+    """Where the quote stands in its source (round 20 U1, KTD1: the datum's position): the source's table and the flat line (a table row,
+    a paragraph) that holds the whole quote; ("" for the line) when no single line does, or the source is unknown — a position that is
+    not known is compatible with every other (``same_datum``)."""
+    if src is None:
+        return None, ""
+    row = _row_of(context_of_source(src)[1], SupportScope.flat(quote))
+    return src.table_index, _flat_span(row) if row is not None else ""
+
+
+def datum_of(item: Item) -> Datum:
+    """The datum fingerprint of an item from its own fields (``Datum``)."""
+    values = frozenset(headline(item.value, item.quote))
+    return Datum(values, values or frozenset(_number_forms(item.quote)), bool(item.value), frozenset(_item_dates(item)), item.condition,
+                 item.label, _flat_span(item.quote), item.origin == ORIGIN_AGENT, item.block)
+
+
+def fingerprint(item: Item) -> Datum:
+    """The item's frozen datum: computed the first time it is asked for (an item's first comparison or insertion) and kept (KTD1)."""
+    if item.datum is None:
+        item.datum = datum_of(item)
+    return item.datum
+
+
+def _lacks(wanted: str, have: str) -> bool:
+    """Whether ``wanted`` writes a content word that ``have`` does not."""
+    return any(not g & _words(have) for g in _word_groups(wanted))
+
+
+def same_datum(a: Item, b: Item) -> bool:
+    """Whether two fills of one component whose quotes overlap state ONE datum (round 20 U1, KTD1; R1-R3). Overlapping or nested quotes
+    alone never make them one; all of these must hold, each decided against the items' frozen fingerprints:
+
+    - the same headline values — equal sets, so an aggregate over several figures never absorbs one of its parts (an item with no value
+      is asked by the figures of its quote, which must not contradict: one holds the other's);
+    - compatible dates — equal where both give one (one may add a second date, never contradict the first);
+    - the same source block — the same table and the same row or paragraph, where both are known;
+    - no condition of one with a content word the other lacks (the agent's conditions: a server item's, built from the source, is no
+      reading of a datum). An item with no value and no condition is told apart by its label the same way when the quotes differ."""
+    x, y = fingerprint(a), fingerprint(b)
+    if x.valued and y.valued:
+        if x.values != y.values:
+            return False
+    elif x.figures and y.figures and not (x.figures <= y.figures or y.figures <= x.figures):
+        return False
+    if x.dates and y.dates and not (x.dates <= y.dates or y.dates <= x.dates):
+        return False
+    (table_x, line_x), (table_y, line_y) = x.block, y.block
+    if (table_x is not None and table_y is not None and table_x != table_y) or (line_x and line_y and line_x != line_y):
+        return False
+    if x.declared and y.declared:
+        if _lacks(x.condition, y.condition) or _lacks(y.condition, x.condition):
+            return False
+        if (not x.values and not y.values and not (x.condition or y.condition) and x.quote != y.quote
+                and _lacks(x.label, y.label) and _lacks(y.label, x.label)):
+            return False
+    return True
+
+
 # --- blocks: the model-written text the answer gives, as the unit of coverage (round 19 U4, KTD4; R13, R14) ----------------------------
 
 class Block(NamedTuple):
@@ -1257,25 +1368,40 @@ class Ledger:
         return [i for i in self.items.values() if i.component == item.component and i.evidence != ev and _overlap(i.evidence, ev)]
 
     def twin_of(self, item: Item) -> Item | None:
-        """The fill of the ledger that IS the item: the one of its key, else the only fill of its component on an overlapping quote of the
-        same place (another spelling of the same passage). Several overlapping fills are separate evidence — each keeps its own condition
-        check — so none is the item's twin."""
-        if (same := self.items.get(item.key)) is not None:
-            return same
+        """The fill of the ledger that IS the item: the fill of the same component and evidence that states its datum, else the only fill of
+        its component on an overlapping quote of the same place that states it too (another spelling of the same passage). Round 20 U1
+        (KTD1; R1-R3): a structural match is never enough — ``same_datum`` must hold, against the fill's frozen fingerprint — so two
+        different data of one passage are two fills, and a fill is never another datum's twin. Several overlapping fills are separate
+        evidence — each keeps its own condition check — so none is the item's twin."""
+        held = [i for i in self.items.values() if i.component == item.component and i.evidence == item.evidence]
+        for fill in held:
+            if fill is item or same_datum(fill, item):
+                return fill
         # an item built by hand has no place of its own (no document): it is the fill of the same source and quote, placed or not
         unplaced = [i for i in self.items.values() if i.component == item.component and i.source == item.source
-                    and i.evidence[2] == item.evidence[2] and not (i.document_id and item.document_id)]
+                    and i.evidence[2] == item.evidence[2] and not (i.document_id and item.document_id) and same_datum(i, item)]
         if unplaced:
             return unplaced[0]
         near = self._near(item)
-        return near[0] if len(near) == 1 else None
+        return near[0] if len(near) == 1 and same_datum(near[0], item) else None
 
     def id_of(self, item: Item) -> str:
         """The I# of the item: its twin's when the ledger holds one, else the one of its key."""
         twin = self.twin_of(item)
         if twin is None:
             return self.id_for(item.key)
-        return self._ids.setdefault(item.key, twin.id or self.id_for(twin.key))
+        return twin.id or self.id_for(twin.key)
+
+    def _place(self, item: Item) -> None:
+        """Give an item that has no twin its own key and its own I#: when its evidence is already filled by another datum, its key adds the
+        datum's fingerprint (round 20 U1, KTD1: it is not dropped as a duplicate), and an I# another fill holds (the id of a same-evidence
+        item of the same batch, taken before either was merged) is replaced."""
+        if item.key in self.items:
+            item.variant = fingerprint(item).token()
+            while item.key in self.items:
+                item.variant += "'"
+        if not item.id or any(i.id == item.id for i in self.items.values()):
+            item.id = self.id_for(item.key)
 
     def alive(self, item: Item) -> bool:
         """Whether the fill stands in the latest version: an agent's fill the latest version declared, or one the server derives again at
@@ -1290,18 +1416,22 @@ class Ledger:
         and state and reason) — a later version may close it with a valid ``not_verifiable`` or ``not_applicable``, but a closed
         decision is not reopened by the same item listed ``included`` again (round 19 U3, R3); the judge's support and the server's
         source spans never change a fill the ledger already holds. A fill not listed again stays. The same passage of the same component
-        (another spelling of the quote, or another S#) is the same fill (``twin_of``). An agent's fill replaces the origin ``source``
+        (another spelling of the quote, or another S#) is the same fill (``twin_of``) only when it states the same datum (round 20 U1,
+        KTD1: ``same_datum``); another datum is a fill of its own, and a version's item that a later version's item of another datum
+        corrects is closed as superseded (``_supersede``). An agent's fill replaces the origin ``source``
         fill of its own component that holds the same span (round 18 U5): the span's condition is then checked once, as the agent's
         fill — and never touches the fill of another component, which the same evidence also serves (round 19 U3, R2). ``version``:
         recorded in each fill's history."""
         self.version = max(self.version, version)
         for item in kept:
             item.evidence_id = self.evidence_id(item.evidence)
-            item.id = item.id or self.id_of(item)
             twin = self.twin_of(item)
             if twin is None:
-                if item.origin != ORIGIN_AGENT and self._near(item):
-                    continue  # the component already holds this span, in another spelling: a server fill adds nothing
+                # a server fill adds nothing only beside a fill of the same datum (round 20 U1, KTD1): another datum of the passage is kept
+                if item.origin != ORIGIN_AGENT and any(same_datum(n, item) for n in self._near(item)):
+                    continue
+                self._place(item)
+                item.datum = fingerprint(item)  # frozen here, at the first insertion
                 item.first_version = item.last_version = version
                 self._record(item, version)
                 self.items[item.key] = item
@@ -1310,9 +1440,29 @@ class Ledger:
                     self._replace(twin, item, version)
                 else:
                     self._declare(twin, item, version)
+        self._supersede()
         self.excluded += [{"version": version, **e} for e in excluded]
         self.misattributed += [{"version": version, **m} for m in misattributed]
         return list(self.items.values())
+
+    def _supersede(self) -> None:
+        """Close as superseded an agent item of an earlier version that the latest version does not list, when the latest version declares,
+        in the same component, an item of another datum on the same or a nested quote that no earlier version declared (round 20 U1, KTD1;
+        R3): a value corrected, or a condition added, is a new item, and the old one is neither scored nor a gap line. Only an item still
+        ``included`` is closed this way; a decision the agent closed with a reason stays its own. Nothing happens in a turn whose
+        versions are not told."""
+        if self.version <= 0:
+            return
+        latest = [g for g in self.items.values() if g.origin == ORIGIN_AGENT and g.first_version == self.version]
+        for fill in self.items.values():
+            if (fill.origin != ORIGIN_AGENT or fill.last_version >= self.version or fill.superseded_by
+                    or fill.state != ITEM_INCLUDED):
+                continue
+            by = next((g for g in latest if g.component == fill.component and _overlap(g.evidence, fill.evidence)
+                       and g.first_version > fill.last_version), None)
+            if by is not None:
+                fill.superseded_by = by.id
+                fill.history.append({"version": self.version, "state": SUPERSEDED, "reason": "", "origin": fill.origin, "by": by.id})
 
     @staticmethod
     def _record(fill: Item, version: int, declared: str = "") -> None:
@@ -1333,6 +1483,7 @@ class Ledger:
         if old.origin == ORIGIN_SOURCE:
             old.origin, old.candidate = ORIGIN_AGENT, False
         old.last_version = max(old.last_version, version)
+        old.superseded_by = ""  # a version that lists the item again stands it up again
         self._record(old, version, item.state)
 
     def _replace(self, old: Item, item: Item, version: int) -> None:
@@ -1340,6 +1491,11 @@ class Ledger:
         in the ledger, its history and its first version."""
         item.id, item.first_version, item.last_version = old.id, old.first_version, max(old.last_version, version)
         item.history = list(old.history)
+        if item.key != old.key and item.key in self.items:  # another datum already rests on the agent's evidence (round 20 U1)
+            item.variant = fingerprint(item).token()
+            while item.key in self.items:
+                item.variant += "'"
+        item.datum = fingerprint(item)
         self._ids.setdefault(item.key, old.id)
         self.items = {(item.key if k == old.key else k): (item if k == old.key else v) for k, v in self.items.items()}
         self._record(item, version)
@@ -1363,9 +1519,12 @@ class Ledger:
         # asked when another item of its component has its signature (``_coverage``). Only the fills alive in the latest version count
         # (``alive``): an earlier version's item the latest did not list is no twin of the ones that stand, and neither is a fill of the
         # same passage in another quote (``_overlap``)
-        signatures = {id(i): _signature(i) for i in self.items.values()}
+        # an item a later version's item of another datum corrected is closed as superseded: it is not scored, and no line is written for it
+        # (round 20 U1, KTD1)
+        scored = [i for i in self.items.values() if not i.superseded_by]
+        signatures = {id(i): _signature(i) for i in scored}
         standing: dict[tuple[str, frozenset[str]], list[Item]] = {}
-        for i in self.items.values():
+        for i in scored:
             if self.alive(i) and signatures[id(i)]:
                 standing.setdefault((i.component, signatures[id(i)]), []).append(i)
         units = model_units(units)  # a server-written span covers nothing (KTD4)
@@ -1374,11 +1533,11 @@ class Ledger:
         leads = _leads(units)
         # per evidence, once: of the LAST fill that rests on it (the fills of one evidence may name it by another S# or write its quote
         # with other blanks, and the later fill's reading is the one that stood)
-        spans = {ev: _spans_of(ws, i) for ev, i in {i.evidence: i for i in self.items.values()}.items()}
+        spans = {ev: _spans_of(ws, i) for ev, i in {i.evidence: i for i in scored}.items()}
         rows: list[tuple[Item, Coverage | None]] = []
         gave: dict[Evidence, frozenset[int]] = {}  # the sentences that give each covered evidence (the first is the covering sentence)
         wide: dict[Evidence, tuple[Unit, ...]] = {}  # the multi-sentence blocks that give it, each as one unit
-        for item in self.items.values():
+        for item in scored:
             sig = signatures[id(item)]
             rivals = [j for j in standing.get((item.component, sig), ()) if j is not item and not _overlap(j.evidence, item.evidence)]
             shared = bool(sig) and bool(rivals)
@@ -1400,7 +1559,7 @@ class Ledger:
         owns = {ev: _own_text(ws, i) for ev, i in {i.evidence: i for i, _ in rows}.items()}  # each evidence's own context text (last fill's)
         others = [i for i, _ in rows]
         checked: set[Evidence] = set()
-        covered = [i.evidence for i, g in rows if g is not None and g.ok]
+        covered = [i for i, g in rows if g is not None and g.ok]
         for item, got in rows:
             # the fill's outcome of the one coverage function: covered, partial (with what the block leaves out), omitted, or unchecked
             outcome = _outcome(got)
@@ -1413,9 +1572,10 @@ class Ledger:
             else:  # a declared fill the answer does not give stays declared
                 state = item.state if item.state in NEEDS_REASON else OMITTED
             missing = [missing_detail(ws.sources.get(item.source), item.quote, g) for g in got.missing] if got is not None else []
-            # a quote that holds a smaller covered quote of the same place leaves the check to that one: each narrower quote keeps the
-            # condition of its own row, and the wider one adds no mixed check of the conditions of several
-            if got is not None and got.ok and (item.evidence in checked or any(_inside(e, item.evidence) for e in covered)):
+            # a quote that holds a smaller covered quote of the same place leaves the check to that one only when the narrow item is of the
+            # same component and states the same datum, reads the conditions of the wide one and is given by the same sentences (round 20
+            # U1, KTD1): each narrower quote keeps the condition of its own row, and a narrow item of another component or datum defers nothing
+            if got is not None and got.ok and (item.evidence in checked or any(_defers(item, n, spans, gave) for n in covered)):
                 check = dict(_NO_CHECK)
             else:
                 check = _condition_check(item, got, spans, gave, owns, by_index, others, wide)
@@ -1425,6 +1585,16 @@ class Ledger:
                         "why": got.why if got else "", "outcome": outcome, "missing": missing,
                         "history": [dict(h) for h in item.history], **check})
         return out
+
+
+def _defers(wide: Item, narrow: Item, spans: Mapping[Evidence, Sequence[Span]], gave: Mapping[Evidence, frozenset[int]]) -> bool:
+    """Whether the covered item ``narrow`` carries the condition check of ``wide`` (round 20 U1, KTD1): it is of the same component, its
+    quote lies inside the wide one, it states the same datum, its condition spans contain every span of the wide one, and every sentence
+    that gives the wide item gives it too."""
+    if narrow.component != wide.component or not _inside(narrow.evidence, wide.evidence) or not same_datum(narrow, wide):
+        return False
+    texts = lambda ev: {SupportScope.flat(sp.text) for sp in spans[ev]}  # noqa: E731
+    return texts(wide.evidence) <= texts(narrow.evidence) and gave.get(wide.evidence, frozenset()) <= gave.get(narrow.evidence, frozenset())
 
 
 def _outcome(got: Coverage | None) -> str | None:
