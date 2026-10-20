@@ -1073,7 +1073,7 @@ def test_a_general_question_over_an_untitled_file_is_not_scoped_to_a_unit(client
     assert _values_in(agent.tool_outputs(1)[0]) == {U1_VALUE, U2_VALUE, U3_VALUE}
 
 
-def test_a_claim_about_the_located_unit_resting_on_another_units_value_is_removed_as_wrong_subject(untitled):
+def test_a_claim_about_the_located_unit_resting_on_another_units_value_is_left_to_the_judge_with_an_ownership_fact(untitled):
     from app.chat import verify
 
     ws = T.Workspace(ctx=untitled.ctx())
@@ -1087,8 +1087,14 @@ def test_a_claim_about_the_located_unit_resting_on_another_units_value_is_remove
     answer = (f"שווי הנכס הוא {U2_VALUE} ₪ [{sids[2]}].\n\nשווי הנכס הוא {U3_VALUE} ₪ [{sids[3]}].")
     units = verify.split_units(answer)
     problems = verify.deterministic(units, ws, "מה שווי הנכס בפרויקט הצפצפה?")
-    flagged = {p.unit.index: p for p in problems if p.failure_kind == "wrong_subject"}
-    assert set(flagged) == {units[1].index} and flagged[units[1].index].removes_unit, [p.as_dict() for p in problems]
+    # round 19 U2, R6: units with no stored identity may be one property, so absence of identity is not "another property": nothing is
+    # removed; the claim on unit 3's value rides to the judge with the neutral ownership fact, the located unit's own claim with none
+    assert not [p for p in problems if p.failure_kind == "wrong_subject"], [p.as_dict() for p in problems]
+    question = "מה שווי הנכס בפרויקט הצפצפה?"
+    assert verify._context_check(units[0], ws, question).facts == []
+    assert len(verify._context_check(units[1], ws, question).facts) == 1
+    assert "<ownership" not in verify._ownership_note(units[0], ws)
+    assert "<ownership" in verify._ownership_note(units[1], ws)
     # without a located unit nothing says which of the two is the asked property's: neither is removed here
     bare = T.Workspace(ctx=untitled.ctx())
     bare.requirements = verify.TurnRequirements()

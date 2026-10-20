@@ -261,6 +261,9 @@ class Segment:
     certainty: str = "certain"  # the certainty of the boundary that opens it
     title: str | None = None  # a unit's title
     signals: tuple[str, ...] | None = None  # the signals of the cut that opens it (``units.SIGNALS``); None: not known
+    # the addresses and parcels the lead heading of an appendix or a comparables part states (``from_units``): its title run stops at
+    # a heading, so a part that opens with one holds the identity it names here; not a label and no subject's identity (round 19 U2)
+    lead_identity: Identity = Identity()
 
 
 @dataclass(frozen=True)
@@ -341,17 +344,27 @@ class Contexts:
         from_text = {self.owner(n) for t in spans for n in self.named(t)}
         by_text = SAME if from_text & asked_owners and not from_text - asked_owners else (
             DIFFERENT if from_text - asked_owners and not from_text & asked_owners else None)
-        by_unit = DIFFERENT if self._conflicts(mine) else None
+        by_unit = DIFFERENT if self._conflicts(mine, asked) else None
         if by_text == SAME:
             return UNKNOWN if by_unit == DIFFERENT else SAME
         if DIFFERENT in (by_text, by_unit):
             return DIFFERENT if complete else UNKNOWN
         return SAME if linked else UNKNOWN
 
-    def _conflicts(self, number: int) -> bool:
-        """Whether subject context ``number`` states an identity of its own (an address, a parcel or a name that no other subject
-        context holds; a noise heading is none): the positive identity of a property other than the asked one."""
-        return number in self.subjects and not self._distinguishing[number].empty
+    def _conflicts(self, number: int, asked: set[int]) -> bool:
+        """Whether context ``number`` states an identity of its own that conflicts with the asked property ``asked``: the positive
+        identity of a property other than the asked one. A subject context conflicts when it holds an address, a parcel or a name that
+        no other subject context holds (a noise heading is none). An appendix or a comparables part (no subject) conflicts when the
+        addresses or parcels its own heading and identification state (its segment's identity, as ``_unit_identity`` reads it; a name
+        is no property) differ from the asked side's in a kind both state, and it holds none the asked side holds (round 19 U2, KTD2,
+        R5); a part that states none of its own (an appendix of the appraisal itself) or names the asked property conflicts with nothing."""
+        if number in self.subjects:
+            return not self._distinguishing[number].empty
+        own = self.identity(number) | self.segment(number).lead_identity
+        held = [self.identity(n) for n in asked]
+        if any(own.addresses & h.addresses or own.parcels & h.parcels for h in held):
+            return False
+        return any(own.addresses and h.addresses or own.parcels and h.parcels for h in held)
 
     def at_pages(self, first: int, last: int | None = None) -> list[int]:
         """The subject context a page range is of (round 19 U2, KTD2, R7): the one that holds the whole range, else the one it
@@ -727,6 +740,8 @@ _FIRST_BLOCKS_SQL = (
     " p.geometry_issue FROM document_blocks b LEFT JOIN pages p ON p.version_id = b.version_id AND p.page_no = b.page"
     " WHERE b.version_id = :v AND b.block_index = ANY(:b)")
 _HEADINGS_SQL = "SELECT block_index FROM document_blocks WHERE kind = 'heading' AND version_id = :v ORDER BY block_index"
+_LEAD_TEXT_SQL = ("SELECT block_index, text FROM document_blocks WHERE kind = 'heading' AND version_id = :v"
+                  " AND block_index = ANY(:b)")
 
 
 def _card_identity(fields: Sequence[dict]) -> Identity:
@@ -779,21 +794,37 @@ def _cut_signals(u, n: int) -> tuple[str, ...] | None:
 
 def from_units(units: Sequence, first_blocks: dict, headings: Sequence[int], version_id: str,
                reading_id: str | None = None, tag: str | None = None,
-               cards: dict[tuple[int, int], Sequence[dict]] | None = None) -> Contexts:
+               cards: dict[tuple[int, int], Sequence[dict]] | None = None,
+               lead_texts: dict[int, str] | None = None) -> Contexts:
     """The contexts of a reading's units, one segment per unit in reading order. ``first_blocks``: each unit's first
     block by index (``block_index``, ``page``, ``bbox`` and its page's geometry, for ``top_of``); ``headings``: the
     indexes of the file's heading blocks, in order (a segment's ``lead`` is the first one inside its unit); ``cards``:
-    the subject fields of the units' ``done`` identity cards by block range (``cards.subject_fields``)."""
+    the subject fields of the units' ``done`` identity cards by block range (``cards.subject_fields``); ``lead_texts``: the text of
+    the lead headings of the appendix and comparables units (``lead_heading_blocks``), whose labelled identifiers are the identity such
+    a part states in its heading (round 19 U2)."""
     segments = []
     for n, u in enumerate(units):
         at = bisect_left(headings, u.block_first)
         lead = headings[at] if at < len(headings) and headings[at] <= u.block_last else None
+        heading = (lead_texts or {}).get(lead) if lead is not None and u.kind in NON_SUBJECT_KINDS else None
         b = first_blocks.get(u.block_first)
         start = (b.page or 0, top_of(b)) if n > 0 and b is not None else None
         segments.append(Segment(u.unit_no, _unit_identity(u, (cards or {}).get((u.block_first, u.block_last), ())),
                                 u.block_first, u.block_last, lead, start,
-                                u.page_first, u.page_last, u.kind, u.certainty, u.title, _cut_signals(u, n)))
+                                u.page_first, u.page_last, u.kind, u.certainty, u.title, _cut_signals(u, n),
+                                Identity() if noise_heading(heading) else identifiers(heading)))
     return Contexts(version_id, tuple(segments), reading_id, tag)
+
+
+def lead_heading_blocks(units: Sequence, headings: Sequence[int]) -> list[int]:
+    """The lead heading block (the first heading inside the unit) of every appendix and comparables unit: the blocks whose text
+    ``from_units`` reads for the identity such a part states."""
+    out = []
+    for u in units:
+        at = bisect_left(headings, u.block_first)
+        if u.kind in NON_SUBJECT_KINDS and at < len(headings) and headings[at] <= u.block_last:
+            out.append(headings[at])
+    return out
 
 
 def _of_units(conn: Connection, version_id: str, reading_id: str | None, has_cards: bool = True) -> Contexts | None:
@@ -816,6 +847,8 @@ def _of_units(conn: Connection, version_id: str, reading_id: str | None, has_car
             first = {r.block_index: r for r in conn.execute(
                 text(_FIRST_BLOCKS_SQL), {"v": v, "b": [u.block_first for u in found[1:]]})}
             headings = [r.block_index for r in conn.execute(text(_HEADINGS_SQL), {"v": v})]
+            leads = lead_heading_blocks(found, headings)
+            lead_texts = {r.block_index: r.text for r in conn.execute(text(_LEAD_TEXT_SQL), {"v": v, "b": leads})} if leads else {}
     except Exception:  # noqa: BLE001 - the contexts of the blocks serve instead
         logger.exception("contexts of version %s could not be built from its units", version_id)
         return None
@@ -826,7 +859,7 @@ def _of_units(conn: Connection, version_id: str, reading_id: str | None, has_car
                 card_fields = unit_cards.subject_fields(conn, v)
         except Exception:  # noqa: BLE001
             logger.warning("identity cards of version %s could not be read", version_id, exc_info=True)
-    return from_units(found, first, headings, version_id, reading_id, tag, card_fields)
+    return from_units(found, first, headings, version_id, reading_id, tag, card_fields, lead_texts)
 
 
 def of_version(conn: Connection, version_id: UUID | str, reading_id: str | None) -> Contexts:

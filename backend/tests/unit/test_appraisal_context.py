@@ -1014,6 +1014,52 @@ def test_compare_never_says_different_for_an_asked_side_that_resolved_only_in_pa
     assert cx.compare(1, [1], complete=False) == contexts.SAME
 
 
+def _appendix_file(heading: str, street: str = "", parcel: tuple[str, str] | None = None) -> contexts.Contexts:
+    """Unit 1: the appraisal of the invented «מתחם גבעת האלה» (street «הדס 5», parcel 40100/12). Unit 2: an appendix whose lead
+    heading (block 9, the first heading of the unit) is ``heading`` and whose stored identification states ``street`` and ``parcel``
+    (round 19 U2, KTD2, R5)."""
+    parts = [_unit(1, "appraisal", "מתחם גבעת האלה", ("גבעת האלה",), first=0, last=7, pages=(1, 2),
+                   identifiers=_ident("הדס 5", ("40100", "12"))),
+             _unit(2, "appendix", None, first=8, last=12, pages=(3, 4), identifiers=_ident(street, parcel),
+                   signals=("appendix_marker",))]
+    first = {8: SimpleNamespace(block_index=8, page=3, bbox=[50.0, 40.0, 500.0, 52.0])}
+    return contexts.from_units(parts, first, [4, 9], "v", "r1", lead_texts={9: heading, 4: "1. מבוא"})
+
+
+def test_an_appendix_whose_own_heading_states_another_address_and_parcel_is_another_property(enforced):
+    from app.chat import tools
+
+    cx = _appendix_file("נספח א׳ — נכס השוואה ברחוב הדקל 8, גוש 40105 חלקה 2")  # the unit's title run stopped at this heading
+    assert cx.compare(2, [1]) == contexts.DIFFERENT
+    assert cx.identity(2).empty  # the heading's identity is no label and no subject's identity
+    assert cx.compare(2, [1], complete=False) == contexts.UNKNOWN  # an asked side that resolved only in part never says different
+    assert tools.subject_from(cx, 2, "מתחם גבעת האלה") == "contradicted"
+    # the same identity stated in the unit's stored identification, and a noise heading (a sentence ending with a colon) that is none
+    assert _appendix_file("נספח ב׳", "הדקל 8", ("40105", "2")).compare(2, [1]) == contexts.DIFFERENT
+    assert _appendix_file("להלן נכס השוואה ברחוב הדקל 8, גוש 40105 חלקה 2:").compare(2, [1]) == contexts.UNKNOWN
+
+
+def test_an_appendix_with_no_address_or_parcel_of_its_own_is_not_another_property(enforced):
+    from app.chat import tools
+
+    cx = _appendix_file("נספח א׳ — תחשיב")
+    assert cx.compare(2, [1]) == contexts.UNKNOWN
+    assert tools.subject_from(cx, 2, "מתחם גבעת האלה") == "asserted"
+
+
+def test_an_appendix_naming_the_asked_address_or_parcel_is_not_another_property(enforced):
+    from app.chat import tools
+
+    for street, parcel in (("הדס 5", None), ("", ("40100", "12")), ("הדס 5", ("40100", "12"))):
+        cx = _appendix_file("נספח א׳ — נספח לשומה", street, parcel)
+        assert cx.compare(2, [1]) != contexts.DIFFERENT, (street, parcel)
+        assert tools.subject_from(cx, 2, "מתחם גבעת האלה") != "contradicted", (street, parcel)
+    cx = _appendix_file("נספח א׳ — תחשיב לנכס ברחוב הדס 5, גוש 40100 חלקה 12")  # the heading names the asked property
+    assert cx.compare(2, [1]) != contexts.DIFFERENT and tools.subject_from(cx, 2, "מתחם גבעת האלה") != "contradicted"
+    # one shared identifier is enough: the asked side holds it, so another address beside it proves no other property
+    assert _appendix_file("נספח ב׳", "הדקל 8", ("40100", "12")).compare(2, [1]) != contexts.DIFFERENT
+
+
 def test_a_page_range_names_the_one_unit_that_holds_it_and_none_when_it_spans_several():
     cx = _ownership_file()
     assert cx.at_pages(5, 6) == [3] and cx.at_pages(3, 4) == [2] and cx.at_pages(1, 2) == [1]
