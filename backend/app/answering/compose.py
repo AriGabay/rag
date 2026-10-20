@@ -36,6 +36,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Connection, text
 
+from app.answering.numread import decimal_convention
 from app.answering.templates import UNIT_LABELS, money, number
 from app.answering.verify import (
     CITE,
@@ -396,7 +397,8 @@ def _layer_one(c: Claim, texts: dict[str, str], values: dict[str, ComputedValue]
             problems.append("unknown_computed")
         own = {n for i in ids if i in texts for n in numbers_in(texts[i], words=True)}
         bare, _ = strip_label_numbers(_PLACEHOLDER.sub(" ", raw), [labels[i] for i in ids if i in labels])
-        if numbers_in(bare) - own - question_subject_numbers(bare, question, set()):
+        decimal = any(decimal_convention(texts[i]) for i in ids if i in texts)  # a claim reads a pair as a decimal under a decimal source
+        if numbers_in(bare, decimal=decimal) - own - question_subject_numbers(bare, question, set()):
             problems.append("model_authored_number")  # computed numbers come from tool results only
         if problems:
             return None, problems

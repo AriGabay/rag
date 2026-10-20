@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import re
 import uuid
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -387,3 +388,18 @@ def test_a_number_in_another_cell_is_refused_with_the_locator_of_that_cell(monke
         _take(d, _loc(row="מקדם התאמה לשטח", column="מקדם", number="1.1"))
     msg = str(e.value)
     assert "row_number=2" in msg and "column_number=2" in msg and not d.ws.values
+
+
+# --- a decimal comma is read by context where a value is taken from a source (round 19 U1, KTD3, R12, AE6) ------------------------------
+
+def test_a_decimal_comma_is_a_decimal_and_a_thousands_comma_a_thousands_where_a_value_is_taken():
+    from app.chat import tools as tools_
+
+    assert tools_._parse_number("13,2") == ("13.2", Decimal("13.2"))
+    assert tools_._parse_number("₪ 13,2") == ("13.2", Decimal("13.2"))
+    assert tools_._parse_number("(3.5)")[1] == Decimal("-3.5")
+    assert tools_._parse_number("3,596,696")[1] == Decimal("3596696")
+    assert tools_._parse_number("1,250")[1] == Decimal("1250")
+    found = tools_._numbers_of("שטח 13,2 מ\"ר ושווי 3,596,696 ₪")
+    assert [(w, v) for w, _, _, v in found] == [("13,2", Decimal("13.2")), ("3,596,696", Decimal("3596696"))]
+    assert all("שטח 13,2 מ\"ר ושווי 3,596,696 ₪"[s:e] == w for w, s, e, _ in found)  # found again where it is written

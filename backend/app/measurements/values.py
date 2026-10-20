@@ -3,6 +3,10 @@
 ``parse_amount`` turns a written value into a Decimal and its form: "₪ 9,500" -> 9500 exact, "כ-21,000 ₪" ->
 21000 approximate, "65-85 ₪" -> range 65..85, "(₪ 1,197,500)" -> -1197500 (accounting negative), "6.70%" -> 6.70,
 "שישה" -> 6. Nothing is guessed: text without a number gives None.
+
+A written value is one table cell, so its comma is read by ``numread`` as a cell's: "13,2" is 13.2, "1,250" is 1250, "1.234,56" is
+1234.56, a chain "6,7,8" is a list. A negative is a minus (hyphen or U+2212) before the number, a trailing minus ("104,610-"), or
+accounting brackets with an optional percent or currency ("(3.5)%", "(₪ 1,197,500)").
 """
 
 from __future__ import annotations
@@ -11,6 +15,11 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
+from app.answering.numread import read_separators
+
+_MINUS = "[-\u2212]"
+_CURRENCY = "₪$€£"
+_SIGN_NOISE = re.compile(rf"[{_CURRENCY}%\s]")  # what may stand beside the brackets of an accounting negative: "(3.5)%", "(₪ 1,197,500)"
 _NUM = r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?"
 _RANGE = re.compile(rf"({_NUM})\s*(?:-|–|—|עד|ל-)\s*({_NUM})")
 _ONE = re.compile(_NUM)
@@ -71,8 +80,10 @@ def parse_amount(text: str) -> Amount | None:
     t = (text or "").replace("‏", "").replace("‎", "").strip()
     if not t:
         return None
-    negative = bool(re.fullmatch(r"\(.*\d.*\)", t.replace("₪", "").strip())) or bool(
-        re.match(r"^\s*-\s*₪?\s*\d", t) or re.match(r"^\s*₪\s*-\s*\d", t) or re.match(r"^-₪", t))
+    t = read_separators(t, cell=True)
+    negative = bool(re.fullmatch(r"\(.*\d.*\)", _SIGN_NOISE.sub("", t))) or bool(
+        re.match(rf"^\s*{_MINUS}\s*[{_CURRENCY}]?\s*\d", t) or re.match(rf"^\s*[{_CURRENCY}]\s*{_MINUS}\s*\d", t)
+        or re.search(rf"\d[\s%{_CURRENCY}]*{_MINUS}\s*$", t))
     m = _RANGE.search(t)
     if m and not re.search(r"\d{1,2}[./]\d{1,2}[./]\d{2,4}", t):
         low, high = _dec(m.group(1)), _dec(m.group(2))

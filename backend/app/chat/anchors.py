@@ -62,6 +62,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from app.answering.numread import read_separators
 from app.answering.verify import _NUMBER
 from app.chat import datum, reader
 from app.chat.meaning import _norm, units_attested
@@ -162,20 +163,20 @@ class Located:
 
 def _number_value(written: str) -> Decimal | None:
     try:
-        return Decimal(written.rstrip(".,").replace(",", ""))
+        return Decimal(read_separators(written, cell=True).rstrip(".,").replace(",", ""))
     except InvalidOperation:
         return None
 
 
 def _number_at(s: str, pos: int) -> Decimal | None:
-    for m in _NUMBER.finditer(s):
+    for m in _NUMBER.finditer(read_separators(s)):
         if m.start() <= pos < m.end():
             return _number_value(m.group(0))
     return None
 
 
 def _values_in(s: str) -> list[Decimal]:
-    return [v for m in _NUMBER.finditer(_norm(s or "")) if (v := _number_value(m.group(0))) is not None]
+    return [v for m in _NUMBER.finditer(read_separators(_norm(s or ""))) if (v := _number_value(m.group(0))) is not None]
 
 
 def locate_quote(blocks, quote: str, value: Decimal) -> Located | None:
@@ -208,7 +209,7 @@ def locate_quote(blocks, quote: str, value: Decimal) -> Located | None:
         i = flat.find(q, i + 1)
     if not hits:
         return None
-    in_quote = next((m for m in _NUMBER.finditer(q) if _number_value(m.group(0)) == abs(value)), None)
+    in_quote = next((m for m in _NUMBER.finditer(read_separators(q)) if _number_value(m.group(0)) == abs(value)), None)
 
     def raw_at(f: int) -> tuple[int, int]:
         tok = max((t for t in tokens if t[3] <= f), key=lambda t: t[3])

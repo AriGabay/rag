@@ -1070,3 +1070,105 @@ def _negation_start(head: str) -> int:
     start = words[0].start() if words else len(head)
     closings = list(meaning._NEGATION_END.finditer(head, start, len(head)))
     return closings[-1].end() if closings else start
+
+
+# --- numbers keep their header, row, unit, scale, period and sign (round 19 U1, KTD3, R9-R12, AE5, AE6) ----------------------------
+#
+# Synthetic wording only. A Hebrew abbreviation ends with a quote mark and a letter ("סה"כ", "מע"מ", "בע"מ", "דמ"ש"): that letter is
+# never the split piece of the next word, so "סה"כ לשנה" stays an annual header; an abbreviated construct plural ("דמ"ש") is a
+# plural noun before the plural monthly adjective; a decimal comma is read by context, a sign is part of the number.
+
+@pytest.mark.parametrize("text", [
+    'סה"כ לשנה', 'סה״כ לשנה', 'מע"מ לחודש', 'דמי שכירות בע"מ לשנה', 'דמ"ש לחודש', 'דמ״ש חודשיים', "סה'כ לחודש",
+])
+def test_the_last_letter_of_an_abbreviation_is_never_joined_to_the_next_word(text):
+    assert meaning._read(text) == meaning._norm(text)
+    assert len(meaning._read(text)) == len(text)
+
+
+def test_an_annual_total_header_with_an_abbreviation_keeps_the_yearly_period():
+    table = 'נכס | סה"כ לשנה (₪)\nהדולב 4 | 120,000\nהדולב 6 | 96,000'
+    assert _periods(table, "120,000", "הדולב 4 | 120,000") == {"year"}
+    assert meaning._all('סה"כ לשנה').keys("period") == {"year"}
+    assert meaning._all('מע"מ לחודש').keys("period") == {"month"}
+
+
+def test_a_table_of_two_columns_with_different_periods_keeps_each_columns_period():
+    table = 'נכס | שכ"ד לחודש (₪) | סה"כ לשנה (₪)\nהדולב 4 | 10,000 | 120,000\nהדולב 6 | 8,000 | 96,000'
+    row = "הדולב 4 | 10,000 | 120,000"
+    assert _periods(table, "10,000", row) == {"month"}
+    assert _periods(table, "120,000", row) == {"year"}
+    (p,) = _problems("הדולב 4: סה\"כ ההכנסה הוא 120,000 ₪ [S1].", _ws(table, kind="table"))
+    assert p.kind == "period" and p.annotation == "לשנה"
+    assert _problems("הדולב 4: סה\"כ ההכנסה לשנה הוא 120,000 ₪ [S1].", _ws(table, kind="table")) == []
+
+
+def test_a_duration_column_next_to_an_annual_column_has_no_period():
+    table = 'נכס | תקופה (חודשים) | סה"כ לשנה (₪)\nהדולב 4 | 36 | 120,000'
+    row = "הדולב 4 | 36 | 120,000"
+    _no_period(table, "36", row)
+    assert _periods(table, "120,000", row) == {"year"}
+
+
+@pytest.mark.parametrize("text", ['דמ"ש חודשיים 5,000 ₪', "דמ״ש חודשיים 5,000 ₪", 'הדמ"נ חודשיים 800 ₪'])
+def test_an_abbreviated_construct_plural_before_the_plural_monthly_adjective_is_a_monthly_period(text):
+    assert meaning._all(text).keys("period") == {"month"}
+
+
+@pytest.mark.parametrize("text", [
+    "תקופה של חודשיים", "שכירות לתקופה של חודשיים", "חודשיים לאחר מכן", 'סה"כ חודשיים', 'בע"מ חודשיים',
+])
+def test_a_period_of_two_months_is_no_period(text):
+    assert meaning._all(text).keys("period") == set()
+
+
+def test_ae6_a_decimal_comma_cell_reads_as_its_decimal_and_a_thousands_number_as_its_thousands():
+    source = "שטח | שווי\n13,2 | 3,596,696"
+    assert meaning.source_occurrences(source, {"13.2"})[0]
+    assert not meaning.source_occurrences(source, {"13"})[0] and not meaning.source_occurrences(source, {"132"})[0]
+    assert meaning.source_occurrences(source, {"3596696"})[0]
+
+
+def test_a_list_is_no_decimal_and_an_ambiguous_pair_keeps_both_readings_in_a_source():
+    assert not meaning.source_occurrences("קומות 6,7,8 בבניין", {"6.7"})[0]
+    assert meaning.source_occurrences("קומות 6,7,8 בבניין", {"7"})[0]
+    for form in ("3.4", "3", "4"):
+        assert meaning.source_occurrences("בקומות 3,4 יש חדרים", {form})[0]
+
+
+def test_a_decimal_comma_in_the_answer_meets_the_same_number_in_the_source():
+    source = "דמי הניהול 13,2 ₪ למ\"ר לחודש."
+    assert _problems("דמי הניהול הם 13,2 ₪ למ\"ר לחודש [S1].", _ws(source)) == []
+    (p,) = _problems("דמי הניהול הם 13,2 ₪ למ\"ר [S1].", _ws(source))
+    assert p.kind == "period" and p.annotation == "לחודש"
+
+
+def test_a_negative_source_number_has_its_signed_forms():
+    for source in ("השינוי (3.5)% בשנה.", "השינוי -3.5% בשנה.", "השינוי 3.5- בשנה."):
+        assert meaning.source_occurrences(source, {"-3.5"})[0], source
+        assert meaning.source_occurrences(source, {"3.5"})[0], source
+    assert not meaning.source_occurrences("השינוי 3.5% בשנה.", {"-3.5"})[0]
+
+
+def test_a_plot_or_unit_identifier_carries_no_area_basis_or_header_qualifiers():
+    for source in ("מ\"ר אקוו' בתא שטח 101", "מ\"ר אקוו' בגוש 6004", "מ\"ר אקוו' בתת חלקה 12", "מ\"ר אקוו' בנספח 3"):
+        (occ,), _ = meaning.source_occurrences(source, set(meaning.numbers_in(source[-4:].strip())))
+        assert occ.identifier and not occ.qualifiers.found, source
+    table = "תא שטח | שטח (מ\"ר אקוו') | מקדם\nתא שטח 101 | 250 | 0.8"
+    ((ident,), _) = meaning.source_occurrences(table, {"101"})
+    assert ident.identifier and not ident.qualifiers.keys("basis")
+    (area,), _ = meaning.source_occurrences(table, {"250"})
+    assert not area.identifier and area.qualifiers.keys("basis") == {"אקוו"}
+
+
+def test_a_number_the_evidence_states_only_as_an_identifier_is_not_checked_for_a_basis():
+    ws = _ws("מ\"ר אקוו' בתא שטח 101")
+    assert _problems("הערך הוא 101 [S1].", ws) == []
+
+
+def test_a_plot_label_before_a_quantity_is_still_a_quantity():
+    source = "שטח מגרש 450 מ\"ר אקוו' ושווי מגרש 1,250,000 ₪."
+    (occ,), _ = meaning.source_occurrences(source, {"450"})
+    assert not occ.identifier and occ.qualifiers.keys("basis") == {"אקוו"}
+    (occ,), _ = meaning.source_occurrences(source, {"1250000"})
+    assert not occ.identifier

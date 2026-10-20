@@ -38,6 +38,13 @@ once: a word the text layer split ("חודש י") is joined first, the plural ad
 only, and neither "בחודש מאי", "לשנה אחת" nor a negated "אינו חודשי" is a period. Each table of a source has its own
 header, aligned to its data rows by their non-empty cells, and an empty header cell continues the cell before it.
 
+Round 19 (U1, KTD3, R9, R11, R12): a letter that follows a quote mark ends an abbreviation ("סה"כ", "מע"מ", "דמ"ש") and is never
+joined to the next word, so "סה"כ לשנה" stays an annual header; an abbreviated construct plural ("דמ"ש") is a plural noun before
+"חודשיים". A number is read with its sign and its decimal comma (``answering.numread``): "13,2" is 13.2 in a cell or next to a unit,
+"3,4" in a sentence keeps both readings in a source, "6,7,8" is a list, "(3.5)%" is negative. A number the source writes as an
+identifier (after תא שטח, מגרש, חלקה, גוש, סעיף, עמוד, נספח) carries no row, header or caption qualifier, and a number whose evidence
+occurrences are all identifiers is not checked.
+
 Round 9 (U12, KTD10, R22): a number that is no quantity — an identifier after מס׳ / מספר / No. / #, a date's day, month
 or year, a bare year — gets no check, and neither does a clause saying the source does not state something ("לא צוין
 אם הסכום כולל מע״מ"): it claims no basis, period or VAT.
@@ -59,7 +66,8 @@ from decimal import Decimal, InvalidOperation
 from functools import cache, cached_property, lru_cache
 from typing import TYPE_CHECKING
 
-from app.answering.verify import _NUMBER as _NUM_AT
+from app.answering.numread import NUMBER as _NUM_AT
+from app.answering.numread import number_spans, read_separators
 from app.answering.verify import not_an_amount, numbers_in
 from app.chat.datum import STATUS_NOT_READ
 from app.chat.evidence import _content_words
@@ -194,7 +202,9 @@ def _of_rate(text: str, pos: int) -> bool:
 # every written form of a month or a year (prefix letters, the noun, the adjective and the plural / dual nouns)
 _TIME_FORM = re.compile(r"[והבלמשכ]{0,2}(?:חודש(?:י(?:ת|ים|ות)?|ים)?|שנ(?:ה|ים|ות|תי(?:ת|ים|ות)?))")
 _SPLIT_TAIL = re.compile(r"(?<![א-ת])([א-ת]{2,}) ([א-ת])(?![א-ת])")
-_SPLIT_HEAD = re.compile(r"(?<![א-ת])([א-ת]) ([א-ת]{2,})(?![א-ת])")
+# a letter that follows a quote mark ends an abbreviation (סה"כ, מע"מ, בע"מ, דמ"ש), never a word split by the text layer: it is
+# not joined to the next word ("סה"כ לשנה" must not become "סה"כל שנה")
+_SPLIT_HEAD = re.compile(r"(?<![א-ת\"'״׳])([א-ת]) ([א-ת]{2,})(?![א-ת])")
 
 
 def _join_time_form(m: re.Match) -> str:
@@ -207,9 +217,10 @@ def _rejoin(text: str) -> str:
 
 
 def _read(text: str) -> str:
-    """The text as the number-meaning checks read it: one spelling of the Hebrew marks (``_norm``) and the split period words
-    joined (``_rejoin``); the same length as ``text``."""
-    return _rejoin(_norm(text))
+    """The text as the number-meaning checks read it: one spelling of the Hebrew marks (``_norm``), the split period words
+    joined (``_rejoin``) and the decimal commas written as points (``numread.read_separators``: a comma is read by context and by the
+    text's convention); the same length as ``text``."""
+    return read_separators(_rejoin(_norm(text)))
 
 
 # a negation that governs the period word: one of the ``NEGATION_TOKENS`` words before it, in the same part of the clause ("אינו מוצג
@@ -311,9 +322,13 @@ def _words_after(text: str, pos: int, count: int) -> list[str]:
         width *= 4
 
 
+# the abbreviated construct plural of a rent or a fee ("דמ"ש", "דמ"נ": דמי שכירות, דמי ניהול), with its prefix letters
+_ABBREVIATED_PLURAL = re.compile(r"^[והבלמשכ]{0,2}דמ\"[א-ת]$")
+
+
 def _after_plural_noun(text: str, pos: int) -> bool:
     words = re.findall(r"[א-ת\"']+", text[max(0, pos - 40):pos])[-2:]
-    return any(_PLURAL_ENDING.search(w) for w in words)
+    return any(_PLURAL_ENDING.search(w) or _ABBREVIATED_PLURAL.match(w) for w in words)
 
 
 def _period_word_ok(text: str, m: re.Match) -> bool:
@@ -363,13 +378,24 @@ def _scan(text: str, rates: bool = True) -> list[tuple[int, str, str, str]]:
     return sorted(out)
 
 
+@lru_cache(maxsize=512)
+def _spans(text: str) -> tuple[tuple[int, int, frozenset[str]], ...]:
+    return tuple(number_spans(text, source=True))
+
+
 def _numbers(text: str) -> list[tuple[int, int, frozenset[str]]]:
-    return [(m.start(), m.end(), frozenset(numbers_in(m.group(0)))) for m in _NUM_AT.finditer(text)]
+    """Every number of the text as (start, end, forms): the forms keep the sign, and an ambiguous pair ("3,4") is one number with
+    both readings (``numread.number_spans``; the text is evidence or answer, and both read alike here)."""
+    return list(_spans(text))
 
 
 def written_at(text: str, pos: int) -> str:
-    """The number written at ``pos`` as the answer shows it: without the comma that ends a list item ("בשנים 2021, 2022"), so a
-    year is tested as a year and an identifier as an identifier."""
+    """The number written at ``pos`` as the text shows it (its own digits, separators and all, so a decimal comma stays a comma),
+    without the comma that ends a list item ("בשנים 2021, 2022"), so a year is tested as a year and an identifier as an identifier.
+    An ambiguous pair ("3,4") is written whole."""
+    for start, end, _ in _spans(text):
+        if start == pos:
+            return text[start:end].rstrip(", ")
     return _NUM_AT.match(text, pos).group(0).rstrip(",")
 
 
@@ -482,6 +508,7 @@ class Occurrence:
     context: str  # the words around it, to choose the occurrence closest to the unit
     measurement: bool = False
     area: bool = False  # its row or column names it a per-area amount, or its row label or cell an area
+    identifier: bool = False  # the source writes it as an identifier (a plot, a unit, a section): it carries no qualifiers
 
     @cached_property
     def context_words(self) -> set[str]:
@@ -792,6 +819,11 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                 head = f"{own_heads[i]} {upper_heads[i]}".strip()
                 found, _ = attached(cell)
                 for f, at, q in found:
+                    if not_an_amount(cell, at, at + len(written_at(cell, at)), years=False):
+                        # a plot, a unit or a section label (תא שטח 101): the source writes it as a name, so no row, header or
+                        # caption qualifier belongs to it (round 19 U1, KTD3)
+                        occurrences.append((f, Occurrence(Qualifiers(), line, identifier=True)))
+                        continue
                     own = cells[0] + " " + cell
                     row_meaning = own + " " + head
                     kind = after_kind(cell, at + len(written_at(cell, at))) or context_kind(row_meaning)
@@ -826,6 +858,9 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
         if n in captions:
             general.merge(_only(_all(line), "period", keep=False), "paragraph")
         for i, (f, at, q) in enumerate(found):
+            if not_an_amount(line, at, at + len(written_at(line, at)), years=False):
+                occurrences.append((f, Occurrence(Qualifiers(), line, identifier=True)))
+                continue
             q = _tagged(q, "sentence")
             if not after_kind(line, at + len(written_at(line, at))):
                 q.merge(period(n))
@@ -850,16 +885,22 @@ def _flat(text: str) -> str:
     return " ".join(_norm(text).split())
 
 
+def _one_point(text: str) -> str:
+    """``text`` with every separator between digits written as a point: a quote is the same line of the source whether its decimal
+    comma was read as a decimal in the line or in the quote alone (the reading depends on what surrounds the comma)."""
+    return re.sub(r"(?<=\d)[.,](?=\d)", ".", text)
+
+
 def number_qualifiers(text: str, forms: frozenset[str], within: str) -> Qualifiers:
     """What a source attaches to a number where it states it inside ``within`` (a quote of the source, or a table
     row as read), with the period stated for it there and what the source states for all
     its numbers — the qualifiers a value taken from the source may carry as the source's own
     (``tools.tool_take_value``). The same number elsewhere in the source does not count."""
     parsed, general = parse_source(text)
-    w = _flat(_read(within))
+    w = _one_point(_flat(_read(within)))
     q = Qualifiers().merge(general)
     for f, o in parsed:
-        line = _flat(o.context)
+        line = _one_point(_flat(o.context))
         if f & forms and line and (w in line or line in w):
             q.merge(o.qualifiers)
     return q
@@ -1305,6 +1346,7 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
     if not unit.ids:
         return []
     text = _read(unit.text)
+    unit_text = _norm(unit.text)  # the number as the unit writes it (a decimal comma stays a comma), at the positions of ``text``
     whole = _all(text + "\n" + _norm(unit.context))
     approx_anywhere = bool(_APPROX_WORDS.search(text))
     words = _content_words(text)
@@ -1314,7 +1356,7 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
     for forms, pos, claimed in in_unit:
         if not forms:
             continue
-        written = written_at(text, pos)
+        written = written_at(unit_text, pos)
         # an identifier, a date's part or a year is no amount; a number in a clause saying the source does not state
         # something claims no meaning (round 9 U12)
         if not_an_amount(text, pos, pos + len(written)) or any(a <= pos < b for a, b in absent):
@@ -1323,6 +1365,8 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
         occurrences, general = _evidence(unit, ws, forms)
         if not occurrences:
             continue  # not a number of the cited evidence: the number check owns it
+        if all(o.identifier for o in occurrences):
+            continue  # the evidence writes it as an identifier (a plot, a unit, a section), not as an amount
         # attested: what the evidence attaches to the number, and anything its source line says at all — a
         # qualifier phrased before the amount ("השטח 120 מ"ר, דמי השכירות לחודש 7,560 ₪") is never "added"
         attested = Qualifiers().merge(general)

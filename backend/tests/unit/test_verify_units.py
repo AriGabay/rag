@@ -1816,6 +1816,32 @@ def test_a_number_in_the_name_of_a_property_or_a_plot_is_still_not_vat_bearing(t
     assert not any(f in ("7", "1234", "56", "12", "3") for f, _ in pairs), text
 
 
+@pytest.mark.parametrize("text, house", [
+    ("השכירות 4,500 ₪ בהרצל 12 ללא מע\"מ", "12"),
+    ("השכירות 4,500 ₪ ליד בניין 7 לא כולל מע\"מ", "7"),
+    ("השכירות 4,500 ₪ בדירה 305 ללא מע\"מ", "305"),
+])
+def test_a_bare_whole_number_of_up_to_three_digits_is_not_vat_bearing(text, house):
+    """Round 19 U1 (KTD3): a house number has no currency, scale, percent, separator or unit near it, so the VAT phrase after it
+    belongs to the amount before it."""
+    pairs, _ = verify.vat_attachments(text)
+    assert pairs == {(f, "excluded") for f in verify.numbers_in("4,500")}, text
+    assert not any(f == house for f, _ in pairs)
+
+
+@pytest.mark.parametrize("text, amount", [
+    ("שכר דירה 800 ₪ ללא מע\"מ", "800"),
+    ("דמי שימוש במבנה 800 לחודש ללא מע\"מ", "800"),
+    ("עלות הפיתוח 120 אלף ללא מע\"מ", "120"),
+    ("שכר דירה ₪ 950 ללא מע\"מ", "950"),
+    ("תשלום 100 שקלים לא כולל מע\"מ", "100"),
+    ("דמי ניהול 4,500 ללא מע\"מ", "4500"),
+])
+def test_a_small_amount_with_a_currency_scale_period_or_separator_is_still_vat_bearing(text, amount):
+    pairs, _ = verify.vat_attachments(text)
+    assert any(f == amount and p == "excluded" for f, p in pairs), text
+
+
 def test_the_vat_of_a_rent_written_with_a_shekel_word_after_a_property_noun_is_checked_against_the_source():
     source = 'שכר דירה 4,500 ש"ח, לא כולל מע"מ.'
     assert _deterministic('שכר דירה 4,500 ש"ח לא כולל מע"מ [S1].', source) == []

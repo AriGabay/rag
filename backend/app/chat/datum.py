@@ -30,6 +30,7 @@ from decimal import Decimal
 from functools import lru_cache
 from typing import NamedTuple
 
+from app.answering.numread import read_separators
 from app.measurements.values import parse_amount
 
 STATUS_STATED, STATUS_NONE, STATUS_NOT_READ = "stated", "none", "not_read"
@@ -1048,7 +1049,7 @@ def reduction_cue(text: str | None) -> bool:
 def _half_unit(site) -> Decimal:
     """Half a unit of the last digit a datum's number is written with, as a fraction: "15" of a percent is 0.005, "0.15" of a ratio
     0.005, "8.5" of a percent 0.0005."""
-    found = _NUMBER_WRITTEN.search(getattr(site, "written", "") or "")
+    found = _NUMBER_WRITTEN.search(read_separators(getattr(site, "written", "") or "", cell=True))
     places = len(found.group(1) or "") if found else 0
     half = Decimal(5) / (Decimal(10) ** (places + 1))
     return half / 100 if getattr(site, "unit", "") == "percent" else half

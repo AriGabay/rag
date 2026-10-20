@@ -36,6 +36,37 @@ def test_written_values_parse_with_their_form():
     assert parse_amount("ללא ערך") is None
 
 
+def test_a_written_decimal_comma_and_an_accounting_percent_parse_as_written():
+    """Round 19 U1 (KTD3, R11, R12, AE6): a comma is read by context, a sign is part of the number."""
+    assert parse_amount("13,2").value == Decimal("13.2")
+    assert parse_amount("€ 13,2").value == Decimal("13.2")
+    assert parse_amount("13,2%").value == Decimal("13.2")
+    assert parse_amount("0,125").value == Decimal("0.125")
+    assert parse_amount("(3.5)%").value == Decimal("-3.5")
+    assert parse_amount("(3.5%)").value == Decimal("-3.5")
+    assert parse_amount("-3.5%").value == Decimal("-3.5")
+    assert parse_amount("\u22123.5%").value == Decimal("-3.5")
+    assert parse_amount("104,610-").value == Decimal("-104610")
+    assert parse_amount("3.5%").value == Decimal("3.5")
+
+
+def test_thousands_and_ranges_parse_as_before_beside_the_decimal_comma():
+    assert parse_amount("1,250").value == Decimal("1250")
+    assert parse_amount("3,596,696").value == Decimal("3596696")
+    assert parse_amount("1.234,56").value == Decimal("1234.56")
+    assert parse_amount("1,234.56").value == Decimal("1234.56")
+    a = parse_amount("65,5-85,5 ₪")
+    assert (a.low, a.high, a.form) == (Decimal("65.5"), Decimal("85.5"), "range")
+    assert parse_amount("כ-21,000 ₪").value == Decimal("21000")  # a hyphen after a prefix is no minus
+    assert parse_amount("6,7,8").value == Decimal("6")  # a chain is a list, never 6.7
+
+
+def test_same_number_compares_a_decimal_comma_by_its_value():
+    from app.measurements.values import same_number
+
+    assert same_number("13,2", Decimal("13.2")) and not same_number("13,2", Decimal("132")) and not same_number("13,2", Decimal("13"))
+
+
 def test_a_date_is_not_read_as_a_range():
     assert parse_amount("14.12.2021").form == "exact"
 

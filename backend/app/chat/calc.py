@@ -70,6 +70,7 @@ from fractions import Fraction
 from typing import Any
 from uuid import UUID
 
+from app.answering.numread import read_separators
 from app.chat import datum
 from app.chat.contexts import context_subject
 from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
@@ -492,7 +493,7 @@ def rounding_interval(written: str) -> tuple[Decimal, Decimal] | None:
     """The values a number written with its precision may stand for (round 7 KTD8, R23): half a unit of its last
     written digit on each side — "17" (or "כ-17%") is 16.5–17.5, "17.5" is 17.45–17.55. None unless the text holds
     exactly one number."""
-    found = _WRITTEN_NUMBER.findall(written or "")
+    found = _WRITTEN_NUMBER.findall(read_separators(written or "", cell=True))  # "13,2" is 13.2, never 132
     if len(found) != 1:
         return None
     raw = found[0].replace(",", "")

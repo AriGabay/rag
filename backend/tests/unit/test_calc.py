@@ -326,6 +326,7 @@ def test_the_structural_literals_keep_their_structural_uses():
 @pytest.mark.parametrize("written, low, high", [
     ("17", "16.5", "17.5"), ("כ-17%", "16.5", "17.5"), ("20", "19.5", "20.5"), ("17.5", "17.45", "17.55"),
     ("6.25%", "6.245", "6.255"), ("0.5", "0.45", "0.55"),
+    ("13,2", "13.15", "13.25"), ("13,2%", "13.15", "13.25"), ("0,125", "0.1245", "0.1255"),  # a decimal comma, never 132 (round 19 U1)
 ])
 def test_a_written_rate_has_the_rounding_interval_of_its_last_written_digit(written, low, high):
     assert calc.rounding_interval(written) == (Decimal(low), Decimal(high))

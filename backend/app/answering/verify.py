@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping
-from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from app.answering.numread import (
+    NUMBER as _NUMBER,  # one reading of numbers for every check that imports it from here
+)
+from app.answering.numread import add_form as _add
+from app.answering.numread import decimal_convention, number_forms
 from app.providers.llm import (
     CallStatus,
     LLMProvider,
@@ -27,14 +31,16 @@ from app.providers.llm import (
 )
 
 CITE = re.compile(r"\[(E\d+)\]")
-# A number may follow a Hebrew prefix letter ("ב2019"), but not a Latin letter, digit or underscore. A comma is a thousands
-# separator only in groups of three ("1,250,000"): "2018,2019,2021" is a list of three years.
-_NUMBER = re.compile(r"(?<![0-9A-Za-z_])(?:\d{1,3}(?:,\d{3})+(?!\d)|\d+)(?:\.\d+)?")
 # a date ends where no digit continues it: sentence punctuation after it ("01.11.1966." / "…,") is not a decimal
 # part, while a further "./" and digit ("1.2.2020.5") makes it a longer chain, which is no date
 _DATE = re.compile(r"(?<![\d.,/])(\d{1,2})[./-](\d{1,2})[./-](\d{4}|\d{2})(?!\d)(?![./]\d)")
 # a number right after "מס׳ / מספר / No. / #" names a document or a case, not a quantity
 _IDENTIFIER_BEFORE = re.compile(r"(?:(?<![א-ת])(?:מס|מספר|מס\"ד)[׳'’.]?|\bNo\.?|\bNr\.?|#)\s*:?\s*$")
+# a number right after the label of a plot, a unit or a place in a document names it, whatever the table around it says about its
+# neighbours ("תא שטח 101", "גוש 6004", "סעיף 4"): an identifier, unless a unit or a currency follows it (``_QUANTITY_AFTER``: "מגרש 450 מ״ר")
+_LABEL_BEFORE = re.compile(
+    r"(?<![א-ת])[בלמ]?(?:תא[\s-]+שטח|תא|מגרש|תת[\s-]*חלקה|חלקה|גוש|סעיף|עמוד|נספח)[׳']?\s*:?\s*$")
+_QUANTITY_AFTER = re.compile(r"\s*(?:₪|ש[\"״]ח|מ[\"״]ר|דונם|%|אלף|מיליון|מטר)")
 _YEAR = re.compile(r"(?:19|20)\d\d")
 # Counts written as words ("שתי קומות"); used on the evidence side only, so a claim's digit can match them.
 _NUMBER_WORDS = {
@@ -66,27 +72,22 @@ JUDGE_POLICY = (
 )
 
 
-def _add(out: set[str], token: str) -> None:
-    try:
-        value = Decimal(token.rstrip(".,").replace(",", ""))
-    except InvalidOperation:
-        return
-    out.add(str(value.normalize()))
-    if value == value.to_integral_value():
-        out.add(str(int(value)))
-
-
-def numbers_in(text: str, *, words: bool = False) -> set[str]:
+def numbers_in(text: str, *, words: bool = False, source: bool = False, decimal: bool = False) -> set[str]:
     """Normalized numbers in ``text``, ignoring [E#] citations and list ordinals: 2.80 and 2.8, 1,250 and
     1250 are the same number, and a date (14/02/2023, 14.2.2023) is its day, month and year. With ``words``,
-    counts written as Hebrew words count as well (for evidence, never for a claim)."""
+    counts written as Hebrew words count as well (for evidence, never for a claim).
+
+    A comma and a sign are read as ``numread`` reads them (round 19 U1, KTD3): "13,2%" is 13.2 and "1.234,56" is 1234.56, "3,596,696"
+    is thousands, "6,7,8" is a list; a negative number has its signed form next to its unsigned one. ``source`` (implied by
+    ``words``): the text is evidence, so an ambiguous pair ("3,4") keeps both readings (3.4, 3 and 4) and accounting brackets and
+    a trailing minus count as a minus. ``decimal``: a claim whose cited source writes decimals with a comma (``decimal_convention``)
+    reads such a pair as the decimal."""
     out: set[str] = set()
     text = _ORDINAL.sub(" ", CITE.sub(" ", text))
     for m in _DATE.finditer(text):
         for part in m.groups():
             _add(out, part)
-    for raw in _NUMBER.findall(_DATE.sub(" ", text)):
-        _add(out, raw)
+    out |= number_forms(_DATE.sub(" ", text), source=source or words, decimal=decimal)
     if words:
         for w in _WORD.findall(text):
             for form in (w, w[1:] if w[:1] in _PREFIX_LETTERS else None):
@@ -97,9 +98,12 @@ def numbers_in(text: str, *, words: bool = False) -> set[str]:
 
 def not_an_amount(text: str, start: int, end: int, *, years: bool = True) -> bool:
     """Whether the number at ``text[start:end]`` is no quantity: an identifier (a number right after מס׳, מספר, No.
-    or #), a part of a date, or — with ``years`` — a bare year (1900-2099, no currency, unit or percent after it).
+    or #, or after the label of a plot, a unit or a place: תא שטח, מגרש, חלקה, גוש, סעיף, עמוד, נספח), a part of a date, or — with ``years`` — a bare year (1900-2099, no currency, unit or percent after it).
     The period, basis and VAT checks give a number a meaning only when it is a quantity (round 9 U12, R22)."""
     if _IDENTIFIER_BEFORE.search(text[max(0, start - 12):start]):
+        return True
+    if _LABEL_BEFORE.search(text[max(0, start - 14):start]) and "," not in text[start:end] \
+            and not _QUANTITY_AFTER.match(text, end):
         return True
     if any(d.start() <= start and end <= d.end() for d in _DATE.finditer(text)):
         return True
@@ -202,11 +206,13 @@ def check_claim(text: str, evidence_ids: list[str], declared_numbers: list[str],
     allowed = set(computed)
     for i in ids & evidence.keys():
         allowed |= numbers_in(evidence[i], words=True)
+    # a claim reads a "d,d" pair as a decimal only when its cited source writes decimals with a comma (round 19 U1, KTD3)
+    decimal = any(decimal_convention(evidence[i]) for i in ids & evidence.keys())
     declared = set()
     for n in declared_numbers:
-        declared |= numbers_in(n)
+        declared |= numbers_in(n, decimal=decimal)
     stated, label_numbers = strip_label_numbers(text, [labels[i] for i in ids if labels and i in labels])
-    in_text = numbers_in(stated)
+    in_text = numbers_in(stated, decimal=decimal)
     declared -= label_numbers - in_text  # a declared label number the claim only uses as the label
     allowed |= question_subject_numbers(text, question, declared)
     if (in_text | declared) - allowed:

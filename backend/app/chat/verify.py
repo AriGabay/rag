@@ -3724,10 +3724,33 @@ def _in_a_name(clause: str, m: re.Match) -> bool:
     return bool(_NAME_BEFORE.search(before) or ("," not in m.group(0) and _GENERIC_NAME_BEFORE.search(before)))
 
 
+# a currency sign or word right before a number
+_CURRENCY_NEAR_BEFORE = re.compile(r"(?:[₪$€£]|ש[\"״']?ח|שקל(?:ים)?)\s*$")
+
+
+def _bare_small_number(clause: str, m: re.Match) -> bool:
+    """Whether the number ``m`` is a bare whole number of up to three digits with no currency, scale word, percent, thousands
+    separator or period word near it, and no name of a kind of amount (rent, value, price, cost ...) right before it: a house number,
+    an apartment, a floor or a count — never an amount that carries a VAT status (round 19 U1, KTD3). "ברחוב הרצל 12 ללא מע״מ" is a
+    street number; "4,500", "800 ₪", "800 לחודש", "120 אלף" and "דמי השכירות 58" are amounts."""
+    from app.chat.calc import scale_after
+
+    if not (m.group(0).isdigit() and len(m.group(0)) <= 3):
+        return False
+    if _PRICE_AFTER.match(clause, m.end()) or _CURRENCY_NEAR_BEFORE.search(clause[max(0, m.start() - 10):m.start()]):
+        return False
+    # the name of a kind of amount right before it ("דמי השכירות 58", "שווי 900") makes it an amount whatever follows
+    near = " ".join(clause[max(0, m.start() - 30):m.start()].split()[-3:])
+    if any(meaning.kind_attested(k, near) for k in meaning.MONEY_KINDS):
+        return False
+    return scale_after(clause, m.start(), m.end())[0] == 1
+
+
 def _vat_bearing(clause: str, m: re.Match, nested: bool = False) -> bool:
     """Whether a number can carry a VAT status: not a year, not an area, count or rate (a number followed by
     מ״ר, דונם, שנים, % ...), not a number in the name of a property, plot or building (a short whole number after
-    "מגדל הים", "גוש", ...), and not a number inside parentheses ("9,500 ₪ (שטח 120 מ״ר), לא כולל מע״מ" — the VAT is the
+    "מגדל הים", "גוש", ...), not a bare whole number of up to three digits with no currency, scale, period or separator near it
+    (``_bare_small_number``: a house number), and not a number inside parentheses ("9,500 ₪ (שטח 120 מ״ר), לא כולל מע״מ" — the VAT is the
     9,500's) — unless ``nested``: the number is in the parentheses that hold the VAT phrase itself, which then belong to it."""
     value = m.group(0).replace(",", "")
     if re.fullmatch(r"(19|20)\d\d", value) and "₪" not in clause[m.end():m.end() + 3]:
@@ -3737,6 +3760,8 @@ def _vat_bearing(clause: str, m: re.Match, nested: bool = False) -> bool:
     if _NOT_A_PRICE_AFTER.match(clause, m.end()):
         return False
     if _in_a_name(clause, m):
+        return False
+    if _bare_small_number(clause, m):
         return False
     before = clause[:m.start()]
     return nested or before.count("(") <= before.count(")")

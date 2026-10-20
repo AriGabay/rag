@@ -170,6 +170,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, text
 
+from app.answering.numread import read_separators
 from app.answering.verify import numbers_in
 from app.chat import anchors, calc, contexts, datum, meaning, reader
 from app.chat import dates as chat_dates
@@ -5807,7 +5808,7 @@ def uncertain_inputs(ws: Workspace, ids) -> list[str]:
 def _parse_number(raw: str) -> tuple[str, Decimal] | None:
     """A number as written, tolerant of ₪, %, NBSP, spaces, thousands commas and a sign: ("12,450,000", 12450000).
     None when it holds no number or more than one."""
-    s = meaning._norm(str(raw or "")).replace(" ", " ").replace(" ", " ")
+    s = read_separators(meaning._norm(str(raw or "")).replace(" ", " ").replace(" ", " "), cell=True)
     found = [m for m in _SIGNED.finditer(s) if m.group(3)]
     if len(found) != 1:
         return None
@@ -5874,12 +5875,12 @@ def _label_units(label: str) -> set[str]:
 
 def _numbers_of(text_: str) -> list[tuple[str, int, int, Decimal]]:
     """Every number written in a text: (as written, start, end, value)."""
-    from app.answering.verify import _NUMBER
+    from app.answering.numread import numbers_written
 
     out = []
-    for m in _NUMBER.finditer(text_ or ""):
-        try:
-            out.append((m.group(0), m.start(), m.end(), Decimal(m.group(0).rstrip(".,").replace(",", ""))))
+    for written, start, end, token in numbers_written(text_ or ""):
+        try:  # a decimal comma is read by context (``numread``): "13,2" is 13.2, "1,250" is 1250
+            out.append((written, start, end, Decimal(token.rstrip(".,").replace(",", ""))))
         except ArithmeticError:
             continue
     return out

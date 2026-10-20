@@ -254,8 +254,6 @@ YEARLY_LINE = "עלות הביטוח היא 24,000 ₪ לשנה [S1]."
 ABBREVIATIONS_ANSWER = f"{MONTHLY_LINE}\n{ANNUAL_LINE}\n{YEARLY_LINE}"
 
 
-@strict_xfail("U1", "the period of a column whose header is written with an abbreviation (סה\"כ לשנה, דמ\"ש חודשיים) is lost, "
-                    "and the amount is edited or removed")
 def test_values_under_headers_written_with_abbreviations_keep_their_periods(client, office, monkeypatch):
     m = ask(client, office, monkeypatch, ABBREVIATIONS, read_pages(1, 1), ABBREVIATIONS_ANSWER,
             "מהם דמי השכירות החודשיים ממשרדים, ההכנסה השנתית מדמי שכירות ממשרדים ועלות הביטוח?",
@@ -277,8 +275,6 @@ DECIMAL_QUESTION = "מהם שיעור התשואה הגולמית, השינוי 
 DECIMAL_ASK = "שיעור התשואה הגולמית, השינוי השנתי במחירי הנכסים באזור ושווי הנכס"
 
 
-@strict_xfail("U1", "a decimal comma in a table cell (13,2%) is read as a thousands separator, so the claim 13.2% is an unstated number "
-                    "and is removed")
 def test_a_decimal_comma_in_a_cell_is_read_as_a_decimal_when_the_table_writes_thousands_elsewhere(
         client, office, monkeypatch):
     m = ask(client, office, monkeypatch, DECIMAL, read_pages(1, 1), f"{RATE_LINE}\n{VALUE_LINE}", DECIMAL_QUESTION,
@@ -289,8 +285,6 @@ def test_a_decimal_comma_in_a_cell_is_read_as_a_decimal_when_the_table_writes_th
     assert removals(client, m) == [], md
 
 
-@strict_xfail("U1", "a negative percent the source writes with a decimal comma (−3,5%) is read as 35 (or loses its sign), so the claim "
-                    "−3.5% is an unstated number and is removed")
 def test_a_negative_percent_the_source_writes_with_a_decimal_comma_is_kept_with_its_sign(client, office, monkeypatch):
     m = ask(client, office, monkeypatch, DECIMAL, read_pages(1, 1), CHANGE_LINE, DECIMAL_QUESTION, DECIMAL_ASK)
     md = m["answer"]["markdown"]
