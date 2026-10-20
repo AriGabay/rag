@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass
 
 from app.extraction.base import TableResult, TableRow
-from app.extraction.hebrew import fix_line
+from app.extraction.hebrew import fix_line, has_hebrew
 
 HEADER_VOCAB = (
     "כתובת", "גוש", "חלקה", "תאריך", "שטח", "מחיר", "סוג", "חדרים", "קומה", "רחוב", "עסקה", "שווי", "יחידה",
@@ -32,6 +32,10 @@ _LETTERS = re.compile(r"[^\u05D0-\u05EA₪]")
 _UNIT = re.compile(r"\(([^()]+)\)")
 _SPACE = re.compile(r"\s+")
 _DIGIT = re.compile(r"\d")
+_LATIN = re.compile(r"[A-Za-z]")
+# A header cell that is only a year or a quarter ("2022", "Q3 2022", "3Q22"): its period, as (year, quarter).
+_YEAR_CELL = re.compile(r"((?:19|20)\d{2})")
+_QUARTER_CELL = re.compile(r"(?:Q([1-4])[ /\-]*((?:19|20)?\d{2})|((?:19|20)?\d{2})[ /\-]*Q([1-4])|([1-4])Q[ /\-]*((?:19|20)?\d{2}))", re.I)
 
 
 def clean_cell(text: str | None) -> str:
@@ -72,9 +76,41 @@ def units_for(headers: list[str]) -> list[str | None]:
     return out
 
 
-def logical_row(cells_ltr: list[str | None], visual_default: bool = True) -> list[str]:
+def _period(cell: str | None) -> tuple[int, int] | None:
+    """The (year, quarter) a header cell names when it is only a year or a quarter of a year; quarter 0: the whole year."""
+    text = clean_cell(cell)
+    m = _YEAR_CELL.fullmatch(text)
+    if m:
+        return int(m.group(1)), 0
+    m = _QUARTER_CELL.fullmatch(text)
+    if not m:
+        return None
+    quarter, year = next((int(q), int(y)) for q, y in ((m.group(1), m.group(2)), (m.group(4), m.group(3)), (m.group(5), m.group(6))) if q)
+    return (year + 2000 if year < 100 else year), quarter
+
+
+def reads_left_to_right(grid: list[list[str | None]], page_has_hebrew: bool) -> bool:
+    """Whether a text-layer table is stored in the order it reads: neither the table nor its page holds a Hebrew letter, and the
+    table gives a left-to-right cue: a cell with Latin letters in its first row, or years or quarters that rise from left to
+    right along a row. A table of numbers only has no cue, and keeps the right-to-left handling (KTD4)."""
+    if page_has_hebrew or any(has_hebrew(c or "") for row in grid for c in row):
+        return False
+    first = next((row for row in grid if any(clean_cell(c) for c in row)), [])
+    if any(_LATIN.search(c or "") for c in first):
+        return True
+    for row in grid:
+        periods = [p for p in map(_period, row) if p is not None]
+        if len(periods) >= 2 and all(a < b for a, b in zip(periods, periods[1:], strict=False)):
+            return True
+    return False
+
+
+def logical_row(cells_ltr: list[str | None], visual_default: bool = True, left_to_right: bool = False) -> list[str]:
     """pdfplumber cells (left -> right, visual text) -> logical column order with logical cell text.
-    Wrapped cell lines are fixed one by one and joined with a space."""
+    Wrapped cell lines are fixed one by one and joined with a space. ``left_to_right`` (``reads_left_to_right``): the columns
+    keep the order they are stored in and the cell text, which holds no Hebrew letter, is kept as it is."""
+    if left_to_right and not any(has_hebrew(c or "") for c in cells_ltr):
+        return [clean_cell(" ".join(ln for ln in (cell or "").splitlines() if ln.strip())) for cell in cells_ltr]
     out = []
     for cell in reversed(cells_ltr):
         lines = [ln for ln in (cell or "").splitlines() if ln.strip()]
@@ -82,9 +118,9 @@ def logical_row(cells_ltr: list[str | None], visual_default: bool = True) -> lis
     return out
 
 
-def logical_boxes(boxes_ltr: list | None) -> list:
-    """pdfplumber cell boxes (left -> right) in the logical column order ``logical_row`` gives their cells."""
-    return list(reversed(boxes_ltr or []))
+def logical_boxes(boxes_ltr: list | None, left_to_right: bool = False) -> list:
+    """pdfplumber cell boxes (left -> right) in the column order ``logical_row`` gives their cells."""
+    return list(boxes_ltr or []) if left_to_right else list(reversed(boxes_ltr or []))
 
 
 @dataclass

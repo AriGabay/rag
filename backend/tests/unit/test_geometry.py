@@ -178,6 +178,13 @@ def test_cell_boxes_follow_the_column_reversal_of_their_cells():
     assert logical_boxes(None) == []
 
 
+def test_cell_boxes_of_a_left_to_right_table_keep_their_order_with_their_cells():
+    boxes_ltr = [[100.0, 0, 200.0, 10], [200.0, 0, 300.0, 10], [300.0, 0, 400.0, 10]]
+    assert logical_row(["GLA", "Tenant", "Rent"], left_to_right=True) == ["GLA", "Tenant", "Rent"]
+    assert logical_boxes(boxes_ltr, left_to_right=True) == boxes_ltr
+    assert logical_boxes(None, left_to_right=True) == []
+
+
 def test_cell_boxes_survive_empty_rows_padding_and_a_continuation_page():
     page1 = [HEADERS, ["התאנה 3", "82", "1,640,000"], ["", " ", ""], ["התאנה 9", "95"]]
     page2 = [["", "", ""], ["הרימון 4", "77", "1,520,000"]]

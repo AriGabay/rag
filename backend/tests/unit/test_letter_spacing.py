@@ -10,6 +10,9 @@ from app.extraction import letterspacing as ls
 from app.extraction.hebrew import fix_text_lines, strip_bidi_controls
 from app.extraction.letterspacing import JOINED, PLAIN, UNCERTAIN, Glyph
 
+# A Hebrew line of the same page: a digits-only line follows the file's orientation only on a page that holds Hebrew (round 20, U4).
+HEBREW_LINE = "תינכת"
+
 
 def line(words: list[str], pitch: float, word_pitch: float, *, width: float = 6.0, size_pt: float = 10.5,
          seq_desc: bool = False, x0: float = 100.0) -> tuple[str, list[Glyph | None]]:
@@ -125,7 +128,7 @@ def test_the_fixture_shapes_come_out_as_the_numbers_the_page_shows():
     raw, glyphs = line(["1202/60/12", "2424"], pitch=11.3, word_pitch=28.0, seq_desc=True)
     verdict = ls.read_line(raw, glyphs, 10.5)
     joined = ls.join_line(raw, glyphs, verdict)
-    fixed = fix_text_lines([joined.raw], default_visual=True)[0]
+    fixed = fix_text_lines([HEBREW_LINE, joined.raw], default_visual=True)[1]
     assert fixed == "2424 1202/60/12"  # the fix alone leaves each digit run in x order
     final = ls.apply_flips(joined.raw, fixed, joined.flips)
     assert final == "4242 21/06/2021"
@@ -134,7 +137,7 @@ def test_the_fixture_shapes_come_out_as_the_numbers_the_page_shows():
 def test_words_drawn_left_to_right_keep_their_order_through_the_fix():
     raw, glyphs = line(["2021/60/12", "4242"], pitch=11.3, word_pitch=28.0)
     joined = ls.join_line(raw, glyphs, ls.read_line(raw, glyphs, 10.5))
-    fixed = fix_text_lines([joined.raw], default_visual=True)[0]
+    fixed = fix_text_lines([HEBREW_LINE, joined.raw], default_visual=True)[1]
     assert ls.apply_flips(joined.raw, fixed, joined.flips) == "4242 2021/60/12"
 
 
@@ -162,7 +165,7 @@ def test_a_page_without_orientation_evidence_reads_flagged_words_after_the_docum
     raw, glyphs = line(["1202/60/12", "2424"], pitch=11.3, word_pitch=28.0, seq_desc=True)
     joined = ls.join_line(raw, glyphs, ls.read_line(raw, glyphs, 10.5))
     ln = pdf._Line(10.0, "", layer_text=joined.raw, flips=[list(f) for f in joined.flips])
-    pdf._read_flips(ln, fix_text_lines([joined.raw], default_visual=True)[0])
+    pdf._read_flips(ln, fix_text_lines([HEBREW_LINE, joined.raw], default_visual=True)[1])
     assert ln.text == "4242 21/06/2021" and ln.uncertain is None
     broken = pdf._Line(10.0, "", layer_text="abc", flips=[[0, 3]])
     pdf._read_flips(broken, "xyz")

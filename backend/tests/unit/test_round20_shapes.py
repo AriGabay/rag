@@ -264,7 +264,6 @@ def _visual_file():
 NUMBER_LINE = "1,200 1,450 1,600"
 
 
-@strict_xfail("U4", "a line of numbers on a page with no Hebrew is reversed when the file's default orientation is visual: fix_line reverses a Hebrew-free line without Latin letters")
 def test_ae9_a_number_only_line_on_a_page_with_no_hebrew_keeps_its_stored_left_to_right_order():
     from app.extraction.hebrew import fix_text_lines
 
@@ -272,7 +271,6 @@ def test_ae9_a_number_only_line_on_a_page_with_no_hebrew_keeps_its_stored_left_t
     assert fix_text_lines(["Quarterly revenue by property", NUMBER_LINE], default_visual=True)[1] == NUMBER_LINE
 
 
-@strict_xfail("U4", "the stored page and block of the Hebrew-free page hold the number line reversed (1,600 1,450 1,200): orient_pages applies the file's visual orientation to it")
 def test_ae9_the_stored_page_and_block_of_a_hebrew_free_page_hold_the_number_line_as_drawn():
     result = _visual_file()
     page = next(p for p in result.pages if p.page_no == 2)
@@ -286,7 +284,6 @@ def test_protection_ae9_the_same_number_line_on_a_page_with_hebrew_keeps_todays_
     assert fix_text_lines(["ןג תמר :ריע", NUMBER_LINE], default_visual=True) == ["עיר: רמת גן", "1,600 1,450 1,200"]
 
 
-@strict_xfail("U4", "the columns of a table with Latin headers on a page with no Hebrew are reversed (logical_row reverses every text-layer table): the first column is read last")
 def test_a_table_with_latin_headers_on_a_page_with_no_hebrew_keeps_its_columns_in_box_order():
     result = _visual_file()
     table = next(t for t in result.tables if t.page_start == 2)

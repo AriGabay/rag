@@ -152,10 +152,13 @@ def fix_text_lines(lines: list[str], default_visual: bool | None = None) -> list
     """Fix all lines of one page. The page majority decides lines with weak evidence; a line
     overrides the page only with a clear margin (mixed-producer documents)."""
     page = page_is_visual(lines) if default_visual is None else default_visual
+    # A page with no Hebrew letter has no right-to-left paragraph for a digits-only line to follow, whatever the
+    # document's default orientation is: the line keeps the order its words are stored in (round 20, KTD4).
+    page_hebrew = any(has_hebrew(line) for line in lines)
     out = []
     for line in lines:
         if not has_hebrew(line):
-            out.append(fix_line(line, bool(page)))
+            out.append(fix_line(line, bool(page) and page_hebrew))
             continue
         own = looks_visual(line, margin=2)
         if own is None:

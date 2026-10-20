@@ -85,6 +85,7 @@ from app.extraction.fontmap import FontMapFix, WordSample
 from app.extraction.hebrew import (
     QUALITY_THRESHOLD,
     fix_text_lines,
+    has_hebrew,
     orientation_evidence,
     page_is_visual,
     quality_score,
@@ -93,7 +94,15 @@ from app.extraction.hebrew import (
 )
 from app.extraction.images import PictureReading, VisionReader
 from app.extraction.regions import PageLayer, ReadingCache, Region
-from app.extraction.tables import RawTable, assemble_tables, clean_cell, logical_boxes, logical_row, units_for
+from app.extraction.tables import (
+    RawTable,
+    assemble_tables,
+    clean_cell,
+    logical_boxes,
+    logical_row,
+    reads_left_to_right,
+    units_for,
+)
 
 log = logging.getLogger(__name__)
 
@@ -422,18 +431,21 @@ def _text_layer(page, index: int, fix: FontMapFix | None = None) -> _TextLayer:
         if not grid or max(len(r) for r in grid) < 2:
             continue
         grid = [[strip_bidi_controls(c) if c else c for c in row] for row in grid]
-        # pdfplumber returns columns left -> right: reverse to logical order, fix each cell's text.
-        rows = [logical_row(r, visual_default=True if visual is None else visual) for r in grid]
+        # pdfplumber returns columns left -> right: reverse to logical order, fix each cell's text. A table with no Hebrew
+        # on a page with no Hebrew that shows a left-to-right cue keeps its columns in the order they are stored in.
+        ltr = reads_left_to_right(grid, any(has_hebrew(t) for t in raw_texts))
+        rows = [logical_row(r, visual_default=True if visual is None else visual, left_to_right=ltr) for r in grid]
         reason = _uncertain_in(page.chars, t.bbox) if fix is not None else None
         # ``extract`` reads ``t.rows`` cell by cell, so its grid and the cell boxes line up (None: a merged cell)
-        boxes = [logical_boxes([list(c) if c is not None else None for c in row.cells]) for row in t.rows]
+        boxes = [logical_boxes([list(c) if c is not None else None for c in row.cells], left_to_right=ltr)
+                 for row in t.rows]
         if spacing.lines and len(grid) == len(t.rows):
             for r, (trow, cells) in enumerate(zip(t.rows, grid, strict=True)):
                 for c, cell_box in enumerate(trow.cells if len(trow.cells) == len(cells) else []):
                     read = spacing.cell(cell_box, cells[c]) if cell_box is not None else None
                     if read is not None:
                         if read[0] is not None:
-                            rows[r][len(cells) - 1 - c] = clean_cell(read[0])
+                            rows[r][c if ltr else len(cells) - 1 - c] = clean_cell(read[0])
                         reason = reason or read[1]
         reason = reason or spacing.table_note(t.bbox)
         out.tables.append(([round(float(x), 1) for x in t.bbox], rows, reason, boxes))

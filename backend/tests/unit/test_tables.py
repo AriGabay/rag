@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from app.extraction.tables import RawTable, assemble_tables, is_header_row, logical_row, units_for
+from app.extraction.tables import (
+    RawTable,
+    assemble_tables,
+    is_header_row,
+    logical_row,
+    reads_left_to_right,
+    units_for,
+)
 
 HEADERS = ["כתובת", "גוש/חלקה", "תאריך עסקה", "סוג נכס", "חדרים", "שטח (מ״ר)", "סוג שטח", "מחיר (₪)",
            "מחיר למ״ר (₪)"]
@@ -161,3 +168,43 @@ def test_a_part_is_one_line_with_its_kind_and_block_and_a_pointer_when_the_block
     assert T._part_line(part) == "[אחרי הטבלה · בין שתי טבלאות · פסקה · בלוק 9] שורה ראשונה שורה שנייה"
     assert T._part_line(part, {9: "S4"}) == "[אחרי הטבלה · בין שתי טבלאות · פסקה · בלוק 9: כבר הוחזר ב-S4]"
     assert T._part_line(part, {3: "S1"}).endswith("שורה שנייה")
+
+
+# --- a table with no Hebrew on a page with no Hebrew keeps the order it is stored in, when a cue shows it (round 20, U4) -----
+
+ENGLISH_GRID = [["GLA (sq m)", "Tenant", "Cad. Municipality"], ["1,200", "Alpha", "North"]]
+
+
+def test_an_english_table_on_a_page_with_no_hebrew_reads_left_to_right():
+    assert reads_left_to_right(ENGLISH_GRID, page_has_hebrew=False)
+    assert logical_row(ENGLISH_GRID[0], left_to_right=True) == ["GLA (sq m)", "Tenant", "Cad. Municipality"]
+    assert logical_row(ENGLISH_GRID[1], left_to_right=True) == ["1,200", "Alpha", "North"]
+
+
+def test_the_same_english_table_on_a_page_with_hebrew_is_not_decided_by_the_cue():
+    assert not reads_left_to_right(ENGLISH_GRID, page_has_hebrew=True)
+    assert logical_row(ENGLISH_GRID[0]) == ["Cad. Municipality", "Tenant", "GLA (sq m)"]
+
+
+def test_a_hebrew_table_keeps_the_right_to_left_handling():
+    assert not reads_left_to_right([RAW_HEADER, RAW_ROW0], page_has_hebrew=False)
+    assert not reads_left_to_right([["Address", "תבותכ"], ["1", "2"]], page_has_hebrew=False)
+    assert logical_row(["Address", "תבותכ"], left_to_right=True) == ["כתובת", "Address"]  # a Hebrew cell: never kept
+
+
+def test_a_numbers_only_table_has_no_cue_unless_its_periods_rise_from_left_to_right():
+    assert not reads_left_to_right([["1,200", "1,450"], ["3", "4"]], page_has_hebrew=False)
+    assert not reads_left_to_right([["31/12/2022", "30/09/2022"], ["3", "4"]], page_has_hebrew=False)  # dates are no period cue
+    assert reads_left_to_right([["2021", "2022", "2023"], ["3", "4", "5"]], page_has_hebrew=False)
+    assert not reads_left_to_right([["2023", "2022", "2021"], ["3", "4", "5"]], page_has_hebrew=False)
+    assert reads_left_to_right([["", "1Q23", "2Q23"], ["3", "4", "5"]], page_has_hebrew=False)
+    assert reads_left_to_right([["3", "4"], ["2022", "2023"]], page_has_hebrew=False)
+    assert logical_row(["1,200", "1,450"]) == ["1,450", "1,200"]  # no cue: today's handling
+
+
+def test_a_trailing_minus_cell_keeps_its_sign_with_its_number_in_a_left_to_right_row():
+    assert logical_row(["Net", "-50,000", "4,368,752"], left_to_right=True) == ["Net", "-50,000", "4,368,752"]
+
+
+def test_wrapped_lines_of_a_left_to_right_cell_are_joined_in_reading_order():
+    assert logical_row(["Gross\nrent", "1,200"], left_to_right=True) == ["Gross rent", "1,200"]
