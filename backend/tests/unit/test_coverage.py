@@ -3370,3 +3370,48 @@ def test_a_value_the_answer_does_not_show_is_still_found_but_not_presented():
     final, outcomes = _finish(ws, a, r, turn)
     assert outcomes[1]["limitation"] == "not_verifiable" and outcomes[1]["variant"] == "not_presented"
     assert "לא הוצגו בתשובה" in final.answer_markdown
+
+
+# --- round 19 U3: the evidence and the fills of the ledger in the verification (KTD1; R1-R3; AE2) --------------------------------
+
+RATE_SECOND_ASKED = "התעריף לשימוש בכניסות הלילה"
+
+
+def test_a_candidate_two_components_both_ask_for_gets_a_fill_for_each_and_one_line_per_evidence():
+    from app.chat import items as ledger_items
+
+    ws = _rate_file()
+    turn = _turn({"id": "1", "text": RATE_ASKED}, {"id": "2", "text": RATE_SECOND_ASKED})
+    answer = _answer(RATE_ONE).model_copy(update={"items": []})
+    ledger = ledger_items.Ledger()
+    r = verify_answer(_candidate_judge(), answer, ws, "?", [], requirements=turn, ledger=ledger)
+    made = [(i.component, i.quote) for i in ledger.items.values() if i.candidate]
+    assert made == [("N1", "כניסה בלילה | 8"), ("N1", "כניסה בסוף שבוע | 15"), ("N2", "כניסה בלילה | 8"), ("N2", "כניסה בסוף שבוע | 15")]
+    assert len({i.id for i in ledger.items.values()}) == 4 and len({i.evidence_id for i in ledger.items.values()}) == 2
+    rows = r.item_diagnostics()["items"]
+    assert [(x["component"], x["evidence_id"]) for x in rows if x["quote"] == "כניסה בלילה | 8"] == [("N1", "E1"), ("N2", "E1")]
+    assert all(x["fill_id"] == x["id"] and x["history"] for x in rows)
+    final, outcomes = _finish(ws, answer, r, turn)
+    lines = _gap(final, answer).splitlines()
+    assert len(r.item_gaps) == 2 and len(lines) == 2  # the two fills of one row read the same: one line each row, not one per component
+
+
+def test_a_decision_closed_in_version_one_stays_after_a_repair_lists_the_item_included_and_keeps_its_line():
+    from app.chat import items as ledger_items
+
+    ws = _adj_file()
+    turn = _turn({"id": "1", "text": ADJ_ASK})
+    ledger = ledger_items.Ledger()
+    reason = "ההתאמה לגיל הבניין אינה חלה על הנכס"
+    markdown = "ההתאמה למיקום היא 5% [S2]. ההתאמה לקומה היא 3% [S2]."
+    first = _adj_items(state="not_applicable", reason=reason)
+    verify_answer(_judge(lambda frozen, units: [_req("", "full", list(units), id=frozen[0][0])]),
+                  _answer(markdown).model_copy(update={"items": first}), ws, "?", [], requirements=turn, ledger=ledger, item_version=1)
+    repaired = _answer(markdown).model_copy(update={"items": _adj_items()})  # the repair lists it again, included, with no reason
+    r = verify_answer(_judge(lambda frozen, units: [_req("", "full", list(units), id=frozen[0][0])]), repaired, ws, "?", [], requirements=turn,
+                      ledger=ledger, item_version=2)
+    states = {i["quote"]: i for i in r.item_states()}
+    assert states["גיל הבניין | 2%"]["state"] == "not_applicable" and states["גיל הבניין | 2%"]["reason"] == reason
+    assert [h["version"] for h in states["גיל הבניין | 2%"]["history"]] == [1, 2] and len(ledger.items) == 3
+    (line,) = [x for x in coverage.item_gap_lines(ws, r, r.requirement_outcomes())]
+    assert line["state"] == "not_applicable" and "גיל הבניין" in line["text"]

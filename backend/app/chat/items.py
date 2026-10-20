@@ -17,10 +17,18 @@ This module is what the server does with that list. It never takes the agent's w
   of its label's content words), and the item's date when it has one. The item's condition words are asked only to tell apart
   items of one component that share a value (or a label), so a paraphrased condition still covers. Words or numbers somewhere
   else in the answer, or in a unit that cites another document, cover nothing.
-- ``Ledger`` is the turn's ledger across answer versions, keyed by (component, source, verbatim quote). Each version's valid items
+- ``Ledger`` is the turn's ledger across answer versions, keyed by (component, evidence). Each version's valid items
   merge into it; an item the server added from the judge's support (``support_item``, state ``omitted``) stays until a surviving
   unit covers it or a later version declares it ``not_verifiable`` or ``not_applicable`` with a valid reason. The agent not
   listing an item again closes nothing.
+
+Round 19 U3 (KTD1; R1-R3) separates the EVIDENCE from the REQUEST COMPONENT it fills. A piece of evidence is a span of a source,
+identified by (document, appraisal unit, verbatim quote) — no S# handle, so a repair citing the same passage under another S# is the
+same evidence, and the same quote in two appraisal units of one file is two. An ``Item`` is the FILL of one component by one
+evidence: its own state, reason, origin, version and history. One evidence fills several components with one fill each; an agent's
+fill replaces a server fill only of the SAME component (the same evidence, or a containing or contained quote of the same document
+and unit) and never deletes the fill of another; the condition of an evidence is checked once, whatever the number of its fills. A
+closed decision (``not_verifiable`` / ``not_applicable`` with a reason) is not reopened by the same item listed ``included`` again.
 
 The wiring into the requirements call, the outcomes and the repair is round 17 U3's.
 
@@ -62,7 +70,7 @@ import functools
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from app.answering.verify import numbers_in
@@ -87,6 +95,7 @@ from app.chat.verify import (
     _value_forms,
     asked_components,
     context_of_source,
+    evidence_key,
     is_server_item,
     request_word_forms,
     shares_request_word,
@@ -101,12 +110,18 @@ NEEDS_REASON = (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)
 _WHY_ORDER = ("not_attributed", "value_not_stated", "date_not_stated", "condition_not_stated")
 
 
+Evidence = tuple[str, str, str]  # (document, appraisal unit, verbatim quote): ``verify.evidence_key``
+ItemKey = tuple[str, Evidence]  # (component, evidence): a fill
+
+
 @dataclass
 class Item:
-    """One item of the ledger. ``component``: the N# id ("" in a turn with no frozen components); ``source``: an S#, as a V# or
-    T# the agent gave is resolved to the text it names; ``origin``: ``agent`` or ``judge_support``; ``id``: I#, assigned by the
-    turn's ledger and kept for the item's key across versions; ``document_id`` and ``unit_id`` (None in a file without unit
-    marks): the place of its source, for diagnostics (coverage reads them from the workspace)."""
+    """One FILL of the ledger: one request component filled by one piece of evidence (round 19 U3). ``component``: the N# id ("" in a
+    turn with no frozen components); ``source``: an S#, as a V# or T# the agent gave is resolved to the text it names; ``origin``:
+    ``agent`` or ``judge_support``; ``id``: I# (the fill's id), assigned by the turn's ledger and kept for the fill's key across versions;
+    ``document_id`` and ``unit_id`` (None in a file without unit marks): the place of its source, which with the quote is the evidence
+    (``evidence``; ``evidence_id``: the ledger's E#). ``first_version`` / ``last_version`` / ``history``: the answer versions that declared
+    it and what each declared, as the ledger merged it."""
 
     component: str
     label: str
@@ -121,17 +136,26 @@ class Item:
     document_id: str = ""
     unit_id: str | None = None
     candidate: bool = False  # round 18 U6: an origin ``source`` item built from a candidate the requirements call assigned to a component
+    evidence_id: str = ""
+    first_version: int = 0
+    last_version: int = 0
+    history: list[dict] = field(default_factory=list)
 
     @property
-    def key(self) -> tuple[str, str, str]:
-        """The item's identity across answer versions: its component, its source and its verbatim quote."""
-        return self.component, self.source, SupportScope.flat(self.quote)
+    def evidence(self) -> Evidence:
+        """The piece of evidence the fill rests on: its document, its appraisal unit and its verbatim quote."""
+        return evidence_key(self.document_id, self.unit_id, self.source, self.quote)
+
+    @property
+    def key(self) -> ItemKey:
+        """The fill's identity across answer versions: its component and its evidence."""
+        return self.component, self.evidence
 
     def public(self) -> dict:
         return {"id": self.id, "component": self.component, "label": self.label, "source": self.source,
                 "quote": self.quote, "value": self.value, "condition": self.condition, "state": self.state,
                 "reason": self.reason, "origin": self.origin, "document_id": self.document_id, "unit_id": self.unit_id,
-                "candidate": self.candidate}
+                "candidate": self.candidate, "evidence_id": self.evidence_id, "fill_id": self.id}
 
 
 class Validation(NamedTuple):
@@ -198,7 +222,7 @@ def validate(raw: Iterable[object], ws, units: Sequence[Unit], components: Seque
     kept: list[Item] = []
     excluded: list[dict] = []
     misattributed: list[dict] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[ItemKey] = set()
     numbers = iter(range(1, 10**6))
     for entry in raw:
         f = _fields(entry)
@@ -213,10 +237,11 @@ def validate(raw: Iterable[object], ws, units: Sequence[Unit], components: Seque
             why = "component_unassigned"
         else:
             sid = _resolve_source(ws, sid, flat, scope)
-            key = (component, sid, flat)
+            src = ws.sources.get(sid)
+            # the same evidence under one component is one item, whichever S# the agent cites it by (round 19 U3)
+            key = (component, evidence_key(*_site_of(src), sid, flat) if src is not None else (sid, "", flat))
             why = "duplicate" if key in seen else scope.source_problem(sid, flat)
             if why is None:
-                src = ws.sources[sid]
                 why = scope.place_problem(src) or (None if scope.verbatim(sid, src, flat) else "not_verbatim")
             if why is None:
                 seen.add(key)
@@ -227,7 +252,7 @@ def validate(raw: Iterable[object], ws, units: Sequence[Unit], components: Seque
                     condition = ""  # the item is checked against its own context (``condition_spans``), not the agent's words
                 item = Item(component, f["label"], sid, f["quote"], f["value"], condition, f["state"], f["reason"],
                             document_id=document_id, unit_id=unit_id)
-                item.id = ledger.id_for(item.key) if ledger is not None else f"I{next(numbers)}"
+                item.id = ledger.id_of(item) if ledger is not None else f"I{next(numbers)}"
                 kept.append(item)
                 continue
         excluded.append({"component": f["component"], "source": f["source"], "quote": f["quote"][:SUPPORT_QUOTE_MAX],
@@ -242,7 +267,7 @@ def support_item(component: str, source: str, quote: str, ledger: Ledger, *, lab
     item = Item(component, label, source, quote, value, condition, OMITTED, "", ORIGIN_JUDGE_SUPPORT)
     if ws is not None and (src := ws.sources.get(source)) is not None:
         item.document_id, item.unit_id = _site_of(src)
-    item.id = ledger.id_for(item.key)
+    item.id = ledger.id_of(item)
     return item
 
 
@@ -446,11 +471,17 @@ def _same_source(ws, a: str, b: str) -> bool:
     return a == b or (first is not None and first.same_as == b) or (second is not None and second.same_as == a)
 
 
-def _holds(item: Item, sid: str, ws, flat: str) -> bool:
-    """Whether the ledger item already covers the span ``flat`` of source ``sid``: the same source (or its re-read) and a quote
-    that holds or is held by the span."""
+def _holds(item: Item, sid: str, ws, flat: str, component: str | None = None) -> bool:
+    """Whether the ledger item already covers the span ``flat`` of source ``sid``: a quote that holds or is held by the span, in the same
+    place — the same document and appraisal unit (the same source, or its re-read, for an item with no place of its own). Round 19 U3:
+    with ``component``, only an item of that component holds it: one span serves several components, one fill each."""
+    if component is not None and item.component != component:
+        return False
     mine = _flat_text(item.quote)
-    return _same_source(ws, item.source, sid) and (mine in flat or flat in mine)
+    if not (mine in flat or flat in mine):
+        return False
+    place = _place(ws, sid)
+    return place == (item.document_id, item.unit_id) if place is not None and item.document_id else _same_source(ws, item.source, sid)
 
 
 def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledger: Ledger) -> list[Item]:
@@ -474,18 +505,20 @@ def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledge
                 indexes[sid] = _span_index(src)
             for quote, label, value in _cited_spans(indexes[sid], wanted):
                 flat = SupportScope.flat(quote)
+                component = _component_of(asked, f"{unit.text} {label}")
+                # a fill of ANOTHER component on the span holds nothing for this one: the span serves each component (round 19 U3)
                 if (made >= ROWS_PER_UNIT or scope.source_problem(sid, flat) or scope.place_problem(src)
-                        or any(_holds(i, sid, ws, flat) for i in [*held, *built])):
+                        or any(_holds(i, sid, ws, flat, component) for i in [*held, *built])):
                     continue
                 spans = condition_spans(src, quote)
                 if not spans:
                     continue
                 made += 1
                 document_id, unit_id = _site_of(src)
-                item = Item(_component_of(asked, f"{unit.text} {label}"), label, sid, quote, value,
+                item = Item(component, label, sid, quote, value,
                             " ; ".join(sp.text for sp in spans), ITEM_INCLUDED, "", ORIGIN_SOURCE,
                             document_id=document_id, unit_id=unit_id)
-                item.id = ledger.id_for(item.key)
+                item.id = ledger.id_of(item)
                 built.append(item)
     return built
 
@@ -681,10 +714,10 @@ def candidates(units: Sequence[Unit], ws, ledger: Ledger, components: Sequence[M
         if not found:
             continue
         used += 1
+        document_id, unit_id = _site_of(src)
         for n in found[:CANDIDATES_PER_SOURCE]:
             raw = raws[n]
-            document_id, unit_id = _site_of(src)
-            offered.append(Candidate(ledger.candidate_id(sid, flats[n]), sid, raw.quote, raw.label, raw.value,
+            offered.append(Candidate(ledger.candidate_id(evidence_key(document_id, unit_id, sid, flats[n])), sid, raw.quote, raw.label, raw.value,
                                      " ; ".join(sp.text for sp in condition_spans(src, raw.quote)), " ".join(raw.own.split()),
                                      raw.kind, document_id, unit_id))
         if len(found) > CANDIDATES_PER_SOURCE:
@@ -698,7 +731,7 @@ def candidate_item(c: Candidate, component: str, ledger: Ledger) -> Item:
     surviving unit gives it."""
     item = Item(component, c.label, c.source, c.quote, c.value, c.condition, ITEM_INCLUDED, "", ORIGIN_SOURCE,
                 document_id=c.document_id, unit_id=c.unit_id, candidate=True)
-    item.id = ledger.id_for(item.key)
+    item.id = ledger.id_of(item)
     return item
 
 
@@ -885,89 +918,188 @@ def _coverage(item: Item, units: Sequence[Unit], ws, shared: bool, leads: Mappin
 
 # --- the turn's ledger ---------------------------------------------------------------------------------------------------------
 
+def _overlap(a: Evidence, b: Evidence) -> bool:
+    """Whether two pieces of evidence are one passage: the same document and appraisal unit, and a quote that holds or is held by the other."""
+    return a[:2] == b[:2] and (a[2] in b[2] or b[2] in a[2])
+
+
+def _inside(narrow: Evidence, wide: Evidence) -> bool:
+    """Whether ``narrow`` is a strictly smaller quote of the same place held by ``wide``."""
+    return narrow != wide and narrow[:2] == wide[:2] and narrow[2] in wide[2]
+
+
 class Ledger:
-    """The turn's items across answer versions, keyed by (component, source, verbatim quote), with the items excluded so far."""
+    """The turn's fills across answer versions, keyed by (component, evidence), with the items excluded so far."""
 
     def __init__(self) -> None:
-        self.items: dict[tuple[str, str, str], Item] = {}
+        self.items: dict[ItemKey, Item] = {}
         self.excluded: list[dict] = []
         self.misattributed: list[dict] = []
-        self._ids: dict[tuple[str, str, str], str] = {}
-        self._candidate_ids: dict[tuple[str, str], str] = {}
+        self.version = 0  # the latest answer version an agent declared items in (0: versions are not told)
+        self._ids: dict[ItemKey, str] = {}
+        self._evidence_ids: dict[Evidence, str] = {}
+        self._candidate_ids: dict[Evidence, str] = {}
 
-    def candidate_id(self, source: str, flat: str) -> str:
-        """The K# of a candidate (its source and verbatim quote): the same in every call of the turn."""
-        return self._candidate_ids.setdefault((source, flat), f"K{len(self._candidate_ids) + 1}")
+    def candidate_id(self, evidence: Evidence) -> str:
+        """The K# of a candidate (its evidence): the same in every call of the turn, whichever S# names the passage."""
+        return self._candidate_ids.setdefault(evidence, f"K{len(self._candidate_ids) + 1}")
 
-    def id_for(self, key: tuple[str, str, str]) -> str:
+    def evidence_id(self, evidence: Evidence) -> str:
+        """The E# of a piece of evidence: the same in every version, for every component it fills."""
+        return self._evidence_ids.setdefault(evidence, f"E{len(self._evidence_ids) + 1}")
+
+    def id_for(self, key: ItemKey) -> str:
         """The I# of a key: the same for the same key in every version."""
         return self._ids.setdefault(key, f"I{len(self._ids) + 1}")
+
+    def _near(self, item: Item) -> list[Item]:
+        """The fills of the item's component on a quote that holds or is held by its quote, in its document and appraisal unit."""
+        ev = item.evidence
+        return [i for i in self.items.values() if i.component == item.component and i.evidence != ev and _overlap(i.evidence, ev)]
+
+    def twin_of(self, item: Item) -> Item | None:
+        """The fill of the ledger that IS the item: the one of its key, else the only fill of its component on an overlapping quote of the
+        same place (another spelling of the same passage). Several overlapping fills are separate evidence — each keeps its own condition
+        check — so none is the item's twin."""
+        if (same := self.items.get(item.key)) is not None:
+            return same
+        # an item built by hand has no place of its own (no document): it is the fill of the same source and quote, placed or not
+        unplaced = [i for i in self.items.values() if i.component == item.component and i.source == item.source
+                    and i.evidence[2] == item.evidence[2] and not (i.document_id and item.document_id)]
+        if unplaced:
+            return unplaced[0]
+        near = self._near(item)
+        return near[0] if len(near) == 1 else None
+
+    def id_of(self, item: Item) -> str:
+        """The I# of the item: its twin's when the ledger holds one, else the one of its key."""
+        twin = self.twin_of(item)
+        if twin is None:
+            return self.id_for(item.key)
+        return self._ids.setdefault(item.key, twin.id or self.id_for(twin.key))
+
+    def alive(self, item: Item) -> bool:
+        """Whether the fill stands in the latest version: an agent's fill the latest version declared, or one the server derives again at
+        every verification (a candidate, the judge's support, a cited span). An agent's fill an earlier version declared and the latest one
+        did not list is still open, but is no twin of the items that do (``Ledger.outcomes``: ``shared``)."""
+        return item.origin != ORIGIN_AGENT or item.last_version >= self.version
 
     def merge(self, kept: Iterable[Item], *, excluded: Iterable[dict] = (), version: int = 0,
               misattributed: Iterable[dict] = ()) -> list[Item]:
         """Merge one answer version's valid items (and record what it excluded and the conditions it misattributed); the ledger's
-        items, in the order first seen. An item already in the ledger takes its new declaration from the agent (state, reason,
-        label, value, condition) — a later version may close it with a valid ``not_verifiable`` or ``not_applicable``, or state it
-        ``included`` again; the judge's support and the server's source spans never change an item the ledger already holds. An item
-        not listed again stays. An item the agent declares replaces the origin ``source`` items that hold the same span (round 18
-        U5): the span's condition is then checked once, as the agent's item."""
+        items, in the order first seen. A fill already in the ledger takes its new declaration from the agent (label, value, condition,
+        and state and reason) — a later version may close it with a valid ``not_verifiable`` or ``not_applicable``, but a closed
+        decision is not reopened by the same item listed ``included`` again (round 19 U3, R3); the judge's support and the server's
+        source spans never change a fill the ledger already holds. A fill not listed again stays. The same passage of the same component
+        (another spelling of the quote, or another S#) is the same fill (``twin_of``). An agent's fill replaces the origin ``source``
+        fill of its own component that holds the same span (round 18 U5): the span's condition is then checked once, as the agent's
+        fill — and never touches the fill of another component, which the same evidence also serves (round 19 U3, R2). ``version``:
+        recorded in each fill's history."""
+        self.version = max(self.version, version)
         for item in kept:
-            item.id = item.id or self.id_for(item.key)
-            old = self.items.get(item.key)
-            if item.origin == ORIGIN_AGENT:
-                for key in [k for k, i in self.items.items()
-                            if i.origin == ORIGIN_SOURCE and k != item.key and k[1] == item.key[1]
-                            and (k[2] in item.key[2] or item.key[2] in k[2])]:
-                    del self.items[key]
-            if old is None:
+            item.evidence_id = self.evidence_id(item.evidence)
+            item.id = item.id or self.id_of(item)
+            twin = self.twin_of(item)
+            if twin is None:
+                if item.origin != ORIGIN_AGENT and self._near(item):
+                    continue  # the component already holds this span, in another spelling: a server fill adds nothing
+                item.first_version = item.last_version = version
+                self._record(item, version)
                 self.items[item.key] = item
             elif item.origin == ORIGIN_AGENT:
-                old.label, old.value, old.condition = item.label or old.label, item.value or old.value, item.condition or old.condition
-                old.state, old.reason = item.state, item.reason
-                if old.origin == ORIGIN_SOURCE:
-                    old.origin, old.candidate = ORIGIN_AGENT, False
+                if twin.key != item.key and twin.origin == ORIGIN_SOURCE:
+                    self._replace(twin, item, version)
+                else:
+                    self._declare(twin, item, version)
         self.excluded += [{"version": version, **e} for e in excluded]
         self.misattributed += [{"version": version, **m} for m in misattributed]
         return list(self.items.values())
 
+    @staticmethod
+    def _record(fill: Item, version: int, declared: str = "") -> None:
+        """Add the fill's present state to its history, once per version and state; ``declared``: what the agent said when the fill kept a
+        closed decision instead."""
+        rec = {"version": version, "state": fill.state, "reason": fill.reason, "origin": fill.origin}
+        if declared and declared != fill.state:
+            rec["declared"] = declared
+        if not fill.history or fill.history[-1] != rec:
+            fill.history.append(rec)
+
+    def _declare(self, old: Item, item: Item, version: int) -> None:
+        """The agent's declaration of the fill ``old``: its words (never emptied), its state and reason — except that a closed decision
+        stays when the agent lists the item ``included`` again — and its origin, an origin ``source`` fill becoming the agent's."""
+        old.label, old.value, old.condition = item.label or old.label, item.value or old.value, item.condition or old.condition
+        if not (old.state in NEEDS_REASON and item.state == ITEM_INCLUDED):
+            old.state, old.reason = item.state, item.reason
+        if old.origin == ORIGIN_SOURCE:
+            old.origin, old.candidate = ORIGIN_AGENT, False
+        old.last_version = max(old.last_version, version)
+        self._record(old, version, item.state)
+
+    def _replace(self, old: Item, item: Item, version: int) -> None:
+        """The agent's fill takes the place of the origin ``source`` fill of its component on an overlapping quote: its id and its position
+        in the ledger, its history and its first version."""
+        item.id, item.first_version, item.last_version = old.id, old.first_version, max(old.last_version, version)
+        item.history = list(old.history)
+        self._ids.setdefault(item.key, old.id)
+        self.items = {(item.key if k == old.key else k): (item if k == old.key else v) for k, v in self.items.items()}
+        self._record(item, version)
+
     def outcomes(self, units: Sequence[Unit], ws) -> list[dict]:
-        """Every item with its state against these surviving units: ``covered`` (a unit gives it), ``omitted`` (an included or
-        judge-added item no unit gives), or the ``not_verifiable`` / ``not_applicable`` the agent declared with a reason. Round 18
-        U5: a covered item also has its condition check against the unit that gives it (``condition_check``: "" without a
+        """Every fill with its state against these surviving units: ``covered`` (a unit gives it), ``omitted`` (an included or
+        judge-added fill no unit gives), or the ``not_verifiable`` / ``not_applicable`` the agent declared with a reason. Round 18
+        U5: a covered fill also has its condition check against the unit that gives it (``condition_check``: "" without a
         material condition, else ``kept``, ``missing``, ``undecided`` or ``hint``; ``condition_quote``: for ``missing``, the clause of the span the unit leaves
         out; ``condition_hint``: ``contradicted`` and/or ``other_item``;
         ``condition_spans``: its spans; ``condition_foreign``: the items whose condition the sentence states; ``condition_unit``:
-        the unit checked). An origin ``source`` item no surviving unit gives is not an open item: the sentence that cited its span
-        is gone, so it is left out; a ``candidate`` item (round 18 U6) is the exception: a component asks for it, so it stays
-        open (``omitted``) until a sentence gives it."""
+        the unit checked). Round 19 U3: the condition is a property of the EVIDENCE, so it is checked once for the fills of one
+        evidence — on the first of them a unit gives, against the units that give any of them — and the others carry no check.
+        An origin ``source`` fill no surviving unit gives is not an open item: the sentence that cited its span
+        is gone, so it is left out; a ``candidate`` fill (round 18 U6) is the exception: a component asks for it, so it stays
+        open (``omitted``) until a sentence gives it. ``history``: the answer versions' declarations of the fill."""
         out = []
         # each item's signature is computed once, and the items of a component that share one are counted: an item's condition is
-        # asked when another item of its component has its signature (``_coverage``)
+        # asked when another item of its component has its signature (``_coverage``). Only the fills alive in the latest version count
+        # (``alive``): an earlier version's item the latest did not list is no twin of the ones that stand, and neither is a fill of the
+        # same passage in another quote (``_overlap``)
         signatures = {id(i): _signature(i) for i in self.items.values()}
-        alike = Counter((i.component, signatures[id(i)]) for i in self.items.values())
+        standing: dict[tuple[str, frozenset[str]], list[Item]] = {}
+        for i in self.items.values():
+            if self.alive(i) and signatures[id(i)]:
+                standing.setdefault((i.component, signatures[id(i)]), []).append(i)
         by_index = {u.index: u for u in units}
         leads = _leads(units)
-        spans = {i.key: _spans_of(ws, i) for i in self.items.values()}
+        spans = {i.evidence: _spans_of(ws, i) for i in self.items.values()}
         rows: list[tuple[Item, Coverage | None]] = []
-        gave: dict[tuple[str, str, str], frozenset[int]] = {}  # the units that give each covered item (the first is the covering unit)
+        gave: dict[Evidence, frozenset[int]] = {}  # the units that give each covered evidence (the first is the covering unit)
         for item in self.items.values():
             sig = signatures[id(item)]
-            shared = bool(sig) and alike[(item.component, sig)] > 1
+            shared = bool(sig) and any(j is not item and not _overlap(j.evidence, item.evidence)
+                                       for j in standing.get((item.component, sig), ()))
             got = None
             if item.state in (ITEM_INCLUDED, OMITTED):
                 got, covering = _coverage_all(item, units, ws, shared, leads)
                 if got.ok:
-                    gave[item.key] = covering
+                    gave[item.evidence] = gave.get(item.evidence, frozenset()) | covering
             if is_server_item(item) and (got is None or not got.ok):
                 continue  # (a candidate the call assigned to a component is an open item whatever sentence cited what: round 18 U6)
             rows.append((item, got))
-        owns = {i.key: _own_text(ws, i) for i, _ in rows}  # each item's own context text
+        owns = {i.evidence: _own_text(ws, i) for i, _ in rows}  # each evidence's own context text
         others = [i for i, _ in rows]
+        checked: set[Evidence] = set()
+        covered = [i.evidence for i, g in rows if g is not None and g.ok]
         for item, got in rows:
             state = item.state if got is None else (COVERED if got.ok else OMITTED)
-            check = _condition_check(item, got, spans, gave, owns, by_index, others)
+            # a quote that holds a smaller covered quote of the same place leaves the check to that one: each narrower quote keeps the
+            # condition of its own row, and the wider one adds no mixed check of the conditions of several
+            if got is not None and got.ok and (item.evidence in checked or any(_inside(e, item.evidence) for e in covered)):
+                check = dict(_NO_CHECK)
+            else:
+                check = _condition_check(item, got, spans, gave, owns, by_index, others)
+                if got is not None and got.ok:
+                    checked.add(item.evidence)
             out.append({**item.public(), "state": state, "declared": item.state, "covered_by": got.unit if got else None,
-                        "why": got.why if got else "", **check})
+                        "why": got.why if got else "", "history": [dict(h) for h in item.history], **check})
         return out
 
 
@@ -994,11 +1126,11 @@ def _condition_check(item: Item, got: Coverage | None, spans: dict, gave: dict, 
     (``conditions.outcome``) — the worst of them, a hint over an undecided over a kept; a sentence that states an operator clause
     of another item's span that the item's own context does not hold is a hint from that item. Among several units that give the
     item the one that keeps its condition wins, else the first."""
-    mine = spans[item.key]
+    mine = spans[item.evidence]
     if got is None or not got.ok:
         return dict(_NO_CHECK)
     best = None
-    for index in sorted(gave.get(item.key, {got.unit})):
+    for index in sorted(gave.get(item.evidence, {got.unit})):
         unit = by_index[index]
         read = [conditions.read(sp.text, unit.text) for sp in mine]  # (outcome, quote) of each span
         results = [outcome for outcome, _ in read]
@@ -1030,11 +1162,13 @@ def _foreign_items(item: Item, unit: Unit, spans: dict, gave: dict, owns: dict, 
     """The items whose operator clauses the sentence states and the item's own context does not hold: the sentence gives this item
     a condition of another item. Another item the same sentence gives itself is no source of one."""
     found = []
+    seen = {item.evidence}  # the fills of the item's own evidence are no other item's; another evidence is named once
     for other in others:
-        if other.key == item.key or unit.index in gave.get(other.key, ()):
+        if other.evidence in seen or unit.index in gave.get(other.evidence, ()):
             continue
-        for sp in spans[other.key]:
-            if _span_kept(sp.text, unit.text) and not conditions.stated_in(sp.text, owns[item.key]):
+        seen.add(other.evidence)
+        for sp in spans[other.evidence]:
+            if _span_kept(sp.text, unit.text) and not conditions.stated_in(sp.text, owns[item.evidence]):
                 found.append(other.id)
                 break
     return found

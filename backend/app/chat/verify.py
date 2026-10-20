@@ -2168,6 +2168,13 @@ class VerifyReport:
                 st |= {"state": ITEM_OMITTED, "covered_by": None, "why": "value_not_stated"}
         return states
 
+    def _evidence_of(self, sid: str, quote: str) -> tuple[str, str, str]:
+        """The evidence a judge's support entry names (``evidence_key``): the document and appraisal unit of its S# in the ledger's
+        workspace, so that it is the same evidence as an item that cites the passage under another S# (round 19 U3)."""
+        src = self.item_ws.sources.get(sid) if self.item_ws is not None else None
+        document_id, unit_id = (src.document_id, (src.unit or {}).get("id")) if src is not None else (None, None)
+        return evidence_key(str(document_id) if document_id is not None else "", unit_id, sid, quote)
+
     def _as_edited(self, u: Unit) -> Unit:
         """The unit as it reads once the server's edits of its own words are applied: the spans the edit ladder cuts
         (``cuts``) and the qualifier words it takes out (``qualifier_edits``) are gone, so an item stated only in a cut claim is
@@ -2227,21 +2234,21 @@ class VerifyReport:
         """The candidates a requirements call offered and a frozen component asks for (``JudgeRequirement.candidates``, validated by
         ``_Coverage.valid_candidates``) enter the turn's ledger as items the server builds from the source (``items.candidate_item``,
         round 18 U6, KTD2; R6, R7): origin ``source``, label, value and condition from the source, open until a surviving unit gives
-        them. A candidate a component of an earlier call asked for stays in the ledger; one named by two components belongs to the
-        first. Nothing is added without a ledger or for a candidate this verification was not offered."""
+        them. A candidate a component of an earlier call asked for stays in the ledger; one named by two components gets a fill for
+        each (round 19 U3, KTD1). Nothing is added without a ledger or for a candidate this verification was not offered."""
         from app.chat import items as item_ledger
 
         ledger = self.item_ledger
         if ledger is None or not self.candidate_pool:
             return
         kept = []
-        seen: set[str] = set()
+        seen: set[tuple[str, str]] = set()
         for r in self.requirements:
             for v in self.requirement_votes.get(r["id"], []):
                 for a in v.candidates:
                     c = self.candidate_pool.get(a.candidate)
-                    if c is not None and a.candidate not in seen:
-                        seen.add(a.candidate)
+                    if c is not None and (a.candidate, r["id"]) not in seen:
+                        seen.add((a.candidate, r["id"]))
                         kept.append(item_ledger.candidate_item(c, r["id"], ledger))
         ledger.merge(kept)
 
@@ -2401,7 +2408,7 @@ class VerifyReport:
         # the item ledger (round 17 U3, KTD3, R2, R6): the items no surviving unit gives, by component, and the keys of the items
         # the ledger closed (covered, or declared not verifiable / not applicable with a reason)
         omitted_by: dict[str, list[dict]] = {}
-        closed: set[tuple[str, str, str]] = set()
+        closed: set[tuple[str, tuple[str, str, str]]] = set()
         for st in self.item_states(kept) if states is None else states:
             if is_server_item(st):
                 continue  # an item the server built from a cited span is given by the sentence that cites it: it never caps a component
@@ -2409,7 +2416,7 @@ class VerifyReport:
             if st["state"] == ITEM_OMITTED:
                 omitted_by.setdefault(st["component"], []).append(st)
             else:
-                closed.add((st["component"], st["source"], SupportScope.flat(st["quote"])))
+                closed.add((st["component"], evidence_key(st["document_id"], st["unit_id"], st["source"], st["quote"])))
         out: dict[str, dict] = {}
         for r in self.requirements:
             votes = self.requirement_votes.get(r["id"], [])
@@ -2438,7 +2445,7 @@ class VerifyReport:
                  # the judge's validated support, less what the ledger closed; and the omitted items, which are the same kind of
                  # evidence (a part of the asked kind that a read source states and the answer does not give)
                  "support": [x for x in self.text_support.get(r["id"], [])
-                             if (r["id"], x["id"], SupportScope.flat(x["quote"])) not in closed]}
+                             if (r["id"], self._evidence_of(x["id"], x["quote"])) not in closed]}
             validated = list(o["support"]) if kind in SEARCHABLE_KINDS else []  # the judge's validated part: evidence of a gap (R2)
             omitted = omitted_by.get(r["id"], []) if kind in SEARCHABLE_KINDS else []
             if omitted:
@@ -8336,6 +8343,21 @@ def is_server_item(x) -> bool:
     if isinstance(x, dict):
         return x.get("origin") == ORIGIN_SOURCE and not x.get("candidate")
     return x.origin == ORIGIN_SOURCE and not x.candidate
+
+
+@functools.lru_cache(maxsize=2048)
+def _flat_span(quote: str) -> str:
+    """``SupportScope.flat`` of a quote, kept: a ledger reads the same few quotes at every merge and outcome."""
+    return SupportScope.flat(quote)
+
+
+def evidence_key(document_id: object, unit_id: object, source: str, quote: str) -> tuple[str, str, str]:
+    """The identity of a piece of evidence, a span of a source (round 19 U3, KTD1): its document, its appraisal unit ("" in a file without
+    unit marks) and its verbatim quote — never the S# handle, so the same passage under another S# is the same evidence, and the same quote
+    in two units of one file is two. A span with no document (an item built by hand) falls back to its source handle."""
+    return (str(document_id) if document_id else source, "" if unit_id is None else str(unit_id), _flat_span(quote))
+
+
 # whether a score was cast by this round's call or carried from an earlier round of the turn (a score's ``_stamp["origin"]``)
 FRESH, CARRIED = "fresh", "carried"
 

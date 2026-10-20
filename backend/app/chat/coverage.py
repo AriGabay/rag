@@ -869,10 +869,17 @@ def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict]) -> list[dict
     # component's own line (``read_not_used``), and an item the server built from a span a sentence cites is covered by that sentence;
     # a candidate a component asked for is an item like an agent's (its line is built from the source's label and quote, ``item_line``);
     # and an item a sentence gives by attribution and value but not by its date is no item "read and not used" (the date is a note at most)
-    lines = [item_line(ws, st, request) for st in report.item_states()
-             if st["component"] not in skip and not is_server_item(st)
-             and (st["state"] in (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)
-                  or (st["state"] == ITEM_OMITTED and st["origin"] != ORIGIN_JUDGE_SUPPORT and st["why"] != "date_not_stated"))]
+    lines: list[dict] = []
+    written: set[tuple[str, str]] = set()  # one evidence can fill several components (round 19 U3): its fills that read the same make one line
+    for st in report.item_states():
+        if (st["component"] in skip or is_server_item(st)
+                or not (st["state"] in (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)
+                        or (st["state"] == ITEM_OMITTED and st["origin"] != ORIGIN_JUDGE_SUPPORT and st["why"] != "date_not_stated"))):
+            continue
+        line = item_line(ws, st, request)
+        if (mark := (st.get("evidence_id") or st["id"], line["text"])) not in written:
+            written.add(mark)
+            lines.append(line)
     if len(lines) <= ITEM_GAP_LINES:
         return lines
     rest = len(lines) - ITEM_GAP_LINES

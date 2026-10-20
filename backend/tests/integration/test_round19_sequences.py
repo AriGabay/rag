@@ -184,8 +184,6 @@ def ledger_of(client, m: dict) -> dict:
     return client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["resolution"]["item_ledger"]
 
 
-@strict_xfail("U3", "the agent's item for the first component keeps the server from giving the second component its own item for "
-                    "the same row (the ledger holds one item, for N1)")
 def test_a_row_the_agent_declares_under_one_component_still_gives_the_other_component_its_own_covered_item(
         client, office, monkeypatch):
     doc = ingest_pdf(office, monkeypatch, TWO)
@@ -215,8 +213,6 @@ def condition_missing_judge(input: str) -> dict:
     return out
 
 
-@strict_xfail("U3", "the agent's item for the second component deletes the server's item of the first component for the same row "
-                    "(the ledger holds one item, for N2)")
 def test_a_row_the_server_gave_the_first_component_keeps_its_item_when_the_agent_later_declares_the_row_under_the_second(
         client, office, monkeypatch):
     """The other order: the first version declares nothing (the server builds the row's item from the first sentence that cites it,

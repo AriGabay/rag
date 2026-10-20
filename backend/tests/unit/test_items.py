@@ -857,3 +857,247 @@ def test_a_held_item_on_the_reread_touches_the_paragraph_of_the_cited_original_a
     ledger.merge([_item(source="S3", label="", quote="הנתונים מפורטים להלן", value="הנתונים")])
     offer = _offer(ws, "השווי נקבע לפי השוואה [S1].", ask, ledger=ledger)  # the answer cites the original S1 only
     assert [c.value for c in offer.candidates if c.source == "S1"] == ["6.5%", "7.0%"]
+
+
+# --- round 19 U3: the evidence and the fills of the ledger (KTD1; R1-R3; AE1, AE2) ------------------------------------------------
+
+ROW_ASK = [{"id": "N1", "text": "השטח הכולל לבנייה בנכס"}, {"id": "N2", "text": "התנאי שבו חלות זכויות הבנייה"}]
+ROW_FIRST = "השטח הכולל לבנייה בנכס הוא 1,200 מ״ר [S1]."
+ROW_BOTH = ROW_FIRST + "\nהזכויות בשטח של 1,200 מ״ר חלות רק על פי תכנית מאושרת [S1]."
+SECOND_ROW = "שטח למרתף | 340 | הזכויות חלות רק עד שנה מהמסירה"
+SECOND_NOTE = "הזכויות חלות רק עד שנה מהמסירה"
+TWO_ROWS = "\n".join([*PLAN_HEAD, PLAN_ROWS[0], PLAN_ROWS[1], SECOND_ROW])
+ROW_QUOTE = "שטח כולל לבנייה | 1,200 | " + PLAN_NOTE
+
+
+def _declared(ws: Workspace, markdown: str, ledger: items.Ledger, *raw: dict, components=ROW_ASK, version: int = 1) -> list[items.Item]:
+    """The agent's items of one answer version, validated and merged into ``ledger`` (as ``verify_answer`` does)."""
+    res = _validate(ws, markdown, *raw, components=components, ledger=ledger)
+    ledger.merge(res.kept, excluded=res.excluded, version=version, misattributed=res.misattributed)
+    return res.kept
+
+
+def _by_component(ledger: items.Ledger, markdown: str, ws: Workspace) -> dict[str, dict]:
+    return {o["component"]: o for o in ledger.outcomes(_units(markdown), ws)}
+
+
+def test_ae1_a_row_the_agent_declares_under_one_component_keeps_the_server_fill_of_the_other_and_each_has_its_own_state():
+    ws = _ws(PLAN_TABLE)
+    ledger = items.Ledger()
+    _declared(ws, ROW_BOTH, ledger, _raw(label="שטח כולל", quote=ROW_QUOTE, value="1,200"))
+    ledger.merge(items.source_items(_units(ROW_BOTH), ws, ROW_ASK, ledger), version=1)  # the second sentence gives the row to N2
+    by = _by_component(ledger, ROW_BOTH, ws)
+    assert sorted(by) == ["N1", "N2"] and (by["N1"]["origin"], by["N2"]["origin"]) == ("agent", "source")
+    assert by["N1"]["state"] == by["N2"]["state"] == "covered"
+    assert by["N1"]["id"] != by["N2"]["id"] and by["N1"]["evidence_id"] == by["N2"]["evidence_id"] != ""  # two fills, one evidence
+    assert by["N1"]["fill_id"] == by["N1"]["id"]
+
+
+def test_ae1_the_other_merge_order_the_server_fill_of_the_first_component_survives_the_agents_item_for_the_second():
+    ws = _ws(PLAN_TABLE)
+    ledger = items.Ledger()
+    ledger.merge(items.source_items(_units(PLAN_BARE), ws, ROW_ASK, ledger), version=1)  # version 1: no items; the server builds N1's fill
+    (built,) = ledger.items.values()
+    assert built.component == "N1" and built.origin == "source"
+    _declared(ws, ROW_BOTH, ledger, _raw(component="N2", label="התנאי", quote=PLAN_QUOTE, value="1,200", condition=PLAN_NOTE), version=2)
+    assert sorted((i.component, i.origin) for i in ledger.items.values()) == [("N1", "source"), ("N2", "agent")]
+    by = _by_component(ledger, ROW_BOTH, ws)
+    assert by["N1"]["state"] == by["N2"]["state"] == "covered" and by["N1"]["id"] == built.id
+
+
+def test_an_agent_fill_for_the_same_component_still_takes_the_place_of_the_server_fill_of_that_component_only():
+    ws = _ws(PLAN_TABLE)
+    ledger = items.Ledger()
+    ledger.merge(items.source_items(_units(ROW_BOTH), ws, ROW_ASK, ledger), version=1)
+    assert sorted(i.component for i in ledger.items.values()) == ["N1", "N2"]
+    first = ledger.items[next(k for k, i in ledger.items.items() if i.component == "N1")]
+    _declared(ws, ROW_BOTH, ledger, _raw(label="שטח כולל", quote=PLAN_QUOTE, value="1,200"), version=2)  # a cell of the row, for N1
+    assert sorted((i.component, i.origin) for i in ledger.items.values()) == [("N1", "agent"), ("N2", "source")]
+    (n1,) = [i for i in ledger.items.values() if i.component == "N1"]
+    assert n1.id == first.id and [h["origin"] for h in n1.history] == ["source", "agent"]  # the same fill: id, place and history kept
+
+
+def test_two_overlapping_items_with_different_conditions_keep_separate_condition_checks():
+    ws = _ws(TWO_ROWS)
+    ledger = items.Ledger()
+    markdown = "השטח הכולל לבנייה הוא 1,200 מ״ר ושטח המרתף הוא 340 מ״ר [S1]."
+    ledger.merge(items.source_items(_units(markdown), ws, PLAN_ASK, ledger), version=1)
+    assert len(ledger.items) == 2
+    both = f"{ROW_QUOTE} | {SECOND_ROW}"  # one quote of the agent that holds both rows
+    _declared(ws, markdown, ledger, _raw(label="שטחים", quote=both, value="1,200"), components=PLAN_ASK, version=2)
+    out = ledger.outcomes(_units(markdown), ws)
+    rows = {o["quote"]: o for o in out}
+    assert ROW_QUOTE in rows and SECOND_ROW in rows and len(out) == 3  # neither row's fill was deleted by the wider quote
+    assert [s["text"] for s in rows[ROW_QUOTE]["condition_spans"]] == [PLAN_NOTE]
+    assert [s["text"] for s in rows[SECOND_ROW]["condition_spans"]] == [SECOND_NOTE]
+    assert len({o["evidence_id"] for o in out}) == 3
+
+
+def test_an_agent_row_quote_and_a_server_cell_quote_of_one_component_are_one_fill_with_one_condition_check():
+    ws = _ws(PLAN_TABLE)
+    ledger = items.Ledger()
+    ledger.merge(items.source_items(_units(PLAN_BARE), ws, PLAN_ASK, ledger), version=1)  # the server holds the whole row
+    _declared(ws, PLAN_BARE, ledger, _raw(label="שטח כולל", quote=PLAN_QUOTE, value="1,200"), components=PLAN_ASK, version=2)
+    (out,) = ledger.outcomes(_units(PLAN_BARE), ws)
+    assert out["origin"] == "agent" and len(ledger.items) == 1
+    assert out["condition_check"] == "missing" and [s["text"] for s in out["condition_spans"]] == [PLAN_NOTE]
+
+
+def test_a_second_fill_of_one_evidence_carries_no_condition_check_of_its_own():
+    ws = _ws(PLAN_TABLE)
+    ledger = items.Ledger()
+    _declared(ws, ROW_BOTH, ledger, _raw(label="שטח כולל", quote=PLAN_QUOTE, value="1,200"),
+              _raw(component="N2", label="התנאי", quote=PLAN_QUOTE, value="1,200"))
+    by = _by_component(ledger, ROW_BOTH, ws)
+    assert by["N1"]["state"] == by["N2"]["state"] == "covered"
+    assert by["N1"]["condition_check"] != "" and by["N2"]["condition_check"] == "" and by["N2"]["condition_spans"] == []
+
+
+def test_a_re_registration_with_another_spelling_of_the_same_quote_stays_one_item():
+    ws = _ws(AGE_TABLE)
+    ledger = items.Ledger()
+    markdown = "ההתאמה לגיל הבניין היא 2% [S1]."
+    full = "גיל הבניין | 2% | כאשר הבניין מעל גיל 30 שנה"
+    (first,) = _declared(ws, markdown, ledger, _raw(label="הגיל", quote=full), version=1)
+    (second,) = _declared(ws, markdown, ledger, _raw(label="ההתאמה לגיל הבניין", quote="גיל הבניין | 2%"), version=2)
+    assert len(ledger.items) == 1 and second.id == first.id
+    (fill,) = ledger.items.values()
+    assert fill.label == "ההתאמה לגיל הבניין" and fill.quote == full and fill.first_version == 1 and fill.last_version == 2
+    assert [h["version"] for h in fill.history] == [1, 2]
+    # the other way round: the longer quote of the next version is still the one fill
+    (third,) = _declared(ws, markdown, ledger, _raw(quote=full), version=3)
+    assert len(ledger.items) == 1 and third.id == first.id
+
+
+def test_a_repair_that_cites_the_same_passage_under_another_s_number_is_the_same_evidence():
+    ws = _ws(ADJUSTMENTS, ADJUSTMENTS, same_file=True)
+    ledger = items.Ledger()
+    markdown = "ההתאמה לגיל הבניין היא 2% [S1] [S2]."
+    (first,) = _declared(ws, markdown, ledger, _raw(), components=COMPONENTS, version=1)
+    (second,) = _declared(ws, markdown, ledger, _raw(source="S2"), components=COMPONENTS, version=2)
+    assert second.id == first.id and len(ledger.items) == 1 and second.evidence == first.evidence
+    twice = _validate(ws, markdown, _raw(), _raw(source="S2"))
+    assert [e["reason"] for e in twice.excluded] == ["duplicate"]  # in one version they are one item too
+
+
+def test_the_same_quote_in_two_appraisal_units_of_one_file_is_two_pieces_of_evidence():
+    ws = _ws(ADJUSTMENTS, ADJUSTMENTS, same_file=True)
+    _in_units(ws, 1, 2)
+    ledger = items.Ledger()
+    markdown = "ההתאמה לגיל הבניין היא 2% [S1] [S2]."
+    kept = _declared(ws, markdown, ledger, _raw(), _raw(source="S2"), components=COMPONENTS)
+    assert len(kept) == 2 and len(ledger.items) == 2
+    one, two = kept
+    assert one.evidence[2] == two.evidence[2] and one.evidence[1] != two.evidence[1] and one.evidence != two.evidence
+    assert one.evidence_id != two.evidence_id and one.id != two.id
+
+
+def test_ae2_a_decision_closed_with_a_reason_is_not_reopened_by_the_same_item_listed_included_without_one():
+    ws = _ws(ADJUSTMENTS)
+    ledger = items.Ledger()
+    markdown = "ההתאמה לקומה היא 3% [S1]."
+    closed = _raw(state="not_applicable", reason="ההתאמה אינה חלה על נכס מסוג זה")
+    (first,) = _declared(ws, markdown, ledger, closed, version=1)
+    _declared(ws, markdown, ledger, _raw(), version=2)  # the repair round lists it again with the default state
+    (fill,) = ledger.items.values()
+    assert fill.id == first.id and (fill.state, fill.reason) == ("not_applicable", "ההתאמה אינה חלה על נכס מסוג זה")
+    assert [o["state"] for o in ledger.outcomes(_units(markdown), ws)] == ["not_applicable"]
+    assert fill.history[-1] == {"version": 2, "state": "not_applicable", "reason": "ההתאמה אינה חלה על נכס מסוג זה",
+                                "origin": "agent", "declared": "included"}  # what the agent said and what stayed, by version
+
+
+def test_a_closed_decision_is_replaced_only_by_another_state_with_a_reason_of_its_own():
+    ws = _ws(ADJUSTMENTS)
+    ledger = items.Ledger()
+    markdown = "ההתאמה לקומה היא 3% [S1]."
+    _declared(ws, markdown, ledger, _raw(state="not_applicable", reason="ההתאמה אינה חלה"), version=1)
+    _declared(ws, markdown, ledger, _raw(state="not_verifiable", reason="המקור נקרא בקריאה לא ודאית"), version=2)
+    (fill,) = ledger.items.values()
+    assert (fill.state, fill.reason) == ("not_verifiable", "המקור נקרא בקריאה לא ודאית")
+    rejected = _validate(ws, markdown, _raw(state="not_applicable", reason=""), ledger=ledger)  # no reason: invalid, the decision stays
+    ledger.merge(rejected.kept, excluded=rejected.excluded, version=3)
+    assert fill.state == "not_verifiable" and [e["reason"] for e in ledger.excluded] == ["no_reason"] and ledger.excluded[0]["version"] == 3
+
+
+def test_a_decision_is_kept_after_a_repair_that_cites_another_s_number_and_after_the_claim_is_removed():
+    ws = _ws(ADJUSTMENTS, ADJUSTMENTS, same_file=True)
+    ledger = items.Ledger()
+    markdown = "ההתאמה לגיל הבניין היא 2% [S1] [S2]. ההתאמה לקומה היא 3% [S1]."
+    _declared(ws, markdown, ledger, _raw(state="not_applicable", reason="ההתאמה אינה חלה על הנכס"),
+              _raw(label="ההתאמה לקומה", quote="קומה | 3%", value="3%"), components=COMPONENTS, version=1)
+    _declared(ws, markdown, ledger, _raw(source="S2"), components=COMPONENTS, version=2)  # another handle of the same passage
+    removed = "אין כאן מידע על ההתאמות."  # every sentence of the answer is gone
+    out = {o["quote"]: o for o in ledger.outcomes(_units(removed), ws)}
+    assert len(ledger.items) == 2
+    assert out["גיל הבניין | 2%"]["state"] == "not_applicable" and out["קומה | 3%"]["state"] == "omitted"  # an included item reopens; a decision stays
+    back = {o["quote"]: o for o in ledger.outcomes(_units(markdown), ws)}  # a repair that restores the claim: the same fills, the same ids
+    assert back["קומה | 3%"]["state"] == "covered" and back["גיל הבניין | 2%"]["state"] == "not_applicable"
+    assert back["גיל הבניין | 2%"]["id"] == out["גיל הבניין | 2%"]["id"]
+
+
+def test_a_fill_is_recorded_by_version_and_a_candidate_two_components_ask_for_gets_one_fill_each():
+    ws = _ws(RATE_TABLE)
+    ledger = items.Ledger()
+    ask = [{"id": "N1", "text": "התעריפים לשימוש בחניון"}, {"id": "N2", "text": "התעריף לכניסות בלילה"}]
+    night = next(c for c in items.candidates(_units(RATE_ONE), ws, ledger, ask, "").candidates if c.label == "כניסה בלילה")
+    ledger.merge([items.candidate_item(night, "N1", ledger), items.candidate_item(night, "N2", ledger)])
+    ledger.merge([items.candidate_item(night, "N2", ledger)])  # a later call names it again: still one fill per component
+    one, two = ledger.items.values()
+    assert (one.component, two.component) == ("N1", "N2") and one.id != two.id and one.evidence_id == two.evidence_id != ""
+    assert one.quote == two.quote and one.candidate and two.candidate
+    out = ledger.outcomes(_units(RATE_ONE), ws)
+    assert [(o["component"], o["state"]) for o in out] == [("N1", "omitted"), ("N2", "omitted")]  # each component's own open item
+    assert items.Ledger().candidate_id(night_evidence := ("d", "", "x")) == items.Ledger().candidate_id(night_evidence)
+
+
+def test_a_candidate_has_the_same_k_number_whichever_s_number_names_the_passage():
+    ws = _ws(RATE_TABLE, RATE_TABLE, same_file=True)
+    ledger = items.Ledger()
+    first = items.candidates(_units(RATE_ONE), ws, ledger, RATE_ASK, "").candidates
+    second = items.candidates(_units("התעריף לכניסה בודדת הוא 12 ₪ [S2]."), ws, ledger, RATE_ASK, "").candidates
+    assert {c.quote: c.id for c in first if c.source == "S1"} == {c.quote: c.id for c in second if c.source == "S2"}
+
+
+def test_items_shared_by_value_count_only_the_fills_alive_in_the_latest_version():
+    ws = _ws("\n".join(["התאמות לנכס להשוואה", "סוג התאמה | שיעור", "מיקום | 5%", "קומה | 5%", "גיל הבניין | 2%"]))
+    place = _raw(label="ההתאמה למיקום", quote="מיקום | 5%", value="5%")
+    floor = _raw(label="ההתאמה לקומה", quote="קומה | 5%", value="5%")
+    stated = _units("השיעור הוא 5% [S1].")
+    # both 5% rows are listed again in version 2: they share a value, so each needs its own words
+    both = items.Ledger()
+    _declared(ws, "ההתאמה למיקום היא 5% [S1].", both, place, floor, components=COMPONENTS, version=1)
+    _declared(ws, "ההתאמה למיקום היא 5% [S1].", both, place, floor, components=COMPONENTS, version=2)
+    shared = {o["quote"]: o for o in both.outcomes(stated, ws)}
+    assert shared["מיקום | 5%"]["state"] == "omitted" and shared["מיקום | 5%"]["why"] == "condition_not_stated"
+    # version 2 lists neither: they are items of an earlier version, no twins of the ones that stand
+    earlier = items.Ledger()
+    _declared(ws, "ההתאמה למיקום היא 5% [S1].", earlier, place, floor, components=COMPONENTS, version=1)
+    _declared(ws, "ההתאמה לגיל הבניין היא 2% [S1].", earlier, _raw(), components=COMPONENTS, version=2)
+    alone = {o["quote"]: o for o in earlier.outcomes(stated, ws)}
+    assert alone["מיקום | 5%"]["state"] == alone["קומה | 5%"]["state"] == "covered"
+
+
+def test_a_wider_quote_of_the_same_row_is_one_fill_with_the_narrower_one_and_never_a_twin_that_makes_the_row_share_its_value():
+    ws = _ws(TWO_ROWS)
+    ledger = items.Ledger()
+    markdown = "השטח הכולל לבנייה הוא 1,200 מ״ר [S1]."
+    _declared(ws, markdown, ledger, _raw(label="שטח", quote=PLAN_QUOTE, value="1,200"),
+              _raw(label="שטח כולל", quote=ROW_QUOTE, value="1,200"), components=PLAN_ASK)
+    assert len(ledger.items) == 1  # one passage, one fill (the longer quote is only another spelling of it)
+    two = items.Ledger()
+    two.merge([_item(label="שטח", quote=PLAN_QUOTE, value="1,200"), _item(label="שטח כולל", quote=ROW_QUOTE, value="1,200",
+                                                                          condition=PLAN_NOTE)])
+    assert len(two.items) == 1
+    (out,) = two.outcomes(_units(markdown), ws)
+    assert out["state"] == "covered"  # not "shared": the row's condition words are not asked of the sentence
+
+
+def test_a_narrower_covered_quote_carries_the_condition_check_and_the_wider_quote_adds_none():
+    ws = _ws(PLAN_TABLE)
+    ledger = items.Ledger()
+    # the agent's cell quote for N1 and the server's whole row for N2: two pieces of evidence of one row, checked once
+    _declared(ws, ROW_BOTH, ledger, _raw(label="שטח כולל", quote=PLAN_QUOTE, value="1,200"))
+    ledger.merge(items.source_items(_units(ROW_BOTH), ws, ROW_ASK, ledger), version=1)
+    by = _by_component(ledger, ROW_BOTH, ws)
+    assert by["N1"]["evidence_id"] != by["N2"]["evidence_id"] and by["N2"]["quote"] == ROW_QUOTE
+    assert by["N1"]["condition_check"] == "kept" and by["N2"]["condition_check"] == ""  # the second sentence states the row's condition
