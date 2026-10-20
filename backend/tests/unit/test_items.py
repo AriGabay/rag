@@ -1359,3 +1359,60 @@ def test_a_sentence_candidate_is_valued_by_its_amount_and_not_by_a_footnote_mark
     assert items._named("(1) ההכנסה השנתית מהשכרה 9,190 ₪")[1] == "9,190"
     assert items._named("תכנית 9190 קובעת שיעור 6.5%")[1] == "6.5%"
     assert items._named("1. הנימוק הראשון ללא מספרים")[1] == "הנימוק הראשון ללא מספרים"  # an ordinal is no value: the member is its own value
+
+
+# --- twins told apart by their date (round 19 U4, KTD4; R13-R16) ------------------------------------------------------------------
+
+_PAY = {
+    "8.24": "סך של 12.5% מסך התמורה ישולמו ביום 21.8.2024.",
+    "2.24": "סך של 12.5% מסך התמורה ישולמו ביום 21.2.2024.",
+    "8.23": "סך של 12.5% מסך התמורה ישולמו ביום 21.8.2023.",
+    "2.23": "סך של 12.5% מסך התמורה ישולמו ביום 21.2.2023.",
+    "2.25": "סך של 10% מסך התמורה ישולמו 21.2.2025 .",
+    "hand": "סך של 10% מסך התמורה ישולמו 7 ימים לפני מסירת החזקה בדירה .",
+}
+_PAY_ANSWER = ("**תשלומי התמורה**, לפי המועדים הידועים: 10% ביום 21.2.2025; 12.5% ביום 21.8.2024; 12.5% ביום 21.2.2024; "
+               "12.5% ביום 21.8.2023; ו־12.5% ביום 21.2.2023 [S1]. בנוסף, 10% ישולמו 7 ימים לפני מסירת החזקה [S1].")
+
+
+def _payment_states(markdown: str) -> dict[str, dict]:
+    ws = _ws("\n".join(_PAY.values()), kind="paragraph")
+
+    def pay(date: str, key: str, pct: str = "12.5%") -> items.Item:
+        return _item(label=f"תשלום ביום {date}", quote=_PAY[key], value=f"{pct} מהתמורה", condition=f"ביום {date}")
+
+    ledger = items.Ledger()
+    ledger.merge([pay("21.8.2024", "8.24"), pay("21.2.2024", "2.24"), pay("21.8.2023", "8.23"), pay("21.2.2023", "2.23"),
+                  pay("21.2.2025", "2.25", "10%"),
+                  _item(label="תשלום של 10% לפני מסירת החזקה", quote=_PAY["hand"], value="10% מהתמורה",
+                        condition="7 ימים לפני מסירת החזקה בדירה")])
+    return {o["label"]: o for o in ledger.outcomes(_units(markdown), ws)}
+
+
+def test_twins_with_one_value_that_differ_only_by_their_date_are_told_apart_by_the_date_the_paragraph_states_for_each():
+    states = _payment_states(_PAY_ANSWER)
+    assert len(states) == 6
+    assert {label: o["state"] for label, o in states.items()} == dict.fromkeys(states, "covered")  # no "condition_not_stated" gap line
+
+
+def test_a_twin_whose_date_the_paragraph_leaves_out_is_the_only_one_omitted():
+    states = _payment_states(_PAY_ANSWER.replace("12.5% ביום 21.8.2023; ", ""))
+    omitted = {label for label, o in states.items() if o["state"] != "covered"}
+    assert omitted == {"תשלום ביום 21.8.2023"}
+    assert states["תשלום ביום 21.8.2023"]["why"] in {"date_not_stated", "value_not_stated", "not_attributed"}
+
+
+def test_twins_that_share_their_date_and_differ_by_a_word_still_need_that_word():
+    quotes = ["הדייר ישלם 5% ביום 1.1.2024 עבור חניה.", "הדייר ישלם 5% ביום 1.1.2024 עבור מחסן."]
+    ws = _ws("\n".join(quotes), kind="paragraph")
+
+    def state(markdown: str) -> dict[str, str]:
+        ledger = items.Ledger()
+        ledger.merge([_item(label="תשלום עבור חניה", quote=quotes[0], value="5%", condition="ביום 1.1.2024 עבור חניה"),
+                      _item(label="תשלום עבור מחסן", quote=quotes[1], value="5%", condition="ביום 1.1.2024 עבור מחסן")])
+        return {o["label"]: o["state"] for o in ledger.outcomes(_units(markdown), ws)}
+
+    assert state("הדייר ישלם 5% ביום 1.1.2024 עבור חניה, ו־5% ביום 1.1.2024 עבור מחסן [S1].") == dict.fromkeys(
+        ["תשלום עבור חניה", "תשלום עבור מחסן"], "covered")
+    only_one = state("הדייר ישלם 5% ביום 1.1.2024 עבור חניה [S1].")
+    assert only_one["תשלום עבור חניה"] == "covered" and only_one["תשלום עבור מחסן"] != "covered"

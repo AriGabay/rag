@@ -907,10 +907,19 @@ def _enough(wanted: str, have: frozenset[str]) -> bool:
     return not groups or sum(1 for g in groups if g & have) >= (len(groups) + 1) // 2
 
 
-def _tells_apart(item: Item, have: frozenset[str], rivals: frozenset[str]) -> bool:
+def _condition_dates(item: Item) -> frozenset[str]:
+    """The dates (ISO) the item's own condition and label state: what tells it apart from a twin that states other dates (round 19 U4)."""
+    return frozenset(p.iso for p in shared_dates.find_all(f"{item.condition} ; {item.label}"))
+
+
+def _tells_apart(item: Item, have: frozenset[str], rivals: frozenset[str], rival_dates: frozenset[str] = frozenset()) -> bool:
     """Whether the block's words tell the item apart from the items that share its value: at least half of the words of its condition (else
     its label) that none of those items writes (``rivals``: their words). A condition that every twin writes tells nothing apart, so the
-    label's words are asked, and when no word of either differs nothing is asked (round 19 U4)."""
+    label's words are asked, and when no word of either differs nothing is asked (round 19 U4). A date is no word (``_TOKEN`` reads letters),
+    so twins that differ only by their date are told apart by it: when the item states a date that none of its twins states
+    (``rival_dates``), the date tells it apart, and ``_states_date`` has already asked the block for it (KTD4; R13-R16)."""
+    if (own := _condition_dates(item)) and not own <= rival_dates:
+        return True
     for text in (item.condition, item.label):
         if not text:
             continue
@@ -1127,11 +1136,12 @@ def _leads(units: Sequence[Unit]) -> dict[int, str]:
     return out
 
 
-def _check_block(item: Item, block: Block, ws, shared: bool, rivals: frozenset[str], lead: str = "") -> _Check:
+def _check_block(item: Item, block: Block, ws, shared: bool, rivals: frozenset[str], lead: str = "",
+                 rival_dates: frozenset[str] = frozenset()) -> _Check:
     """What one block of the answer gives of the item: its failure ``why`` (the first check it fails), ``partial`` with the headline values it
     leaves out, or "" when it gives it. Attribution is the union of the citations of the block's sentences (R5); the value is every headline
     value in the block's text; the date may stand in the block's lead; the condition words are asked only to tell apart items that
-    share a value, over the block's words."""
+    share a value, over the block's words, and a date the item states that its twins do not state tells it apart (round 19 U4)."""
     unit = block.unit
     if not _attributed(item, unit, ws):
         return _Check("not_attributed")
@@ -1141,7 +1151,7 @@ def _check_block(item: Item, block: Block, ws, shared: bool, rivals: frozenset[s
         return verdict
     if not _states_date(item, unit.text, lead):
         return _Check("date_not_stated")
-    if shared and not _tells_apart(item, words, rivals):
+    if shared and not _tells_apart(item, words, rivals, rival_dates):
         return _Check("condition_not_stated")
     return verdict
 
@@ -1172,12 +1182,13 @@ _NO_GIVING = Giving(frozenset(), ())
 
 
 def _coverage_all(item: Item, blocks: Sequence[Block], ws, shared: bool, leads: Mapping[int, str],
-                  rivals: frozenset[str] = frozenset()) -> tuple[Coverage, Giving]:
+                  rivals: frozenset[str] = frozenset(), rival_dates: frozenset[str] = frozenset()) -> tuple[Coverage, Giving]:
     """``_coverage`` and, from the same pass over the blocks, every sentence that gives the item (``Ledger.outcomes``): the coverage names
     the first of them. Raises ``CoverageUnavailable`` when the item's source is not in the workspace."""
     if ws is None or _place(ws, item.source) is None:
         raise CoverageUnavailable(item.id)
-    checks = [(b, _check_block(item, b, ws, shared, rivals, leads.get(b.unit.index, ""))) for b in blocks]
+    checks = [(b, _check_block(item, b, ws, shared, rivals, leads.get(b.unit.index, ""), rival_dates))
+              for b in blocks]
     giving = [b for b, c in checks if not c.why]
     if giving:
         parts = [(b, _giving_parts(item, b)) for b in giving]
@@ -1375,7 +1386,8 @@ class Ledger:
             if item.state in (ITEM_INCLUDED, OMITTED, *NEEDS_REASON):  # a declared item passes the same check (R16)
                 try:
                     got, covering = _coverage_all(item, blocks, ws, shared, leads,
-                                                  frozenset().union(*(_words(j.condition or j.label) for j in rivals)))
+                                                  frozenset().union(*(_words(j.condition or j.label) for j in rivals)),
+                                                  frozenset().union(*(_condition_dates(j) for j in rivals)))
                 except Exception as exc:  # noqa: BLE001 - any failure of the check is "could not be completed", never "not used" (R17)
                     logger.warning("item coverage check could not be completed: %s", type(exc).__name__)
                     got, covering = Coverage(False, None, ITEM_UNCHECKED, checked=False), _NO_GIVING
