@@ -295,7 +295,8 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # (kept, missing, contradicted or from another item, each with a quote in the right span). 17 (round 18 U6, KTD2): the requirements call's
 # ``<candidates>`` offers the siblings of what the answer draws on (a table's other rows, a list's other members, a passage's other
 # value-bearing sentences) and a requirement names the ones it asks for with the request words they answer (``candidates``).
-JUDGE_VERSION = 17
+# 18 (round 19 U2, KTD2): a unit whose evidence's owner the context check could not settle is shown with a neutral ``<ownership>`` fact line; rule (34) reads it.
+JUDGE_VERSION = 18
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -442,7 +443,11 @@ JUDGE_POLICY = (
     "להסיר את ההיקף שהיחידה כותבת כשההקשר אומר אותו. "
     "(33) יחידה שנפתחת בתווית קצרה ואחריה משפט (\"מיקום: סעיף 5, פסקה 3\") היא טענה ולא כותרת או תווית: סווג אותה לפי "
     "המשפט שאחרי התווית ושפוט אותו מול המקור שהיא מצטטת. navigation ו-not_factual שמורים לכותרת, לתווית בלי משפט ולפתיח. "
-    "בכותרת של מקור, מה שנכתב אחרי «קובץ:» הוא שם הקובץ, ולא הנכס של הקטע: הנכס של הקטע הוא ההקשר שנכתב לפניו."
+    "בכותרת של מקור, מה שנכתב אחרי «קובץ:» הוא שם הקובץ, ולא הנכס של הקטע: הנכס של הקטע הוא ההקשר שנכתב לפניו. "
+    "(34) <ownership unit=\"N\">…</ownership> לפני יחידה הוא עובדה ניטרלית שהשרת רושם כשלא הצליח להכריע אם הנתון שהיחידה מצטטת "
+    "שייך לנכס שנשאל עליו: איפה הנתון כתוב ואיזה נכס נשאל. זו אינה טענה ואינה פסק דין. מספר ההקשר או הכותרת של היחידה שבה הנתון "
+    "כתוב אינם מוכיחים שהוא של נכס אחר; שפוט לפי הקטע המצוטט עצמו: אם הוא מזהה (בשם, בחלקה או בכתובת) את הנכס שנשאל עליו, הנתון "
+    "שלו; אם הוא מזהה נכס אחר, wrong_subject; ואם אינו מזהה אף נכס, אל תסיק wrong_subject מההבדל בהקשר לבדו."
 )
 
 
@@ -1379,8 +1384,10 @@ def unit_key(unit: Unit, ws: Workspace, request: str, heading: str, digests: dic
             digests["*"] = hashlib.sha256("\x1f".join(
                 f"{sid}\x1e" + "\x1f".join(_source_parts(ws, sid) or ()) for sid in ws.sources).encode()).hexdigest()
         evidence.append(("*", digests["*"]))
-    raw = json.dumps([_norm(unit.text), evidence, unit.context, heading, unit.table_header, request,
-                      JUDGE_VERSION], ensure_ascii=False)
+    key = [_norm(unit.text), evidence, unit.context, heading, unit.table_header, request, JUDGE_VERSION]
+    if fact := (getattr(ws, "ownership_facts", None) or {}).get(_fact_key(unit)):  # the judge reads it beside the unit (rule 34)
+        key.append(fact)
+    raw = json.dumps(key, ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -4129,10 +4136,14 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
         if from_standard:
             problems.append(Problem(u, from_standard, failure_kind="wrong_subject", check="property_datum_from_standard"))
             continue
-        elsewhere = _wrong_context(u, ws, question)
-        if elsewhere:
-            problems.append(Problem(u, elsewhere, failure_kind="wrong_subject", check="context"))
+        owner = _context_check(u, ws, question)
+        if owner.reason:
+            problems.append(Problem(u, owner.reason, failure_kind="wrong_subject", check="context"))
             continue
+        if owner.facts:  # an owner the server could not settle is not removed: the judge reads the facts (rule 34)
+            _facts_of(ws)[_fact_key(u)] = " ".join(owner.facts)
+        else:
+            _facts_of(ws).pop(_fact_key(u), None)
         for reason in _vat_problems(u, ws) if u.ids else []:
             problems.append(Problem(u, reason, failure_kind="wrong_unit", check="vat"))
         blocking = [m for m in meanings.get(u.index, []) if m.blocking]
@@ -5324,34 +5335,143 @@ def declared_contexts(ws: Workspace, cx) -> set[int]:
     return {n for n in cx.subjects if cx.key(n) in keys}
 
 
+@dataclass
+class ContextCheck:
+    """What the context check found for a unit (round 19 U2, KTD2): ``reason`` — the claim rests on another property's datum, said
+    only where the evidence's owner is DIFFERENT from the asked property — and ``facts``: the neutral lines for the judge about evidence
+    whose owner the server could not settle (UNKNOWN), never a removal."""
+
+    reason: str | None = None
+    facts: list[str] = field(default_factory=list)
+
+
+def _cells_of(line: str) -> list[str]:
+    """The cells of a Markdown table row."""
+    row = line.strip()
+    row = row[1:] if row.startswith("|") else row
+    row = row[:-1] if row.endswith("|") else row
+    return [c.strip() for c in row.split("|")]
+
+
+def _row_cells(u: Unit) -> list[tuple[str, Unit]]:
+    """For a table row: ``(the heading of the cell's column, the cell as a unit)`` of each cell that cites evidence (round 19 U2, R7:
+    a comparison's cell is checked against the side its column names). Empty for anything but a body row whose cells line up with its
+    table's header row."""
+    if u.table_span is None or u.table_header or not u.context:
+        return []
+    header = u.context.split("\n", 1)[0].strip()
+    if not header.startswith("|"):
+        return []
+    heads, cells = _cells_of(header), _cells_of(u.raw)
+    if len(heads) != len(cells):
+        return []
+    return [(h, Unit(u.index, c, _IDS.sub("", c).strip(), ids_in(c))) for h, c in zip(heads, cells, strict=True) if ids_in(c)]
+
+
+def _evidence_spans(i: str, ws: Workspace) -> tuple[list[str], bool]:
+    """The words of the cited evidence ``i`` that can say whom its datum belongs to (the cited passage with the heading and caption of
+    its table, a value's or measurement's own quote, label and section), and whether the server linked the appraisal it is in to the
+    property (``Source.link``, a link alone is no identity)."""
+    if i in ws.sources:
+        src = ws.sources[i]
+        return [src.text or ""], bool(getattr(src, "link", None))
+    if i in ws.values:
+        v = ws.values[i]
+        src = ws.sources.get(getattr(v, "source_id", None))
+        return [x for x in (getattr(v, "quote", None), getattr(v, "label", None), getattr(v, "section", None)) if x], bool(
+            src is not None and getattr(src, "link", None))
+    if i in ws.measurements:
+        m = ws.measurements[i]
+        return [x for x in (getattr(m.row, "quote", None), getattr(m.row, "metric", None), getattr(m.row, "section", None)) if x], False
+    return [], False
+
+
+def _fact_key(u: Unit) -> tuple:
+    return _norm(u.text), tuple(sorted(set(u.ids)))
+
+
+def _facts_of(ws: Workspace) -> dict:
+    """The turn's ownership facts (``Workspace.ownership_facts``); a workspace without the field gets one."""
+    facts = getattr(ws, "ownership_facts", None)
+    if facts is None:
+        facts = {}
+        try:
+            ws.ownership_facts = facts
+        except AttributeError:
+            pass
+    return facts
+
+
+def _ownership_note(u: Unit, ws: Workspace) -> str:
+    """The neutral fact line beside a unit whose evidence's owner the context check could not settle (rule 34): where the datum is
+    written and which property was asked, never a verdict."""
+    fact = (getattr(ws, "ownership_facts", None) or {}).get(_fact_key(u))
+    return f'<ownership unit="{u.index}">{prompt_text(fact)}</ownership>\n' if fact else ""
+
+
 def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
     """A claim about the asked property that rests on another appraisal context of the same file (round 7 U6, KTD7,
-    R21; round 15 U7, KTD7, KTD8, R3, R10): the asked set is the property the unit's own words name, else the one the
-    request's components name (their subjects), else the one the question names — each only by a DISTINGUISHING name or
-    identifier (``Contexts.named``: a project word, a street or a name two units of the file share names neither) — else
-    the one the value's own subject names, else the units the answer DECLARED (``declared_units``), else the unit the
-    turn located. A declaration is therefore never what the model checks itself with: when the claim, the components or
-    the question name a unit distinctively, that unit is the asked set and a declaration excluding it is contradicted; the
-    declaration decides only where nothing distinctive was written. A value, measurement or source of another context
-    (a passage a search returned across a probable edge is of the neighbour it lies in), or a calculation none of whose
-    inputs is of the asked context, is another property's figure — the file, its title or the conversation's focus never
-    prove otherwise. Only a subject context counts as elsewhere: evidence in an appendix or a comparables part belongs to
-    the appraisal it serves and is left to the judge — except a value there whose recorded subject is ``contradicted``
-    (the source places it on another property), and never a calculation built from such values. Only when the context
-    checks are enforced (``contexts.enforced``); None when nothing is asked or nothing is elsewhere. A name the
-    evidence's own unit writes in the passages read there separates nothing: a unit named only by such a name is not the
-    asked set (round 15, held-out)."""
+    R21; round 15 U7, KTD7, KTD8, R3, R10; round 19 U2, KTD2, R4-R8): ``_context_check``'s reason, or None."""
+    return _context_check(u, ws, question).reason
+
+
+def _context_check(u: Unit, ws: Workspace, question: str) -> ContextCheck:
+    """The context check of a unit: its reason when a claim about the asked property rests on a datum that is another property's, and
+    the facts for the judge where it could not be settled.
+
+    The asked set is the property the unit's own words name, else the one the request's components name (their subjects), else the one
+    the question names — each only by a DISTINGUISHING name or identifier (``Contexts.named``: a project word, a street or a name two
+    units of the file share names neither) or a page range — else the one the value's own subject names, else the units the answer
+    DECLARED (``declared_units``), else the unit the turn located. A subject written as several sides ("appraisals X and Y") is
+    checked side by side (``tools.resolved_sides``), and a table cell against the side its column names (``_row_cells``); a compound
+    that resolved only in part leaves the asked side unresolved. A declaration is never what the model checks itself with: when the claim,
+    the components or the question name a unit distinctively, that unit is the asked set and a declaration excluding it is
+    contradicted; the declaration decides only where nothing distinctive was written.
+
+    The evidence's owner is then compared with the asked set (``Contexts.compare``: the cited text's own names, parcels and
+    addresses, the unit's identity — a noise heading is none —, a link, established continuity): only DIFFERENT removes. SAME keeps;
+    UNKNOWN (no identity says whom it belongs to, or the asked side did not fully resolve) never removes deterministically and
+    adds a neutral fact line to the judge's input, which already judges the unit. A value, measurement or source of another context
+    whose identity is another property's, or a calculation none of whose inputs is of the asked context, is another property's
+    figure — the file, its title or the conversation's focus never prove otherwise. Only a subject context counts as elsewhere:
+    evidence in an appendix or a comparables part belongs to the appraisal it serves and is left to the judge — except a value there
+    whose recorded subject is ``contradicted`` (the source places it on another property), and never a calculation built from such
+    values. Only when the context checks are enforced (``contexts.enforced``); an empty check when nothing is asked or nothing is
+    elsewhere. A name the evidence's own unit writes in the passages read there separates nothing: a unit named only by such a name
+    is not the asked set (round 15, held-out). The permission of a document is not decided here."""
     from app.chat import contexts
     from app.chat import intent as intent_mod
-    from app.chat.contexts import Identity
-    from app.chat.tools import asked_subjects, located_contexts
 
     if not contexts.enforced():
-        return None
+        return ContextCheck()
     # a professional question is not about the property of a file: an appraisal read there is one property's example, and
     # a supported sentence of a general answer is never removed because no appraisal was located (round 10 U9, R35)
     if getattr(ws, "intent", None) == intent_mod.PROFESSIONAL:
-        return None
+        return ContextCheck()
+    cells = _row_cells(u)
+    if not cells:
+        return _check_evidence(u, u.text, ws, question)
+    out = ContextCheck()
+    for heading, cell in cells:
+        found = _check_evidence(cell, u.text, ws, question, heading)
+        if found.reason:
+            return found
+        out.facts += found.facts
+    outside = [i for i in u.ids if not any(i in cell.ids for _, cell in cells)]
+    if outside:
+        found = _check_evidence(dataclasses.replace(u, ids=outside), u.text, ws, question)
+        out = ContextCheck(found.reason, out.facts + found.facts)
+    return out
+
+
+def _check_evidence(u: Unit, names_from: str, ws: Workspace, question: str, heading: str = "") -> ContextCheck:
+    """``_context_check`` of the evidence ``u`` cites; ``names_from``: the words of the claim that name its property (a table
+    row's, when ``u`` is one cell of it); ``heading``: the heading of the column of a cell (the side it is attributed to)."""
+    from app.chat import contexts
+    from app.chat.contexts import DIFFERENT, SAME, Identity
+    from app.chat.tools import asked_subjects, located_contexts, resolved_sides
+
+    out = ContextCheck()
     subjects, from_components = asked_subjects(ws)
     for version, numbers, what, i in _evidence_contexts(u, ws):
         cx = ws.contexts.get(version)
@@ -5359,41 +5479,68 @@ def _wrong_context(u: Unit, ws: Workspace, question: str) -> str | None:
             continue
         # evidence in an appendix or comparables part is the judge's, unless it is a value whose recorded subject the
         # source places on another property (``contradicted``): that one is presented as the asked property's own
-        if not (i in ws.values and ws.values[i].subject_from == "contradicted"):
+        contradicted = i in ws.values and ws.values[i].subject_from == "contradicted"
+        if not contradicted:
             numbers = {n for n in numbers if cx.is_subject(n)}
         if not numbers:
             continue
         passages = [s.text for s in ws.sources.values()
                     if str(s.version_id) == version and set(s.contexts or ()) & numbers and s.text]
-        naming = u.text
-        asked = set(cx.named(u.text))
+        naming = names_from
+        complete = True
+        by_heading = set(cx.resolve(heading)) if heading else set()  # a cell is checked against the side its column names
+        asked = by_heading or set(cx.named(names_from))
         if not asked:
             naming = " ".join(subjects)
-            asked = {n for x in subjects for n in cx.named(x)} if from_components else set()
+            sides = [resolved_sides(cx, x) for x in subjects] if from_components else []
+            asked = set().union(*(n for n, _ in sides)) if sides else set()
+            complete = all(c for _, c in sides)
         if not asked:
             naming = question
-            asked = set(cx.named(question))
+            asked, complete = resolved_sides(cx, question, explicit=True)
         # a unit named only by a name that the evidence's own unit writes in the passages read there is named by nothing
         # that separates it from that unit (round 15, held-out)
-        asked = {n for n in asked if cx.named_by_identifier(n, naming)
-                 or not any(Identity(names=(x,)).name_spans(t) for x in cx.naming_names(n, naming) for t in passages)}
+        if not by_heading:
+            asked = {n for n in asked if cx.named_by_identifier(n, naming)
+                     or not any(Identity(names=(x,)).name_spans(t) for x in cx.naming_names(n, naming) for t in passages)}
         declared = declared_contexts(ws, cx)
         distinctive = bool(asked)
-        if not asked and i in ws.values and ws.values[i].subject_from == "contradicted":
+        if not asked and contradicted:
             asked = set(cx.named(ws.values[i].subject))
+            complete = True
         if not asked:  # nothing distinctive was written: the units the answer declared are the asked property
-            asked = declared
+            asked, complete = declared, True
         if not asked:  # no title or alias names the asked property: the unit the turn located for the question is it
-            asked = located_contexts(ws, cx)
-        # a context that only continues the one before it (the calculation pages of an appraisal) is that one's own: it is not
-        # "another property" (round 18 U3, KTD3); a different address or parcel stays another property
-        if asked and not {cx.owner(n) for n in numbers} & {cx.owner(n) for n in asked}:
+            asked, complete = located_contexts(ws, cx), True
+        if not asked:
+            continue
+        # the evidence's owner against the asked property (round 19 U2): what its own text writes, the identity of its unit, a link,
+        # and the continuity of the pages that only continue the asked context (round 18 U3, KTD3)
+        spans, linked = _evidence_spans(i, ws)
+        states = []
+        for n in sorted(numbers):
+            state = cx.compare(n, asked, spans, linked, complete)
+            if state != SAME and contradicted and not cx.is_subject(n):  # the source places this appendix value on another property
+                state = DIFFERENT if complete else contexts.UNKNOWN
+            states.append(state)
+        if SAME in states:
+            continue
+        if all(x == DIFFERENT for x in states):
             said = (", והתשובה הצהירה על " + ", ".join(cx.describe(n) for n in sorted(declared))
                     if distinctive and declared and not declared & asked else "")
-            return (f"{what} כתוב ב" + ", ".join(cx.describe(n) for n in sorted(numbers)) + ", והטענה עוסקת ב"
-                    + ", ".join(cx.describe(n) for n in sorted(asked)) + said + ": זה נתון של נכס אחר באותו קובץ. קח את "
-                    "הנתון מההקשר של הנכס שנשאל עליו, או ייחס אותו לנכס שלו")
-    return None
+            out.reason = (f"{what} כתוב ב" + ", ".join(cx.describe(n) for n in sorted(numbers)) + ", והטענה עוסקת ב"
+                          + ", ".join(cx.describe(n) for n in sorted(asked)) + said + ": זה נתון של נכס אחר באותו קובץ. קח את "
+                          "הנתון מההקשר של הנכס שנשאל עליו, או ייחס אותו לנכס שלו")
+            return out
+        out.facts.append(MSG_OWNER_UNKNOWN.format(
+            what=what, where=", ".join(cx.describe(n) for n in sorted(numbers)), asked=", ".join(cx.describe(n) for n in sorted(asked)),
+            partial=MSG_OWNER_PARTIAL if not complete else ""))
+    return out
+
+
+MSG_OWNER_UNKNOWN = ("{what} כתוב ב{where}; הטענה עוסקת ב{asked}{partial}. השרת לא מצא בטקסט המצוטט ובזהות היחידה ראיה שמכריעה אם "
+                     "הנתון שייך לנכס שנשאל עליו.")
+MSG_OWNER_PARTIAL = " (הנושא שנשאל מורכב, ורק חלקו זוהה בקובץ)"
 
 
 # --- a number derived from the values a unit cites (round 13 U9, KTD9, R12, AE5) -------------------------------------------------
@@ -6548,7 +6695,7 @@ def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = Non
             shown.setdefault(sid, (b[1], b[2]))  # what the judge was shown of it, and whether that is an excerpt
     # before a unit: the headings above it and its table row's header (R7); after a unit showing a result of a
     # conditional calculation: the qualifier the server writes next to it
-    units = [_unit_context(u) + _preceding_note(u) + _unstated_note(u) + _reread_note(batch, u)
+    units = [_unit_context(u) + _preceding_note(u) + _unstated_note(u) + _ownership_note(u, ws) + _reread_note(batch, u)
              + f'<unit index="{u.index}" cites="{prompt_attr(",".join(u.ids))}">\n'
              f'{_unit_text(u)}\n</unit>'
              + "".join(f'\n<server_qualifier unit="{u.index}">({prompt_text(note)})</server_qualifier>'

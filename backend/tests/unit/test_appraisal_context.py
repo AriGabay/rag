@@ -715,21 +715,23 @@ def test_the_judge_header_of_a_passage_in_the_declared_unit_names_it_by_handle_a
 
 # --- a name the evidence's own unit writes separates nothing (round 15, held-out) ----------------------------------------------
 
-def _brand_contexts() -> contexts.Contexts:
-    """Unit 2's card holds the synthetic name «מרכז אופנה סינתטי» (and the street «הדקל 7»); unit 3 has no identity at all."""
+def _brand_contexts(other: dict | None = None) -> contexts.Contexts:
+    """Unit 2's card holds the synthetic name «מרכז אופנה סינתטי» (and the street «הדקל 7»); unit 3 has no identity at all, or — with
+    ``other`` — the identifiers of a property of its own (round 19 U2: absence of an identity proves nothing, an identity of its own
+    is another property's)."""
     parts = [_unit(1, "front_matter", None, first=0, last=1),
              _unit(2, "appraisal", "מרכז אופנה סינתטי", ("מרכז אופנה סינתטי",), first=2, last=5, pages=(2, 3),
                    identifiers=_ident("הדקל 7")),
-             _unit(3, "appraisal", None, first=6, last=9, pages=(4, 5), identifiers={})]
+             _unit(3, "appraisal", None, first=6, last=9, pages=(4, 5), identifiers=other or {})]
     first = {n: SimpleNamespace(block_index=n, page=p, bbox=[50.0, 40.0, 500.0, 52.0]) for n, p in ((2, 2), (6, 4))}
     return contexts.from_units(parts, first, [3, 7], "v", "r1")
 
 
-def _brand_wrong(monkeypatch, passage: str, claim: str):
+def _brand_wrong(monkeypatch, passage: str, claim: str, other: dict | None = None):
     from app.config import get_settings
 
     monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
-    cx = _brand_contexts()
+    cx = _brand_contexts(other)
     assert cx.subjects == [1, 2, 3] and cx.named("מרכז אופנה סינתטי") == [2]
     source = SimpleNamespace(contexts=[3], version_id="v", text=passage, document_id="d")
     return _wrong(cx, {"V1": 3}, "מה ה-NOI?", claim=claim, sources={"S1": source}), cx
@@ -741,15 +743,16 @@ def test_a_name_the_evidence_unit_writes_in_its_own_passages_does_not_make_anoth
     assert removed is None  # unit 3 itself writes that name: it separates unit 2 from unit 3 by nothing
 
 
-def test_a_name_the_evidence_unit_does_not_write_still_marks_its_value_as_another_properties(monkeypatch):
-    removed, cx = _brand_wrong(monkeypatch, "הכנסה נטו 14,850,000 ₪ לשנה.", "ה-NOI של מרכז אופנה סינתטי הוא 14,850,000 ₪")
+def test_a_name_the_evidence_unit_does_not_write_still_marks_its_value_as_another_properties_when_the_unit_has_an_identity(monkeypatch):
+    removed, cx = _brand_wrong(monkeypatch, "הכנסה נטו 14,850,000 ₪ לשנה.", "ה-NOI של מרכז אופנה סינתטי הוא 14,850,000 ₪",
+                               other=_ident("הצפצפה 3"))
     assert removed and cx.describe(3) in removed and cx.describe(2) in removed  # the protection is kept
 
 
 def test_a_unit_named_by_an_identifier_is_kept_asked_though_the_passage_writes_its_other_name(monkeypatch):
-    removed, _ = _brand_wrong(monkeypatch, "מרכז אופנה סינתטי — הכנסה נטו 14,850,000 ₪.",
-                              "ה-NOI של מרכז אופנה סינתטי, רחוב הדקל 7, הוא 14,850,000 ₪")
-    assert removed  # the address names unit 2 whatever the passage writes
+    removed, _ = _brand_wrong(monkeypatch, "מרכז אופנה סינתטי — רחוב הצפצפה 3 — הכנסה נטו 14,850,000 ₪.",
+                              "ה-NOI של מרכז אופנה סינתטי, רחוב הדקל 7, הוא 14,850,000 ₪", other=_ident("הצפצפה 3"))
+    assert removed  # the address names unit 2 whatever the passage writes; the passage also writes unit 3's own address
 
 
 # --- a unit's running subject is its name: a brand phrase on one card, the longer name on another (round 16 U5, AE4, R9) ---
@@ -820,10 +823,7 @@ def test_calculation_pages_cut_only_at_a_restarted_numbering_are_the_appraisals_
 @pytest.mark.parametrize(("why", "second"), [
     ("an address of its own", {"identifiers": _ident("הצפצפה 7")}),
     ("a parcel of its own", {"identifiers": _ident(parcel=("30874", "9"))}),
-    ("a subject line opens it", {"signals": ("subject_line", "label_restart")}),
-    ("a letter opening opens it", {"signals": ("letter_opening",)}),
     ("a name of its own", {"title": "פרויקט נחל הצבר", "aliases": ("נחל הצבר",)}),
-    ("the signals of the cut are not known", {"signals": None}),
 ], ids=lambda x: x if isinstance(x, str) else "")
 def test_a_value_of_a_context_that_is_not_a_mere_continuation_is_still_another_property(monkeypatch, why, second):
     from app.config import get_settings
@@ -835,6 +835,26 @@ def test_a_value_of_a_context_that_is_not_a_mere_continuation_is_still_another_p
     assert cx.owner(2) == 2, why
 
 
+@pytest.mark.parametrize(("why", "second"), [
+    ("a subject line opens it", {"signals": ("subject_line", "label_restart")}),
+    ("a letter opening opens it", {"signals": ("letter_opening",)}),
+    ("the signals of the cut are not known", {"signals": None}),
+    ("its heading is digit noise", {"title": "2315 63", "signals": ("subject_line",)}),
+    ("its heading is a sentence ending with a colon", {"title": "להלן פירוט החישוב של שווי הנכס לפי נתוני השומה:",
+                                                       "signals": ("subject_line",)}),
+], ids=lambda x: x if isinstance(x, str) else "")
+def test_a_context_that_states_no_identity_is_neither_the_appraisals_continuation_nor_another_property(monkeypatch, why, second):
+    """Round 19 U2 (R5, R6): an opening signal or an unknown cut proves the pages are not an established continuation, but without
+    an address, a parcel or a name of their own they are not another property either: nothing is removed deterministically."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+    cx = _calc_pages_file(RESTART | second)
+    assert cx.owner(2) == 2, why  # no established continuation: the cut opens it
+    assert cx.compare(2, [1]) == contexts.UNKNOWN, why
+    assert _wrong(cx, {"V1": 2}, ASK_CALC, claim="ההכנסה נטו השנתית היא 14,850,000 ₪") is None, why
+
+
 def test_a_continuation_after_an_appendix_has_nothing_to_continue(monkeypatch):
     from app.config import get_settings
 
@@ -843,8 +863,9 @@ def test_a_continuation_after_an_appendix_has_nothing_to_continue(monkeypatch):
              _unit(2, "appendix", "נספח", first=4, last=7, pages=(2, 2), signals=("label_restart",)),
              _unit(3, "document", None, first=8, last=10, pages=(3, 3), signals=("label_restart",))]
     cx = contexts.from_units(parts, {}, [], "v", "r1")
-    assert _wrong(cx, {"V1": 3}, ASK_CALC, claim="ההכנסה נטו השנתית היא 14,850,000 ₪")
-    assert cx.owner(3) == 3
+    assert cx.owner(3) == 3  # an appendix is nothing to continue
+    assert cx.compare(3, [1]) == contexts.UNKNOWN  # and the pages state no identity of their own: not another property either
+    assert _wrong(cx, {"V1": 3}, ASK_CALC, claim="ההכנסה נטו השנתית היא 14,850,000 ₪") is None
 
 
 def test_a_second_continuation_continues_the_same_appraisal():
@@ -876,3 +897,228 @@ def test_the_header_of_a_passage_in_a_file_of_several_reports_names_its_own_unit
     ws.contexts["v1"] = cx1
     tools._mark(one, cx1, [1], ws)
     assert verify._source_parts(ws, one.sid)[0].startswith("שומת מקרקעין — עמוד 1 — זיהוי מתוך המסמך: מתחם הגפן")
+
+
+# --- three-state ownership: same, different or unknown (round 19 U2, KTD2, R4-R8; AE3, AE4) ----------------------------------
+
+COLON = "להלן פירוט החישוב של שווי הנכס בגישת היוון ההכנסות לפי נתוני השומה:"
+ASK_OWNER = "מה ההכנסה נטו השנתית של מתחם גבעת האלה?"
+OWNER_CLAIM = "ההכנסה נטו השנתית של מתחם גבעת האלה היא 610,000 ₪"
+OWNER_TEXT = "טבלה 1 — חישוב ההיוון לגוש 40100 חלקה 12: הכנסה נטו שנתית 610,000 ₪."
+
+
+def _ownership_file(second: dict | None = None) -> contexts.Contexts:
+    """Unit 1: the appraisal of the invented «מתחם גבעת האלה» (street «הדס 5», parcel 40100/12). Unit 2: pages that a restarted
+    numbering cut (``second`` are its fields). Unit 3 and unit 4: appraisals of other invented properties, with a parcel and a name each."""
+    parts = [_unit(1, "appraisal", "מתחם גבעת האלה", ("גבעת האלה",), first=0, last=7, pages=(1, 2),
+                   identifiers=_ident("הדס 5", ("40100", "12"))),
+             _unit(2, **({"kind": "document", "title": None, "first": 8, "last": 12, "pages": (3, 4),
+                          "signals": ("label_restart",)} | (second or {}))),
+             _unit(3, "appraisal", "פרויקט נחל הלוטם", ("נחל הלוטם",), first=13, last=20, pages=(5, 6),
+                   identifiers=_ident("הלוטם 9", ("40100", "31")), signals=("subject_line",)),
+             _unit(4, "appraisal", "פרויקט עין השקמה", ("עין השקמה",), first=21, last=28, pages=(7, 8),
+                   identifiers=_ident("השקמה 2", ("40100", "55")), signals=("subject_line",))]
+    first = {8: SimpleNamespace(block_index=8, page=3, bbox=[50.0, 40.0, 500.0, 52.0]),
+             13: SimpleNamespace(block_index=13, page=5, bbox=[50.0, 40.0, 500.0, 52.0]),
+             21: SimpleNamespace(block_index=21, page=7, bbox=[50.0, 40.0, 500.0, 52.0])}
+    return contexts.from_units(parts, first, [4, 9, 14, 22], "v", "r1")
+
+
+def _passage(number: int, text: str, link: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(contexts=[number], version_id="v", text=text, document_id="d", link=link)
+
+
+def _owned(cx, number: int, text: str, claim: str = OWNER_CLAIM, question: str = ASK_OWNER, link: str | None = None):
+    """The context check of a claim citing a passage of context ``number`` that reads ``text``."""
+    from app.chat import verify
+
+    ws = _declared_ws(cx, {}, question, sources={"S1": _passage(number, text, link)})
+    return verify._context_check(verify.Unit(0, f"{claim} [S1].", claim, ["S1"]), ws, question)
+
+
+@pytest.fixture
+def enforced(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+
+
+@pytest.mark.parametrize("heading", ["2315 63", "0 7 1 8 3 4 2", "  ", "1.", COLON, "שם הנכס:"])
+def test_a_digit_noise_heading_and_a_colon_sentence_are_no_name(heading):
+    assert contexts.noise_heading(heading)
+    cx = _ownership_file({"title": heading, "aliases": (heading,)})
+    assert cx.identity(2).names == () and cx.identity(2).empty
+
+
+@pytest.mark.parametrize("heading", ["מתחם גבעת האלה", "פרויקט נחל הלוטם ב", "Harbor Tower"])
+def test_a_title_with_words_and_no_colon_is_still_a_name(heading):
+    assert not contexts.noise_heading(heading)
+    assert contexts.name_key(heading) in contexts_names(_ownership_file({"title": heading}), 2)
+
+
+def contexts_names(cx, number):
+    return cx.identity(number).names
+
+
+@pytest.mark.parametrize("heading", [COLON, "2315 63"], ids=["a colon sentence", "digit noise"])
+def test_ae3_a_value_on_pages_under_a_noise_heading_is_the_asked_propertys_when_the_cited_text_names_its_parcel(enforced, heading):
+    cx = _ownership_file({"title": heading, "signals": ("subject_line",)})  # the cut even opens with a (false) subject line
+    assert cx.owner(2) == 2 and cx.compare(2, [1]) == contexts.UNKNOWN  # no continuity, no identity: nothing is known by the unit
+    found = _owned(cx, 2, OWNER_TEXT)
+    assert found.reason is None and found.facts == []  # the cited text names the asked property by its parcel: the same
+    # the same pages, the text silent about the property: unknown, never "another property", and the judge is told
+    silent = _owned(cx, 2, "הכנסה נטו שנתית 610,000 ₪.")
+    assert silent.reason is None and len(silent.facts) == 1
+    assert cx.describe(2) in silent.facts[0] and cx.describe(1) in silent.facts[0]
+
+
+def test_ae3_protection_a_value_of_a_property_with_another_parcel_in_the_same_file_is_still_removed(enforced):
+    cx = _ownership_file({"title": COLON})
+    other = _owned(cx, 3, "גוש 40100 חלקה 31: שווי הנכס בגישת ההשוואה 610,000 ₪.")  # unit 3's text names its own parcel
+    assert other.reason and cx.describe(3) in other.reason and cx.describe(1) in other.reason
+    # unit 3's value cited with a text that names nothing: its own identity (parcel, name) says whose it is
+    assert _owned(cx, 3, "שווי הנכס בגישת ההשוואה 610,000 ₪.").reason
+    # pages that state no identity and open with a subject line, whose text names ANOTHER property's parcel: that property's
+    opened = _ownership_file({"title": COLON, "signals": ("subject_line",)})
+    assert _owned(opened, 2, "גוש 40100 חלקה 55: הכנסה נטו שנתית 610,000 ₪.").reason
+
+
+def test_a_text_that_names_the_asked_property_and_a_unit_that_states_another_leave_it_unknown_not_removed(enforced):
+    cx = _ownership_file()
+    claim = "ההכנסה נטו השנתית בגוש 40100 חלקה 12 היא 610,000 ₪"
+    found = _owned(cx, 3, "בהשוואה למתחם גבעת האלה (גוש 40100 חלקה 12): הכנסה נטו שנתית 610,000 ₪.", claim=claim)
+    assert found.reason is None and len(found.facts) == 1
+    assert _owned(cx, 3, "גוש 40100 חלקה 31: הכנסה נטו שנתית 610,000 ₪.", claim=claim).reason  # the text names only unit 3's parcel
+
+
+def test_a_link_to_the_same_property_is_ownership_when_nothing_conflicts_and_never_overrides_an_identity(enforced):
+    cx = _ownership_file({"title": COLON, "signals": ("subject_line",)})
+    link = "שומה של אותו נכס: חלקה 40100/12 משותפת"
+    assert cx.compare(2, [1], linked=True) == contexts.SAME and cx.compare(2, [1]) == contexts.UNKNOWN
+    assert _owned(cx, 2, "הכנסה נטו שנתית 610,000 ₪.", link=link) == _owned(cx, 2, OWNER_TEXT)  # a link alone: the same
+    # a link on a source of unit 3 does not make unit 3's own parcel the asked one
+    assert _owned(cx, 3, "גוש 40100 חלקה 31: הכנסה נטו שנתית 610,000 ₪.", link=link).reason
+
+
+def test_ae3_established_continuity_still_says_same(enforced):
+    cx = _ownership_file({"title": COLON})  # a restarted numbering and nothing of its own
+    assert cx.owner(2) == 1 and cx.compare(2, [1]) == contexts.SAME
+    assert _owned(cx, 2, "הכנסה נטו שנתית 610,000 ₪.") .reason is None
+
+
+def test_compare_never_says_different_for_an_asked_side_that_resolved_only_in_part_or_not_at_all():
+    cx = _ownership_file()
+    assert cx.compare(3, [1]) == contexts.DIFFERENT
+    assert cx.compare(3, [1], complete=False) == contexts.UNKNOWN
+    assert cx.compare(3, []) == contexts.UNKNOWN
+    assert cx.compare(1, [1], complete=False) == contexts.SAME
+
+
+def test_a_page_range_names_the_one_unit_that_holds_it_and_none_when_it_spans_several():
+    cx = _ownership_file()
+    assert cx.at_pages(5, 6) == [3] and cx.at_pages(3, 4) == [2] and cx.at_pages(1, 2) == [1]
+    assert cx.resolve("השומה בעמודים 7–8") == [4] and cx.resolve("עמוד 5") == [3]
+    assert cx.resolve("השומה בעמודים 2–5") == []  # spans several units: it names none
+    assert cx.resolve("מתחם גבעת האלה ופרויקט נחל הלוטם") == [1, 3]
+
+
+def test_a_compound_subject_is_divided_into_its_sides_and_resolved_side_by_side():
+    from app.chat import tools
+
+    cx = _ownership_file()
+    assert tools.subject_sides("מתחם גבעת האלה והשומה בעמודים 7–8") == ["מתחם גבעת האלה", "השומה בעמודים 7–8"]
+    assert tools.subject_sides("פרויקט וילה גן") == ["פרויקט וילה גן"]  # a name that starts with the conjunction letter is one side
+    assert tools.subject_sides("שומות מתחם גבעת האלה ובית 20 בנחל") == ["שומות מתחם גבעת האלה", "בית 20 בנחל"]
+    assert tools.resolved_sides(cx, "מתחם גבעת האלה והשומה בעמודים 7–8") == ({1, 4}, True)
+    assert tools.resolved_sides(cx, "מתחם גבעת האלה והשומה בעמודים 90–91") == ({1}, False)  # only in part
+    assert tools.resolved_sides(cx, "הנכס") == (set(), True)  # a plain subject that names nothing is no partial compound
+
+
+def _compound_ws(cx, cited: dict[str, int], subject: str, question: str = "השווה"):
+    ws = _declared_ws(cx, cited, question)
+    ws.requirement_items = [{"subject": subject}]
+    return ws
+
+
+def test_a_compound_subject_that_resolves_only_in_part_is_unknown_and_nothing_is_removed(enforced):
+    from app.chat import verify
+
+    cx = _ownership_file()
+    unit = verify.Unit(0, "שווי הנכס 14,850,000 ₪ [V1].", "שווי הנכס 14,850,000 ₪", ["V1"])
+    # side two (pages 90-91) is in no unit: a value of unit 3 is not provably another property's
+    partial = _compound_ws(cx, {"V1": 3}, "מתחם גבעת האלה והשומה בעמודים 90–91")
+    found = verify._context_check(unit, partial, "השווה")
+    assert found.reason is None and len(found.facts) == 1 and verify.MSG_OWNER_PARTIAL in found.facts[0]
+    # both sides resolved: unit 3 is neither side, unit 4 is a side
+    resolved = _compound_ws(cx, {"V1": 3}, "מתחם גבעת האלה והשומה בעמודים 7–8")
+    assert verify._context_check(unit, resolved, "השווה").reason
+    assert verify._context_check(unit, _compound_ws(cx, {"V1": 4}, "מתחם גבעת האלה והשומה בעמודים 7–8"), "השווה") == verify.ContextCheck()
+
+
+def _cells_ws(cx, cited: dict[str, tuple[int, str]], subject: str = "השוואת שתי השומות") -> SimpleNamespace:
+    ws = _declared_ws(cx, {}, "השווה")
+    ws.requirement_items = [{"subject": subject}]
+    ws.values = {vid: SimpleNamespace(context=_real_value(cx, n, vid, "1").context, written=amount, version_id="v",
+                                      subject_from="", subject="הנכס") for vid, (n, amount) in cited.items()}
+    return ws
+
+
+def _row(a: str, b: str):
+    from app.chat import verify
+
+    raw = f"| שווי | {a} | {b} |"
+    return verify.Unit(0, raw, raw.replace("[V1]", "").replace("[V2]", ""), verify.ids_in(raw), 0, len(raw), False,
+                       (0, 60), "| נתון | מתחם גבעת האלה | פרויקט נחל הלוטם |\nהשוואה:")
+
+
+def test_ae4_each_cell_of_a_comparison_is_checked_against_the_side_its_column_names(enforced):
+    from app.chat import verify
+
+    cx = _ownership_file()
+    own = _row("7,100,000 ₪ [V1]", "8,200,000 ₪ [V2]")
+    assert verify._row_cells(own)[0][0] == "מתחם גבעת האלה"
+    assert verify._context_check(own, _cells_ws(cx, {"V1": (1, "7,100,000"), "V2": (3, "8,200,000")}), "השווה") == verify.ContextCheck()
+    # the cell under side A's column cites side B, though the row as a whole cites both sides' contexts
+    swapped = _row("8,200,000 ₪ [V2]", "7,100,000 ₪ [V1]")
+    found = verify._context_check(swapped, _cells_ws(cx, {"V1": (1, "7,100,000"), "V2": (3, "8,200,000")}), "השווה")
+    assert found.reason and cx.describe(3) in found.reason and cx.describe(1) in found.reason
+    # a cell citing a third property under either column
+    third = _row("7,100,000 ₪ [V1]", "8,200,000 ₪ [V2]")
+    assert verify._context_check(third, _cells_ws(cx, {"V1": (1, "7,100,000"), "V2": (4, "8,200,000")}), "השווה").reason
+
+
+def test_a_comparison_cell_under_a_column_that_names_no_property_is_checked_against_the_whole_requests_sides(enforced):
+    from app.chat import verify
+
+    cx = _ownership_file()
+    raw = "| שווי | 7,100,000 ₪ [V1] | 8,200,000 ₪ [V2] |"
+    row = verify.Unit(0, raw, raw.replace("[V1]", "").replace("[V2]", ""), ["V1", "V2"], 0, len(raw), False, (0, 60),
+                      "| נתון | צד א | צד ב |\nהשוואה:")
+    ws = _cells_ws(cx, {"V1": (1, "7,100,000"), "V2": (3, "8,200,000")}, "מתחם גבעת האלה והשומה בעמודים 5–6")
+    assert verify._context_check(row, ws, "השווה") == verify.ContextCheck()  # both sides asked: each cell is one of them
+    ws = _cells_ws(cx, {"V1": (1, "7,100,000"), "V2": (4, "8,200,000")}, "מתחם גבעת האלה והשומה בעמודים 5–6")
+    assert verify._context_check(row, ws, "השווה").reason  # unit 4 is neither side
+
+
+def test_subject_from_is_contradicted_only_when_the_identities_say_another_property(enforced):
+    from app.chat import tools
+
+    cx = _ownership_file({"title": COLON, "signals": ("subject_line",)})
+    subject = "מתחם גבעת האלה"
+    assert tools.subject_from(cx, 1, subject) == "context"
+    assert tools.subject_from(cx, 3, subject) == "contradicted"  # unit 3 states a parcel and a name of its own
+    assert tools.subject_from(cx, 2, subject) == "asserted"  # pages with no identity: the subject is the model's word only
+    assert tools.subject_from(cx, 3, "מתחם גבעת האלה והשומה בעמודים 90–91") == "asserted"  # a compound resolved in part
+    assert tools.subject_from(cx, 2, "") == "" and tools.subject_from(cx, 2, "הנכס") == "asserted"
+    assert tools.subject_from(_ownership_file({"title": COLON}), 2, subject) == "context"  # established continuity
+
+
+def test_the_value_hint_calls_a_value_another_propertys_only_when_the_identities_say_so(enforced):
+    from app.chat import tools
+
+    cx = _ownership_file({"title": COLON, "signals": ("subject_line",)})
+    ws = SimpleNamespace(requirement_items=[{"subject": "מתחם גבעת האלה"}], user_messages=[], located_unit=None)
+    for number, said in ((2, False), (3, True), (1, False)):
+        value = SimpleNamespace(context={"described": cx.describe(number), "number": number}, subject_from="", subject="")
+        lines = tools._context_lines(ws, cx, value)
+        assert any("אינו ערך של הנכס שנשאל עליו" in x for x in lines) is said, (number, lines)

@@ -87,6 +87,12 @@ UNIT_KIND_MARKS = {"appendix": "נספח", "comparables": "עסקאות השוו
 MSG_UNNAMED = "ללא שם מזהה"
 LABEL_NAMES = 2  # how many of a unit's names label it when it has no title and no identifiers (``Contexts.label``)
 MSG_NO_TITLE ="ללא כותרת"  # a unit with no title of its own, named in a line that shows it
+# the three answers of ``Contexts.compare`` (round 19 U2, KTD2, R4-R6): a claim's evidence belongs to the asked property, to another one,
+# or the server cannot tell
+SAME, DIFFERENT, UNKNOWN = "same", "different", "unknown"
+_LETTER_RUN = re.compile(r"[A-Za-zא-ת]{2,}")
+# a page range as a request writes a side by it: "בעמודים 3–4", "עמוד 5", "pages 3-4"
+_PAGE_RANGE = re.compile(r"(?<![א-תA-Za-z])[ובהלמכש]{0,2}(?:עמודים|עמוד|עמ['׳’]?|pages?|pp?\.?)\s*(\d{1,4})(?:\s*[-–—]\s*(\d{1,4}))?", re.IGNORECASE)
 # punctuation that separates the words of a name (the aliases of a unit are normalized with it)
 NAME_PUNCT = re.compile(r"[\"“”‘’,.:;(){}\[\]<>!?|/\\—–_*•]")
 
@@ -176,6 +182,14 @@ def _patterns(identity: Identity) -> tuple[re.Pattern, ...]:
         out.append(re.compile(rf"גוש\D{{0,6}}?0*{b}\D{{0,20}}?חלק(?:ה|ות)?\D{{0,6}}?0*{p}(?!\d)"
                               rf"|(?<![\d/])0*{b}\s*/\s*0*{p}(?!\d)"))
     return tuple(out)
+
+
+def noise_heading(text: str | None) -> bool:
+    """Whether a unit's title or alias names no property (round 19 U2, KTD2, R5): a heading with no word in it (digits and
+    punctuation: OCR noise such as «2315 63»), or one that ends with a colon (a descriptive sentence that introduces what follows, such
+    as «להלן פירוט החישוב:»). Such a heading is no identity of the unit, and a unit it heads is not "named" by it."""
+    stripped = (text or "").strip()
+    return not _LETTER_RUN.search(stripped) or stripped.endswith(":")
 
 
 def name_key(raw: str | None) -> str:
@@ -281,13 +295,14 @@ class Contexts:
         return self.segment(number).kind
 
     def owner(self, number: int) -> int:
-        """The subject context that context ``number`` belongs to when the check of a claim's property compares contexts (round 18
-        U3, KTD3, R8): itself, unless it only continues the subject context before it. The continuity rule of ``units`` (a new
-        unit that states no new address or parcel continues the previous one): a subject context whose cut rests only on a
-        restarted numbering, a running line or a repeated layout (no ``subject_line`` and no ``letter_opening``), that states
-        no address or parcel of its own and names nothing of its own (an appraisal's calculation pages), is a part of the
-        subject context right before it, and of that one's owner in turn. A context that states an address or a parcel, is
-        named, opens with a subject line or a letter opening, or whose cut signals are not known, is its own property."""
+        """The subject context that context ``number`` ESTABLISHEDLY continues (round 18 U3, KTD3, R8; round 19 U2): itself, unless it
+        only continues the subject context before it. The continuity rule of ``units`` (a new unit that states no new address or
+        parcel continues the previous one): a subject context whose cut rests only on a restarted numbering, a running line or a
+        repeated layout (no ``subject_line`` and no ``letter_opening``), that states no address or parcel of its own and names nothing
+        of its own (an appraisal's calculation pages), is a part of the subject context right before it, and of that one's owner in
+        turn. A noise heading (digits, or a sentence ending with a colon) is no name (``noise_heading``). A context that states an
+        address or a parcel, is named, opens with a subject line or a letter opening, or whose cut signals are not known, is its own
+        property here: that proves nothing about whom it belongs to (``compare`` says it)."""
         from app.chat.units import OPENING_SIGNALS
 
         order = [s.number for i, s in enumerate(self.segments) if i == 0 or s.number != self.segments[i - 1].number]
@@ -302,6 +317,57 @@ class Contexts:
                 return number
             number = order[at - 1]
         return number
+
+    def compare(self, number: int, asked: Iterable[int], spans: Sequence[str] = (), linked: bool = False,
+                complete: bool = True) -> str:
+        """Whether the datum of context ``number`` belongs to the asked property ``asked`` (the subject contexts the asked side is):
+        ``SAME``, ``DIFFERENT`` or ``UNKNOWN`` (round 19 U2, KTD2, R4-R7). Only ``DIFFERENT`` is a reason to say "another property";
+        absence of an identity proves neither that the context continues the asked one nor that it is another property.
+
+        The evidence of whom the datum belongs to, in order (R5): (1) the names, parcels and addresses the cited text itself writes
+        (``spans``: the cited passages and their table headings, or the value's own words), matched as ``named`` does, by what no other
+        subject context holds; (2) the identity of the unit the datum is in (its distinguishing addresses, parcels and names; a noise
+        heading is none) or, for a part that established-ly continues another unit (``owner``), that unit's; (3) a link to the same
+        property (``linked``) that conflicts with neither; (4) the continuity of a part that only continues the asked context
+        (``owner``). The text and the unit identity that disagree leave it ``UNKNOWN``. ``complete`` False (the asked side is a compound
+        of which only a part resolved, R7) never gives ``DIFFERENT``."""
+        asked = set(asked)
+        if not asked:
+            return UNKNOWN
+        asked_owners = {self.owner(n) for n in asked}
+        mine = self.owner(number)
+        if number in asked or mine in asked_owners:
+            return SAME
+        from_text = {self.owner(n) for t in spans for n in self.named(t)}
+        by_text = SAME if from_text & asked_owners and not from_text - asked_owners else (
+            DIFFERENT if from_text - asked_owners and not from_text & asked_owners else None)
+        by_unit = DIFFERENT if self._conflicts(mine) else None
+        if by_text == SAME:
+            return UNKNOWN if by_unit == DIFFERENT else SAME
+        if DIFFERENT in (by_text, by_unit):
+            return DIFFERENT if complete else UNKNOWN
+        return SAME if linked else UNKNOWN
+
+    def _conflicts(self, number: int) -> bool:
+        """Whether subject context ``number`` states an identity of its own (an address, a parcel or a name that no other subject
+        context holds; a noise heading is none): the positive identity of a property other than the asked one."""
+        return number in self.subjects and not self._distinguishing[number].empty
+
+    def at_pages(self, first: int, last: int | None = None) -> list[int]:
+        """The subject context a page range is of (round 19 U2, KTD2, R7): the one that holds the whole range, else the one it
+        touches alone; none when the range lies in several contexts (it names none of them)."""
+        last = first if last is None else max(first, last)
+        touching = [n for n in self.subjects if (p := self.pages(n))[0] is not None and p[0] <= last and (p[1] or p[0]) >= first]
+        whole = [n for n in touching if self.pages(n)[0] <= first and last <= (self.pages(n)[1] or self.pages(n)[0])]
+        return whole[:1] if len(whole) == 1 else touching if len(touching) == 1 else []
+
+    def resolve(self, words: str | None) -> list[int]:
+        """The subject contexts a side of a request is written as: by a distinguishing name or identifier (``named``) or by its
+        page range ("השומה בעמודים 3–4"; ``at_pages``)."""
+        if not words or not self.multi:
+            return []
+        by_pages = [n for m in _PAGE_RANGE.finditer(words) for n in self.at_pages(int(m.group(1)), int(m.group(2) or m.group(1)))]
+        return sorted(set(self.named(words)) | set(by_pages))
 
     @property
     def numbers(self) -> list[int]:
@@ -674,7 +740,8 @@ def _card_identity(fields: Sequence[dict]) -> Identity:
         quote = f.get("quote") or ""
         kind = f.get("field")
         if kind == "name":
-            names.append(name_key(quote))
+            if not noise_heading(quote):
+                names.append(name_key(quote))
         elif kind in ("address", "block_parcel"):
             found = identifiers(quote)
             ident |= found
@@ -694,7 +761,8 @@ def _unit_identity(u, card_fields: Sequence[dict] = ()) -> Identity:
             tuple(p) for p in stored.get("parcels") or ()}:
         ident = Identity(frozenset(tuple(a) for a in stored.get("addresses") or ()),
                          frozenset(tuple(p) for p in stored.get("parcels") or ()), shown)
-    names = tuple(dict.fromkeys(k for x in ([u.title] if u.title else []) + list(u.aliases) if (k := name_key(x))))
+    names = tuple(dict.fromkeys(k for x in ([u.title] if u.title else []) + list(u.aliases)
+                                if not noise_heading(x) and (k := name_key(x))))
     base = Identity(ident.addresses, ident.parcels, shown, ident.streets, names)
     return base | _card_identity(card_fields) if card_fields else base
 

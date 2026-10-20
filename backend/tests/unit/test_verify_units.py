@@ -1633,7 +1633,7 @@ def test_the_judge_policy_names_the_server_held_line_and_the_derived_computation
 # --- the judge contract is version 14: a verdict of an older contract is not reused (round 13 U9, U11, KTD19; round 15 U7; round 16 U1; round 18 U3) --
 
 def test_a_verdict_cached_under_judge_contract_13_misses_under_14(monkeypatch):
-    assert verify.JUDGE_VERSION == 17  # 15: round 18 U4 (the marks of a table part's attribution, rule 32); 16: round 18 U5 (the condition outcome of an item in the requirements call, `conditions`); 17: round 18 U6 (the candidates of the requirements call, `candidates`)
+    assert verify.JUDGE_VERSION == 18  # 15: round 18 U4 (the marks of a table part's attribution, rule 32); 16: round 18 U5 (the condition outcome of an item in the requirements call, `conditions`); 17: round 18 U6 (the candidates of the requirements call, `candidates`); 18: round 19 U2 (the `<ownership>` fact line of a unit whose evidence's owner is unknown, rule 34)
     ws, a, cache = _valued(), _answer("הנכס פנוי [S1]."), verify.VerdictCache()
     judge, seen = _recording_supported()
     monkeypatch.setattr(verify, "JUDGE_VERSION", 13)
@@ -1910,3 +1910,96 @@ def test_a_claim_span_the_judge_took_from_a_bold_labelled_statement_stays_a_subs
         assert verify._claim_span(u, span) == want and verify._claim_span(u, span) in u.text, span
     assert verify._claim_span(u, "שווי: ") is None  # a span that ends inside the label is no statement
     assert verify._claim_span(u, "שטח אחר") is None
+
+
+# --- three-state ownership: an unknown owner is never removed deterministically, the judge reads a neutral fact line (round 19 U2) ----
+
+def _owner_file(version: str):
+    """An appraisal of the invented «מתחם גבעת האלה» (unit 1: street and parcel), calculation pages that a restarted numbering and an
+    opening subject line cut and that state nothing (unit 2), and another invented property with its own parcel (unit 3)."""
+    from types import SimpleNamespace
+
+    from app.chat import contexts, units
+
+    def ident(written: str) -> dict:
+        found = contexts.identifiers(written)
+        return {"addresses": [list(a) for a in found.addresses], "parcels": [list(p) for p in found.parcels],
+                "shown": list(found.shown)}
+
+    def unit(no, kind, title, identifiers, first, last, pages, signals=("subject_line",)):
+        return units.Unit(no, kind, title, (), identifiers, pages[0], pages[1], first, last, "certain",
+                          {"boundary": {"block": first, "signals": list(signals)}})
+
+    parts = [unit(1, "appraisal", "מתחם גבעת האלה", ident("רחוב הדס 5\nגוש 40100 חלקה 12"), 0, 7, (1, 2), ()),
+             unit(2, "document", None, {}, 8, 12, (3, 4)),
+             unit(3, "appraisal", "פרויקט נחל הלוטם", ident("רחוב הלוטם 9\nגוש 40100 חלקה 31"), 13, 20, (5, 6))]
+    first = {n: SimpleNamespace(block_index=n, page=p, bbox=[50.0, 40.0, 500.0, 52.0]) for n, p in ((8, 3), (13, 5))}
+    return contexts.from_units(parts, first, [4, 9, 14], version, "r1")
+
+
+def _owner_ws(text: str, number: int, question: str = "מה ההכנסה נטו השנתית של מתחם גבעת האלה?"):
+    version = uuid.uuid4()
+    ws = _ws()
+    ws.contexts[str(version)] = _owner_file(str(version))
+    ws.user_messages = [{"text": question, "current": True}]
+    src = ws.add_source(document_id=uuid.uuid4(), version_id=version, title="שומה", section=None, location="עמוד 3",
+                        kind="context", text=text)
+    src.contexts = [number]
+    return ws, src.sid
+
+
+OWNER_ANSWER = "ההכנסה נטו השנתית של מתחם גבעת האלה היא 610,000 ₪ [S1]."
+
+
+@pytest.fixture
+def owner_enforced(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", True)
+
+
+def test_an_unknown_owner_is_not_removed_and_the_judge_reads_a_neutral_fact_line_in_the_call_that_judges_the_unit(owner_enforced):
+    ws, sid = _owner_ws("הכנסה נטו שנתית 610,000 ₪.", 2)
+    judge, seen = _recording_supported()
+    report = verify_answer(judge, _answer(OWNER_ANSWER), ws, ws.user_messages[0]["text"], [])
+    assert sid == "S1" and not [p for p in report.problems if p.check == "context"]  # nothing is removed deterministically
+    assert report.verdicts == {0: "supported"} and len(seen) == 1  # the one call that judges the unit; no call was added
+    (rendered,) = seen
+    assert re.search(r'<ownership unit="0">[^<]*הקשר 2[^<]*הקשר 1[^<]*</ownership>', rendered), rendered
+    assert rendered.index("<ownership") < rendered.index('<unit index="0"')  # beside the unit, never inside its text
+    assert "ראיה שמכריעה" in rendered
+
+
+def test_an_owner_the_text_settles_adds_no_fact_line_and_a_different_owner_is_removed_before_the_judge(owner_enforced):
+    same, _ = _owner_ws("חישוב ההיוון לגוש 40100 חלקה 12: הכנסה נטו שנתית 610,000 ₪.", 2)
+    judge, seen = _recording_supported()
+    verify_answer(judge, _answer(OWNER_ANSWER), same, same.user_messages[0]["text"], [])
+    assert len(seen) == 1 and "<ownership" not in seen[0]
+    other, _ = _owner_ws("הכנסה נטו שנתית 610,000 ₪.", 3)  # unit 3 states a parcel and a name of its own
+    judge, seen = _recording_supported()
+    report = verify_answer(judge, _answer(OWNER_ANSWER), other, other.user_messages[0]["text"], [])
+    assert [p.check for p in report.problems] == ["context"] and report.problems[0].failure_kind == "wrong_subject"
+    assert not seen or "<ownership" not in seen[0]
+
+
+def test_the_verdict_cache_key_changes_with_the_ownership_fact_and_the_fact_is_recomputed_each_round(owner_enforced):
+    ws, _ = _owner_ws("הכנסה נטו שנתית 610,000 ₪.", 2)
+    (unit,) = split_units(OWNER_ANSWER)
+    q = ws.user_messages[0]["text"]
+    plain = verify.unit_key(unit, ws, q, "", {})
+    verify.deterministic([unit], ws, q)
+    assert ws.ownership_facts[verify._fact_key(unit)]
+    assert verify.unit_key(unit, ws, q, "", {}) != plain  # a verdict given without the line is not reused with it
+    ws.sources["S1"].text = "חישוב ההיוון לגוש 40100 חלקה 12: הכנסה נטו שנתית 610,000 ₪."  # the text now settles it
+    verify.deterministic([unit], ws, q)
+    assert verify._fact_key(unit) not in ws.ownership_facts
+
+
+def test_permissions_are_not_touched_a_citation_of_a_source_the_turn_does_not_hold_is_still_an_invalid_citation(owner_enforced):
+    """The context check reads only the evidence the turn holds (the workspace is built from the documents the user may see): a citation
+    of anything else fails as before, whatever the ownership of the sources that are held."""
+    ws, _ = _owner_ws("חישוב ההיוון לגוש 40100 חלקה 12: הכנסה נטו שנתית 610,000 ₪.", 2)
+    (unit,) = split_units("ההכנסה נטו השנתית של מתחם גבעת האלה היא 610,000 ₪ [S1] [S9].")
+    (problem,) = verify.deterministic([unit], ws, ws.user_messages[0]["text"])
+    assert problem.check == "unknown_id" and problem.failure_kind == "invalid_citation"
+    assert not ws.ownership_facts  # no ownership was decided for a unit that cites what is not held

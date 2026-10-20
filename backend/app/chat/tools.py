@@ -617,6 +617,10 @@ class Workspace:
     # ({"source", "scope", "outcome", ...}), kept across the turn's verification rounds
     reread_done: set = field(default_factory=set)
     reread_log: dict = field(default_factory=dict)
+    # the neutral fact line the judge reads beside a unit whose evidence's owner the server could not settle (round 19 U2, KTD2, R6):
+    # (the unit's normalised text, its cited ids) -> the line; written by the context check (``verify._context_check``), read by the
+    # judge's input and the unit's reuse key
+    ownership_facts: dict = field(default_factory=dict)
     # the blocks of the section a re-read source cites, kept for the turn (``rereader._section_rows``): (version, first block,
     # reading) -> (the heading chain, the blocks), so the section is loaded once for the lead-in, the notes and the heading
     section_rows: dict = field(default_factory=dict)
@@ -1114,11 +1118,49 @@ def located_contexts(ws: Workspace, cx) -> set[int]:
     return {n for n in cx.numbers if located and cx.is_subject(n) and cx.key(n) == located["key"]} if cx.multi else set()
 
 
+# where a request's subject is two (or more) sides: "X ו-Y", "בין X לבין Y", "X מול Y". The Hebrew conjunction is a prefix, so it divides a
+# subject only before the article, a hyphen, a digit, a Latin letter, a word that opens a property's name ("ושומת", "ונכס") or a name
+# that carries a number ("ובית 20"); the explicit connectors divide a free text too (the question)
+_SIDE_WORDS = "נכס|שומ|דוח|חוו|מתחם|פרויקט|בניין|דירה|מגרש|חלק|גוש|רחוב|עמוד|עמ"
+_SIDE_EXPLICIT = r"\s+(?:לבין|לעומת|מול|ובין)\s+|\s+&\s+"
+_SIDE_SPLIT = re.compile(rf"{_SIDE_EXPLICIT}|\s+ו(?=[-־]|ה[א-ת]|\d|[A-Za-z]|(?:{_SIDE_WORDS})|\S+\s+\S*\d)")
+_SIDE_SPLIT_EXPLICIT = re.compile(_SIDE_EXPLICIT)
+
+
+def subject_sides(text: str | None, explicit: bool = False) -> list[str]:
+    """The sides a subject is written as (round 19 U2, KTD2, R7): "appraisals X and Y" is two; a subject with no conjunction is one.
+    ``explicit``: divide only where a connector says it ("בין X לבין Y"), as a free text (the question) needs."""
+    split = _SIDE_SPLIT_EXPLICIT if explicit else _SIDE_SPLIT
+    parts = [x.strip(" -־,.") for x in split.split(text or "") if x and x.strip(" -־,.")]
+    return parts if len(parts) > 1 else ([text.strip()] if text and text.strip() else [])
+
+
+def resolved_sides(cx, text: str | None, explicit: bool = False) -> tuple[set[int], bool]:
+    """The subject contexts a subject text names, by each of its sides (``subject_sides``; a side by its name, identifier or page
+    range), and whether the subject is resolved: a subject of one side always is (it names what it names, or nothing); a compound
+    subject is only when every side names a context (round 19 U2, R7). A compound that resolves only in part is not."""
+    if not text:
+        return set(), True
+    sides = subject_sides(text, explicit)
+    found = [set(cx.resolve(x)) for x in sides]
+    whole = set(cx.resolve(text))
+    union = whole.union(*found)
+    return union, len(sides) <= 1 or all(found) or len(whole) >= len(sides)
+
+
+def asked_sides(ws: Workspace, cx) -> tuple[set[int], bool]:
+    """The contexts of a file the request names (its components' subjects, else its question), and whether every side of a
+    compound subject resolved (``resolved_sides``); when no title or alias names one, the unit the turn located."""
+    subjects, _ = asked_subjects(ws)
+    found = [resolved_sides(cx, x) for x in subjects]
+    named = set().union(*(n for n, _ in found)) if found else set()
+    return (named, all(c for _, c in found)) if named else (located_contexts(ws, cx), True)
+
+
 def asked_contexts(ws: Workspace, cx) -> set[int]:
     """The contexts of a file the request names (its components' subjects, else its question); when no title or alias
     names one, the unit the turn located."""
-    subjects, _ = asked_subjects(ws)
-    return {n for x in subjects for n in cx.named(x)} or located_contexts(ws, cx)
+    return asked_sides(ws, cx)[0]
 
 
 def _context_note(ws: Workspace, cx) -> str:
@@ -1340,8 +1382,10 @@ def _context_lines(ws: Workspace, cx, value: calc.Value) -> list[str]:
         lines.append(MSG_SUBJECT_CONTRADICTED.format(subject=_txt(value.subject), where=where, other=other))
     elif value.subject_from == "asserted":
         lines.append(MSG_SUBJECT_ASSERTED.format(subject=_txt(value.subject), where=where))
-    asked = asked_contexts(ws, cx)
-    if asked and value.context["number"] not in asked:
+    asked, complete = asked_sides(ws, cx)
+    # the hint says the value is another property's only when the contexts' identities say it (``Contexts.compare``): a value whose
+    # context states no identity of its own is not told to be another property's (round 19 U2, R6)
+    if asked and value.context["number"] not in asked and cx.compare(value.context["number"], asked, complete=complete) == contexts.DIFFERENT:
         lines.append(MSG_VALUE_NOT_ASKED.format(where=where, asked=", ".join(cx.describe(n) for n in sorted(asked))))
     return lines
 
@@ -1357,14 +1401,16 @@ def value_context(cx, number: int | None) -> dict | None:
 
 
 def subject_from(cx, number: int | None, subject: str) -> str:
-    """Where a value's subject stands against its context (R21): it names the context's identifiers (``context``),
-    another context's only (``contradicted``), or none of them (``asserted``); "" without a subject or contexts."""
+    """Where a value's subject stands against its context (R21; round 19 U2): it names the context's identifiers (``context``),
+    another context's only AND the contexts' identities say so (``contradicted``), or neither (``asserted``: it names none of them,
+    or the context states no identity that settles it); "" without a subject or contexts."""
     if cx is None or not cx.multi or number is None or not (subject or "").strip():
         return ""
-    named = cx.named(subject)
-    if cx.owner(number) in {cx.owner(n) for n in named}:  # the pages that only continue a context are its own (round 18 U3)
-        return "context"
-    return "contradicted" if named else "asserted"
+    named, complete = resolved_sides(cx, subject)
+    # the same comparison as the verification's (round 19 U2, KTD2, R6): the subject is contradicted only when the contexts' identities
+    # say the value is another property's; a context that states none (a noise heading, calculation pages) leaves it asserted
+    return {contexts.SAME: "context", contexts.DIFFERENT: "contradicted"}.get(
+        cx.compare(number, named, complete=complete), "asserted")
 
 
 # --- pools and professional sources (round 10 U8: KTD11-KTD13, KTD15; R22-R32) -------------------------------------------

@@ -88,12 +88,8 @@ OTHER_ANSWER = f"שווי הנכס בגישת ההשוואה של מתחם גב�
 
 
 @pytest.mark.parametrize("spec, heading", [
-    pytest.param(CALCULATION, "a colon sentence", marks=strict_xfail(
-        "U2", "values on calculation pages whose first line is a colon sentence, in a table that states the parcel of the "
-              "asked property, are removed as another property")),
-    pytest.param(NOISE, "digit noise", marks=strict_xfail(
-        "U2", "values on calculation pages whose first line is digit noise, in a table that states the parcel of the asked "
-              "property, are removed as another property")),
+    pytest.param(CALCULATION, "a colon sentence"),
+    pytest.param(NOISE, "digit noise"),
 ])
 def test_values_on_calculation_pages_are_the_asked_propertys_when_their_first_line_names_nothing_and_the_table_states_its_parcel(
         client, office, monkeypatch, spec, heading):
@@ -154,8 +150,6 @@ OWN_CELLS = (comparison_row("שווי הנכס בגישת ההשוואה", f"{SI
              + comparison_row("שטח הנכס", f"{SIDE_A['area']} מ״ר [S1]", f"{SIDE_B['area']} מ״ר [S2]"))
 
 
-@strict_xfail("U2", "every row of a comparison whose second side the question writes by its pages is removed as another property "
-                    "(the table row is judged against the one side the question names)")
 def test_each_cell_of_a_comparison_is_checked_against_its_own_side_when_the_second_side_is_written_by_its_pages(
         client, office, monkeypatch):
     m = compare(client, office, monkeypatch, OWN_CELLS)
@@ -165,8 +159,6 @@ def test_each_cell_of_a_comparison_is_checked_against_its_own_side_when_the_seco
     assert removals(client, m) == [], md
 
 
-@strict_xfail("U2", "a comparison whose second side the question writes by its pages loses its rows (all of them, so the "
-                    "own cells of both sides go with the cell that cites side B under side A)")
 def test_a_cell_that_cites_side_b_under_side_a_is_removed_and_the_cells_that_cite_their_own_side_stay(
         client, office, monkeypatch):
     misplaced = comparison_row("שטח הנכס", f"{SIDE_B['area']} מ״ר [S2]", "—")

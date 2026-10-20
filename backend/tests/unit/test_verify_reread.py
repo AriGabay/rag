@@ -634,7 +634,7 @@ def test_the_new_kind_has_its_sentence_label_and_hint_and_the_judge_cannot_emit_
     assert verify.REMOVAL_SENTENCES[kind] and verify.FAILURE_LABELS[kind] and verify.REPAIR_HINTS[kind]
     assert verify.removal_summary(kind)["text"] == verify.REMOVAL_SENTENCES[kind]
     assert kind not in get_args(verify.JudgeFailure)  # the server sets it; the judge's field stays as it was
-    assert verify.JUDGE_VERSION == 17  # the policy text moved to 9 with round 13 U11 (rule 31); 10: round 15 U7; 11: round 16 U1 (read passages, `support`); 12: every returned passage; 13: round 17 U5 (defect `scope`); 14: round 18 U3 (the source header of a multi-report file, a bold label over a statement; rule 33); 15: round 18 U4 (the marks of a table part's attribution, rule 32); 16: round 18 U5 (the condition outcome of an item in the requirements call, `conditions`); 17: round 18 U6 (the candidates of the requirements call, `candidates`)
+    assert verify.JUDGE_VERSION == 18  # the policy text moved to 9 with round 13 U11 (rule 31); 10: round 15 U7; 11: round 16 U1 (read passages, `support`); 12: every returned passage; 13: round 17 U5 (defect `scope`); 14: round 18 U3 (the source header of a multi-report file, a bold label over a statement; rule 33); 15: round 18 U4 (the marks of a table part's attribution, rule 32); 16: round 18 U5 (the condition outcome of an item in the requirements call, `conditions`); 17: round 18 U6 (the candidates of the requirements call, `candidates`); 18: round 19 U2 (the `<ownership>` fact line of a unit whose evidence's owner is unknown, rule 34)
 
 
 def test_a_header_re_read_that_states_the_datum_makes_the_claim_supported():
