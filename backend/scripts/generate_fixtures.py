@@ -7991,11 +7991,206 @@ def write_round18(out: Path, font_dir: Path) -> None:
     print(f"wrote {ROUND18_DIR}/{ROUND18_MANIFEST}")
 
 
+# Synthetic appraisals for the round-19 reproductions of failures the diagnosis found (attribution between the request, the
+# claim and the source): calculation pages cut into a context whose first line is a descriptive sentence ending in a colon
+# (R19a) or digit noise (R19b), with a second property of another parcel later in the file; two appraisals to compare (R19c);
+# one table row that answers two request components (R19d); headers written with abbreviations (R19e); a table that writes
+# a decimal comma and a negative percent (R19f); and rows whose figures a list item states over two sentences (R19g).
+# Every name, street and figure is invented.
+
+ROUND19_DIR = "round19"
+ROUND19_MANIFEST = "manifest.json"
+ROUND19_FILES = {
+    "calc_sentence": "R19a_synthetic_calculation_pages_sentence_heading.pdf",
+    "calc_noise": "R19b_synthetic_calculation_pages_digit_noise_heading.pdf",
+    "comparison": "R19c_synthetic_two_appraisals_to_compare.pdf",
+    "two_components": "R19d_synthetic_row_answers_two_components.pdf",
+    "abbreviations": "R19e_synthetic_abbreviated_period_headers.pdf",
+    "decimal_comma": "R19f_synthetic_decimal_comma_and_negative_percent.pdf",
+    "coverage_rows": "R19g_synthetic_rows_plan_identifier_and_two_figures.pdf",
+}
+ROUND19_INTRO = ROUND18_INTRO
+ROUND19_CALCULATION = {
+    "title": "שומת מקרקעין — מתחם גבעת הברוש", "street": "רחוב הברוש 12", "block": "33410", "parcel": "27",
+    "intro": ROUND19_INTRO, "value_heading": "2. הערכת השווי", "value_line": "שווי הנכס בגישת ההשוואה: 9,400,000 ₪.",
+    # the calculation pages: a printed numbering that restarts, a first line the size of a title, and a table whose caption
+    # states the parcel of the property (the cited text names the asked property by its parcel)
+    "sentence_heading": "להלן פירוט החישוב של שווי הנכס בגישת היוון ההכנסות לפי נתוני השומה:",
+    "noise_heading": "0 7 1 8 3 4 2",
+    "calculation_lead": "החישוב מבוסס על נתוני השומה.",
+    "calculation_caption": "טבלה 1 — חישוב ההיוון לגוש 33410 חלקה 27",
+    "calculation_headers": ["פריט", "ערך"],
+    "calculation_rows": [["הכנסה נטו שנתית", "610,000 ₪"], ["שיעור היוון", "6.5%"], ["שווי מהוון", "9,384,615 ₪"]],
+    "calculation_end": "החישוב לעיל נערך לצורך הדגמה בלבד (מסמך סינתטי).",
+    # another property of the same file, with a parcel of its own
+    "other": {"subject": "שומת מקרקעין — פרויקט נחל התמר", "street": "דרך התמר 4", "block": "33422", "parcel": "9",
+              "value": "7,300,000"},
+}
+ROUND19_COMPARISON = {
+    "reports": [
+        {"key": "first", "subject": "שומת מקרקעין — מתחם גבעת השקד", "street": "רחוב השקד 7", "value": "7,300,000",
+         "area": "640"},
+        {"key": "second", "subject": "שומת מקרקעין — פרויקט נחל האורן", "street": "דרך האורן 2", "value": "9,150,000",
+         "area": "810"},
+    ],
+}
+ROUND19_TWO_COMPONENTS = {
+    "title": "שומת הדגמה לנכס ברחוב הגפן — זכויות בנייה", "intro": ROUND19_INTRO,
+    "heading": "3. זכויות הבנייה", "lead": "הטבלה שלהלן מפרטת את זכויות הבנייה בנכס.",
+    "caption": "טבלה 3.1 — זכויות הבנייה בנכס", "headers": ["סוג שטח", "שטח (מ״ר)", "הערה"],
+    "rows": [["שטח כולל לבנייה", "1,200", "הזכויות חלות רק על פי תכנית מאושרת"], ["שטח למרתף", "340", "ללא הערה"]],
+    "condition_phrase": "רק על פי תכנית מאושרת",
+}
+ROUND19_ABBREVIATIONS = {
+    "title": "שומת הדגמה לבניין המשרדים ברחוב הרימון — הכנסות", "intro": ROUND19_INTRO,
+    "heading": "3. הכנסות מהנכס", "lead": "הטבלה שלהלן מפרטת את ההכנסות לפי רכיב.",
+    "caption": "טבלה 3.1 — הכנסות מדמי שכירות",
+    "headers": ["רכיב", "דמ\"ש חודשיים (₪)", "סה\"כ לשנה (₪)"],
+    "rows": [["משרדים", "100,000", "1,200,000"], ["מסחר", "45,000", "540,000"]],
+    "second_caption": "טבלה 3.2 — עלויות תחזוקה",
+    "second_headers": ["רכיב", "סה\"כ שנתי (₪)"],
+    "second_rows": [["תחזוקה שוטפת", "96,000"], ["ביטוח", "24,000"]],
+}
+ROUND19_DECIMAL_COMMA = {
+    "title": "שומת הדגמה לנכס ברחוב השקמה — שיעורים", "intro": ROUND19_INTRO,
+    "heading": "4. שיעורים ושווי", "lead": "הטבלה שלהלן מפרטת את השיעורים ואת שווי הנכס.",
+    "caption": "טבלה 4.1 — שיעורים ושווי", "headers": ["פרמטר", "ערך"],
+    "rows": [["שיעור תשואה גולמית", "13,2%"], ["שינוי שנתי במחירי הנכסים באזור", "−3,5%"],
+             ["שווי הנכס", "3,596,696 ₪"]],
+}
+ROUND19_COVERAGE_ROWS = {
+    "title": "שומת הדגמה לנכס ברחוב הדובדבן — זכויות", "intro": ROUND19_INTRO,
+    "heading": "3. זכויות הבנייה", "lead": "הטבלה שלהלן מפרטת את זכויות הבנייה בנכס.",
+    "caption": "טבלה 3.1 — זכויות הבנייה בנכס", "headers": ["רכיב", "שטח (מ״ר)", "מספר קומות", "תכנית"],
+    "rows": [["שטח עיקרי", "1,200", "6", "ג/4521"], ["שטח מרתף", "340", "2", "ג/4521"]],
+}
+
+
+class Round19PdfRenderer(Round18PdfRenderer):
+    """The round-19 documents: the round-18 layouts (a title block, an introduction, ruled tables, a printed numbering that
+    restarts) and, where a shape needs it, a first line the size of a title, a second property with a parcel of its own, or
+    a table whose headers are written with abbreviations."""
+
+    def _title_sized(self, text: str) -> None:
+        """One bold line the size of a title (the unit derivation takes it as a title line)."""
+        self.placed(None, text, size=15, bold=True, h=9)
+        self.pdf.ln(2)
+
+    def _other_property(self, other: dict[str, str]) -> None:
+        """Two pages of a second property: a letter and a subject line, its address and its own block and parcel."""
+        self._page(1)
+        self.opening({"subject": other["subject"], "street": other["street"], "in_table": False})
+        self.placed(None, f"גוש: {other['block']} חלקה: {other['parcel']}")
+        self.pdf.ln(2)
+        self.heading_line(None, "1. הערכת שווי")
+        self.body_line(None, f"שווי הנכס בגישת ההשוואה הוא {other['value']} ₪.")
+        self.body_line(None, f"{SYNTHETIC_MARKER} — כל הנתונים בדויים")
+
+    def _calculation(self, first_line: str) -> bytes:
+        """The appraisal of the first property (printed 1, 2), calculation pages that restart the numbering and open with
+        ``first_line`` in the size of a title, and a second property of another parcel."""
+        spec = ROUND19_CALCULATION
+        self._page(1)
+        self.title_block(spec["title"], f"{spec['street']}, {ROUND9_PLACE}", spec["block"], spec["parcel"])
+        self.heading_line(None, spec["intro"][0])
+        self.body_line(None, spec["intro"][1])
+        self._page(2)
+        self.heading_line(None, spec["value_heading"])
+        self.body_line(None, spec["value_line"])
+        self._page(1)
+        self._title_sized(first_line)
+        self.body_line(None, spec["calculation_lead"])
+        self._table(spec["calculation_caption"], [spec["calculation_headers"]], spec["calculation_rows"], [90, 90])
+        self._page(2)
+        self.body_line(None, spec["calculation_end"])
+        self._other_property(spec["other"])
+        return bytes(self.pdf.output())
+
+    def render_calc_sentence(self) -> bytes:
+        return self._calculation(ROUND19_CALCULATION["sentence_heading"])
+
+    def render_calc_noise(self) -> bytes:
+        return self._calculation(ROUND19_CALCULATION["noise_heading"])
+
+    def render_comparison(self) -> bytes:
+        """Two reports (two pages each), each opening with a letter and a subject line; the printed numbering restarts."""
+        for r in ROUND19_COMPARISON["reports"]:
+            self._page(1)
+            self.opening({"subject": r["subject"], "street": r["street"], "in_table": False})
+            self.heading_line(None, "1. הערכת שווי")
+            self.body_line(None, f"שווי הנכס בגישת ההשוואה הוא {r['value']} ₪.")
+            self._page(2)
+            self.heading_line(None, "2. שטח הנכס")
+            self.body_line(None, f"שטח הנכס הוא {r['area']} מ״ר.")
+            self.body_line(None, f"{SYNTHETIC_MARKER} — כל הנתונים בדויים")
+        return bytes(self.pdf.output())
+
+    def _one_table(self, spec: dict[str, Any], widths: list[int]) -> bytes:
+        self.pdf.add_page()
+        self._opening(spec)
+        self.heading_line(None, spec["heading"])
+        self.body_line(None, spec["lead"])
+        self._table(spec["caption"], [spec["headers"]], spec["rows"], widths)
+        return bytes(self.pdf.output())
+
+    def render_two_components(self) -> bytes:
+        return self._one_table(ROUND19_TWO_COMPONENTS, [50, 40, 90])
+
+    def render_abbreviations(self) -> bytes:
+        spec = ROUND19_ABBREVIATIONS
+        self.pdf.add_page()
+        self._opening(spec)
+        self.heading_line(None, spec["heading"])
+        self.body_line(None, spec["lead"])
+        self._table(spec["caption"], [spec["headers"]], spec["rows"], [60, 60, 60])
+        self._table(spec["second_caption"], [spec["second_headers"]], spec["second_rows"], [90, 90])
+        return bytes(self.pdf.output())
+
+    def render_decimal_comma(self) -> bytes:
+        return self._one_table(ROUND19_DECIMAL_COMMA, [100, 80])
+
+    def render_coverage_rows(self) -> bytes:
+        return self._one_table(ROUND19_COVERAGE_ROWS, [50, 40, 40, 50])
+
+
+def write_round19(out: Path, font_dir: Path) -> None:
+    """Writes the round-19 PDFs and their ``manifest.json`` (the texts the tests check against)."""
+    rdir = out / ROUND19_DIR
+    rdir.mkdir(parents=True, exist_ok=True)
+    specs = {"calc_sentence": ("render_calc_sentence", ROUND19_CALCULATION),
+             "calc_noise": ("render_calc_noise", ROUND19_CALCULATION),
+             "comparison": ("render_comparison", ROUND19_COMPARISON),
+             "two_components": ("render_two_components", ROUND19_TWO_COMPONENTS),
+             "abbreviations": ("render_abbreviations", ROUND19_ABBREVIATIONS),
+             "decimal_comma": ("render_decimal_comma", ROUND19_DECIMAL_COMMA),
+             "coverage_rows": ("render_coverage_rows", ROUND19_COVERAGE_ROWS)}
+    documents = {}
+    for key, (render, spec) in specs.items():
+        data = getattr(Round19PdfRenderer(font_dir), render)()
+        name = ROUND19_FILES[key]
+        assert "synthetic" in name
+        (rdir / name).write_bytes(data)
+        documents[key] = {"file": f"{ROUND19_DIR}/{name}"} | spec
+        print(f"wrote {ROUND19_DIR}/{name} ({len(data):,} bytes)")
+    manifest = {
+        "about": f"{SYNTHETIC_MARKER}. Known contents of the round-19 fixtures (R19a: calculation pages whose first line is a "
+                 "sentence ending in a colon, and a second property of another parcel; R19b: the same with a first line "
+                 "of digit noise; R19c: two appraisals to compare; R19d: one table row that answers two request "
+                 "components; R19e: headers written with abbreviations; R19f: a decimal comma and a negative percent; "
+                 "R19g: rows with a plan identifier and two figures): generated by scripts/generate_fixtures.py "
+                 "--only round19 - do not edit by hand. Every name and figure is invented.",
+        "synthetic_marker": SYNTHETIC_MARKER,
+        "documents": documents,
+    }
+    (rdir / ROUND19_MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {ROUND19_DIR}/{ROUND19_MANIFEST}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--font-dir", default=DEFAULT_FONT_DIR)
     parser.add_argument("--out", default="tests/fixtures")
-    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11", "round12", "round13", "round14", "round15", "round16", "round17", "round18"],
+    parser.add_argument("--only", choices=["all", "regions", "positions", "citations", "round7", "round8", "round9", "round10", "round11", "round12", "round13", "round14", "round15", "round16", "round17", "round18", "round19"],
                         default="all",
                         help="regions: write only the uncovered-region fixtures (tests/fixtures/regions/); "
                              "positions: only the page-position fixtures (tests/fixtures/positions/); "
@@ -8020,7 +8215,9 @@ def main() -> None:
                              "round17: only the round-17 sensitivity-note and three-adjustments fixtures (PDF) and "
                              "their manifest (tests/fixtures/round17/); "
                              "round18: only the round-18 meaning, condition and removal fixtures (PDF) and their "
-                             "manifest (tests/fixtures/round18/)")
+                             "manifest (tests/fixtures/round18/); "
+                             "round19: only the round-19 attribution, number-reading and coverage fixtures (PDF) and "
+                             "their manifest (tests/fixtures/round19/)")
     args = parser.parse_args()
     font_dir = Path(args.font_dir)
     out = Path(args.out)
@@ -8069,6 +8266,9 @@ def main() -> None:
         return
     if args.only == "round18":
         write_round18(out, font_dir)
+        return
+    if args.only == "round19":
+        write_round19(out, font_dir)
         return
 
     docs: dict[str, dict[str, Any]] = {}

@@ -560,7 +560,11 @@ MULTI = {"R7b_synthetic_two_appraisals_one_file.pdf": 2, "R9a_synthetic_compendi
          "R16a_synthetic_compendium_running_lines.pdf": 3,
          # one appraisal whose calculation pages restart their printed numbering: derivation cuts them into a second,
          # unnamed unit; verification treats that unit as the appraisal's own (round 18 U3), derivation stays as it is
-         "R18d_synthetic_calculation_pages_colon_heading.pdf": 2, "R18e_synthetic_two_reports_in_one_file.pdf": 2}
+         "R18d_synthetic_calculation_pages_colon_heading.pdf": 2, "R18e_synthetic_two_reports_in_one_file.pdf": 2,
+         # round 19: the same calculation pages with a title-sized first line (a colon sentence, digit noise) are a second unit,
+         # and a third unit is another property of the file; two reports to compare derive two units
+         "R19a_synthetic_calculation_pages_sentence_heading.pdf": 3,
+         "R19b_synthetic_calculation_pages_digit_noise_heading.pdf": 3, "R19c_synthetic_two_appraisals_to_compare.pdf": 2}
 SKIPPED = {"R9d_synthetic_long_file_1000_pages.pdf"}  # a thousand pages: its first 50 are read below
 
 
