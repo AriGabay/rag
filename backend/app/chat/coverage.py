@@ -49,9 +49,9 @@ table, first match wins (``reason_of``):
    and a facet the decision joins (``datum.relation``) — two components of one appraisal, or two values whose facets cannot be
    compared, never conflict;
 9. the judge's "undeterminable" (an evidence state, not a status) — found, not verifiable (or sources conflict, 8);
-10. data found that the verified answer does not present — found, not verifiable; data the answer cites in full, which only its kind
-    being asserted made uncertain, gives no reason at all (round 18 U7): the component keeps the judge's status, is listed in
-    completeness and has no line;
+10. data found that the verified answer does not present — found, not verifiable — written only when a datum id is NOT cited in the final
+    text (round 19 U4); data the answer cites in full (``shown``) give no reason at all (round 18 U7, round 19 U4): the component keeps the
+    judge's status, is listed in completeness and has no line;
 10-text. a part of a partly given or missing component that a passage the turn read states, with a verbatim quote the
     server validated (``verify.validated_support``, round 16 U2, KTD2) and the answer still omits — found, not verifiable,
     variant ``read_not_used``: the part was read at that place (the document, the section or pages, the S#) and not used.
@@ -59,7 +59,10 @@ table, first match wins (``reason_of``):
 10-item. an item of the turn's item ledger (``items.Ledger``, round 17 U3, KTD3, R8) the answer does not give — listed by the agent
     and given by no surviving unit — or that the agent declared ``not_verifiable`` or ``not_applicable`` with a reason: its own
     line after the gap paragraph (``item_gap_lines``, the ``item_gap`` server span) naming the item, the place it was read at
-    (document, location, S#) and, for a declared one, the reason. An omitted item makes its component partial
+    (document, location, S#) and, for a declared one, the reason. Round 19 U4 (KTD4): every line is read from ONE coverage decision over
+    the answer as it stands (``VerifyReport.decision``: by block, see ``items``); an item the answer gives in part gets a line that names
+    what is missing, an item a declared reason closed that the answer states gets none, and a check that could not be completed says so.
+    An omitted item makes its component partial
     (``VerifyReport.requirement_outcomes``) and, as the judge's validated support does, is a ``REQ_TEXT_FOUND`` completion for the
     repair round; it is never "not found". A declared item does not block ``full``. Round 18 U7 (KTD6): the line is built from verified
     material — the item is named as its source names it (``items.source_name``), the agent's reason is shown only when its words stand
@@ -724,7 +727,9 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
         return out | {"reason": "calculation_incomplete", "variant": "not_computed"}
     if _uncertain_value(ws, ev["data"], shown):
         return out | {"reason": "not_verifiable", "variant": "uncertain"}
-    if (ev["data"] and conflicting(ws, ev["documents"] or None, ev["data"])) or (
+    # values of one datum that differ are a conflict the component is not given for; a passage the turn read that states the omitted part
+    # is a concrete omission that comes first (round 19 U4, KTD4: "conflicting sources" only without full coverage)
+    if (ev["data"] and not ev["text"] and conflicting(ws, ev["documents"] or None, ev["data"])) or (
             claim is not None and claim["status"] == "sources_conflict"):
         return out | {"reason": "sources_conflict"}
     if o.get("evidence_state") == "undeterminable":
@@ -733,6 +738,11 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
         # also when related data was found: it is the omitted part's place
         return out | _read_not_used(ws, ev["text"][0]["id"], ev["text"][0].get("quote") or "")
     if ev["data"]:
+        if all(i in shown for i in ev["data"]):
+            # the final text cites every datum found for the component (round 19 U4, KTD4): "found but not presented" would be false, and
+            # no other reason of the table is true of a component whose data the answer cites, so it keeps the judge's status with no
+            # reason and no line of the server's
+            return out | {"reason": None}
         if _shown_with_unasserted_kind(ws, ev["data"], shown):
             # the only thing that made these values uncertain was that their kind was asserted, and the answer shows every one of them:
             # neither "uncertain" nor "not presented" is true, so the component keeps the judge's status with no reason and no line of
@@ -830,7 +840,7 @@ def item_line(ws: Workspace, state: dict, request: str = "") -> dict:
     word of it stands in the item's source context or in the ``request`` (``verify.words_stand_in``), else the state's own wording
     stands without it."""
     from app.chat.items import _own_context, source_name
-    from app.chat.verify import ITEM_NOT_APPLICABLE, ITEM_NOT_VERIFIABLE, words_stand_in
+    from app.chat.verify import ITEM_NOT_APPLICABLE, ITEM_NOT_VERIFIABLE, ITEM_UNCHECKED, words_stand_in
 
     src = ws.sources.get(state["source"])
     title = (src.title if src is not None else "") or ""
@@ -840,10 +850,17 @@ def item_line(ws: Workspace, state: dict, request: str = "") -> dict:
     reason = _plain(state["reason"], ITEM_REASON_CHARS).rstrip(".")
     reason = reason if reason and words_stand_in(reason, own, request) else ""
     tail = f": {reason}." if reason else "."
-    if state["state"] == ITEM_NOT_VERIFIABLE:
+    missing = [_plain(m, ITEM_NAME_CHARS) for m in state.get("missing") or [] if m]
+    if state["state"] == ITEM_UNCHECKED:
+        # round 19 U4, R17: a check that failed technically says so; it never says the item was not used or not found
+        text = f"{name}: נקרא {place}, אך לא ניתן היה להשלים את הבדיקה אם הוא נכלל בתשובה."
+    elif state["state"] == ITEM_NOT_VERIFIABLE:
         text = f"{name}: נקרא {place}, אך לא ניתן לאמת אותו" + tail
     elif state["state"] == ITEM_NOT_APPLICABLE:
         text = f"{name}: נקרא {place}, ולא נכלל בתשובה כי הוא אינו חל על הבקשה" + tail
+    elif state.get("outcome") == "partial" and missing:
+        # round 19 U4, R15: the answer gives part of the item: it is not "not used"; the line names what the answer leaves out
+        text = f"{name}: נקרא {place}, והתשובה נתנה אותו בחלקו; לא נאמר בה: {'; '.join(missing)}."
     else:
         text = f"{name}: נקרא {place}, ולא נעשה בו שימוש בתשובה."
     return {"id": state["id"], "state": state["state"], "text": text,
@@ -851,14 +868,17 @@ def item_line(ws: Workspace, state: dict, request: str = "") -> dict:
             "title": title}
 
 
-def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict]) -> list[dict]:
-    """The lines for the ledger's items that stand open in the saved answer: those the agent listed and no surviving unit gives
-    (still omitted) and those declared ``not_verifiable`` or ``not_applicable`` with a reason (``item_line``), in the ledger's order, at most
-    ``ITEM_GAP_LINES`` (one more line counts the rest). An item of a component the request made not relevant is not stated."""
+def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict], states: Sequence[dict] | None = None) -> list[dict]:
+    """The lines for the ledger's items that stand open in the saved answer, from THE coverage decision (``VerifyReport.decision``, round
+    19 U4; ``states``, else the report's present state): those the agent listed and no block of the answer gives, wholly (read and not
+    used) or in part (the line names what is missing), those whose check could not be completed, and those declared ``not_verifiable`` or
+    ``not_applicable`` with a reason that the answer does not state (``item_line``), in the ledger's order, at most ``ITEM_GAP_LINES`` (one
+    more line counts the rest). An item of a component the request made not relevant is not stated."""
     from app.chat.verify import (
         ITEM_NOT_APPLICABLE,
         ITEM_NOT_VERIFIABLE,
         ITEM_OMITTED,
+        ITEM_UNCHECKED,
         ORIGIN_JUDGE_SUPPORT,
         is_server_item,
     )
@@ -871,10 +891,11 @@ def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict]) -> list[dict
     # and an item a sentence gives by attribution and value but not by its date is no item "read and not used" (the date is a note at most)
     lines: list[dict] = []
     written: set[tuple[str, str]] = set()  # one evidence can fill several components (round 19 U3): its fills that read the same make one line
-    for st in report.item_states():
+    for st in report.item_states() if states is None else states:
         if (st["component"] in skip or is_server_item(st)
                 or not (st["state"] in (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)
-                        or (st["state"] == ITEM_OMITTED and st["origin"] != ORIGIN_JUDGE_SUPPORT and st["why"] != "date_not_stated"))):
+                        or (st["state"] in (ITEM_OMITTED, ITEM_UNCHECKED) and st["origin"] != ORIGIN_JUDGE_SUPPORT
+                            and st["why"] != "date_not_stated"))):
             continue
         line = item_line(ws, st, request)
         if (mark := (st.get("evidence_id") or st["id"], line["text"])) not in written:
@@ -918,7 +939,7 @@ def _claims_by_component(ws: Workspace, requested, opened: dict[str, tuple[str, 
 
 
 def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRequirements | None,
-                       requested=()) -> list[dict]:
+                       requested=(), states: Sequence[dict] | None = None) -> list[dict]:
     """Each component with its status in the shown answer (``VerifyReport.requirement_outcomes``) and, when it is a
     leaf not given (not answered, partial, needs clarification), its reason (``reason_of``): ``limitation`` (a
     ``REASONS`` key) and ``limitation_text``; the evidence it rests on — ``place`` (the section, table or pages read,
@@ -929,10 +950,11 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
     for its ``missing_part`` — the part the judge named as not given, validated against the request: its line names
     that part with the component's reason (R20), the status staying partial, and a conditional requirement is never
     stated (R21); a partly given leaf with none is listed in completeness only, and so is a leaf with no reason
-    at all: ``limitation`` None, when the answer shows all its data and only the kind of a value was asserted)."""
+    at all: ``limitation`` None, when the answer shows all its data and only the kind of a value was asserted). ``states``: the coverage
+    decision (``VerifyReport.decision``) the caps rest on, when the caller holds it (round 19 U4)."""
     opened = _openings(ws)  # the turn's openings, for every claim and component
     claims, _ = _claims_by_component(ws, requested, opened)
-    outcomes = report.requirement_outcomes(applied)
+    outcomes = report.requirement_outcomes(applied, None if states is None else list(states))
     signal = None  # the turn's unit signal, computed once for the first component that needs a reason
     shown = cited_ids(applied.answer_markdown)  # the ids the final answer cites: a value among them is not called uncertain by its kind
     for o in outcomes:
@@ -1064,10 +1086,16 @@ def compose_components(ws: Workspace, answer: FinalAnswer, report,
     edited = report.edit(answer)
     if answer.status == "clarification":
         return edited, []
-    outcomes = component_outcomes(ws, report, edited.answer(answer), turn, answer.requested) if report.requirements else []
+    # THE coverage decision of the answer as edited (round 19 U4, KTD4): one list, computed here from the units that stand, that the
+    # components' caps, the gap paragraph and the item lines below all read. A removal that follows (``supersede``) computes it again
+    applied = edited.answer(answer)
+    states = report.decision(applied) if report.requirements else []
+    outcomes = component_outcomes(ws, report, applied, turn, answer.requested, states) if report.requirements else []
     if outcomes and report.supersede(outcomes):
         edited = report.edit(answer)
-        outcomes = component_outcomes(ws, report, edited.answer(answer), turn, answer.requested)
+        applied = edited.answer(answer)
+        states = report.decision(applied)
+        outcomes = component_outcomes(ws, report, applied, turn, answer.requested, states)
     if outcomes:  # the instruction plane from the components as stated, beside the content and completeness planes
         report.instructions = report.instruction_plane(outcomes)
     items = [o for o in outcomes if o["stated"]] + ([] if report.requirements else _unlinked_gaps(ws, answer.requested))
@@ -1085,8 +1113,9 @@ def compose_components(ws: Workspace, answer: FinalAnswer, report,
     # the ledger's items the answer does not give, or that were declared not verifiable / not applicable, one line each (round 17
     # U3, R8): server text, a pure function of the final state like the gap paragraph. Whether the answer is partial follows the
     # components (an omitted item makes its component partial; an item declared with a reason does not)
-    item_lines = item_gap_lines(ws, report, outcomes) if outcomes else []
+    item_lines = item_gap_lines(ws, report, outcomes, states) if outcomes else []
     report.item_gaps = item_lines
+    report.decided = states if report.requirements else None
     if item_lines:
         doc.tidy_blank_lines()
         doc.append(("\n\n" if doc.text else "") + "\n".join(x["text"] for x in item_lines), "item_gap")

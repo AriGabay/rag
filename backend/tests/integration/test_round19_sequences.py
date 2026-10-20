@@ -307,8 +307,6 @@ def item_lines(md: str, name: str) -> list[str]:
     return [ln for ln in md.splitlines() if ln.startswith(f"«{name}»")]
 
 
-@strict_xfail("U4", "an item a list item states over two sentences (the value field holds its figure and the plan identifier) is "
-                    "reported as read and not used")
 def test_a_list_item_that_states_an_item_over_two_sentences_leaves_no_read_and_not_used_line_when_the_value_holds_a_plan_identifier(
         client, office, monkeypatch):
     m = ask(client, office, monkeypatch, ROWS, read_table(ROWS["caption"]), MAIN_SENTENCES, ROWS_QUESTION, ROWS_ASK,
@@ -318,7 +316,6 @@ def test_a_list_item_that_states_an_item_over_two_sentences_leaves_no_read_and_n
     assert item_lines(md, MAIN_ROW[0]) == [] and NOT_USED not in md, md
 
 
-@strict_xfail("U4", "an item of which one of two figures is stated is reported as read and not used, without the missing figure")
 def test_an_item_with_one_of_two_figures_stated_gets_a_partial_line_that_names_the_missing_figure(
         client, office, monkeypatch):
     m = ask(client, office, monkeypatch, ROWS, read_table(ROWS["caption"]), BASEMENT_ONE_FIGURE, ROWS_QUESTION, ROWS_ASK,
@@ -329,7 +326,6 @@ def test_an_item_with_one_of_two_figures_stated_gets_a_partial_line_that_names_t
     assert NOT_USED not in line and BASEMENT_ROW[2] in line and "קומות" in line, md
 
 
-@strict_xfail("U4", "an item the agent declared not applicable is reported as not applicable although the answer states its value")
 def test_an_item_the_agent_declared_not_applicable_that_the_answer_states_gets_no_line(client, office, monkeypatch):
     declared = BASEMENT_ITEM | {"value": BASEMENT_ROW[1], "state": "not_applicable",
                                 "reason": "שטח המרתף אינו חלק משטח הבנייה שנשאל עליו"}

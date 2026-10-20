@@ -1606,3 +1606,88 @@ def test_a_scope_defect_with_no_cited_source_marks_the_sentence_partly_verified_
 def test_a_scope_defect_never_maps_to_a_failure_that_removes():
     assert final_check.DEFECT_FAILURES["scope"] == "context_not_read"
     assert SCOPE_UNIT  # (the sentence the sequences use)
+
+
+# --- round 19 U4: one coverage decision over the final answer (KTD4; R13-R17) -------------------------------------------------------
+
+RIGHTS_TEXT = "\n".join(["זכויות הבנייה", "רכיב | שטח | קומות | תכנית", "שטח עיקרי | 1,200 | 6 | ג/4521", "שטח מרתף | 340 | 2 | ג/4521"])
+RIGHTS_ASK = "זכויות הבנייה בנכס"
+RIGHTS_QUESTION = "מהן זכויות הבנייה בנכס?"
+MAIN_RIGHTS = {"component": RIGHTS_ASK, "label": "שטח עיקרי", "source": "S1", "quote": "שטח עיקרי | 1,200 | 6 | ג/4521",
+               "value": "1,200 מ״ר; תכנית ג/4521", "condition": "", "state": "included", "reason": ""}
+BASEMENT_RIGHTS = {"component": RIGHTS_ASK, "label": "שטח מרתף", "source": "S1", "quote": "שטח מרתף | 340 | 2 | ג/4521",
+                   "value": "340 מ״ר; 2 קומות", "condition": "", "state": "included", "reason": ""}
+
+
+def _sent_text_states(out: engine.TurnOutcome) -> list[dict]:
+    """The coverage decision on the text that was sent: its units split as the final check splits them, the spans the server wrote
+    marked as such (``Unit.server``) — the very function the saved lines came from, called on the saved bytes."""
+    from app.chat import items
+
+    md = out.answer.answer_markdown
+    units = verify.split_units(md)
+    for u in units:
+        u.server = [md[max(s.start, u.start):min(s.end, u.end)] for s in out.server_spans if s.start < u.end and u.start < s.end]
+    return out.report.item_ledger.outcomes(items.model_units(units), out.report.item_ws)
+
+
+def test_the_item_lines_of_the_sent_text_are_the_coverage_functions_output_on_that_text_and_a_server_line_covers_nothing(offline):
+    from app.chat import coverage
+
+    offline.texts = [RIGHTS_TEXT]
+    answer = "- שטח המרתף בנכס הוא 340 מ״ר [S1].\n- השטח העיקרי בנכס הוא 1,200 מ״ר [S1]. הוא נקבע לפי תכנית ג/4521 [S1]."
+    items_ = [MAIN_RIGHTS, BASEMENT_RIGHTS]
+    judge = Judge(lambda t, i, n: "supported", asks={RIGHTS_ASK: "שטח"})
+    out = _turn(ScriptedAgent([SEARCH, final(answer, items=items_), final(answer, items=items_), final(answer, items=items_)],
+                              judge=judge, request=[component(RIGHTS_ASK)]), RIGHTS_QUESTION)
+    md = out.answer.answer_markdown
+    (span,) = [s for s in out.server_spans if s.kind == "item_gap"]
+    sent = md[span.start:span.end].strip().splitlines()
+    assert len(sent) == 1 and sent[0].startswith("«שטח מרתף»") and "קומות: 2" in sent[0] and "לא נעשה בו שימוש" not in sent[0], md
+    # the line names the missing floors, and the line itself is a server span: read as part of the answer it would give them, and it does not
+    states = _sent_text_states(out)
+    assert {s["quote"].split(" | ")[0]: (s["state"], s["outcome"]) for s in states} == {
+        "שטח עיקרי": ("covered", "covered"), "שטח מרתף": ("omitted", "partial")}
+    lines = coverage.item_gap_lines(out.report.item_ws, out.report, out.report.requirement_outcomes(), states)
+    assert [x["text"] for x in lines] == sent == [x["text"] for x in out.report.item_gaps]
+    assert out.final_check["judge_calls"] == 0 and out.final_digest == text_digest(md) and out.answer.status == "partial"
+
+
+def test_the_decision_is_computed_again_over_the_final_text_so_a_sentence_the_final_check_removes_leaves_its_item_a_line(offline):
+    offline.texts = [RIGHTS_TEXT]
+    area, clause = "השטח העיקרי בנכס הוא 1,200 מ״ר", "שאושר בוועדה המחוזית"
+    answer = f"{area}, {clause} [S1]."
+
+    def rule(text, input, n):
+        if n == 1 and clause in text:
+            return {"verdict": "partial", "defect": "part", "claims": [
+                {"span": area, "verdict": "supported"}, {"span": clause, "verdict": "unsupported", "failure": "absent_from_source"}]}
+        return {"verdict": "unsupported", "failure": "absent_from_source"} if MARKER in text else "supported"
+
+    judge = Judge(rule, asks={RIGHTS_ASK: "1,200"})
+    out = _turn(ScriptedAgent([SEARCH, final(answer, items=[MAIN_RIGHTS]), final(answer, items=[MAIN_RIGHTS]),
+                               final(answer, items=[MAIN_RIGHTS])], judge=judge, request=[component(RIGHTS_ASK)]), RIGHTS_QUESTION)
+    md = out.answer.answer_markdown
+    assert "1,200" not in md.split("«")[0], md  # the sentence is gone from the sent text
+    (line,) = [x["text"] for x in out.report.item_gaps]
+    assert line.startswith("«שטח עיקרי»") and "לא נעשה בו שימוש" in line and line in md  # and the item it gave is a line now
+    assert [s["state"] for s in _sent_text_states(out)] == ["omitted"] == [i["state"] for i in out.item_ledger["items"]]
+
+
+def test_a_coverage_check_that_fails_technically_says_so_in_place_of_every_gap_message_and_the_turn_still_completes(offline, monkeypatch):
+    from app.chat import items
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr(items, "_check_block", broken)
+    offline.texts = [RIGHTS_TEXT]
+    answer = "- השטח העיקרי בנכס הוא 1,200 מ״ר [S1]."
+    judge = Judge(lambda t, i, n: "supported", asks={RIGHTS_ASK: "שטח"})
+    out = _turn(ScriptedAgent([SEARCH, final(answer, items=[MAIN_RIGHTS, BASEMENT_RIGHTS]), final(answer, items=[MAIN_RIGHTS, BASEMENT_RIGHTS])],
+                              judge=judge, request=[component(RIGHTS_ASK)]), RIGHTS_QUESTION)
+    md = out.answer.answer_markdown
+    lines = [ln for ln in md.splitlines() if ln.startswith("«")]
+    assert len(lines) == 2 and all("לא ניתן היה להשלים את הבדיקה" in ln for ln in lines), md
+    assert not re.search(r"לא נעשה בו שימוש|לא נמצא|לא אותר", md) and {i["state"] for i in out.item_ledger["items"]} == {"unchecked"}
+    assert out.final_digest == text_digest(md)

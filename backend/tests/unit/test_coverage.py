@@ -3415,3 +3415,201 @@ def test_a_decision_closed_in_version_one_stays_after_a_repair_lists_the_item_in
     assert [h["version"] for h in states["גיל הבניין | 2%"]["history"]] == [1, 2] and len(ledger.items) == 3
     (line,) = [x for x in coverage.item_gap_lines(ws, r, r.requirement_outcomes())]
     assert line["state"] == "not_applicable" and "גיל הבניין" in line["text"]
+
+
+# --- round 19 U4: one coverage decision over the final answer, the gap lines and the gap paragraph (KTD4; R13-R17; AE7) ------------
+# Guards first: the item lines and gap paragraphs the round-18 build wrote RIGHTLY (a true omission, a part read and not used) keep
+# their line; then the wrong ones.
+
+RIGHTS_TEXT = "\n".join(["זכויות הבנייה", "רכיב | שטח | קומות | תכנית", "שטח עיקרי | 1,200 | 6 | ג/4521", "שטח מרתף | 340 | 2 | ג/4521",
+                         "שטח גג | 95 | 1 | ג/4521"])
+RIGHTS_ASK_TEXT = "זכויות הבנייה בנכס"
+
+
+def _item_lines(final: FinalAnswer) -> list[str]:
+    """The server's item lines in the final text (each opens with the item's name in «»). The server may also qualify a figure of the
+    model's sentence (the area basis), which is no concern of these tests."""
+    return [ln for ln in final.answer_markdown.splitlines() if ln.startswith("«")]
+
+
+def _rights(label: str, row: str, value: str, **kw):
+    return _adj_item(label, row, value, **kw)
+
+
+def _rights_items(**roof):
+    return [_rights("שטח עיקרי", "שטח עיקרי | 1,200 | 6 | ג/4521", "1,200 מ״ר; תכנית ג/4521"),
+            _rights("שטח מרתף", "שטח מרתף | 340 | 2 | ג/4521", "340 מ״ר; 2 קומות"),
+            _rights("שטח גג", "שטח גג | 95 | 1 | ג/4521", "95 מ״ר", **roof)]
+
+
+def _rights_check(markdown: str, raw=None, **kw):
+    ws = _file(SOURCE, RIGHTS_TEXT, units=(1, 1), declared=(1,))
+    return (ws, *_ledger_check(ws, markdown, _rights_items() if raw is None else raw, **kw))
+
+
+MAIN_TWO_SENTENCES = "- השטח העיקרי בנכס הוא 1,200 מ״ר [S2]. הוא נקבע לפי תכנית ג/4521 [S2]."
+BASEMENT_FIGURE = "- שטח המרתף בנכס הוא 340 מ״ר [S2]."
+ROOF_FIGURE = "- שטח הגג בנכס הוא 95 מ״ר [S2]."
+
+
+def test_guard_an_item_none_of_whose_figures_the_answer_states_keeps_its_read_and_not_used_line_with_its_place():
+    ws, r, turn, answer, _ = _rights_check(MAIN_TWO_SENTENCES + "\n" + ROOF_FIGURE)
+    final, outcomes = _finish(ws, answer, r, turn)
+    (o,) = outcomes
+    assert o["status"] == "partial" and final.status == "partial" and o["omitted_items"] == ["I2"]
+    (line,) = _item_lines(final)
+    assert line.startswith("«שטח מרתף»") and "S2" in line and "לא נעשה בו שימוש" in line and "קומות" not in line
+    assert r.item_gaps[0]["text"] == line
+
+
+def test_guard_a_part_a_passage_states_that_the_answer_omits_is_still_named_by_its_component_line():
+    ws = _rates_file()
+    r, turn, answer = _support(ws, THREE_RATES, MISSING_RATE)
+    final, outcomes = _finish(ws, answer, r, turn)
+    assert outcomes[0]["variant"] == "read_not_used" and outcomes[0]["status"] == "partial"
+    assert "**שיעורי ההיוון**" in _gap(final, answer) and "לא נעשה בו שימוש" in _gap(final, answer)
+
+
+def test_ae7_a_list_item_over_two_sentences_with_a_plan_identifier_in_its_value_is_given_and_a_partial_item_names_its_missing_figure():
+    ws, r, turn, answer, _ = _rights_check(MAIN_TWO_SENTENCES + "\n" + BASEMENT_FIGURE + "\n" + ROOF_FIGURE)
+    final, outcomes = _finish(ws, answer, r, turn)
+    (o,) = outcomes
+    assert o["status"] == "partial" and o["omitted_items"] == ["I2"]  # the main area is given; the basement is given in part
+    (line,) = _item_lines(final)
+    assert line.startswith("«שטח מרתף»") and "קומות: 2" in line and "בחלקו" in line
+    assert not re.search(r"לא נעשה בו שימוש|לא נמצא|לא אותר", line) and not any("שטח עיקרי" in ln for ln in _item_lines(final))
+
+
+def test_a_partly_given_item_is_given_in_full_once_the_repair_adds_the_missing_figure():
+    ws, r, turn, answer, ledger = _rights_check(MAIN_TWO_SENTENCES + "\n" + BASEMENT_FIGURE + "\n" + ROOF_FIGURE)
+    assert [i["outcome"] for i in r.item_states()] == ["covered", "partial", "covered"]
+    fuller = MAIN_TWO_SENTENCES + "\n- שטח המרתף בנכס הוא 340 מ״ר, ב-2 קומות [S2].\n" + ROOF_FIGURE
+    r2, turn2, answer2, _ = _ledger_check(ws, fuller, _rights_items(), ledger=ledger)
+    final, outcomes = _finish(ws, answer2, r2, turn2)
+    assert outcomes[0]["status"] == "full" and r2.item_gaps == [] and final.status == "answered"
+
+
+def test_a_declared_not_applicable_item_the_answer_states_gets_no_line_and_one_it_does_not_state_keeps_its_line():
+    ws, r, turn, answer, _ = _rights_check(MAIN_TWO_SENTENCES + "\n" + BASEMENT_FIGURE.replace("מ״ר", "מ״ר ובו 2 קומות") + "\n" + ROOF_FIGURE,
+                                           _rights_items(state="not_applicable", reason="שטח הגג אינו חלק מהשטח שנשאל עליו"))
+    final, outcomes = _finish(ws, answer, r, turn)
+    assert outcomes[0]["status"] == "full" and r.item_gaps == [] and final.status == "answered"
+    assert "אינו חל על הבקשה" not in final.answer_markdown
+    ws2, r2, turn2, answer2, _ = _rights_check(MAIN_TWO_SENTENCES + "\n" + BASEMENT_FIGURE.replace("מ״ר", "מ״ר ובו 2 קומות"),
+                                               _rights_items(state="not_applicable", reason="שטח הגג אינו חלק מהשטח שנשאל עליו"))
+    final2, _ = _finish(ws2, answer2, r2, turn2)
+    (line,) = _item_lines(final2)
+    assert line.startswith("«שטח גג»") and "אינו חל על הבקשה" in line
+
+
+def test_a_coverage_check_that_fails_gets_its_own_wording_in_place_of_read_and_not_used_and_caps_nothing(monkeypatch):
+    from app.chat import items as ledger_items
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr(ledger_items, "_check_block", broken)
+    ws, r, turn, answer, _ = _rights_check(MAIN_TWO_SENTENCES)
+    final, outcomes = _finish(ws, answer, r, turn)
+    lines = _item_lines(final)
+    assert len(lines) == 3 and all("לא ניתן היה להשלים את הבדיקה" in ln for ln in lines)
+    assert not re.search(r"לא נעשה בו שימוש|לא נמצא|לא אותר", final.answer_markdown)
+    assert [o["status"] for o in outcomes] == ["full"] and "I1" not in (outcomes[0].get("omitted_items") or [])  # a check that failed is no omission
+
+
+def test_the_gap_lines_the_caps_and_the_body_rest_on_the_one_decision_the_report_holds():
+    ws, r, turn, answer, _ = _rights_check(MAIN_TWO_SENTENCES + "\n" + BASEMENT_FIGURE)
+    final, outcomes = _finish(ws, answer, r, turn)
+    decision = r.decision(final)
+    open_items = [s["id"] for s in decision if s["state"] == "omitted"]
+    assert open_items == outcomes[0]["omitted_items"] == ["I2", "I3"]
+    assert [x["id"] for x in r.item_gaps] == open_items and outcomes[0]["status"] == "partial"
+    assert [x["text"] for x in coverage.item_gap_lines(ws, r, outcomes, decision)] == _item_lines(final)
+
+
+def test_a_server_line_about_an_item_covers_nothing_in_the_decision():
+    from app.chat import items as ledger_items
+
+    ws, r, turn, answer, _ = _rights_check(MAIN_TWO_SENTENCES + "\n" + BASEMENT_FIGURE)
+    final, _ = _finish(ws, answer, r, turn)
+    units = verify.split_units(final.answer_markdown)
+    for u in units:  # the lines after the answer are the server's
+        if u.start >= len(answer.answer_markdown.strip()):
+            u.server = [u.text]
+    states = {s["id"]: s for s in r.item_ledger.outcomes(ledger_items.model_units(units), ws)}
+    assert states["I2"]["outcome"] == "partial" and states["I2"]["missing"] == ["קומות: 2"]  # the line names the floors: it still gives none
+
+
+# the reason table: "found but not presented" only for a datum the final text does not cite; "conflicting sources" only without a passage
+
+def _data_turn(*cited: str, related: tuple[str, ...]):
+    ws = _ws()
+    ids = [_value(ws, "12", "דמי הניהול"), _value(ws, "30", "ארנונה")]
+    a = _answer("השווי למ\"ר הוא 9,500 ₪ [S1]. " + " ".join(f"דמי ניהול ו-ארנונה [{ids[n]}]." for n in cited))
+    turn = TurnRequirements()
+    r = verify_answer(_judge(_by_words({"השווי למ\"ר": {}, "דמי הניהול": {"related": [ids[n] for n in related]}},
+                                       missing_status="missing")), a, ws, "?", [], requirements=turn)
+    return ws, a, turn, r
+
+
+def test_found_but_not_presented_is_written_only_when_a_datum_of_the_component_is_not_cited_in_the_final_text():
+    ws, a, turn, r = _data_turn(0, related=(0, 1))  # only the first of two data is cited
+    final, outcomes = _finish(ws, a, r, turn)
+    assert outcomes[1]["limitation"] == "not_verifiable" and outcomes[1]["variant"] == "not_presented"
+    assert "לא הוצגו בתשובה" in final.answer_markdown
+
+
+def test_a_component_whose_every_datum_the_final_text_cites_gets_no_found_but_not_presented_line():
+    ws, a, turn, r = _data_turn(0, 1, related=(0, 1))
+    final, outcomes = _finish(ws, a, r, turn)
+    o = outcomes[1]
+    assert o["status"] == "not_answered" and o["limitation"] is None and o["stated"] is False and o["gap"] is None
+    assert "לא הוצגו" not in final.answer_markdown and coverage.completeness(outcomes)["missing"][0]["reason"] is None
+
+
+def test_a_passage_the_turn_read_that_states_the_omitted_part_is_named_before_a_conflict_between_values_related_to_the_component():
+    ws = _rates_file()
+    doc = uuid.uuid4()
+    ids = [_value(ws, "12", "דמי הניהול", "management_fee", document=doc, grounded=True),
+           _value(ws, "15", "דמי הניהול", "management_fee", document=doc, grounded=True)]
+    assert coverage.conflicting(ws, None, ids)  # the two values do conflict
+    r, turn, answer = _support(ws, THREE_RATES, MISSING_RATE, related=tuple(ids))
+    final, outcomes = _finish(ws, answer, r, turn)
+    assert outcomes[0]["limitation"] == "not_verifiable" and outcomes[0]["variant"] == "read_not_used"
+    assert "סותרים" not in final.answer_markdown
+
+
+def test_a_part_the_judge_names_that_a_list_item_of_the_answer_states_over_two_sentences_with_a_footnote_mark_in_its_quote_is_no_omission():
+    """The judge's quote carries the source's footnote mark (43) and the answer states the rate over two sentences of one list item: the
+    presence test reads the block and not the mark, so no completion is asked and no gap line is written (round 19 U4)."""
+    row = "שיעור היוון למסחר מיוחד 9.5% (43)"
+    ws = _file(SOURCE, "\n".join(["שיעורי ההיוון שנקבעו בשומה:", *RATE_LINES[:3], row]), units=(1, 1), declared=(1,))
+    stated = THREE_RATES + "\n- שיעור ההיוון למסחר מיוחד הוא 9.5% [S2]. הוא חל על כל המבנים."
+    r, turn, answer = _support(ws, stated, row)
+    assert _completions(r) == [] and r.text_support == {}
+    (vote,) = r.requirements_trace()[0]["votes"]
+    assert [x["outcome"] for x in vote["support"]] == ["already_in_answer"]
+    # the protection: the same quote with a figure the answer does not state is still support of an omitted part
+    r2, _, _ = _support(ws, THREE_RATES, row)
+    assert len(_completions(r2)) == 1
+
+
+def test_items_that_share_a_value_whose_condition_every_twin_writes_are_not_asked_for_it_and_a_condition_in_the_next_sentence_counts():
+    from app.chat import items as ledger_items
+
+    text = "\n".join(["שיעורי היוון", "שימוש | שיעור | הערה", "משרדים | 7% | לפי מועד הערכה", "חנויות | 7% | לפי מועד הערכה"])
+    ws = _ws(text)
+    offices = ledger_items.Item("N1", "שיעור למשרדים", "S1", "משרדים | 7% | לפי מועד הערכה", "7%", "לפי מועד הערכה",
+                                document_id=str(ws.sources["S1"].document_id), unit_id=None)
+    shops = ledger_items.Item("N1", "שיעור לחנויות", "S1", "חנויות | 7% | לפי מועד הערכה", "7%", "לפי מועד הערכה",
+                              document_id=str(ws.sources["S1"].document_id), unit_id=None)
+    ledger = ledger_items.Ledger()
+    ledger.merge([offices, shops])
+    got = {o["quote"].split(" | ")[0]: o["state"] for o in ledger.outcomes(verify.split_units("- השיעור למשרדים הוא 7% [S1]."), ws)}
+    assert got == {"משרדים": "covered", "חנויות": "covered"}  # the condition tells the two apart by nothing, the answer need not repeat it
+    labelled = ledger_items.Item("N1", "שיעור למשרדים בקומה גבוהה", "S1", "משרדים | 7% | לפי מועד הערכה", "7%", "לפי מועד הערכה",
+                                 document_id=str(ws.sources["S1"].document_id), unit_id=None)
+    again = ledger_items.Ledger()
+    again.merge([labelled, shops])
+    two = {o["quote"].split(" | ")[0]: o["state"] for o in again.outcomes(verify.split_units("- השיעור לחנויות הוא 7% [S1]."), ws)}
+    assert two == {"משרדים": "omitted", "חנויות": "covered"}  # a label word the twin lacks is still asked

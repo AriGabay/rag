@@ -1423,6 +1423,9 @@ class Unit:
     # so a short colon line there is a lead-in (``structural_kind``)
     list_item: bool = False
     leads_list: bool = False
+    # the block the unit belongs to (``split_units``, round 19 U4, KTD4): a list item (its continuation lines included), a paragraph, a
+    # table row or a heading is one block, whatever the number of its sentences; -1 for a unit built by hand (its own block)
+    block: int = -1
     # a unit of the final check that refers back (``has_back_reference``) after a unit before it in its section was removed
     # (round 13 U11, KTD13): the text that stays before it in its section, and the draft indexes of the removed units, shown
     # to the judge as ``<preceding>`` (rule 31)
@@ -1723,6 +1726,9 @@ class VerifyReport:
     item_ledger: Ledger | None = None
     item_ws: Workspace | None = None
     item_gaps: list[dict] = field(default_factory=list)
+    # the coverage decision the saved text was composed from (``VerifyReport.decision`` at the last compose pass, round 19 U4); None before
+    # any compose. The diagnostics read it, so they describe the decision that drove the text and not a recomputation of it
+    decided: list[dict] | None = None
     request: str = ""  # the request this verification judged (its words, with the components', ground the model text of a server line)
     # the candidates this verification's requirements calls were offered, by K# (``items.Candidate``), and the offer's record (the K# ids,
     # the counts left out): the judge's validated assignments are read against them (``add_candidate_items``), round 18 U6
@@ -2165,8 +2171,14 @@ class VerifyReport:
             # sentence of the same table that shares the rate's words would close an omitted rate
             if st["origin"] == ORIGIN_JUDGE_SUPPORT and st["state"] == ITEM_COVERED \
                     and not _in_answer(st["quote"], units, texts.get(st["component"], "")):
-                st |= {"state": ITEM_OMITTED, "covered_by": None, "why": "value_not_stated"}
+                st |= {"state": ITEM_OMITTED, "covered_by": None, "why": "value_not_stated", "outcome": "omitted", "missing": []}
         return states
+
+    def decision(self, applied: FinalAnswer | None = None) -> list[dict]:
+        """THE coverage decision of the answer as it stands (round 19 U4, KTD4; R13): ``item_states`` over the units that survive in
+        ``applied`` — the same units ``requirement_outcomes`` reads — so the body's completeness, the requirement caps, the gap paragraph
+        and the item lines all rest on this one list. Recomputed at every compose pass; a pure function of the report's present state."""
+        return self.item_states(self._standing(applied))
 
     def _evidence_of(self, sid: str, quote: str) -> tuple[str, str, str]:
         """The evidence a judge's support entry names (``evidence_key``): the document and appraisal unit of its S# in the ledger's
@@ -2212,6 +2224,7 @@ class VerifyReport:
         for s in self.item_states(kept, texts):
             row = {k: s[k] for k in ("id", "component", "origin", "candidate", "label", "source", "quote", "value", "condition", "state",
                                      "reason")}
+            row["state"] = ITEM_INCLUDED if row["state"] == ITEM_UNCHECKED else row["state"]  # the judge is told no state of its own
             asked = ask and s["condition_check"] in ASKED_CHECKS
             out.append(row | {"check": s["condition_check"] if asked else "", "unit": s["condition_unit"],
                               "hint": s["condition_hint"], "foreign": s["condition_foreign"],
@@ -2259,7 +2272,8 @@ class VerifyReport:
         if ledger is None or not (ledger.items or ledger.excluded or ledger.misattributed):
             return {}
         # round 18 U5: the conditions an agent wrote that stand only in another item's context are recorded, never silent
-        return {"items": self.item_states(), "excluded": list(ledger.excluded)} | (
+        return {"items": self.item_states() if self.decided is None else [dict(x) for x in self.decided],
+                "excluded": list(ledger.excluded)} | (
             {"misattributed": list(ledger.misattributed)} if ledger.misattributed else {}) | (
             {"candidates": dict(self.candidate_offer)} if self.candidate_offer.get("offered") else {})
 
@@ -2359,7 +2373,7 @@ class VerifyReport:
             out.append(entry)
         return out
 
-    def requirement_outcomes(self, applied: FinalAnswer | None = None) -> list[dict]:
+    def requirement_outcomes(self, applied: FinalAnswer | None = None, states: list[dict] | None = None) -> list[dict]:
         """Each component with its status in the verified answer (KTD3, R6, R7), merged by id across the judge
         calls, from the units that survived verification only:
 
@@ -2382,8 +2396,18 @@ class VerifyReport:
         The scores are the ones of this verification's version (``requirement_votes``: its fresh calls and the admitted carried
         scores), merged by best status, and then the server's evidence of a missing part caps the merge (round 17 U1, KTD1, R2):
         a full component with validated support (``validated_support``) or an omitted ledger item is at most ``partial``, whatever
-        any score says. ``requirement_decisions`` is the same merge with the scores each decision rests on."""
-        return self._resolve(applied, None)
+        any score says. ``requirement_decisions`` is the same merge with the scores each decision rests on.
+        ``states``: ``decision(applied)``, when the caller holds the coverage decision of the present state already (round 19 U4): the caps
+        then rest on the very list the item lines are written from."""
+        return self._resolve(applied, None, states)
+
+    def _standing(self, applied: FinalAnswer | None) -> set[int]:
+        """The indexes of the units that stand: those not removed, and none when nothing cited survived in ``applied`` (the answer was
+        replaced by a statement that it was not supported)."""
+        errors = self.removed_units()
+        if applied is not None and errors and not _IDS.search(applied.answer_markdown):
+            return set()
+        return {u.index for u in self.units if u.index not in errors}
 
     def _resolve(self, applied: FinalAnswer | None, notes: dict[str, dict] | None,
                  states: list[dict] | None = None) -> list[dict]:
@@ -2391,9 +2415,7 @@ class VerifyReport:
         scores a cap overruled (``overruled``) and the caps that applied (``caps``). ``states``: ``item_states()`` of the present
         state, when the caller holds it already (the units that stand are then those it was read for)."""
         errors = self.removed_units()
-        kept = {u.index for u in self.units if u.index not in errors}
-        if applied is not None and errors and not _IDS.search(applied.answer_markdown):
-            kept = set()  # nothing cited survived: the answer was replaced by a statement that it was not supported
+        kept = self._standing(applied)
         texts = {u.index: u.text for u in self.units}
         uncited = [texts[i] for i in self.uncited_data(kept)]
         kind_of = {p.unit.index: p.failure_kind for p in self.removals()}
@@ -2415,7 +2437,7 @@ class VerifyReport:
                 # (a candidate a component asked for (round 18 U6) is an item of that component like an agent's: it caps it while omitted)
             if st["state"] == ITEM_OMITTED:
                 omitted_by.setdefault(st["component"], []).append(st)
-            else:
+            elif st["state"] != ITEM_UNCHECKED:  # a check that could not be completed closes nothing and caps nothing (R17)
                 closed.add((st["component"], evidence_key(st["document_id"], st["unit_id"], st["source"], st["quote"])))
         out: dict[str, dict] = {}
         for r in self.requirements:
@@ -2996,12 +3018,22 @@ def split_units(markdown: str) -> list[Unit]:
     starts = [0]
     for line in lines:
         starts.append(starts[-1] + len(line) + 1)
+    block, shape = -1, ""  # the current block, and the shape of the last line ("" after a blank line)
     for n, line in enumerate(lines):
         line_start = offset
         offset += len(line) + 1
         stripped = line.strip()
+        if not stripped:
+            shape = ""
         if not stripped or re.fullmatch(r"[|\-:\s]+", stripped):
             continue
+        # a list item, a table row and a heading open a block of their own; a plain line continues the paragraph or the list item
+        # right above it, and opens a block after a blank line or a heading or a table
+        line_shape = ("table" if stripped.startswith("|") else "heading" if _HEADING_LINE.match(stripped)
+                      else "item" if _LIST_ITEM.match(stripped) else "plain")
+        if line_shape != "plain" or shape not in ("plain", "item"):
+            block += 1
+        shape = line_shape
         following = next((x.strip() for x in lines[n + 1:] if x.strip()), "")
         header_row = stripped.startswith("|") and bool(re.fullmatch(r"\|?[\s:]*-[|\-:\s]*", following))
         base = line_start + line.index(stripped)
@@ -3048,7 +3080,7 @@ def split_units(markdown: str) -> list[Unit]:
             if not re.search(r"[א-תA-Za-z0-9]", clean):
                 continue
             units.append(Unit(len(units), part, clean, ids_in(part), base + a, base + a + len(part),
-                              header_row, table_span, context))
+                              header_row, table_span, context, block=block))
         if table_span is None and len(units) > first_unit:
             item = bool(_LIST_ITEM.match(stripped))
             for u in units[first_unit:]:
@@ -3129,7 +3161,8 @@ def _attach_bare_lines(markdown: str, units: list[Unit]) -> list[Unit]:
 def _joined(markdown: str, first: Unit, second: Unit) -> Unit:
     raw = markdown[first.start:second.end]
     return Unit(first.index, raw, _IDS.sub("", raw).strip(), list(dict.fromkeys([*first.ids, *second.ids])),
-                first.start, second.end, False, None, "", list_item=first.list_item, leads_list=second.leads_list)
+                first.start, second.end, False, None, "", list_item=first.list_item, leads_list=second.leads_list,
+                block=first.block)
 
 
 _KIND_NAMES = {source_kinds.STANDARD: "תקן", source_kinds.PROFESSIONAL: "מסמך מקצועי"}
@@ -8317,19 +8350,21 @@ def _support_in_asked_units(ws: Workspace, src: Source, asked: set[str]) -> bool
 
 
 def _in_answer(quote: str, units: list[Unit], component: str = "") -> bool:
-    """Whether the quoted part is in the answer (KTD2): a single unit holds the quote's numbers together with at least half
-    of its content words, the words that name the item (its label) — not those of the component's own text, which every item
-    of a list shares ("שיעור היוון") — and its value. Another item with the same value is no presence. A quote with neither
-    numbers nor words counts as present, so it supports nothing."""
-    nums, words = claim_terms(quote)
-    words = words - claim_terms(component)[1] or words
-    need = (len(words) + 1) // 2
-    return any(nums <= n and len(words & w) >= need for n, w in map(claim_terms, [u.text for u in units]))
+    """Whether the quoted part is in the answer (KTD2): one block of the answer — a sentence, a list item with all its sentences, a paragraph,
+    a table row — holds the quote's headline values together with at least half of its content words, the words that name the item (its
+    label), not those of the component's own text, which every item of a list shares ("שיעור היוון"). It is the presence test of the ledger's
+    coverage (``items.quote_in_blocks``, round 19 U4): an identifier, a footnote mark or an ordinal of the quote is no value the block must
+    state. A quote with neither numbers nor words counts as present, so it supports nothing."""
+    from app.chat.items import quote_in_blocks
+
+    return quote_in_blocks(quote, units, component)
 
 
 # the states of a ledger item (``app.chat.items``): what the agent declares, and ``omitted`` / ``covered``, which the server assigns
 ITEM_INCLUDED, ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE = "included", "not_verifiable", "not_applicable"
 ITEM_OMITTED, ITEM_COVERED = "omitted", "covered"
+# the coverage check of a fill could not be completed (a technical failure or a missing input: round 19 U4, R17): neither given nor omitted
+ITEM_UNCHECKED = "unchecked"
 # who put an item in the ledger: the answering agent, the server from the judge's validated support, or the server from a source span
 # an answer sentence cites and no item covers (round 18 U5, KTD1: a span that carries a material condition, so the condition is
 # checked on turns where the agent declared nothing). A source item is covered by the sentence that cites it: it is checked for its
@@ -8416,7 +8451,7 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
              for cid, vs in report.requirement_votes.items()}
     if not any(votes.values()):
         return {}
-    units = [u for u in report.units if u.index not in failed]
+    units = [report._as_edited(u) for u in report.units if u.index not in failed]  # the text the user will see (round 19 U4)
     scope = SupportScope(ws, units)
     components = {r["id"]: r["text"] for r in report.requirements}
     out: dict[str, list[dict]] = {}

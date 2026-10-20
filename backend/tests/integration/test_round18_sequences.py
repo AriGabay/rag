@@ -479,8 +479,10 @@ def test_a_value_stated_in_a_sentence_the_server_cites_is_not_read_and_not_used(
             "השווי המהוון של הנכס", judge=candidate_and_source_judge)
     md = m["answer"]["markdown"]
     assert "לא נעשה בו שימוש" not in md and METHOD_VALUE in md, md
-    ledger = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["resolution"]["item_ledger"]
-    assert [i["state"] for i in ledger["items"]] == ["covered"], ledger["items"]
+    # round 19 U4: the paragraph states the value in one sentence and cites the table in the next, which is one block: the row is given by
+    # it from the start, so the judge is offered no open candidate for it and no item of the ledger is left open
+    ledger = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["resolution"].get("item_ledger") or {}
+    assert [i["state"] for i in ledger.get("items", [])] in ([], ["covered"]), ledger.get("items")
 
 
 # --- 10. a per-use rate table of which the answer cites one row (AE5, AE6, U6) -----------------------------------------------

@@ -1031,7 +1031,9 @@ def test_a_decision_is_kept_after_a_repair_that_cites_another_s_number_and_after
     assert len(ledger.items) == 2
     assert out["גיל הבניין | 2%"]["state"] == "not_applicable" and out["קומה | 3%"]["state"] == "omitted"  # an included item reopens; a decision stays
     back = {o["quote"]: o for o in ledger.outcomes(_units(markdown), ws)}  # a repair that restores the claim: the same fills, the same ids
-    assert back["קומה | 3%"]["state"] == "covered" and back["גיל הבניין | 2%"]["state"] == "not_applicable"
+    # (round 19 U4, R16: the decision is kept, and a surviving sentence that states the evidence covers it: no line is written)
+    assert back["קומה | 3%"]["state"] == "covered"
+    assert back["גיל הבניין | 2%"]["state"] == "covered" and back["גיל הבניין | 2%"]["declared"] == "not_applicable"
     assert back["גיל הבניין | 2%"]["id"] == out["גיל הבניין | 2%"]["id"]
 
 
@@ -1101,3 +1103,248 @@ def test_a_narrower_covered_quote_carries_the_condition_check_and_the_wider_quot
     by = _by_component(ledger, ROW_BOTH, ws)
     assert by["N1"]["evidence_id"] != by["N2"]["evidence_id"] and by["N2"]["quote"] == ROW_QUOTE
     assert by["N1"]["condition_check"] == "kept" and by["N2"]["condition_check"] == ""  # the second sentence states the row's condition
+
+
+# --- round 19 U4: one coverage decision over the final answer, by block (KTD4; R13-R17; AE7) --------------------------------------
+# The guard tests come first: the shapes of the lines the round-18 build wrote RIGHTLY (a figure of the item is in no block of the
+# answer that cites its source) keep their line; then the shapes it wrote wrongly.
+
+RIGHTS_ASK = [{"id": "N1", "text": "זכויות הבנייה בנכס"}]
+RIGHTS = "\n".join(["זכויות הבנייה", "רכיב | שטח | קומות | תכנית", "שטח עיקרי | 1,200 | 6 | ג/4521", "שטח מרתף | 340 | 2 | ג/4521",
+                    "שטח גג | 95 | 1 | ג/4521"])
+MAIN = dict(label="שטח עיקרי", quote="שטח עיקרי | 1,200 | 6 | ג/4521", value="1,200 מ״ר; תכנית ג/4521")
+BASEMENT = dict(label="שטח מרתף", quote="שטח מרתף | 340 | 2 | ג/4521", value="340 מ״ר; 2 קומות")
+ROOF = dict(label="שטח גג", quote="שטח גג | 95 | 1 | ג/4521", value="95 מ״ר")
+
+
+def _states(ws: Workspace, markdown: str, *given: items.Item, units=None) -> dict[str, dict]:
+    """The outcome of each fill (by its quote's first cell) against the answer ``markdown``."""
+    ledger = items.Ledger()
+    ledger.merge(list(given))
+    out = ledger.outcomes(_units(markdown) if units is None else units, ws)
+    return {o["quote"].split(" | ")[0]: o for o in out}
+
+
+def test_guard_a_row_none_of_whose_figures_a_block_of_the_answer_states_stays_omitted_with_nothing_partly_given():
+    ws = _ws(RIGHTS)
+    # the answer states other figures of the same table, and a number of the omitted rows only as a count of something else
+    markdown = "השטח העיקרי הוא 1,200 מ״ר [S1]. הבניין בן 7 שנים, ובו 5 דיירים [S1]."
+    got = _states(ws, markdown, _item(**MAIN), _item(**BASEMENT), _item(**ROOF))
+    assert got["שטח עיקרי"]["state"] == "covered"
+    for name in ("שטח מרתף", "שטח גג"):
+        assert got[name]["state"] == "omitted" and got[name]["outcome"] == "omitted" and got[name]["missing"] == []
+        assert got[name]["why"] == "value_not_stated"
+
+
+def test_guard_a_candidate_the_answer_does_not_state_stays_an_open_item_of_its_component():
+    ws = _ws(RATE_TABLE)
+    ledger = items.Ledger()
+    offer = _offer(ws, RATE_ONE, ledger=ledger)
+    night = next(c for c in offer.candidates if c.label == "כניסה בלילה")
+    ledger.merge([items.candidate_item(night, "N1", ledger)])
+    (out,) = ledger.outcomes(_units(RATE_ONE), ws)
+    assert out["state"] == "omitted" and out["outcome"] == "omitted" and out["candidate"] is True
+
+
+def test_guard_a_rounded_value_is_not_given_by_a_small_number_of_another_sentence_of_the_cited_passage():
+    ws = _ws("\n".join(["תוצאות החישוב", "מדד | ערך", "רווחי ניהול מהוונים | 12,658,300", "תקופת היוון | 8"]))
+    item = _item(label="רווחי ניהול מהוונים", quote="רווחי ניהול מהוונים | 12,658,300", value="12.66 מיליון")
+    got = _states(ws, "תקופת ההיוון היא 8 שנים [S1].", item)
+    assert got["רווחי ניהול מהוונים"]["state"] == "omitted"
+
+
+def test_guard_an_answer_that_holds_no_unit_leaves_every_item_of_the_ledger_omitted():
+    ws = _ws(RIGHTS)
+    got = _states(ws, "", _item(**MAIN), _item(**BASEMENT), units=[])
+    assert {o["state"] for o in got.values()} == {"omitted"} and {o["why"] for o in got.values()} == {"not_attributed"}
+
+
+def test_guard_a_figure_in_a_block_that_cites_another_document_covers_nothing_and_neither_does_a_figure_in_another_list_item():
+    ws = _ws(RIGHTS, "שטח עיקרי | 1,200 | 6 | ג/4521")  # another document of the same shape
+    other = _states(ws, "השטח העיקרי הוא 1,200 מ״ר [S2].", _item(**MAIN))
+    assert other["שטח עיקרי"]["state"] == "omitted" and other["שטח עיקרי"]["why"] == "not_attributed"
+    # a list item is a block of its own: the citation of one item does not carry to the figure of the next
+    split = _states(ws, "- השטח העיקרי נקבע בתכנית [S1].\n- הוא 1,200 מ״ר.", _item(**MAIN))
+    assert split["שטח עיקרי"]["state"] == "omitted"
+
+
+def test_guard_two_items_of_one_value_are_still_told_apart_by_the_words_that_differ_between_them():
+    ws = _ws("\n".join(["שיעורי היוון", "שימוש | שיעור", "משרדים בקומות עליונות | 7%", "חנויות בקומת קרקע | 7%"]))
+    upper = _item(label="שיעור למשרדים", quote="משרדים בקומות עליונות | 7%", value="7%", condition="משרדים בקומות עליונות")
+    ground = _item(label="שיעור לחנויות", quote="חנויות בקומת קרקע | 7%", value="7%", condition="חנויות בקומת קרקע")
+    got = _states(ws, "- השיעור למשרדים בקומות עליונות הוא 7% [S1].", upper, ground)
+    assert got["משרדים בקומות עליונות"]["state"] == "covered" and got["חנויות בקומת קרקע"]["state"] == "omitted"
+    assert got["חנויות בקומת קרקע"]["why"] == "condition_not_stated"
+
+
+def test_ae7_a_list_item_that_states_an_item_over_two_sentences_gives_it_though_the_value_holds_a_plan_identifier():
+    ws = _ws(RIGHTS)
+    markdown = "- השטח העיקרי בנכס הוא 1,200 מ״ר [S1]. הוא נקבע לפי תכנית ג/4521 [S1]."
+    assert items.headline(MAIN["value"], MAIN["quote"]) == (frozenset({"1200", "1.2E+3"}),)  # the plan number is no headline value
+    got = _states(ws, markdown, _item(**MAIN))
+    assert got["שטח עיקרי"]["state"] == "covered" and got["שטח עיקרי"]["outcome"] == "covered"
+
+
+def test_ae7_an_item_with_one_of_two_figures_stated_is_partial_and_names_the_missing_figure_as_its_source_does():
+    ws = _ws(RIGHTS)
+    got = _states(ws, "- שטח המרתף בנכס הוא 340 מ״ר [S1].", _item(**BASEMENT))["שטח מרתף"]
+    assert got["state"] == "omitted" and got["outcome"] == "partial" and got["why"] == "value_partial"
+    assert got["missing"] == ["קומות: 2"]  # the cell and the header of its column, both the source's own
+
+
+def test_the_figures_of_one_item_spread_over_the_sentences_of_a_list_item_are_given_by_that_block():
+    ws = _ws(RIGHTS)
+    markdown = "- שטח המרתף בנכס הוא 340 מ״ר [S1]. יש בו 2 קומות."
+    assert _states(ws, markdown, _item(**BASEMENT))["שטח מרתף"]["state"] == "covered"
+    # the same two sentences as two paragraphs are two blocks: neither gives the whole item
+    apart = _states(ws, "שטח המרתף בנכס הוא 340 מ״ר [S1].\n\nיש בו 2 קומות.", _item(**BASEMENT))["שטח מרתף"]
+    assert apart["outcome"] == "partial"
+
+
+def test_a_paragraph_of_several_sentences_is_one_block_whose_citations_are_the_union_of_its_sentences():
+    ws = _ws(RIGHTS)
+    got = _states(ws, "זכויות הבנייה בנכס מפורטות להלן. שטח המרתף הוא 340 מ״ר ובו 2 קומות. הנתון נקרא [S1].", _item(**BASEMENT))
+    assert got["שטח מרתף"]["state"] == "covered"
+
+
+def test_a_table_row_of_the_answer_under_its_heading_gives_the_item_and_the_heading_gives_its_date():
+    ws = _ws("\n".join(["רשימת מחירים", "פריט | מחיר | תאריך", "יחידה א | 1,500 | 01.02.2020"]))
+    item = _item(label="יחידה א", quote="יחידה א | 1,500 | 01.02.2020", value="1,500")
+    table = "### נכון ליום 01.02.2020\n\n| פריט | מחיר |\n|---|---|\n| יחידה א | 1,500 [S1] |"
+    got = _states(ws, table, item)["יחידה א"]
+    assert got["state"] == "covered"
+    other_date = _states(ws, table.replace("01.02.2020", "01.03.2021"), item)["יחידה א"]
+    assert other_date["state"] == "omitted" and other_date["why"] == "date_not_stated"
+
+
+def test_a_shared_lead_in_gives_the_date_of_every_item_of_its_list():
+    ws = _ws("\n".join(["נתוני השכרה", "יחידה | דמי שכירות | מועד", "יחידה ב | 2,300 | 01.05.2021"]))
+    item = _item(label="יחידה ב", quote="יחידה ב | 2,300 | 01.05.2021", value="2,300")
+    markdown = "נכון ליום 01.05.2021:\n- דמי השכירות ליחידה ב הם 2,300 ₪ [S1]."
+    assert _states(ws, markdown, item)["יחידה ב"]["state"] == "covered"
+
+
+def test_a_calculation_result_that_shows_the_figure_of_an_item_gives_it_by_the_values_it_rests_on():
+    from types import SimpleNamespace
+
+    ws = _ws(RIGHTS)
+    _value(ws, "V1", "1,200")
+    ws.computations["C1"] = SimpleNamespace(leaves=["V1"])
+    got = _states(ws, "- השטח הכולל, כפי שחושב, הוא 1,200 מ״ר [C1].", _item(**MAIN))["שטח עיקרי"]
+    assert got["state"] == "covered"
+
+
+def test_a_declared_not_applicable_item_the_answer_states_is_covered_and_keeps_its_declaration_in_the_record():
+    ws = _ws(RIGHTS)
+    declared = _item(**ROOF, state="not_applicable", reason="הגג אינו חלק מהשטח שנשאל עליו")
+    stated = _states(ws, "- שטח הגג הוא 95 מ״ר [S1].", declared)["שטח גג"]
+    assert stated["state"] == "covered" and stated["declared"] == "not_applicable" and stated["outcome"] == "covered"
+    unstated = _states(ws, "- השטח העיקרי הוא 1,200 מ״ר [S1].", declared)["שטח גג"]  # the protection: not stated, the declaration stands
+    assert unstated["state"] == "not_applicable" and unstated["reason"] == "הגג אינו חלק מהשטח שנשאל עליו"
+    declared_partial = _item(**BASEMENT, state="not_verifiable", reason="הקריאה לא ודאית")
+    assert _states(ws, "- שטח המרתף הוא 340 מ״ר [S1].", declared_partial)["שטח מרתף"]["state"] == "not_verifiable"
+
+
+def test_the_first_value_of_a_sentence_is_never_an_identifier_a_footnote_mark_or_an_ordinal():
+    assert items._first_value("(1) ההכנסה השנתית 9,190 ₪") == "9,190"
+    assert items._first_value("2. ההכנסה השנתית 9,190 ₪") == "9,190"
+    assert items._first_value("לפי תכנית בי/1/483 ההכנסה 9,190 ₪") == "9,190"
+    assert items._first_value("בתא שטח 101 ההכנסה 9,190 ₪") == "9,190"
+    assert items._first_value("ההיתר 2021/4455 קבע 20%") == "20%"
+    assert items._first_value("השיעור 20% לפי תכנית 9190") == "20%"
+    assert items._first_value("תכנית 45%") == "45%"  # a quantity after the word is a quantity
+    assert items._first_value("סעיף 7 ללא מספרים נוספים") == ""
+
+
+def test_the_value_cell_of_a_table_row_is_not_the_cell_under_an_identifier_header_nor_an_identifier():
+    header = ["מס' חלקה", "מחיר", "גוש"]
+    assert items._row_value(["חלקה א", "38081", "1,250,000"], ["חלקה", "גוש", "מחיר"]) == "1,250,000"
+    assert items._row_value(["חלקה א", "ג/4521", "1,250,000"], []) == "1,250,000"
+    assert items._row_value(["חלקה א", "38081"], ["חלקה", "גוש"]) == "38081"  # no other cell: the first with a digit
+    assert header  # (the header words are the ones the pattern reads)
+
+
+def test_a_candidate_row_is_valued_by_its_amount_and_not_by_a_serial_number_or_an_id_column():
+    table = "\n".join(["עסקאות שנבדקו", "מס' | מספר גוש | מחיר", "29 | 38081 | 1,450,000", "30 | 38082 | 1,520,000"])
+    ws = _ws(table)
+    offer = items.candidates(_units("העסקה הראשונה בסכום 1,450,000 ₪ [S1]."), ws, items.Ledger(),
+                             [{"id": "N1", "text": "עסקאות שנבדקו"}], "")
+    assert [c.value for c in offer.candidates] == ["1,520,000"]
+
+
+def test_a_content_word_check_ignores_an_identifier_written_with_a_slash():
+    assert items._word_groups("תכנית בי/1/483") == items._word_groups("תכנית")
+    assert items._enough("תכנית בי/1/483 למגרש", items._words("התכנית חלה על המגרש"))
+
+
+def test_a_value_the_quote_does_not_write_is_no_headline_and_the_item_is_asked_by_its_words():
+    assert items.headline("7.5% לפי עמדת המבקשת", "דחיית הבקשה בהתאם לתקנות") == ()
+    ws = _ws("דחיית הבקשה בהתאם לתקנות")
+    item = _item(label="דחיית הבקשה", quote="דחיית הבקשה בהתאם לתקנות", value="7.5% לפי עמדת המבקשת")
+    got = _states(ws, "הבקשה נדחתה, ובהתאם לתקנות נקבע שהדחייה סופית [S1].", item, units=_units("דחיית הבקשה בהתאם לתקנות [S1]."))
+    assert next(iter(got.values()))["state"] == "covered"
+
+
+def test_a_sentence_made_of_server_spans_covers_nothing_and_a_server_span_inside_a_model_sentence_is_not_its_text():
+    ws = _ws(RIGHTS)
+    markdown = "השטח העיקרי נקרא.\n\nשטח המרתף הוא 340 מ״ר ובו 2 קומות [S1] (אומת חלקית)."
+    units = _units(markdown)
+    units[1].server = [units[1].text]  # the whole sentence is a server line (a gap line, an item line, a note)
+    got = _states(ws, markdown, _item(**BASEMENT), units=units)["שטח מרתף"]
+    assert got["state"] == "omitted" and got["why"] == "not_attributed"
+    mixed = _units(markdown)
+    mixed[1].server = ["(אומת חלקית)"]
+    assert items.model_units(mixed)[1].text.endswith("[S1]") is False and "אומת" not in items.model_units(mixed)[1].text
+    assert _states(ws, markdown, _item(**BASEMENT), units=mixed)["שטח מרתף"]["state"] == "covered"
+
+
+def test_a_check_that_cannot_be_completed_is_neither_given_nor_omitted(monkeypatch):
+    ws = _ws(RIGHTS)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr(items, "_check_block", broken)
+    got = _states(ws, "השטח העיקרי הוא 1,200 מ״ר [S1].", _item(**MAIN))["שטח עיקרי"]
+    assert got["state"] == "unchecked" and got["outcome"] == "unchecked" and got["why"] == "unchecked" and got["covered_by"] is None
+
+
+def test_an_item_whose_source_the_workspace_does_not_hold_is_unchecked_and_never_omitted():
+    ws = _ws(RIGHTS)
+    item = _item(**MAIN)
+    ledger = items.Ledger()
+    ledger.merge([item])
+    del ws.sources["S1"]
+    (out,) = ledger.outcomes(_units("השטח העיקרי הוא 1,200 מ״ר [S1]."), ws)
+    assert out["state"] == "unchecked"
+
+
+def test_blocks_are_the_lines_the_list_items_the_paragraphs_and_the_table_rows_of_the_answer():
+    markdown = "\n".join(["## כותרת", "הנכס פנוי. הנכס מושכר.", "המשך הפסקה.", "", "- פריט ראשון. עוד משפט.", "- פריט שני.", "",
+                          "| ח | ט |", "|---|---|", "| 1 | 2 |", "| 3 | 4 |", "", "פסקה נוספת."])
+    shape = [[u.text for u in b.parts] for b in items.blocks_of(_units(markdown))]
+    assert shape == [["## כותרת"], ["הנכס פנוי.", "הנכס מושכר.", "המשך הפסקה."], ["- פריט ראשון.", "עוד משפט."], ["- פריט שני."], ["| ח | ט |"],
+                     ["| 1 | 2 |"], ["| 3 | 4 |"], ["פסקה נוספת."]]
+
+
+def test_the_presence_test_of_a_quote_reads_a_block_and_ignores_the_footnote_mark_of_the_quote():
+    from app.chat.verify import _in_answer
+
+    units = _units("- שיעור ההיוון למשרדים הוא 6.5% [S1]. הוא חל על כל המבנים.")
+    assert _in_answer("שיעור ההיוון למשרדים (43) 6.5%", units)  # the footnote mark is no value the block must state
+    assert not _in_answer("שיעור ההיוון למסחר 7.0%", units)
+    both = _units("- שיעור ההיוון למשרדים הוא 6.5% [S1]. ולמסחר הוא 7.0% [S1].")
+    assert _in_answer("שיעור ההיוון למשרדים 6.5% ולמסחר 7.0%", both)
+
+
+def test_a_value_that_holds_a_coefficient_the_quote_does_not_write_is_given_by_the_figure_the_sentence_states():
+    ws = _ws("\n".join(["שיעורי התאמה", "התאמה | שיעור", "התאמה לגודל | 20%"]))
+    item = _item(label="התאמה לגודל", quote="התאמה לגודל | 20%", value="20%; מקדם 0.8")
+    assert items.headline(item.value, item.quote) == (frozenset({"20", "2E+1"}),)  # 0.8 is the agent's own number
+    assert _states(ws, "ההתאמה לגודל היא 20% [S1].", item)["התאמה לגודל"]["state"] == "covered"
+
+
+def test_a_sentence_candidate_is_valued_by_its_amount_and_not_by_a_footnote_mark_or_a_plan_number():
+    assert items._named("(1) ההכנסה השנתית מהשכרה 9,190 ₪")[1] == "9,190"
+    assert items._named("תכנית 9190 קובעת שיעור 6.5%")[1] == "6.5%"
+    assert items._named("1. הנימוק הראשון ללא מספרים")[1] == "הנימוק הראשון ללא מספרים"  # an ordinal is no value: the member is its own value
