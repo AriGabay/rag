@@ -122,6 +122,8 @@ The items, listed under each component of the frozen request, that the sources a
 
 A component with an item that is neither given nor stated with a reason is not complete: it is completed from the source already read, and an item still missing is named in the answer as read and not used. The ledger never adds a requirement the user did not ask for. A component's completeness is decided on the answer version the user will see; an earlier verdict counts only while the sentences and the evidence it rested on are unchanged.
 
+An item's condition (a negation, "only", an exception, "subject to", a status, a method, or a limit in time or to a component, as its own source states it) is part of its meaning: an item given without it is not given in full, even when it is the only item of its kind. A missing condition is completed from the source or stated next to the value as written there, and is never a reason to remove the value. Besides the items the agent lists, the ledger holds items the server takes from the structure of the sources the answer cites (other rows of a cited table, other members of a list, other value-bearing sentences of a cited passage), but only those the request is shown to ask for.
+
 ### Identity card
 
 What an appraisal unit says about its own subject, read once at ingestion from the unit's opening (its first pages) and kept for every unit of a file that holds several appraisals. A card holds only fields about the subject property: its name, address and city, block and parcel, property type, and the dates the opening writes as labelled text. Each field is stored together with a verbatim quote of the unit's blocks, and a field whose quote is not in those blocks is discarded, never the whole card.
