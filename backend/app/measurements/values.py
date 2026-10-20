@@ -15,11 +15,10 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
-from app.answering.numread import read_separators
+from app.answering.numread import CURRENCY, read_separators
 
 _MINUS = "[-\u2212]"
-_CURRENCY = "₪$€£"
-_SIGN_NOISE = re.compile(rf"[{_CURRENCY}%\s]")  # what may stand beside the brackets of an accounting negative: "(3.5)%", "(₪ 1,197,500)"
+_SIGN_NOISE = re.compile(rf"[{CURRENCY}%\s]")  # what may stand beside the brackets of an accounting negative: "(3.5)%", "(₪ 1,197,500)"
 _NUM = r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?"
 _RANGE = re.compile(rf"({_NUM})\s*(?:-|–|—|עד|ל-)\s*({_NUM})")
 _ONE = re.compile(_NUM)
@@ -82,8 +81,8 @@ def parse_amount(text: str) -> Amount | None:
         return None
     t = read_separators(t, cell=True)
     negative = bool(re.fullmatch(r"\(.*\d.*\)", _SIGN_NOISE.sub("", t))) or bool(
-        re.match(rf"^\s*{_MINUS}\s*[{_CURRENCY}]?\s*\d", t) or re.match(rf"^\s*[{_CURRENCY}]\s*{_MINUS}\s*\d", t)
-        or re.search(rf"\d[\s%{_CURRENCY}]*{_MINUS}\s*$", t))
+        re.match(rf"^\s*{_MINUS}\s*[{CURRENCY}]?\s*\d", t) or re.match(rf"^\s*[{CURRENCY}]\s*{_MINUS}\s*\d", t)
+        or re.search(rf"\d[\s%{CURRENCY}]*{_MINUS}\s*$", t))
     m = _RANGE.search(t)
     if m and not re.search(r"\d{1,2}[./]\d{1,2}[./]\d{2,4}", t):
         low, high = _dec(m.group(1)), _dec(m.group(2))

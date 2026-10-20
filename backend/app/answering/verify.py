@@ -15,9 +15,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from app.answering.numread import (
-    NUMBER as _NUMBER,  # one reading of numbers for every check that imports it from here
-)
+from app.answering.numread import NUMBER as _NUMBER
 from app.answering.numread import add_form as _add
 from app.answering.numread import decimal_convention, number_forms
 from app.providers.llm import (
@@ -94,6 +92,12 @@ def numbers_in(text: str, *, words: bool = False, source: bool = False, decimal:
                 if form in _NUMBER_WORDS:
                     out.add(str(_NUMBER_WORDS[form]))
     return out
+
+
+def claim_decimal(sources: Iterable[str]) -> bool:
+    """Whether a claim reads a "d,d" pair as a decimal (``numbers_in(..., decimal=True)``): when any of the texts it cites writes its
+    decimals with a comma (``decimal_convention``)."""
+    return any(decimal_convention(src) for src in sources)
 
 
 def not_an_amount(text: str, start: int, end: int, *, years: bool = True) -> bool:
@@ -207,7 +211,7 @@ def check_claim(text: str, evidence_ids: list[str], declared_numbers: list[str],
     for i in ids & evidence.keys():
         allowed |= numbers_in(evidence[i], words=True)
     # a claim reads a "d,d" pair as a decimal only when its cited source writes decimals with a comma (round 19 U1, KTD3)
-    decimal = any(decimal_convention(evidence[i]) for i in ids & evidence.keys())
+    decimal = claim_decimal(evidence[i] for i in ids & evidence.keys())
     declared = set()
     for n in declared_numbers:
         declared |= numbers_in(n, decimal=decimal)

@@ -1143,7 +1143,9 @@ def resolved_sides(cx, text: str | None, explicit: bool = False) -> tuple[set[in
         return set(), True
     sides = subject_sides(text, explicit)
     found = [set(cx.resolve(x)) for x in sides]
-    whole = set(cx.resolve(text))
+    # a subject of one side that is the text itself is resolved once (``subject_sides`` strips a lone side, so a text with blanks around it
+    # is resolved as written)
+    whole = found[0] if len(sides) == 1 and sides[0] == text else set(cx.resolve(text))
     union = whole.union(*found)
     return union, len(sides) <= 1 or all(found) or len(whole) >= len(sides)
 

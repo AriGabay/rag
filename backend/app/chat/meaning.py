@@ -383,6 +383,16 @@ def _spans(text: str) -> tuple[tuple[int, int, frozenset[str]], ...]:
     return tuple(number_spans(text, source=True))
 
 
+@lru_cache(maxsize=512)
+def _span_ends(text: str) -> dict[int, int]:
+    """Where each number of ``text`` ends, by the position it starts at (the first one, were two to start at one position): the lookup of
+    ``written_at``, kept next to the spans it is built from. Private: a caller never changes it."""
+    ends: dict[int, int] = {}
+    for start, end, _ in _spans(text):
+        ends.setdefault(start, end)
+    return ends
+
+
 def _numbers(text: str) -> list[tuple[int, int, frozenset[str]]]:
     """Every number of the text as (start, end, forms): the forms keep the sign, and an ambiguous pair ("3,4") is one number with
     both readings (``numread.number_spans``; the text is evidence or answer, and both read alike here)."""
@@ -393,9 +403,9 @@ def written_at(text: str, pos: int) -> str:
     """The number written at ``pos`` as the text shows it (its own digits, separators and all, so a decimal comma stays a comma),
     without the comma that ends a list item ("בשנים 2021, 2022"), so a year is tested as a year and an identifier as an identifier.
     An ambiguous pair ("3,4") is written whole."""
-    for start, end, _ in _spans(text):
-        if start == pos:
-            return text[start:end].rstrip(", ")
+    end = _span_ends(text).get(pos)
+    if end is not None:
+        return text[pos:end].rstrip(", ")
     return _NUM_AT.match(text, pos).group(0).rstrip(",")
 
 
@@ -900,8 +910,10 @@ def number_qualifiers(text: str, forms: frozenset[str], within: str) -> Qualifie
     w = _one_point(_flat(_read(within)))
     q = Qualifiers().merge(general)
     for f, o in parsed:
+        if not f & forms:
+            continue  # the number is not the one asked: its line is not read
         line = _one_point(_flat(o.context))
-        if f & forms and line and (w in line or line in w):
+        if line and (w in line or line in w):
             q.merge(o.qualifiers)
     return q
 

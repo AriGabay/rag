@@ -306,20 +306,30 @@ class Contexts:
         turn. A noise heading (digits, or a sentence ending with a colon) is no name (``noise_heading``). A context that states an
         address or a parcel, is named, opens with a subject line or a letter opening, or whose cut signals are not known, is its own
         property here: that proves nothing about whom it belongs to (``compare`` says it)."""
+        return self._owners.get(number, number)  # a number no segment has is its own owner
+
+    @cached_property
+    def _owners(self) -> dict[int, int]:
+        """``owner`` of every context of the file, once (the contexts are never changed after they are built, and ``compare`` asks it for
+        the same few numbers again and again)."""
         from app.chat.units import OPENING_SIGNALS
 
         order = [s.number for i, s in enumerate(self.segments) if i == 0 or s.number != self.segments[i - 1].number]
-        seen: set[int] = set()
-        while number in order and number not in seen:
-            seen.add(number)
-            at = order.index(number)
-            seg = self.segment(number)
-            ident = seg.identity
-            if (at == 0 or seg.kind in NON_SUBJECT_KINDS or seg.signals is None or set(seg.signals) & OPENING_SIGNALS
-                    or ident.addresses or ident.parcels or ident.names or not self.is_subject(order[at - 1])):
-                return number
-            number = order[at - 1]
-        return number
+        out: dict[int, int] = {}
+        for start in self.numbers:
+            number = start
+            seen: set[int] = set()
+            while number in order and number not in seen:
+                seen.add(number)
+                at = order.index(number)
+                seg = self.segment(number)
+                ident = seg.identity
+                if (at == 0 or seg.kind in NON_SUBJECT_KINDS or seg.signals is None or set(seg.signals) & OPENING_SIGNALS
+                        or ident.addresses or ident.parcels or ident.names or not self.is_subject(order[at - 1])):
+                    break
+                number = order[at - 1]
+            out[start] = number
+        return out
 
     def compare(self, number: int, asked: Iterable[int], spans: Sequence[str] = (), linked: bool = False,
                 complete: bool = True) -> str:
@@ -739,9 +749,9 @@ _FIRST_BLOCKS_SQL = (
     "SELECT b.block_index, b.page, b.bbox, p.mediabox, p.cropbox, p.rotation, p.display_width, p.display_height,"
     " p.geometry_issue FROM document_blocks b LEFT JOIN pages p ON p.version_id = b.version_id AND p.page_no = b.page"
     " WHERE b.version_id = :v AND b.block_index = ANY(:b)")
-_HEADINGS_SQL = "SELECT block_index FROM document_blocks WHERE kind = 'heading' AND version_id = :v ORDER BY block_index"
-_LEAD_TEXT_SQL = ("SELECT block_index, text FROM document_blocks WHERE kind = 'heading' AND version_id = :v"
-                  " AND block_index = ANY(:b)")
+# the file's heading blocks with their text, in order: the indexes give each unit its lead heading, and the text of the lead headings of
+# the appendix and comparables units is the identity such a part states (``lead_heading_blocks``), in one round trip
+_HEADINGS_SQL = "SELECT block_index, text FROM document_blocks WHERE kind = 'heading' AND version_id = :v ORDER BY block_index"
 
 
 def _card_identity(fields: Sequence[dict]) -> Identity:
@@ -792,6 +802,13 @@ def _cut_signals(u, n: int) -> tuple[str, ...] | None:
     return tuple(found) if isinstance(found, list) else None
 
 
+def _lead_of(u, headings: Sequence[int]) -> int | None:
+    """The lead heading block of unit ``u``: the first heading block of the file (``headings``, in order) that lies inside it; None when
+    it has none."""
+    at = bisect_left(headings, u.block_first)
+    return headings[at] if at < len(headings) and headings[at] <= u.block_last else None
+
+
 def from_units(units: Sequence, first_blocks: dict, headings: Sequence[int], version_id: str,
                reading_id: str | None = None, tag: str | None = None,
                cards: dict[tuple[int, int], Sequence[dict]] | None = None,
@@ -804,8 +821,7 @@ def from_units(units: Sequence, first_blocks: dict, headings: Sequence[int], ver
     a part states in its heading (round 19 U2)."""
     segments = []
     for n, u in enumerate(units):
-        at = bisect_left(headings, u.block_first)
-        lead = headings[at] if at < len(headings) and headings[at] <= u.block_last else None
+        lead = _lead_of(u, headings)
         heading = (lead_texts or {}).get(lead) if lead is not None and u.kind in NON_SUBJECT_KINDS else None
         b = first_blocks.get(u.block_first)
         start = (b.page or 0, top_of(b)) if n > 0 and b is not None else None
@@ -821,9 +837,9 @@ def lead_heading_blocks(units: Sequence, headings: Sequence[int]) -> list[int]:
     ``from_units`` reads for the identity such a part states."""
     out = []
     for u in units:
-        at = bisect_left(headings, u.block_first)
-        if u.kind in NON_SUBJECT_KINDS and at < len(headings) and headings[at] <= u.block_last:
-            out.append(headings[at])
+        lead = _lead_of(u, headings)
+        if u.kind in NON_SUBJECT_KINDS and lead is not None:
+            out.append(lead)
     return out
 
 
@@ -846,9 +862,10 @@ def _of_units(conn: Connection, version_id: str, reading_id: str | None, has_car
             tag = reading.tag if reading is not None else unit_store.current_tag()
             first = {r.block_index: r for r in conn.execute(
                 text(_FIRST_BLOCKS_SQL), {"v": v, "b": [u.block_first for u in found[1:]]})}
-            headings = [r.block_index for r in conn.execute(text(_HEADINGS_SQL), {"v": v})]
-            leads = lead_heading_blocks(found, headings)
-            lead_texts = {r.block_index: r.text for r in conn.execute(text(_LEAD_TEXT_SQL), {"v": v, "b": leads})} if leads else {}
+            heading_rows = conn.execute(text(_HEADINGS_SQL), {"v": v}).all()
+            headings = [r.block_index for r in heading_rows]
+            leads = set(lead_heading_blocks(found, headings))
+            lead_texts = {r.block_index: r.text for r in heading_rows if r.block_index in leads}
     except Exception:  # noqa: BLE001 - the contexts of the blocks serve instead
         logger.exception("contexts of version %s could not be built from its units", version_id)
         return None

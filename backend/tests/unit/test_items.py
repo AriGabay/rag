@@ -792,6 +792,17 @@ def test_ae10_an_item_valued_in_full_digits_is_covered_by_a_sentence_that_writes
     assert _covered(ws, "דמי הניהול הם 45 אלף ₪ [S2].", digits).ok
 
 
+def test_a_decimal_comma_number_with_a_scale_word_is_scaled_from_the_value_the_reader_read_not_from_its_digits():
+    # "13,2 מיליון" is 13.2 million: the forms are scaled from the decimal the number reader produced ("13.2"), never from the raw
+    # slice "13,2" with its comma dropped ("132" x a million)
+    have = items._have("שווי הנכס 13,2 מיליון ₪")
+    assert "13200000" in have and "13.2" in have
+    assert "132000000" not in have
+    assert "13200000" in items._have("הערך 13.2 מיליון ₪") and "132000000" not in items._have("הערך 13.2 מיליון ₪")
+    ((_, _, forms),) = items._numbers_with_scale("שווי 13,2 מיליון ₪")
+    assert {"13.2", "13200000"} <= forms and "132000000" not in forms
+
+
 def test_a_different_amount_is_not_covered_by_a_scale_word_that_does_not_equal_it():
     ws = _ws("שווי הנכס | 16,070,000 ₪")
     item = _item(label="שווי הנכס", quote="שווי הנכס | 16,070,000 ₪", value="16,070,000 ₪")

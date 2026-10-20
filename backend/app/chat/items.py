@@ -79,18 +79,17 @@ that stand, computed at every compose pass, and the body's caps, the gap paragra
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import logging
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from typing import NamedTuple
 
-from app.answering.numread import number_spans
-from app.answering.verify import not_an_amount, numbers_in
+from app.answering.numread import number_forms, number_spans
+from app.answering.verify import _QUANTITY_AFTER, not_an_amount, numbers_in
 from app.chat import conditions
 from app.chat.evidence import claim_terms
 from app.chat.meaning import _row_cells
@@ -108,6 +107,7 @@ from app.chat.verify import (
     SupportScope,
     Unit,
     _cited_sources,
+    _flat_span,
     _is_tabular,
     _without_server,
     asked_components,
@@ -124,6 +124,7 @@ logger = logging.getLogger(__name__)
 STATES = (ITEM_INCLUDED, ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)  # what the agent declares
 OMITTED = ITEM_OMITTED  # what the server assigns: a member the judge's support adds, and an included item no surviving unit covers
 COVERED = ITEM_COVERED
+OUTCOME_PARTIAL = "partial"  # the block gives some of the item's headline values and leaves others out (``Ledger.outcomes``)
 NEEDS_REASON = (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)
 # the order of the coverage checks: a failure is reported by the furthest check a unit reached
 _WHY_ORDER = ("not_attributed", "value_not_stated", "date_not_stated", "condition_not_stated")
@@ -317,7 +318,7 @@ class Span(NamedTuple):
 
 def _row_of(body: Sequence[str], flat: str) -> str | None:
     """The line of a source's body (a table row, a paragraph) that holds the quote ``flat``."""
-    return next((ln for ln in body if flat in _flat_text(ln)), None)
+    return next((ln for ln in body if flat in _flat_span(ln)), None)
 
 
 def source_name(src, quote: str) -> str:
@@ -340,7 +341,7 @@ def missing_detail(src, quote: str, group: frozenset[str]) -> str:
     the header of its column, for a passage the figure with the words next to it. Every word is the source's own."""
     cells = _row_cells(quote) if "|" in quote else []
     if len(cells) >= 2:
-        at = next((i for i, c in enumerate(cells) if group & number_forms_of(c)), None)
+        at = next((i for i, c in enumerate(cells) if group & number_forms(c, source=True)), None)
         if at is not None:
             head = _header_cells(context_of_source(src)[1]) if src is not None else []
             named = f"{head[at]}: {cells[at]}" if len(head) == len(cells) and head[at] else cells[at]
@@ -351,11 +352,6 @@ def missing_detail(src, quote: str, group: frozenset[str]) -> str:
             near = " ".join([*left, quote[start:end].strip(), *right])
             return " ".join(re.sub(r"[\[\]]", " ", near).split())[:MISSING_DETAIL_CHARS]
     return " ".join(quote.split())[:MISSING_DETAIL_CHARS]
-
-
-def number_forms_of(text: str) -> frozenset[str]:
-    """Every form of every number ``text`` writes, read as a source writes it (both readings of an ambiguous pair)."""
-    return frozenset().union(*(f for _, _, f in number_spans(text, source=True)))
 
 
 def _header_cells(body: Sequence[str]) -> list[str]:
@@ -387,7 +383,7 @@ def _row_conditions(row: str, body: Sequence[str], flat: str) -> Iterable[tuple[
             else:
                 yield from (("row", c) for c in conditions.material_clauses(cell))
         return
-    sentence = next((x for x in _SENTENCE_END.split(row) if flat in _flat_text(x)), "")
+    sentence = next((x for x in _SENTENCE_END.split(row) if flat in _flat_span(x)), "")
     yield from (("row", c) for c in conditions.material_clauses(sentence))
 
 
@@ -402,7 +398,7 @@ def condition_spans(src, quote: str) -> list[Span]:
     seen: set[str] = set()
 
     def add(place: str, text: str) -> None:
-        key = _flat_text(text)
+        key = _flat_span(text)
         if key and key not in seen:
             seen.add(key)
             out.append(Span(place, " ".join(text.split())))
@@ -527,7 +523,7 @@ def _holds(item: Item, sid: str, ws, flat: str, component: str | None = None) ->
     with ``component``, only an item of that component holds it: one span serves several components, one fill each."""
     if component is not None and item.component != component:
         return False
-    mine = _flat_text(item.quote)
+    mine = _flat_span(item.quote)
     if not (mine in flat or flat in mine):
         return False
     place = _place(ws, sid)
@@ -776,7 +772,7 @@ def candidates(units: Sequence[Unit], ws, ledger: Ledger, components: Sequence[M
                 free.append(n)
         mine = [SupportScope.flat(h.quote) for h in held if _same_source(ws, h.source, sid)]
         for name, lines in groups.items():
-            if any(q in _flat_text(line) for q in mine for line in lines):
+            if any(q in _flat_span(line) for q in mine for line in lines):
                 touched.add(name)
         found = [n for n in free if (raws[n].group == "table" or raws[n].group in touched)
                  and not scope.source_problem(sid, flats[n]) and scope.verbatim(sid, src, flats[n])
@@ -806,11 +802,6 @@ def candidate_item(c: Candidate, component: str, ledger: Ledger) -> Item:
 
 
 # --- coverage by attribution (R5) --------------------------------------------------------------------------------------------
-
-@functools.lru_cache(maxsize=512)
-def _flat_text(text: str) -> str:
-    return SupportScope.flat(text)
-
 
 def _site_of(src) -> tuple[str, str | None]:
     """(document, appraisal unit id) of a source as the item records them; the unit is None in a file without unit marks."""
@@ -850,7 +841,7 @@ def _attributed(item: Item, unit: Unit, ws) -> bool:
             place = _place(ws, cid)
             if place is None or not _same_place(home, place):
                 continue
-            if _same_source(ws, cid, item.source) or flat in _flat_text(src.text or ""):
+            if _same_source(ws, cid, item.source) or flat in _flat_span(src.text or ""):
                 return True
         elif cid in ws.values:
             v = ws.values[cid]
@@ -930,19 +921,26 @@ def _tells_apart(item: Item, have: frozenset[str], rivals: frozenset[str]) -> bo
     return True
 
 
-def _numbers(text: str, *, source: bool = False) -> list[tuple[int, int, frozenset[str]]]:
+def _numbers_with_scale(text: str, *, source: bool = False) -> list[tuple[int, int, frozenset[str]]]:
     """Every number of ``text`` as (start, end, forms), the way a document writes it (``numread``: a comma by its context, a sign), and,
-    written with a scale word, with the forms of its full value too ("16.07 מיליון" and "16,070,000" are one number: round 18 U7)."""
+    written with a scale word, with the forms of its full value too ("16.07 מיליון" and "16,070,000" are one number: round 18 U7). The
+    full value is scaled from the forms the reader already produced, never from the written slice: "13,2 מיליון" is 13.2 x a million,
+    not the digits "132" x a million. A signed form keeps its unsigned scaled value only (the number's forms already hold its sign)."""
     from app.chat.calc import scale_after
 
     out = []
     for start, end, forms in number_spans(text, source=source):
         scale = scale_after(text, start, end)[0]
         if scale != 1:
-            try:
-                forms = forms | numbers_in(format(Decimal(text[start:end].strip().replace(",", "")) * scale, "f"))
-            except InvalidOperation:
-                pass
+            scaled: set[str] = set()
+            for form in forms:
+                if form.startswith("-"):
+                    continue
+                try:
+                    scaled |= numbers_in(format(Decimal(form) * scale, "f"))
+                except InvalidOperation:
+                    pass
+            forms = forms | scaled
         out.append((start, end, forms))
     return out
 
@@ -951,7 +949,7 @@ def _numbers(text: str, *, source: bool = False) -> list[tuple[int, int, frozens
 def _number_forms(text: str) -> tuple[frozenset[str], ...]:
     """The forms of each number ``text`` writes, outside its dates. A function of the text alone, kept per text: the ledger reads the
     same sentence against every item."""
-    return tuple(forms for _, _, forms in _numbers(_outside_dates(text)))
+    return tuple(forms for _, _, forms in _numbers_with_scale(_outside_dates(text)))
 
 
 @functools.lru_cache(maxsize=2048)
@@ -970,7 +968,6 @@ _CODE_AFTER = re.compile(r"\s?[/\\]\s?\d")
 _MARK_AFTER = re.compile(r"\s*[)\]]")
 _MARK_BEFORE = re.compile(r"[(\[]\s*$")
 _ORDINAL_AT_START = re.compile(r"\s*(?:[-*+•]\s+)?\d{1,3}[.)]\s")
-_QUANTITY_FOLLOWS = re.compile(r"\s*(?:₪|ש[\"״]ח|מ[\"״]ר|דונם|%|אלף|מיליון|מטר)")
 
 
 def _not_headline(text: str, start: int, end: int) -> bool:
@@ -982,7 +979,7 @@ def _not_headline(text: str, start: int, end: int) -> bool:
     before = text[max(0, start - 28):start]
     if _CODE_BEFORE.search(before) or _CODE_AFTER.match(text, end):
         return True
-    if _PLAN_BEFORE.search(before) and not (_QUANTITY_FOLLOWS.match(text, end) or text[start:end].endswith("%")):
+    if _PLAN_BEFORE.search(before) and not (_QUANTITY_AFTER.match(text, end) or text[start:end].endswith("%")):
         return True
     if (end - start <= 2 and _MARK_BEFORE.search(before) and _MARK_AFTER.match(text, end)
             and text[start:end].isdigit()):
@@ -998,10 +995,10 @@ def headline(value: str, quote: str) -> tuple[frozenset[str], ...]:
     context and by the quote's. One set of forms per number, once each; empty for an item whose value states no such figure (it is then
     asked by its words)."""
     blank, source = _outside_dates(value), _outside_dates(quote)
-    written = _numbers(source, source=True)
+    written = _numbers_with_scale(source, source=True)
     quoted = frozenset().union(*(f for _, _, f in written)) if written else frozenset()
     out: list[frozenset[str]] = []
-    for start, end, forms in _numbers(blank):
+    for start, end, forms in _numbers_with_scale(blank):
         if _not_headline(blank, start, end) or not forms & quoted or forms in out:
             continue
         hits = [(a, b) for a, b, f in written if f & forms]
@@ -1031,7 +1028,7 @@ def model_units(units: Iterable[Unit]) -> list[Unit]:
             continue
         text = _without_server(u.text, u.server)
         if re.search(r"\w", text):
-            out.append(dataclasses.replace(u, text=text, server=[]))
+            out.append(replace(u, text=text, server=[]))
     return out
 
 
@@ -1045,7 +1042,7 @@ def blocks_of(units: Sequence[Unit]) -> list[Block]:
         if not run:
             return
         first = run[0]
-        joined = first if len(run) == 1 else dataclasses.replace(
+        joined = first if len(run) == 1 else replace(
             first, raw=" ".join(u.raw for u in run), text=" ".join(u.text for u in run),
             ids=list(dict.fromkeys(i for u in run for i in u.ids)), end=run[-1].end, leads_list=run[-1].leads_list)
         out.append(Block(joined, tuple(run)))
@@ -1059,17 +1056,21 @@ def blocks_of(units: Sequence[Unit]) -> list[Block]:
     return out
 
 
-def quote_in_blocks(quote: str, units: Sequence[Unit], component: str = "") -> bool:
+def quote_in_blocks(quote: str, units: Sequence[Unit], component: str = "", *, blocks: Sequence[Block] | None = None) -> bool:
     """Whether a quoted part of a source is in the answer (round 16 KTD2, by block since round 19 U4): one block holds all the quote's headline
     values (``headline`` of the quote itself: no identifier, footnote mark or ordinal) with at least half of its content words, the words
     that name the item (its label) — not those of the component's own text, which every item of a list shares — and its value. Another
-    item with the same value is no presence. A quote with neither numbers nor words counts as present, so it supports nothing."""
+    item with the same value is no presence. A quote with neither numbers nor words counts as present, so it supports nothing. ``blocks``:
+    the blocks of ``units`` when the caller has them already (``blocks_of(model_units(units))``), for a caller that tests many quotes
+    against the same answer."""
+    if blocks is None:
+        blocks = blocks_of(model_units(units))
     words = _words(quote)
     words = words - _words(component) or words
     need = (len(words) + 1) // 2
     groups = headline(quote, quote)
     return any(all(g & _have(b.unit.text) for g in groups) and len(words & _words(b.unit.text)) >= need
-               for b in blocks_of(model_units(units)))
+               for b in blocks)
 
 
 class _Check(NamedTuple):
@@ -1360,7 +1361,9 @@ class Ledger:
         blocks = blocks_of(units)
         by_index = {u.index: u for u in units}
         leads = _leads(units)
-        spans = {i.evidence: _spans_of(ws, i) for i in self.items.values()}
+        # per evidence, once: of the LAST fill that rests on it (the fills of one evidence may name it by another S# or write its quote
+        # with other blanks, and the later fill's reading is the one that stood)
+        spans = {ev: _spans_of(ws, i) for ev, i in {i.evidence: i for i in self.items.values()}.items()}
         rows: list[tuple[Item, Coverage | None]] = []
         gave: dict[Evidence, frozenset[int]] = {}  # the sentences that give each covered evidence (the first is the covering sentence)
         wide: dict[Evidence, tuple[Unit, ...]] = {}  # the multi-sentence blocks that give it, each as one unit
@@ -1382,14 +1385,13 @@ class Ledger:
             if is_server_item(item) and (got is None or not got.ok):
                 continue  # (a candidate the call assigned to a component is an open item whatever sentence cited what: round 18 U6)
             rows.append((item, got))
-        owns = {i.evidence: _own_text(ws, i) for i, _ in rows}  # each evidence's own context text
+        owns = {ev: _own_text(ws, i) for ev, i in {i.evidence: i for i, _ in rows}.items()}  # each evidence's own context text (last fill's)
         others = [i for i, _ in rows]
         checked: set[Evidence] = set()
         covered = [i.evidence for i, g in rows if g is not None and g.ok]
         for item, got in rows:
             # the fill's outcome of the one coverage function: covered, partial (with what the block leaves out), omitted, or unchecked
-            outcome = (None if got is None else "covered" if got.ok else "unchecked" if not got.checked
-                       else "partial" if got.missing else "omitted")
+            outcome = _outcome(got)
             if got is None:
                 state = item.state
             elif got.ok:
@@ -1411,6 +1413,18 @@ class Ledger:
                         "why": got.why if got else "", "outcome": outcome, "missing": missing,
                         "history": [dict(h) for h in item.history], **check})
         return out
+
+
+def _outcome(got: Coverage | None) -> str | None:
+    """The outcome of one fill (``Ledger.outcomes``): None for a fill that was not checked at all, ``covered``, ``unchecked`` (the check could
+    not be completed), ``partial`` (the block states some headline values and misses others) or ``omitted``."""
+    if got is None:
+        return None
+    if got.ok:
+        return COVERED
+    if not got.checked:
+        return ITEM_UNCHECKED
+    return OUTCOME_PARTIAL if got.missing else OMITTED
 
 
 # --- the condition outcome of a covered item (round 18 U5) ---------------------------------------------------------------------

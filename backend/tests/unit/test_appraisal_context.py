@@ -1122,7 +1122,7 @@ def test_ae4_each_cell_of_a_comparison_is_checked_against_the_side_its_column_na
 
     cx = _ownership_file()
     own = _row("7,100,000 ₪ [V1]", "8,200,000 ₪ [V2]")
-    assert verify._row_cells(own)[0][0] == "מתחם גבעת האלה"
+    assert verify._cited_cells(own)[0][0] == "מתחם גבעת האלה"
     assert verify._context_check(own, _cells_ws(cx, {"V1": (1, "7,100,000"), "V2": (3, "8,200,000")}), "השווה") == verify.ContextCheck()
     # the cell under side A's column cites side B, though the row as a whole cites both sides' contexts
     swapped = _row("8,200,000 ₪ [V2]", "7,100,000 ₪ [V1]")

@@ -204,8 +204,8 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
+from app.answering.numread import NUMBER as _NUM_AT  # one reading of numbers for both checks
 from app.answering.verify import _DATE as _DATE_AT
-from app.answering.verify import _NUMBER as _NUM_AT  # one reading of numbers for both checks
 from app.answering.verify import not_an_amount, numbers_in
 from app.chat import dates as chat_dates
 from app.chat import meaning
@@ -1385,7 +1385,7 @@ def unit_key(unit: Unit, ws: Workspace, request: str, heading: str, digests: dic
                 f"{sid}\x1e" + "\x1f".join(_source_parts(ws, sid) or ()) for sid in ws.sources).encode()).hexdigest()
         evidence.append(("*", digests["*"]))
     key = [_norm(unit.text), evidence, unit.context, heading, unit.table_header, request, JUDGE_VERSION]
-    if fact := (getattr(ws, "ownership_facts", None) or {}).get(_fact_key(unit)):  # the judge reads it beside the unit (rule 34)
+    if fact := ws.ownership_facts.get(_fact_key(unit)):  # the judge reads it beside the unit (rule 34)
         key.append(fact)
     raw = json.dumps(key, ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -2165,12 +2165,16 @@ class VerifyReport:
         # open item and no line (round 18 U5); a candidate a component asks for is open until a unit gives it (round 18 U6)
         states = [st for st in ledger.outcomes(units, self.item_ws) if not is_server_item(st) or st["state"] == ITEM_COVERED]
         texts = texts if texts is not None else {r["id"]: r["text"] for r in self.requirements}
+        blocks = None  # built on the first judge-added item that needs the presence test, then shared by the others
         for st in states:
             # the judge names a part by its quote alone: unit attribution is not enough for it, the round-16 presence test must
             # hold too (the quote's numbers with half of the words that name the item, not the component's own words), or a
             # sentence of the same table that shares the rate's words would close an omitted rate
-            if st["origin"] == ORIGIN_JUDGE_SUPPORT and st["state"] == ITEM_COVERED \
-                    and not _in_answer(st["quote"], units, texts.get(st["component"], "")):
+            if st["origin"] != ORIGIN_JUDGE_SUPPORT or st["state"] != ITEM_COVERED:
+                continue
+            if blocks is None:
+                blocks = _answer_blocks(units)
+            if not _in_answer(st["quote"], units, texts.get(st["component"], ""), blocks=blocks):
                 st |= {"state": ITEM_OMITTED, "covered_by": None, "why": "value_not_stated", "outcome": "omitted", "missing": []}
         return states
 
@@ -4181,9 +4185,9 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
             problems.append(Problem(u, owner.reason, failure_kind="wrong_subject", check="context"))
             continue
         if owner.facts:  # an owner the server could not settle is not removed: the judge reads the facts (rule 34)
-            _facts_of(ws)[_fact_key(u)] = " ".join(owner.facts)
+            ws.ownership_facts[_fact_key(u)] = " ".join(owner.facts)
         else:
-            _facts_of(ws).pop(_fact_key(u), None)
+            ws.ownership_facts.pop(_fact_key(u), None)
         for reason in _vat_problems(u, ws) if u.ids else []:
             problems.append(Problem(u, reason, failure_kind="wrong_unit", check="vat"))
         blocking = [m for m in meanings.get(u.index, []) if m.blocking]
@@ -5385,15 +5389,7 @@ class ContextCheck:
     facts: list[str] = field(default_factory=list)
 
 
-def _cells_of(line: str) -> list[str]:
-    """The cells of a Markdown table row."""
-    row = line.strip()
-    row = row[1:] if row.startswith("|") else row
-    row = row[:-1] if row.endswith("|") else row
-    return [c.strip() for c in row.split("|")]
-
-
-def _row_cells(u: Unit) -> list[tuple[str, Unit]]:
+def _cited_cells(u: Unit) -> list[tuple[str, Unit]]:
     """For a table row: ``(the heading of the cell's column, the cell as a unit)`` of each cell that cites evidence (round 19 U2, R7:
     a comparison's cell is checked against the side its column names). Empty for anything but a body row whose cells line up with its
     table's header row."""
@@ -5402,7 +5398,7 @@ def _row_cells(u: Unit) -> list[tuple[str, Unit]]:
     header = u.context.split("\n", 1)[0].strip()
     if not header.startswith("|"):
         return []
-    heads, cells = _cells_of(header), _cells_of(u.raw)
+    heads, cells = meaning._row_cells(header.strip()), meaning._row_cells(u.raw.strip())
     if len(heads) != len(cells):
         return []
     return [(h, Unit(u.index, c, _IDS.sub("", c).strip(), ids_in(c))) for h, c in zip(heads, cells, strict=True) if ids_in(c)]
@@ -5430,22 +5426,10 @@ def _fact_key(u: Unit) -> tuple:
     return _norm(u.text), tuple(sorted(set(u.ids)))
 
 
-def _facts_of(ws: Workspace) -> dict:
-    """The turn's ownership facts (``Workspace.ownership_facts``); a workspace without the field gets one."""
-    facts = getattr(ws, "ownership_facts", None)
-    if facts is None:
-        facts = {}
-        try:
-            ws.ownership_facts = facts
-        except AttributeError:
-            pass
-    return facts
-
-
 def _ownership_note(u: Unit, ws: Workspace) -> str:
     """The neutral fact line beside a unit whose evidence's owner the context check could not settle (rule 34): where the datum is
     written and which property was asked, never a verdict."""
-    fact = (getattr(ws, "ownership_facts", None) or {}).get(_fact_key(u))
+    fact = ws.ownership_facts.get(_fact_key(u))
     return f'<ownership unit="{u.index}">{prompt_text(fact)}</ownership>\n' if fact else ""
 
 
@@ -5463,7 +5447,7 @@ def _context_check(u: Unit, ws: Workspace, question: str) -> ContextCheck:
     the question names — each only by a DISTINGUISHING name or identifier (``Contexts.named``: a project word, a street or a name two
     units of the file share names neither) or a page range — else the one the value's own subject names, else the units the answer
     DECLARED (``declared_units``), else the unit the turn located. A subject written as several sides ("appraisals X and Y") is
-    checked side by side (``tools.resolved_sides``), and a table cell against the side its column names (``_row_cells``); a compound
+    checked side by side (``tools.resolved_sides``), and a table cell against the side its column names (``_cited_cells``); a compound
     that resolved only in part leaves the asked side unresolved. A declaration is never what the model checks itself with: when the claim,
     the components or the question name a unit distinctively, that unit is the asked set and a declaration excluding it is
     contradicted; the declaration decides only where nothing distinctive was written.
@@ -5488,7 +5472,7 @@ def _context_check(u: Unit, ws: Workspace, question: str) -> ContextCheck:
     # a supported sentence of a general answer is never removed because no appraisal was located (round 10 U9, R35)
     if getattr(ws, "intent", None) == intent_mod.PROFESSIONAL:
         return ContextCheck()
-    cells = _row_cells(u)
+    cells = _cited_cells(u)
     if not cells:
         return _check_evidence(u, u.text, ws, question)
     out = ContextCheck()
@@ -8349,15 +8333,24 @@ def _support_in_asked_units(ws: Workspace, src: Source, asked: set[str]) -> bool
     return any(cx.key(n) in asked for n in numbers) and all(cx.key(n) in asked for n in subjects)
 
 
-def _in_answer(quote: str, units: list[Unit], component: str = "") -> bool:
+def _answer_blocks(units: list[Unit]) -> list:
+    """The blocks of the answer's model-written text (``items.blocks_of(items.model_units(units))``): what ``_in_answer`` tests a quote
+    against; a caller that tests several quotes against the same units builds them once and passes them as ``blocks``."""
+    from app.chat.items import blocks_of, model_units
+
+    return blocks_of(model_units(units))
+
+
+def _in_answer(quote: str, units: list[Unit], component: str = "", *, blocks: list | None = None) -> bool:
     """Whether the quoted part is in the answer (KTD2): one block of the answer — a sentence, a list item with all its sentences, a paragraph,
     a table row — holds the quote's headline values together with at least half of its content words, the words that name the item (its
     label), not those of the component's own text, which every item of a list shares ("שיעור היוון"). It is the presence test of the ledger's
     coverage (``items.quote_in_blocks``, round 19 U4): an identifier, a footnote mark or an ordinal of the quote is no value the block must
-    state. A quote with neither numbers nor words counts as present, so it supports nothing."""
+    state. A quote with neither numbers nor words counts as present, so it supports nothing. ``blocks``: the blocks of ``units``
+    (``_answer_blocks``) when the caller has them already."""
     from app.chat.items import quote_in_blocks
 
-    return quote_in_blocks(quote, units, component)
+    return quote_in_blocks(quote, units, component, blocks=blocks)
 
 
 # the states of a ledger item (``app.chat.items``): what the agent declares, and ``omitted`` / ``covered``, which the server assigns
@@ -8453,6 +8446,7 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
         return {}
     units = [report._as_edited(u) for u in report.units if u.index not in failed]  # the text the user will see (round 19 U4)
     scope = SupportScope(ws, units)
+    blocks = _answer_blocks(units)  # once for every entry of every vote
     components = {r["id"]: r["text"] for r in report.requirements}
     out: dict[str, list[dict]] = {}
     for cid, vs in votes.items():
@@ -8470,7 +8464,7 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
                 seen.add((sid, flat))
                 src = ws.sources[sid]
                 why = scope.place_problem(src)
-                if why is None and _in_answer(quote, units, components.get(cid, "")):
+                if why is None and _in_answer(quote, units, components.get(cid, ""), blocks=blocks):
                     why = "already_in_answer"
                 elif why is None and not scope.verbatim(sid, src, flat):
                     why = "not_verbatim"
