@@ -1640,3 +1640,116 @@ def test_a_superseded_item_a_later_version_lists_again_is_scored_again():
     assert older.superseded_by == "" and older.last_version == 3 and older.id == "I1"
     # both are scored (omitted) now: version 2's item, not listed again, closes nothing
     assert [r["id"] for r in ledger.outcomes(_units("השכירות נקבעת בחוזה [S1]."), ws)] == ["I1", "I2"]
+
+
+# --- the condition of an item comes from its own scope: a note marked on another row, a footnote of another contract (round 20 U3, KTD3) ----
+
+from app.chat import scopes  # noqa: E402
+
+LOT_NOTE = "* התשלום לפי חוזה החכירה הראשון כפוף לאישור הרשות"
+LOT_HEAD = "קבוצת מגרשים | חוזה חכירה | שטח (מ״ר)"
+LOT_A, LOT_B = "קבוצה א׳ | חוזה חכירה ראשון* | 1,500", "קבוצה ב׳ | חוזה חכירה שני | 2,100"
+LOT_TABLE = "\n".join(["הטבלה: 2 שורות", LOT_HEAD, LOT_A, LOT_B, LOT_NOTE])
+LOT_ASK = [{"id": "N1", "text": "שטח קבוצת המגרשים"}]
+
+
+def test_ae7_a_note_marked_on_one_rows_cell_is_a_condition_span_of_that_row_and_of_no_other():
+    ws = _ws(LOT_TABLE)
+    assert _spans(ws, LOT_A) == [("paragraph", LOT_NOTE)]
+    assert _spans(ws, LOT_B) == []
+
+
+def test_a_mark_in_the_header_is_the_mark_of_every_row_and_a_mark_no_cell_carries_stays_the_tables():
+    header = _ws("\n".join(["הטבלה: 2 שורות", "קבוצת מגרשים | חוזה חכירה* | שטח (מ״ר)", "קבוצה א׳ | חוזה ראשון | 1,500",
+                            "קבוצה ב׳ | חוזה שני | 2,100", LOT_NOTE]))
+    assert _spans(header, "קבוצה א׳ | חוזה ראשון | 1,500") == _spans(header, "קבוצה ב׳ | חוזה שני | 2,100") == [("paragraph", LOT_NOTE)]
+    unmarked = _ws("\n".join(["הטבלה: 2 שורות", LOT_HEAD, "קבוצה א׳ | חוזה ראשון | 1,500", "קבוצה ב׳ | חוזה שני | 2,100", LOT_NOTE]))
+    assert _spans(unmarked, "קבוצה ב׳ | חוזה שני | 2,100") == [("paragraph", LOT_NOTE)]  # the mark is nowhere: the note is the table's, as before
+    plain = _ws(LOT_TABLE.replace("* התשלום", "התשלום"))
+    assert _spans(plain, LOT_B) == [("paragraph", "התשלום לפי חוזה החכירה הראשון כפוף לאישור הרשות")]  # a note with no mark limits the table
+
+
+def test_a_numbered_mark_binds_like_an_asterisk_and_two_marks_bind_to_their_own_rows():
+    ws = _ws("\n".join(["הטבלה: 2 שורות", LOT_HEAD, "קבוצה א׳ | חוזה ראשון (1) | 1,500", "קבוצה ב׳ | חוזה שני (2) | 2,100",
+                        "(1) התשלום כפוף לאישור הרשות", "(2) החכירה בלבד עד שנת 2040"]))
+    assert _spans(ws, "קבוצה א׳ | חוזה ראשון (1) | 1,500") == [("paragraph", "(1) התשלום כפוף לאישור הרשות")]
+    assert _spans(ws, "קבוצה ב׳ | חוזה שני (2) | 2,100") == [("paragraph", "(2) החכירה בלבד עד שנת 2040")]
+
+
+def test_ae7_an_agent_condition_that_is_the_note_of_another_row_is_dropped_and_recorded_not_attached():
+    ws = _ws(LOT_TABLE)
+    res = _validate(ws, "שטח קבוצה ב׳ הוא 2,100 מ״ר [S1].", _raw(label="קבוצה ב׳", quote=LOT_B, value="2,100",
+                                                                 condition="התשלום לפי חוזה החכירה הראשון כפוף לאישור הרשות"),
+                    components=LOT_ASK)
+    (kept,) = res.kept
+    assert kept.condition == "" and [m["quote"] for m in res.misattributed] == [LOT_B]
+    own = _validate(ws, "שטח קבוצה א׳ הוא 1,500 מ״ר [S1].", _raw(label="קבוצה א׳", quote=LOT_A, value="1,500",
+                                                                 condition="התשלום כפוף לאישור הרשות"), components=LOT_ASK)
+    assert own.kept[0].condition == "התשלום כפוף לאישור הרשות" and own.misattributed == []
+
+
+def test_a_cited_row_gets_a_server_item_with_the_note_marked_on_it_and_a_row_without_the_mark_gets_none():
+    ws = _ws(LOT_TABLE)
+    assert items.source_items(_units("שטח קבוצה ב׳ הוא 2,100 מ״ר [S1]."), ws, LOT_ASK, items.Ledger()) == []
+    (item,) = items.source_items(_units("שטח קבוצה א׳ הוא 1,500 מ״ר [S1]."), ws, LOT_ASK, items.Ledger())
+    assert item.quote == LOT_A and item.condition == LOT_NOTE
+
+
+FOOTNOTE_PASSAGE = ("ג. חוזה למגרשים 41-45 נחתם בשנת 1994\nד. חוזה למגרשים 1-3, 8 נחתם בשנת 1996\n"
+                    "1 הוצג חוזה אחד בלבד שמייצג את כל המגרשים פרט לתקופת החכירה")
+FOOTNOTE_LAYOUT = scopes.Layout((
+    scopes.Piece(10, "ג. חוזה למגרשים 41-45 נחתם בשנת 1994", "paragraph", 1, ("4. חוזים",), ("1",)),
+    scopes.Piece(11, "ד. חוזה למגרשים 1-3, 8 נחתם בשנת 1996", "paragraph", 1, ("4. חוזים",)),
+    scopes.Piece(12, "1 הוצג חוזה אחד בלבד שמייצג את כל המגרשים פרט לתקופת החכירה", "paragraph", 1, ("4. חוזים",), (), "1")), first=11)
+NOTE_SENTENCE = "הוצג חוזה אחד בלבד שמייצג את כל המגרשים פרט לתקופת החכירה"
+
+
+def test_a_footnote_whose_mark_is_in_another_contracts_paragraph_is_no_condition_of_this_contracts_items():
+    ws = _ws(FOOTNOTE_PASSAGE, kind="context")
+    ws.layouts["S1"] = FOOTNOTE_LAYOUT
+    src = ws.sources["S1"]
+    # the agent's condition for an item of lots 1-3, 8 is the note whose mark stands in the paragraph of parcels 41-45
+    res = _validate(ws, "חוזה למגרשים 1-3, 8 נחתם בשנת 1996 [S1].",
+                    _raw(label="חוזה למגרשים 1-3", quote="ד. חוזה למגרשים 1-3, 8 נחתם בשנת 1996", value="1996", condition=NOTE_SENTENCE),
+                    components=[{"id": "N1", "text": "חוזה למגרשים 1-3"}])
+    assert res.kept[0].condition == "" and len(res.misattributed) == 1
+    # without the preloaded blocks nothing says whose note it is, and the condition is kept as written
+    del ws.layouts["S1"]
+    again = _validate(ws, "חוזה למגרשים 1-3, 8 נחתם בשנת 1996 [S1].",
+                      _raw(label="חוזה למגרשים 1-3", quote="ד. חוזה למגרשים 1-3, 8 נחתם בשנת 1996", value="1996", condition=NOTE_SENTENCE),
+                      components=[{"id": "N1", "text": "חוזה למגרשים 1-3"}])
+    assert again.kept[0].condition == NOTE_SENTENCE and again.misattributed == [] and src is ws.sources["S1"]
+
+
+def test_a_footnote_of_another_scope_makes_no_server_item_and_an_unbound_one_keeps_its_own():
+    ws = _ws(FOOTNOTE_PASSAGE, kind="context")
+    ws.layouts["S1"] = FOOTNOTE_LAYOUT
+    ask = [{"id": "N1", "text": "תנאי החוזה"}]
+    unit = _units("לגבי מגרשים 1-3 ו-8 הוצג חוזה אחד בלבד שמייצג את כל המגרשים פרט לתקופת החכירה, בשנת 1996 [S1].")
+    assert items.source_items(unit, ws, ask, items.Ledger()) == []
+    # its own contract's note is the item's condition, as ever
+    own = _units("לגבי מגרשים 41-45 הוצג חוזה אחד בלבד שמייצג את כל המגרשים פרט לתקופת החכירה, בשנת 1994 [S1].")
+    assert items._note_of_another_scope(ws, "S1", ws.sources["S1"], NOTE_SENTENCE, NOTE_SENTENCE, against=scopes.referent(own[0].text)) is False
+    unbound = scopes.Layout((*FOOTNOTE_LAYOUT.pieces[:2], scopes.Piece(12, "1 הוצג חוזה אחד בלבד שמייצג את כל המגרשים פרט לתקופת החכירה",
+                                                                         "paragraph", 1, ("4. חוזים",), (), "1")), first=11)
+    ws.layouts["S1"] = scopes.Layout(tuple(p if p.index != 10 else scopes.Piece(10, p.text, p.kind, p.page, p.section) for p in unbound.pieces),
+                                     first=11)
+    # no block carries the mark: the note keeps its own server item (its own content, its own condition check), and is nobody else's condition
+    (own_item,) = items.source_items(unit, ws, ask, items.Ledger())
+    assert own_item.quote.startswith("1 הוצג חוזה אחד בלבד") or NOTE_SENTENCE in own_item.quote
+    other_row = "ד. חוזה למגרשים 1-3, 8 נחתם בשנת 1996"
+    assert all(NOTE_SENTENCE not in sp.text for sp in items.condition_spans(ws.sources["S1"], other_row))
+    res = _validate(ws, "חוזה למגרשים 1-3, 8 נחתם בשנת 1996 [S1].", _raw(label="חוזה", quote=other_row, value="1996", condition=NOTE_SENTENCE),
+                    components=[{"id": "N1", "text": "חוזה למגרשים 1-3"}])
+    assert res.misattributed == []  # nothing proves it another item's: the agent's words are left to the judge
+
+
+def test_among_the_sentences_that_state_an_items_value_the_one_that_cites_its_source_gives_it():
+    ws = _ws("סוג | שיעור\nתכנית | 6.5%\nהערה: השיעור חל רק על פי תכנית מאושרת", "השיעור בשומה השנייה הוא 6.5% בלבד", same_file=True)
+    item = items.Item("N1", "שיעור", "S1", "תכנית | 6.5%", "6.5%", "חל רק על פי תכנית מאושרת", "included", "")
+    item.document_id, item.unit_id = items._site_of(ws.sources["S1"])
+    (block,) = items.blocks_of(split_units("- בשתי השומות השיעור הוא 6.5% [S2]. הסיבה לשיעור 6.5% היא הערה [S1]."))
+    assert len(block.parts) == 2
+    parts = items._giving_parts(item, block, ws)
+    assert [u.ids for u in parts] == [["S1"]]  # the sentence that cites S2 only shares the figure through its block
+    assert len(items._giving_parts(item, block)) == 2  # without the workspace, as before

@@ -1335,3 +1335,318 @@ def test_a_claim_citing_only_a_source_of_the_asked_property_has_nothing_to_repor
     cx = _ownership_file()
     found = _cites(cx, {"S25": OWN_SOURCE})
     assert found.reason is None and found.facts == []
+
+
+# --- scopes below the property: the plan, parcel, lot, contract, alternative, stage or state a datum is under (round 20 U3, KTD3) ----------
+#
+# Every identifier, plan number and name below is invented; the shapes (a lettered paragraph that opens a plan, a table whose columns are
+# plans, a parcel line, a footnote mark) are the ones the real units write in their own variety.
+
+from app.chat import scopes  # noqa: E402
+
+
+def _kinds(text: str) -> dict[str, set[str]]:
+    return {k: set(v) for k, v in scopes.by_kind(scopes.mentions(text)).items()}
+
+
+@pytest.mark.parametrize("text, kind, ids", [
+    ("תכנית ג/20039", "plan", {"20039"}),
+    ("ב. בהתאם לתוכנית בניין עיר מספר ג/מק/12078/א׳ אשר פורסמה למתן תוקף", "plan", {"12078"}),  # a district, a kind and a suffix letter
+    ("בתכנית מתאר מקומית עיר הדוגמה מספר ג/18071 אשר פורסמה", "plan", {"18071"}),  # a word of the plan's name before «מספר»
+    ("תב\"ע 5110-ב", "plan", {"5110"}), ("תמ\"א 38", "plan", {"38"}), ("תכנית דמו/5110", "plan", {"5110"}),
+    ("תכנית ב׳", "plan", {"2"}), ("התכנית ג/11111 והתכנית ג/22222", "plan", {"11111", "22222"}),
+    ("בתכניות ג/1000 ו-ג/2000", "plan", {"1000", "2000"}),
+    ("חלקה 12", "parcel", {"12"}), ("בחלקות 1-3, 8", "parcel", {"1", "2", "3", "8"}), ("חלקות 12 ו־14", "parcel", {"12", "14"}),
+    ("חלקה 8401/40", "parcel", {"40"}), ("חלקה 56/57", "parcel", {"56", "57"}),
+    ("מגרש 101", "lot", {"101"}), ("למגרשים 501 ו- 502", "lot", {"501", "502"}), ("תא שטח 7", "lot", {"7"}),
+    ("קבוצת מגרשים ב׳", "group", {"2"}), ("קבוצה א", "group", {"1"}),
+    ("חוזה חכירה שני", "contract", {"2"}), ("החוזה הראשון", "contract", {"1"}), ("חוזה מספר 3", "contract", {"3"}),
+    ("הסכם חכירה ג׳", "contract", {"3"}),
+    ("שלב א׳", "stage", {"1"}), ("בשלב 2", "stage", {"2"}), ("חלופה ב׳", "alternative", {"2"}), ("החלופה השנייה", "alternative", {"2"}),
+    ("חלופה 2", "alternative", {"2"}),
+    ("מצב מאושר", "state", {"approved"}), ("הנתונים במצב המוצע", "state", {"proposed"}), ("התכנית המוצעת", "state", {"proposed"}),
+    ("הזכויות המאושרות", "state", {"approved"}), ("מצב קיים", "state", {"existing"}),
+])
+def test_a_scope_noun_with_its_identifier_is_one_mention_whatever_the_naming(text, kind, ids):
+    assert _kinds(text)[kind] == ids, text
+
+
+@pytest.mark.parametrize("text", [
+    "תכנית 2013", "אושרה ב-26/10/2020", "תכנית זו אושרה", "חלקה", "חוזה", "הבניין הקיים", "התכסית המאושרת", "תכנית כללית ללא מספר",
+    "השומה לשנת 2024", "קבוצה של דיירים",
+])
+def test_a_noun_without_an_identifier_a_date_and_a_year_name_no_scope(text):
+    assert scopes.mentions(text) == [], text
+
+
+def test_hebrew_letters_ordinal_words_and_numbers_are_one_identifier():
+    assert _kinds("חלופה א׳") == _kinds("חלופה 1") == _kinds("החלופה הראשונה") == {"alternative": {"1"}}
+    assert _kinds("קבוצה ב׳") != _kinds("קבוצה ג׳")
+
+
+@pytest.mark.parametrize("line, opens", [
+    ("ג. בהתאם לתכנית בניין עיר מספר ג/20039 אשר פורסמה למתן תוקף בי.פ מספר 6584", {"plan": {"20039"}}),
+    ("(ב) תכנית ג/18071 — מתאר מקומית", {"plan": {"18071"}}),
+    ("חלקה 57 — שטח 950 מ״ר, שווי הקרקע 4,200,000 ₪.", {"parcel": {"57"}}),
+    ("טבלת זכויות בתכנית ג/25083", {"plan": {"25083"}}),
+    ("טבלה 3.1 — זכויות הבנייה — חלופה ב׳", {"alternative": {"2"}}),
+    ("## מצב מוצע", {"state": {"proposed"}}),
+    ("- **חלקה 56:** היתר מתואר כהיתר מכוח תמ״א 38 לחיזוק המבנה", {"parcel": {"56"}}),  # a bullet and bold marks before the noun
+    ("מצב מאושר: תכסית 300 מ\"ר.", {"state": {"approved"}}),
+    ("לפי תכנית ג/12078 מותר 90% בניה בשטח זה", {}),  # a mention inside a sentence about something else opens nothing
+    ("בהתאם לתכנית ג/20039 שטח המגרש הוא 300 מ\"ר", {}),
+    ("הערכת השווי נעשתה לפי הנתונים בתכנית ג/20039 כפי שהוצגו לעיל", {}),
+    ("1. הערכת שווי", {}),
+])
+def test_a_line_opens_a_scope_only_when_it_is_a_lettered_paragraph_a_line_that_begins_with_the_noun_or_a_caption(line, opens):
+    assert {k: set(v) for k, v in scopes.by_kind(scopes.opener(line, caption=True)).items()} == opens
+
+
+def test_a_caption_opens_a_scope_only_when_it_stands_alone_as_a_block_or_a_context_part():
+    caption = "טבלת זכויות בתכנית ג/25083"
+    assert scopes.opener(caption) == [] and scopes.opener(caption, caption=True)  # a sentence of a longer line is no caption
+    assert scopes.opener("זכויות הבנייה בתכנית ג/25083 כפי שהוצגו לעיל", caption=True) == []  # the scope is not where the caption ends
+
+
+def _located(body, parts=(), layout=None, numbers=frozenset()):
+    return scopes.occurrences(list(parts), list(body), layout, lambda line: any(n in line for n in numbers))
+
+
+PLAN_TABLE = ["רכיב | תכנית ג/11111 | תכנית ג/22222", "שטח עיקרי | 1,200 | 1,800", "שטח שירות | 300 | 450"]
+
+
+def _claim(own: str, *cells: str, openings: tuple = ()):
+    return scopes.referent(own, cells, openings)
+
+
+def test_a_figure_under_another_plans_column_is_different_and_under_its_own_is_same():
+    found = _located(PLAN_TABLE, numbers={"450"})
+    assert [dict(o.scope) for o in found] == [{"plan": frozenset({"22222"})}]
+    assert scopes.read(_claim("450", "תכנית ג/11111"), found).state == scopes.DIFFERENT
+    assert scopes.read(_claim("450", "תכנית ג/22222"), found).state == scopes.SAME
+    assert scopes.read(_claim("450", "תכנית ג/11111"), found).other == found
+
+
+def test_a_plans_column_may_be_headed_by_its_bare_number_and_a_row_by_its_label():
+    found = _located(["רכיב | ג/11111 | ג/22222", "שטח עיקרי | 1,200 | 1,800"], numbers={"1,800"})
+    assert scopes.read(_claim("1,800", "ג/11111"), found).state == scopes.DIFFERENT
+    rows = _located(["תכנית | שטח עיקרי", "תכנית ג/11111 | 1,200", "תכנית ג/22222 | 1,800"], numbers={"1,800"})
+    assert scopes.read(_claim("1,800", "תכנית ג/11111"), rows).state == scopes.DIFFERENT
+    assert scopes.read(_claim("1,800", "תכנית ג/22222"), rows).state == scopes.SAME
+
+
+def test_the_figure_in_a_passage_is_under_the_last_opener_before_it():
+    body = ["חלקה 12 — שטח 800 מ״ר, שווי הקרקע 3,100,000 ₪.", "חלקה 14 — שטח 950 מ״ר, שווי הקרקע 4,200,000 ₪."]
+    found = _located(body, numbers={"4,200,000"})
+    assert scopes.read(_claim("חלקה 12: שווי 4,200,000"), found).state == scopes.DIFFERENT
+    assert scopes.read(_claim("חלקה 14: שווי 4,200,000"), found).state == scopes.SAME
+
+
+def test_a_paragraph_written_as_one_line_opens_a_scope_in_each_sentence():
+    line = ["מצב מוצע: תכסית 500 מ\"ר, טרם אושרה. מצב מאושר: תכסית 300 מ\"ר."]
+    assert scopes.read(_claim("מצב מאושר"), _located(line, numbers={"300"})).state == scopes.SAME
+    assert scopes.read(_claim("מצב מאושר"), _located(line, numbers={"500"})).state == scopes.DIFFERENT
+
+
+def test_a_state_in_a_column_head_is_the_scope_of_its_figures():
+    found = _located(["זכויות | מאושר | מוצע", "תכסית | 300 | 500"], numbers={"500"})
+    assert scopes.read(_claim("התכנית המאושרת", "מאושר"), found).state == scopes.DIFFERENT
+    assert scopes.read(_claim("מוצע"), found).state == scopes.SAME
+
+
+def test_the_caption_or_the_line_before_a_table_names_its_scope():
+    found = _located(["רכיב | שטח", "מגרש | 1,500"], parts=[("caption", "טבלת זכויות בתכנית ג/25083")], numbers={"1,500"})
+    assert scopes.read(_claim("תכנית ג/20039"), found).state == scopes.DIFFERENT
+    assert scopes.read(_claim("תכנית ג/25083"), found).state == scopes.SAME
+
+
+def _piece(i, text, kind="paragraph", page=1, section=("7. סיכום",), small=(), note=""):
+    return scopes.Piece(i, text, kind, page, section, small, note)
+
+
+LAYOUT = scopes.Layout((
+    _piece(1, "ב. בהתאם לתכנית ג/מק/12078/א׳ אשר פורסמה"), _piece(2, "התכנית מתירה שימושים למסחר"),
+    _piece(3, "ג. בהתאם לתכנית בניין עיר מספר ג/20039 אשר פורסמה"), _piece(4, "טבלת זכויות והוראות הבניה:"),
+    _piece(5, "יעוד | אחוזים", kind="table"), _piece(6, "ד. בהתאם לתכנית ג/18071"),
+    _piece(7, "ה. בהתאם לתכנית ג/25083"), _piece(8, "זכויות בניה:"), _piece(9, "שימוש | שטח", kind="table")), first=9)
+
+
+def test_a_table_under_a_lettered_paragraph_several_blocks_above_is_under_that_plan():
+    found = _located(["שימוש | שטח", "מסחר | 11,900"], layout=scopes.Layout(LAYOUT.pieces[:5], first=5), numbers={"11,900"})
+    assert dict(found[0].scope) == {"plan": frozenset({"20039"})} and found[0].base == frozenset({"plan"})
+    assert scopes.read(_claim("תכנית ג/25083"), found).state == scopes.DIFFERENT
+    assert scopes.read(_claim("תכנית ג/20039"), found).state == scopes.SAME
+
+
+def test_the_nearest_opener_of_each_kind_wins_and_a_later_plan_replaces_an_earlier_one():
+    found = _located(["שימוש | שטח", "מסחר | 11,900"], layout=LAYOUT, numbers={"11,900"})
+    assert dict(found[0].scope) == {"plan": frozenset({"25083"})}
+
+
+def test_a_heading_that_changes_the_section_ends_the_scopes_above_it():
+    pieces = (*LAYOUT.pieces[:4], _piece(5, "8. נספח", kind="heading", section=("8. נספח",)),
+              _piece(6, "טבלת רכיבים:", section=("8. נספח",)), _piece(7, "x | y", kind="table", section=("8. נספח",)))
+    found = _located(["שימוש | שטח", "מסחר | 11,900"], layout=scopes.Layout(pieces, first=7), numbers={"11,900"})
+    assert found[0].scope == {} and scopes.read(_claim("תכנית ג/25083"), found).state == scopes.UNKNOWN
+
+
+def test_only_the_blocks_within_the_lookback_set_the_scope():
+    far = scopes.Layout((_piece(1, "ג. בהתאם לתכנית ג/20039"), *(_piece(i, "טקסט רגיל") for i in range(2, 2 + scopes.LOOKBACK)),
+                         _piece(2 + scopes.LOOKBACK, "x | y", kind="table")), first=2 + scopes.LOOKBACK)
+    assert scopes.inherited(far) == {}
+
+
+def test_a_source_that_had_already_named_the_claimed_plan_is_not_decided_by_the_opener_above_it():
+    above = scopes.Layout(LAYOUT.pieces[:5], first=5)
+    found = _located(["שימוש | שטח", "מסחר | 11,900"], layout=above, numbers={"11,900"})
+    assert scopes.read(_claim("תכנית ג/25083"), found).state == scopes.DIFFERENT
+    named = _located(["השטח לפי תכנית ג/25083 מוצג להלן", "מסחר | 11,900"], layout=above, numbers={"11,900"})
+    assert scopes.read(_claim("תכנית ג/25083"), named).state == scopes.UNKNOWN  # the opener above is not what the source is under
+    later = _located(["מסחר | 11,900", "ובהמשך: לפי תכנית ג/25083 הוצג שטח אחר"], layout=above, numbers={"11,900"})
+    assert scopes.read(_claim("תכנית ג/25083"), later).state == scopes.DIFFERENT  # a plan named after the figure says nothing about it
+
+
+def test_a_unit_with_no_scope_opener_has_no_scope_decision():
+    plain = _located(["שווי הנכס בגישת ההשוואה הוא 6,800,000 ₪.", "מסמך סינתטי"], numbers={"6,800,000"})
+    assert [dict(o.scope) for o in plain] == [{}]
+    assert scopes.read(_claim("חלקה 12"), plain).state == scopes.UNKNOWN
+    assert scopes.read({}, plain).state == scopes.UNKNOWN and scopes.read(_claim("חלקה 12"), []).state == scopes.UNKNOWN
+
+
+def test_a_figure_found_under_the_claimed_scope_anywhere_is_same_and_only_every_occurrence_elsewhere_is_different():
+    body = ["חלקה 12 — שווי 4,200,000 ₪.", "חלקה 14 — שווי 4,200,000 ₪."]
+    found = _located(body, numbers={"4,200,000"})
+    assert scopes.read(_claim("חלקה 12"), found).state == scopes.SAME
+    assert scopes.read(_claim("חלקה 15"), found).state == scopes.DIFFERENT
+    mixed = _located(["שווי 4,200,000 ₪ בנכס", "חלקה 14 — שווי 4,200,000 ₪."], numbers={"4,200,000"})
+    assert [dict(o.scope) for o in mixed] == [{}, {"parcel": frozenset({"14"})}]
+    assert scopes.read(_claim("חלקה 12"), mixed).state == scopes.UNKNOWN  # one occurrence is under no scope: the datum may be the claimed one's
+    assert scopes.read(_claim("חלקה 12"), mixed).other == mixed[1:]  # ... and the other is told to the judge
+
+
+def test_claim_referent_comes_from_its_own_words_then_the_column_the_row_the_lead_in_that_order():
+    assert _claim("חלקה 12 שווי", "חלקה 14") == {"parcel": frozenset({"12"})}
+    assert _claim("450", "תכנית ג/11111", "שטח שירות", openings=("חלופה ב׳: הטבלה",)) == {"plan": frozenset({"11111"}), "alternative": frozenset({"2"})}
+    assert _claim("450", "רכיב", "שטח") == {}
+
+
+def test_a_lead_names_the_referent_only_when_it_opens_a_scope_and_not_when_a_later_sentence_of_it_mentions_one():
+    assert _claim("השיעור הוא 4.15%", openings=("חלקה 56: מבנה פינתי. ועוד",)) == {"parcel": frozenset({"56"})}
+    assert _claim("העבודות הסתיימו", openings=("**המאושר לעומת הבנוי:** תוכנית 603-1 קובעת בתא שטח 200 זכויות בנייה של כ־39,500 מ״ר עיקרי",)) == {}  # a sentence about something else, after a label
+    assert _claim("העבודות הסתיימו", openings=("לפי תכנית ג/12078 מותר 90% בניה",)) == {}  # a sentence about something else
+    assert scopes.referent("x", headings=("תכנית ג/25083",)) == {"plan": frozenset({"25083"})}
+
+
+@pytest.mark.parametrize("cell, marks", [
+    ("חוזה חכירה ראשון*", {"*"}), ("מעל מפלס הכניסה**", {"**"}), ("שטח (1)", {"#1"}), ("(2) שטח", {"#2"}), ("שטח¹", {"#1"}), ("שטח", set()),
+])
+def test_the_marks_a_table_cell_carries(cell, marks):
+    assert scopes.cell_marks(cell) == frozenset(marks)
+
+
+@pytest.mark.parametrize("note, mark", [
+    ("* התשלום כפוף לאישור", "*"), ("** מפלס הכניסה", "**"), ("(1) הערה", "#1"), ("1) הערה", "#1"), ("¹ הערה", "#1"), ("לא כולל מרתף", ""),
+])
+def test_the_mark_a_note_opens_with(note, mark):
+    assert scopes.note_mark(note) == mark
+
+
+def test_a_note_belongs_to_the_rows_whose_cells_carry_its_mark_and_a_header_mark_to_every_row():
+    header, rows = ["קבוצה", "חוזה", "שטח"], ["קבוצה א׳ | חוזה ראשון* | 1,500", "קבוצה ב׳ | חוזה שני | 2,100"]
+    assert scopes.note_rows("*", header, rows) == frozenset({0})
+    assert scopes.note_rows("*", ["קבוצה", "חוזה*", "שטח"], rows) == frozenset({0, 1})
+    assert scopes.note_rows("**", header, rows) is None and scopes.note_rows("", header, rows) is None
+
+
+def test_small_digit_words_are_the_marks_of_a_block_and_a_block_that_opens_with_one_is_a_note():
+    body = [("הסכם", 11.0), ("נחתם", 11.0), ("ב-1994", 11.0), ("1", 7.0), ("שנה", 11.0)]
+    assert scopes.small_marks(body) == (("1",), "")
+    note = [("1", 6.0), ("רק", 10.0), ("חוזה", 10.0), ("אחד", 10.0), ("הוצג", 10.0)]
+    assert scopes.small_marks(note) == ((), "1")
+    assert scopes.small_marks([("12", 11.0), ("שנה", 11.0), ("חוזה", 11.0)]) == ((), "")  # a number as large as the line is no mark
+
+
+def test_a_stored_block_becomes_a_piece_with_the_small_digits_its_word_geometry_shows():
+    text = "הסכם נחתם 1 בשנה"
+    spans = [[0, 0, 0, 4, 0, 10, 20, 21], [0, 1, 5, 9, 21, 10, 40, 21], [0, 2, 10, 11, 41, 10, 45, 17], [0, 3, 12, 16, 46, 10, 60, 21]]
+    assert scopes.piece_of(3, "paragraph", text, ("7. סיכום",), 2, spans).small == ("1",)
+    assert scopes.piece_of(3, "table", text, (), 2, spans).small == ()  # a table block has no word geometry
+
+
+FOOTNOTES = scopes.Layout((
+    _piece(10, "ג. חוזה לחלקות 41-45 נחתם בשנת 1994", small=("1",)), _piece(11, "תנאי החוזה כמפורט להלן"),
+    _piece(12, "ד. חוזה למגרשים 1-3, 8", page=1), _piece(13, "1 הוצג חוזה אחד בלבד שמייצג את כל המגרשים", page=1, note="1"),
+    _piece(14, "2 הערה שאין לה סימן", page=1, note="2")), first=12)
+
+
+def test_a_note_is_bound_to_the_nearest_earlier_block_of_its_page_that_carries_its_mark():
+    assert scopes.bind_geometry(FOOTNOTES) == {13: 10}
+    other_page = scopes.Layout((_piece(10, "ג. חוזה לחלקות 41-45", small=("1",), page=1), _piece(13, "1 הוצג חוזה", page=2, note="1")), first=13)
+    assert scopes.bind_geometry(other_page) == {}
+
+
+def test_the_scope_of_a_note_is_the_scope_in_force_where_its_mark_stands_and_not_the_one_beside_it():
+    got = {n.index: n for n in scopes.notes(FOOTNOTES)}
+    assert dict(got[13].scope) == {"parcel": frozenset(str(i) for i in range(41, 46))} and got[13].marker == 10
+    assert got[14].scope is None and got[14].marker is None  # no block carries mark 2
+    near = {"lot": frozenset({"1", "2", "3", "8"})}
+    assert scopes.note_conflicts(got[13], {"parcel": frozenset({"2"})}) and not scopes.note_conflicts(got[13], {"parcel": frozenset({"42"})})
+    assert not scopes.note_conflicts(got[14], {"parcel": frozenset({"2"})}) and not scopes.note_conflicts(got[13], near)  # a kind the note lacks
+
+
+@pytest.mark.parametrize("cell, kind, ids", [
+    ("ג/25083 — המאוחרת", "plan", {"25083"}), ("תכנית ג/12078 (קיימת)", "plan", {"12078"}), ("ג/מק/12078/א׳", "plan", {"12078"}),
+    ("מאושר", "state", {"approved"}), ("חלופה ב׳", "alternative", {"2"}),
+])
+def test_a_heading_cell_names_a_plan_by_its_district_prefixed_number_beside_a_word_or_two(cell, kind, ids):
+    assert {k: set(v) for k, v in scopes.by_kind(scopes.cell_scope(cell)).items()} == {kind: ids}
+
+
+@pytest.mark.parametrize("cell", ["12/03/2025", "2024", "שטח עיקרי (מ״ר)", "הערה", "ג/25083 היא התכנית שאושרה בשנת 2020 לאחר דיון ארוך"])
+def test_a_heading_cell_with_a_date_a_year_a_label_or_a_sentence_names_no_scope(cell):
+    assert scopes.cell_scope(cell) == []
+
+
+def test_the_key_cell_of_a_row_takes_the_noun_of_its_columns_header():
+    assert scopes.keyed_label("חלקות בגוש 11588", "1–3 ו־8 בשלמות") == "חלקות 1–3 ו־8 בשלמות"
+    assert _kinds(scopes.keyed_label("חלקות בגוש 11588", "1–3 ו־8 בשלמות")) == {"parcel": {"1", "2", "3", "8"}}
+    assert scopes.keyed_label("שטח", "1,200") == "1,200" and scopes.keyed_label("חלקה", "חלקה 12") == "חלקה 12"  # a cell that names its own scope
+    rows = _located(["חלקות בגוש 11588 | שטח", "1–3 ו־8 בשלמות | 7,750", "4 בשלמות | 1,478"], numbers={"1,478"})
+    assert scopes.read(_claim("חלקה 4"), rows).state == scopes.SAME and scopes.read(_claim("חלקות 1-3"), rows).state == scopes.DIFFERENT
+
+
+ITEMS = scopes.Layout((
+    _piece(1, "ג. בהתאם לחוזה חכירה מהוון, שנחתם בשנת 1994", small=("1",)), _piece(2, "הפרטים כדלקמן:"),
+    _piece(3, "ד. חוזה חכירה מהוון לחלקות 1 - 3, 8 בגוש 11588:"), _piece(4, "תקופת חכירה: 49 שנים"),
+    _piece(5, "שטח | 7,750", kind="table"), _piece(6, "1 הוצג חוזה אחד בלבד", note="1")), first=3)
+
+
+def test_a_block_is_in_the_lettered_item_whose_paragraph_opens_above_it_even_when_the_paragraph_names_no_identifier():
+    assert [scopes.item_at(ITEMS, i) for i in (1, 2, 3, 4, 5)] == [1, 1, 3, 3, 3]
+    assert scopes.item_at(ITEMS, 99) is None and scopes.item_at(None, 1) is None
+    assert scopes.item_at(scopes.Layout((_piece(1, "פסקה רגילה"),), first=1), 1) is None  # no lettered paragraph: no item
+    other_section = scopes.Layout((_piece(1, "ג. פסקה", section=("א",)), _piece(2, "טקסט", section=("ב",))), first=2)
+    assert scopes.item_at(other_section, 2) is None  # a heading that changes the section ends the item
+
+
+def test_the_item_of_a_claim_is_the_item_of_the_paragraph_that_opens_with_its_identifiers_and_a_note_conflicts_with_another_item():
+    assert scopes.item_of_referent(ITEMS, _claim("חלקות 1-3 ו-8")) == 3
+    assert scopes.item_of_referent(ITEMS, _claim("חלקה 77")) is None and scopes.item_of_referent(ITEMS, {}) is None
+    assert scopes.item_of_text(ITEMS, "תקופת חכירה:   49 שנים") == 3
+    (note,) = scopes.notes(ITEMS)
+    assert note.marker == 1 and note.item == 1 and note.scope == {}  # the mark is in paragraph «ג.», which names no identifier
+    assert scopes.note_conflicts(note, {"parcel": frozenset({"1"})}, item=3) and not scopes.note_conflicts(note, {"parcel": frozenset({"1"})}, item=1)
+    assert not scopes.note_conflicts(note, {"parcel": frozenset({"1"})})  # without an item to compare, an empty scope conflicts with nothing
+    inside = scopes.NoteInfo(9, "1", 1, {"parcel": frozenset({"97"})}, "1 הערה", item=1)
+    assert not scopes.note_conflicts(inside, {"parcel": frozenset({"17", "18"})}, item=1)  # the same paragraph: its inner sentences re-open nothing
+    assert scopes.note_conflicts(inside, {"parcel": frozenset({"97"})}, item=3) and scopes.note_conflicts(inside, {"parcel": frozenset({"17"})})
+
+
+def test_a_line_that_names_the_claimed_plan_itself_is_that_plans_whatever_opener_stands_above_it():
+    above = scopes.Layout((_piece(1, "ג. בהתאם לתכנית בניין עיר מספר ג/6898 אשר פורסמה"), _piece(2, "x | y", kind="table")), first=2)
+    body = ["הנתון כי בתאריך 19.10.2021 פורסמה למתן תוקף תכנית מתאר מספר 217-0572784 (ג/23965) אשר מטרתה הסדרת האזור"]
+    found = _located(body, layout=above, numbers={"19.10.2021"})
+    assert dict(found[0].scope) == {"plan": frozenset({"6898"})} and found[0].named == {"plan": frozenset({"23965"})}
+    assert scopes.read(_claim("תכנית ג/23965"), found).state == scopes.SAME  # the line says whose it is
+    assert scopes.read(_claim("תכנית ג/11111"), found).state == scopes.DIFFERENT
+    assert scopes.line_ids("לפי ג/23965 ובחלקה 12") == {"plan": frozenset({"23965"}), "parcel": frozenset({"12"})}

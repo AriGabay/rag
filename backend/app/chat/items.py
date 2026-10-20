@@ -101,7 +101,7 @@ from typing import NamedTuple
 
 from app.answering.numread import number_forms, number_spans
 from app.answering.verify import _QUANTITY_AFTER, not_an_amount, numbers_in
-from app.chat import conditions
+from app.chat import conditions, scopes
 from app.chat.evidence import claim_terms
 from app.chat.meaning import _row_cells
 from app.chat.verify import (
@@ -127,6 +127,7 @@ from app.chat.verify import (
     is_server_item,
     request_word_forms,
     shares_request_word,
+    unit_referent,
 )
 from app.platform import dates as shared_dates
 
@@ -290,7 +291,8 @@ def validate(raw: Iterable[object], ws, units: Sequence[Unit], components: Seque
             if why is None:
                 document_id, unit_id = _site_of(src)
                 condition = f["condition"]
-                foreign = bool(condition) and _foreign_condition(condition, src, f["quote"])
+                foreign = bool(condition) and (_foreign_condition(condition, src, f["quote"])
+                                               or _note_of_another_scope(ws, sid, src, condition, f["quote"], condition=True))
                 item = Item(component, f["label"], sid, f["quote"], f["value"], "" if foreign else condition, f["state"], f["reason"],
                             document_id=document_id, unit_id=unit_id, block=block_of(src, f["quote"]))
                 # a second declaration of the same evidence is a duplicate only when it states the same datum (round 20 U1, KTD1): the
@@ -441,18 +443,31 @@ def condition_spans(src, quote: str) -> list[Span]:
         if part.place == "heading":
             if conditions.material(part.text):
                 add("heading", part.text)
-        elif part.place in ("before", "after", "note") and not part.reason:
+        elif part.place in ("before", "after", "note") and not part.reason and _note_of_row(part.text, body, row):
             for sentence in _SENTENCE_END.split(part.text):
                 if conditions.material(sentence):
                     add("paragraph", sentence)
     return out
 
 
+def _note_of_row(note: str, body: Sequence[str], row: str | None) -> bool:
+    """Whether a note beside a table limits the item whose row is ``row`` (round 20 U3, KTD3, R10, AE7): a note that opens with a mark
+    («*», «**», «(1)») belongs to the cells that carry the same mark, so it is no condition of a row that carries none of them; a mark in
+    a header cell belongs to every row. A note without a mark, a mark no cell carries, and an item that is no table row keep the note."""
+    mark = scopes.note_mark(note)
+    if not mark or row is None or "|" not in row:
+        return True
+    header = scopes.header_of(body)
+    rows = [ln for ln in body if "|" in ln and scopes.row_cells(ln) != header]
+    held = scopes.note_rows(mark, header, rows)
+    return held is None or row in {rows[i] for i in held}
+
+
 def _own_context(src, quote: str) -> str:
     """The text of the item's own context: its quote and row, the paragraphs attributed to the table and its headings."""
     parts, body = context_of_source(src)
     row = _row_of(body, SupportScope.flat(quote))
-    return "\n".join([quote, row or "", *(p.text for p in parts if not p.reason)])
+    return "\n".join([quote, row or "", *(p.text for p in parts if not p.reason and _note_of_row(p.text, body, row))])
 
 
 def _other_context(src, quote: str) -> str:
@@ -462,7 +477,46 @@ def _other_context(src, quote: str) -> str:
         return ""
     parts, body = context_of_source(src)
     row = _row_of(body, SupportScope.flat(quote))
-    return "\n".join([ln for ln in body if ln != row] + [p.text for p in parts if p.reason])
+    return "\n".join([ln for ln in body if ln != row] + [p.text for p in parts if p.reason or not _note_of_row(p.text, body, row)])
+
+
+def _scope_of_quote(ws, sid: str, src, quote: str) -> dict:
+    """The scope the item's quote is written under in its source (``scopes.occurrences``: the openers above it, its column and row), {} when
+    the source has no scope or the quote is not found."""
+    parts, body = context_of_source(src)
+    flat = SupportScope.flat(quote)
+    found = scopes.occurrences([(p.place, p.text) for p in parts], body, (getattr(ws, "layouts", None) or {}).get(sid),
+                               lambda line: flat in _flat_span(line) or _flat_span(line) in flat)
+    return dict(found[0].scope) if found else {}
+
+
+def _note_of_another_scope(ws, sid: str, src, text: str, quote: str, *, condition: bool = False,
+                           against: Mapping[str, frozenset[str]] | None = None) -> bool:
+    """Whether ``text`` is a footnote of the source that its geometry binds to another scope than the item's (round 20 U3, KTD3, R10, AE7):
+    ``condition`` — ``text`` is the words of a condition (stated in the note, not in the item's own context) and the note is bound to
+    other identifiers (another contract, lot group or plan) than the quote stands under; otherwise ``text`` is a sentence of the source,
+    and the note it belongs to is bound to another scope than ``against`` (what the answer sentence that cites it is about). A note whose
+    mark could not be bound conflicts with nothing: it keeps its own server item and is never another item's condition."""
+    layout = (getattr(ws, "layouts", None) or {}).get(sid)
+    found = scopes.notes(layout)
+    if not found:
+        return False
+    flat = SupportScope.flat(text)
+    mine = item = None
+    for note in found:
+        if condition:
+            if not conditions.stated_in(text, note.text) or conditions.stated_in(text, _own_context(src, quote)):
+                continue
+        elif flat not in _flat_span(note.text):
+            continue
+        if note.scope is None:
+            continue  # an unbound note is the note's own item, as before; nothing proves it another item's (the judge is told when a claim states it)
+        if mine is None:
+            mine = against if against is not None else _scope_of_quote(ws, sid, src, quote)
+            item = scopes.item_of_referent(layout, mine) if against is not None else scopes.item_of_text(layout, quote)
+        if scopes.note_conflicts(note, mine, item):
+            return True
+    return False
 
 
 def _foreign_condition(condition: str, src, quote: str) -> bool:
@@ -580,8 +634,10 @@ def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledge
                 flat = SupportScope.flat(quote)
                 component = _component_of(asked, f"{unit.text} {label}")
                 # a fill of ANOTHER component on the span holds nothing for this one: the span serves each component (round 19 U3)
+                # (a footnote of another contract, lot group or plan, or one whose mark is not found, is nobody's condition here: round 20 U3)
                 if (made >= ROWS_PER_UNIT or scope.source_problem(sid, flat) or scope.place_problem(src)
-                        or any(_holds(i, sid, ws, flat, component) for i in [*held, *built])):
+                        or any(_holds(i, sid, ws, flat, component) for i in [*held, *built])
+                        or _note_of_another_scope(ws, sid, src, quote, quote, against=unit_referent(unit))):
                     continue
                 spans = condition_spans(src, quote)
                 if not spans:
@@ -1267,9 +1323,12 @@ def _check_block(item: Item, block: Block, ws, shared: bool, rivals: frozenset[s
     return verdict
 
 
-def _giving_parts(item: Item, block: Block) -> list[Unit]:
+def _giving_parts(item: Item, block: Block, ws=None) -> list[Unit]:
     """The sentences of a block that give the item: those that state one of its headline values (its date, for an item whose value is a date);
-    all of them for an item asked by its words, or when no sentence states a value of its own."""
+    all of them for an item asked by its words, or when no sentence states a value of its own. Round 20 U3 (KTD3, R10): among several that
+    state it, the ones whose OWN citations include the item's source (``_attributed``) — a sentence that only shares the figure with the item
+    through the citations of the block it stands in (it speaks of two appraisals, and cites the other's value) is not the one the item's
+    condition is read against or written into; when none does, all of them, as before."""
     if len(block.parts) == 1:
         return list(block.parts)
     if parsed := shared_dates.parse(item.value):
@@ -1278,7 +1337,11 @@ def _giving_parts(item: Item, block: Block) -> list[Unit]:
         mine = [u for u in block.parts if any(g & _have(u.text) for g in groups)]
     else:
         mine = []
-    return mine or list(block.parts)
+    chosen = mine or list(block.parts)
+    if ws is not None and len(chosen) > 1:
+        own = [u for u in chosen if _attributed(item, u, ws)]
+        return own or chosen
+    return chosen
 
 
 class Giving(NamedTuple):
@@ -1302,7 +1365,7 @@ def _coverage_all(item: Item, blocks: Sequence[Block], ws, shared: bool, leads: 
               for b in blocks]
     giving = [b for b, c in checks if not c.why]
     if giving:
-        parts = [(b, _giving_parts(item, b)) for b in giving]
+        parts = [(b, _giving_parts(item, b, ws)) for b in giving]
         indexes = frozenset(u.index for _, mine in parts for u in mine)
         return (Coverage(True, parts[0][1][0].index, ""),
                 Giving(indexes, tuple(b.unit for b, _ in parts if len(b.parts) > 1)))

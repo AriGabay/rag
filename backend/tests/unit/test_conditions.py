@@ -137,3 +137,55 @@ def test_a_condition_with_one_missing_and_one_undecided_operator_goes_to_the_jud
 
 def test_a_condition_with_an_operator_and_no_operand_is_never_missing():
     assert conditions.outcome("בלבד", "השטח הוא 900 מ״ר") != conditions.MISSING
+
+
+# --- the condition is written only from the item's own scope (round 20 U3, KTD3, R10) ----------------------------------------------------
+
+from types import SimpleNamespace  # noqa: E402
+
+from app.chat import verify  # noqa: E402
+
+
+def _state(**kw) -> dict:
+    return {"id": "I1", "source": "S1", "value": "6 מעל הכניסה ו-2 קומות חניה", "quote": "מספר קומות | 6 מעל הכניסה ו-2 קומות חניה",
+            "condition_spans": [{"place": "note", "text": "רק על פי תכנית מאושרת"}], "condition_unit": 0, "condition_foreign": [], **kw}
+
+
+def test_a_missing_condition_that_is_the_items_whole_value_or_whole_quote_is_no_condition():
+    st = _state()
+    assert verify._whole_value("6 מעל הכניסה ו-2 קומות חניה", st) and verify._whole_value("מספר קומות | 6 מעל הכניסה ו-2 קומות חניה", st)
+    assert verify._whole_value("  6  מעל הכניסה   ו-2 קומות חניה ", st)  # blanks are no difference
+    assert not verify._whole_value("רק על פי תכנית מאושרת", st) and not verify._whole_value("", st)
+
+
+def test_the_clause_another_items_span_holds_and_the_sentence_states_is_the_quote_of_the_other_item_hint():
+    other = _state(id="I2", condition_spans=[{"place": "note", "text": "חל עד שנה מהמסירה"}])
+    unit = verify.Unit(0, "השכירות לדירה גדולה היא 5,000 עד שנה מהמסירה [S2].", "השכירות לדירה גדולה היא 5,000 עד שנה מהמסירה", ["S2"])
+    mine = _state(quote="דירה גדולה | 5,000", condition_foreign=["I2"])
+    assert verify._foreign_quote(mine, [mine, other], unit) == "חל עד שנה מהמסירה"
+    assert verify._foreign_quote(_state(quote="דירה גדולה | 5,000"), [mine, other], unit) == ""  # the ledger named no other item
+    quiet = verify.Unit(0, "השכירות לדירה גדולה היא 5,000 [S2].", "השכירות לדירה גדולה היא 5,000", ["S2"])
+    assert verify._foreign_quote(mine, [mine, other], quiet) == ""  # a sentence that does not state the clause holds nothing of it
+
+
+def test_another_sentence_states_the_condition_only_when_it_cites_the_items_source_and_keeps_every_span():
+    st = _state()
+    ws = SimpleNamespace(values={})
+    shared = verify.Unit(0, "השטח 6 מעל הכניסה בשומה הראשונה [S1][S2].", "השטח 6 מעל הכניסה בשומה הראשונה", ["S1", "S2"])
+    states = verify.Unit(1, "הזכויות רק על פי תכנית מאושרת [S1].", "הזכויות רק על פי תכנית מאושרת", ["S1"])
+    elsewhere = verify.Unit(2, "הזכויות רק על פי תכנית מאושרת [S2].", "הזכויות רק על פי תכנית מאושרת", ["S2"])
+    silent = verify.Unit(3, "הזכויות בנכס [S1].", "הזכויות בנכס", ["S1"])
+    assert verify._sibling_states(st, shared, [shared, states], set(), ws)
+    assert not verify._sibling_states(st, shared, [shared, elsewhere], set(), ws)  # it cites another appraisal's source
+    assert not verify._sibling_states(st, shared, [shared, silent], set(), ws)  # it cites the source and states nothing
+    assert not verify._sibling_states(st, shared, [shared, states], {1}, ws)  # the sentence was removed
+    assert not verify._sibling_states(_state(condition_spans=[]), shared, [shared, states], set(), ws)  # an item with no condition
+
+
+def test_a_sentence_speaks_of_several_appraisals_when_what_it_cites_is_in_more_than_one_context():
+    one = SimpleNamespace(version_id="v", contexts=[1], unit=None)
+    two = SimpleNamespace(version_id="v", contexts=[2], unit=None)
+    ws = SimpleNamespace(sources={"S1": one, "S2": two}, values={}, measurements={})
+    assert verify._speaks_of_several(verify.Unit(0, "", "", ["S1", "S2"]), ws)
+    assert not verify._speaks_of_several(verify.Unit(0, "", "", ["S1"]), ws)
+    assert not verify._speaks_of_several(verify.Unit(0, "", "", []), ws)

@@ -85,6 +85,8 @@ NON_SUBJECT_KINDS = frozenset({"appendix", "comparables"})
 # how a unit that is not an appraisal is called in a label (the one place that words them)
 UNIT_KIND_MARKS = {"appendix": "נספח", "comparables": "עסקאות השוואה", "front_matter": "פתיח"}
 MSG_UNNAMED = "ללא שם מזהה"
+NAMES_SHOWN = 3  # how many of a unit's distinguishing names the judge's source header shows beside its label (``Contexts.names_of``)
+NAME_SHOWN_CHARS = 60  # a longer name is a sentence of the title block, not a name
 LABEL_NAMES = 2  # how many of a unit's names label it when it has no title and no identifiers (``Contexts.label``)
 MSG_NO_TITLE ="ללא כותרת"  # a unit with no title of its own, named in a line that shows it
 # the three answers of ``Contexts.compare`` (round 19 U2, KTD2, R4-R6): a claim's evidence belongs to the asked property, to another one,
@@ -530,6 +532,21 @@ class Contexts:
         by_name = [n for n, sp in spans.items()
                    if not all(any(o[0] <= a and b <= o[1] and (a, b) != o for o in every) for a, b in sp)]
         return [n for n in self.numbers if n in by_id or n in by_name]
+
+    def names_of(self, n: int, limit: int = NAMES_SHOWN) -> tuple[str, ...]:
+        """The DISTINGUISHING names (the title and the document-grounded aliases, never an address or a parcel) of subject context ``n`` that
+        its label does not show (round 20 U3, KTD3, R12): what the judge's source header adds to the unit's label, so a unit labelled by its
+        address is also known by the name its title block gives it. A name that holds an identifier (a card's address quote kept as a name)
+        or that the label already holds is left out; at most ``limit``."""
+        if n not in self.subjects:
+            return ()
+        label = name_key(self.label(n))
+        out: list[str] = []
+        for name in self._distinguishing[n].names:
+            if not identifiers(name).empty or name in label or len(name) > NAME_SHOWN_CHARS:
+                continue
+            out.append(name)
+        return tuple(out[:limit])
 
     def naming_names(self, n: int, words: str | None) -> tuple[str, ...]:
         """The DISTINGUISHING names (title and aliases, not addresses or parcels) of subject context ``n`` that a free text

@@ -8,12 +8,14 @@ through the reader, under the user's own permissions, for the verification only.
 
 from __future__ import annotations
 
+import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from sqlalchemy import Connection, text
 
-from app.chat import reader
+from app.chat import reader, scopes
 from app.chat.tools import (
     _TABLE_SOURCES,
     CONTEXT_CHARS,
@@ -30,10 +32,19 @@ from app.chat.tools import (
 from app.chat.verify import Expansion
 from app.db import tenant_tx
 
+logger = logging.getLogger(__name__)
+
 # --- the bounded re-read of a claim's source (round 8 U5, KTD5) -----------------------------------------------------
 
 REREAD_CHARS = 6000  # the text one expansion sends the judge
 LEAD_BLOCKS = 3  # the paragraphs under a heading that are its lead-in (round 13 U10, KTD11)
+LAYOUT_BACK = 40  # blocks above a source read for its scope (``scopes.LOOKBACK`` of them count)
+TITLE_BLOCKS = 12  # blocks of a unit's top read as its title block, at most, and the lines of them kept
+TITLE_LINES = 30
+TITLE_UNITS = 12  # the other units of a file whose title block is read for it, at most
+_SKIPPED = ("decorative", "unread", "no_text")
+_PIECES_SQL = ("SELECT block_index, kind, section_path, page, status, text, spans FROM document_blocks"
+               " WHERE version_id = :v AND block_index BETWEEN :a AND :b ORDER BY block_index")
 _NOTE_LINE = re.compile(r"^\s*(?:\(\s*\d{1,2}\s*\)|\d{1,2}\s*\)|\(?\*+\)?|\*+)")  # "(1)", "1)", "(*)", "*": a footnote's start
 # a section's own note (round 13 U10, KTD11): a footnote mark, or a line that starts with the word for a note
 _SECTION_NOTE = re.compile(_NOTE_LINE.pattern + r"|^\s*(?:הערה|הערות|הבהרה|הבהרות)\s*[:\d.]")
@@ -357,6 +368,74 @@ class ContextReader:
                       table_index=where.get("table_index", src.table_index), reading_id=head.reading_id,
                       page_list=where.get("page_list", src.page_list), partial_document=head.partial,
                       contexts=list(src.contexts), context=src.context)
+
+    # --- what the scope check reads from the stored document (round 20 U3, KTD3): the blocks above a cited source with their word geometry,
+    # and the title block of the unit it is in. Stored text only, under the user's own permissions, no model call; nothing is written.
+
+    def preload(self, ids: Iterable[str]) -> None:
+        """Read, for the sources the answer cites (a value through the source it was verified in), the layout the scope reader needs
+        (``Workspace.layouts``) and the title block of each appraisal unit of a file holding several (``Workspace.unit_titles``), once
+        each. A source that cannot be read leaves ``None``: its scope is then read from its own text alone."""
+        ws = self.ws
+        wanted: dict[str, Source] = {}
+        for i in ids:
+            sid = ws.values[i].source_id if i in ws.values else i
+            src = ws.sources.get(sid)
+            if src is not None and src.version_id is not None and src.document_id is not None:
+                wanted[sid] = src
+        for sid, src in wanted.items():
+            if sid not in ws.layouts:
+                try:
+                    ws.layouts[sid] = self.layout(src)
+                except Exception:  # noqa: BLE001 - the scope is then read from the source's own text
+                    logger.warning("layout of source %s could not be read", sid, exc_info=True)
+                    ws.layouts[sid] = None
+            cx = ws.contexts.get(str(src.version_id))
+            # the title block of every unit of a file holding several: a name counts as a unit's own only if no other unit's block writes it
+            others = [m for m in (cx.subjects if cx is not None and cx.multi else []) if m not in (src.contexts or [])][:TITLE_UNITS]
+            for n in [*(src.contexts or [])[:2], *others]:
+                key = (str(src.version_id), n)
+                if key not in ws.unit_titles:
+                    try:
+                        ws.unit_titles[key] = self.title_lines(src, n)
+                    except Exception:  # noqa: BLE001
+                        logger.warning("title block of unit %s could not be read", key, exc_info=True)
+                        ws.unit_titles[key] = ()
+
+    def layout(self, src: Source) -> scopes.Layout | None:
+        """The blocks of the source's appraisal unit above its first block (at most ``LAYOUT_BACK``) and its own, each with the small digit
+        words its geometry shows (``scopes.piece_of``). None for a source with no place in the document, one read again since, or one the
+        user may no longer see."""
+        if src.block_start is None:
+            return None
+        with tenant_tx(self.ws.ctx) as conn:
+            head = reader.version(conn, src.version_id)
+            if head is None or (src.reading_id and head.reading_id != src.reading_id):
+                return None
+            cx = contexts_of(self.ws, conn, src.version_id, head.reading_id)
+            seg = cx.segment_at(src.block_start)
+            lo = max(seg.first if seg is not None else 0, src.block_start - LAYOUT_BACK, 0)
+            hi = min(src.block_end if src.block_end is not None else src.block_start, src.block_start + LAYOUT_BACK * 4)
+            rows = conn.execute(text(_PIECES_SQL), {"v": src.version_id, "a": lo, "b": hi}).all()
+        pieces = tuple(scopes.piece_of(r.block_index, r.kind, r.text or "", tuple(r.section_path or ()), r.page, r.spans)
+                       for r in rows if r.status not in _SKIPPED and (r.text or "").strip())
+        return scopes.Layout(pieces, src.block_start)
+
+    def title_lines(self, src: Source, number: int) -> tuple[str, ...]:
+        """The lines of the title block of appraisal unit ``number``: the blocks at the top of its first page, up to its first heading."""
+        with tenant_tx(self.ws.ctx) as conn:
+            head = reader.version(conn, src.version_id)
+            if head is None or (src.reading_id and head.reading_id != src.reading_id):
+                return ()
+            cx = contexts_of(self.ws, conn, src.version_id, head.reading_id)
+            if not cx.multi or number not in cx.numbers:
+                return ()
+            seg = cx.segment(number)
+            end = seg.lead - 1 if seg.lead is not None else seg.first + TITLE_BLOCKS
+            rows = conn.execute(text(_PIECES_SQL), {"v": src.version_id, "a": seg.first, "b": min(end, seg.first + TITLE_BLOCKS)}).all()
+        first_page = rows[0].page if rows else None
+        return tuple(ln.strip() for r in rows if r.status not in _SKIPPED and r.page == first_page and r.kind != "table"
+                     for ln in (r.text or "").splitlines() if ln.strip())[:TITLE_LINES]
 
     def adopt(self, sid: str, kind: str) -> str | None:
         """Register the expansion ``expand`` returned as a turn source, once; its id."""

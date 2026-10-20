@@ -2933,10 +2933,50 @@ def test_ae4_a_time_limit_of_the_neighbouring_row_is_a_condition_from_another_it
     (p,) = _condition_problems(r)
     assert p.check == verify.CONDITION_FOUND_CHECK and p.kind == "requirement" and "דירה גדולה" in p.reason
     assert "עד שנה מהמסירה" in p.reason and r.removed_units() == set() and r.edit(answer).doc.text.startswith(markdown[:40])
-    # the judge's quote must stand in ANOTHER item's span: one from nowhere, and a hint it does not confirm, change nothing
+    # the judge's quote must stand in ANOTHER item's span: one from nowhere confirms nothing, but the ledger's own hint stands (round 20 U3,
+    # KTD3): the sentence states a clause of the neighbouring row that its own row does not hold, so the repair names that clause (the
+    # span of the other item), not the judge's words, and still removes nothing
     r, *_ = _plan_check(markdown, lambda iid, attrs, block: ("other_item", "תקופה אחרת") if iid == "I2" else None,
                         rows=rows, raw=raw, ask="שכירות הדירות")
-    assert _condition_problems(r) == []
+    (p,) = _condition_problems(r)
+    assert p.check == verify.CONDITION_FOUND_CHECK and p.kind == "requirement" and "עד שנה מהמסירה" in p.reason
+    assert "תקופה אחרת" not in p.reason and r.removed_units() == set()
+
+
+TWO_APPRAISALS = "השטח הכולל לבנייה בנכס הוא 1,200 מ״ר בשומה הראשונה ו-900 מ״ר בשומה השנייה [S2][S3]."
+SECOND_APPRAISAL = "השטח הכולל לבנייה בנכס הוא 900 מ״ר."
+
+
+def _two_appraisals(markdown: str, **kw):
+    """The plan table of the first appraisal (S2, with its condition) and a passage of the second (S3): one sentence cites both."""
+    from app.chat import items as ledger_items
+
+    ws = _file(SOURCE, "\n".join(PLAN_ROWS), SECOND_APPRAISAL, units=(1, 1, 2), declared=(1, 2))
+    ws.sources["S2"].kind = "table"
+    answer = _answer(markdown)
+    report = verify_answer(_condition_judge(), answer, ws, "?", [], requirements=_turn({"id": "1", "text": PLAN_ASK}),
+                           ledger=ledger_items.Ledger(), **kw)
+    return report, ws, answer
+
+
+def test_ae7_a_sentence_about_two_appraisals_is_not_given_the_first_ones_condition_when_a_sibling_sentence_states_it():
+    r, ws, answer = _two_appraisals(TWO_APPRAISALS + f"\n{PLAN_NOTE} [S2].")
+    assert _condition_problems(r) == [] and r.removed_units() == set()  # the sibling cites the item's source and states the whole condition
+    assert PLAN_NOTE in r.edit(answer).doc.text and "התנאי לפי המקור" not in r.edit(answer).doc.text
+
+
+def test_a_sentence_about_two_appraisals_that_no_sentence_qualifies_gets_the_condition_with_the_name_of_the_appraisal_it_belongs_to():
+    r, ws, answer = _two_appraisals(TWO_APPRAISALS)
+    (note,) = [p for p in r.problems if p.check == verify.CONDITION_CHECK]
+    assert note.annotation == PLAN_NOTE and note.named == ws.contexts[str(ws.sources["S2"].version_id)].label(1)
+    text = r.edit(answer).doc.text
+    assert f"התנאי לפי המקור של {note.named}: {PLAN_NOTE}" in text and text.count(PLAN_NOTE) == 1 and "1,200" in text and "900" in text
+
+
+def test_a_sentence_about_one_appraisal_is_given_the_condition_without_a_label_as_before():
+    r, ws, answer, _ = _plan_check(PLAN_BARE)
+    (note,) = [p for p in r.problems if p.check == verify.CONDITION_CHECK]
+    assert note.named == "" and f"(התנאי לפי המקור: {PLAN_NOTE}" in r.edit(answer).doc.text
 
 
 def test_a_condition_span_with_no_compact_form_gets_a_precise_not_verified_note_and_not_the_whole_paragraph():
@@ -3041,7 +3081,7 @@ def test_an_old_reply_without_candidates_is_still_a_valid_requirement_score_and_
     out = verify.JudgeCoverageOutput.model_validate({"verdicts": [], "requirements": [{"id": "N1", "status": "full"}]})
     assert out.requirements[0].candidates == []
     assert "candidates" in verify.JudgeRequirement.model_json_schema()["properties"]
-    assert verify.JUDGE_VERSION == 20
+    assert verify.JUDGE_VERSION == 21
 
 
 def test_ae5_the_other_rows_of_a_cited_rate_table_are_candidates_the_judge_assigns_become_items_and_the_repair_adds_them():

@@ -1648,7 +1648,7 @@ def test_the_judge_policy_names_the_server_held_line_and_the_derived_computation
 # --- the judge contract is version 14: a verdict of an older contract is not reused (round 13 U9, U11, KTD19; round 15 U7; round 16 U1; round 18 U3) --
 
 def test_a_verdict_cached_under_judge_contract_13_misses_under_14(monkeypatch):
-    assert verify.JUDGE_VERSION == 20  # 15: round 18 U4 (the marks of a table part's attribution, rule 32); 16: round 18 U5 (the condition outcome of an item in the requirements call, `conditions`); 17: round 18 U6 (the candidates of the requirements call, `candidates`); 18: round 19 U2 (the `<ownership>` fact line of a unit whose evidence's owner is unknown, rule 34); 19: round 19 U2 (that line also tells of a source of another context cited beside the asked one's); 20: round 20 U2 (rule 35: the claims of a table row that holds a defect are its cells)
+    assert verify.JUDGE_VERSION == 21  # 15: round 18 U4 (the marks of a table part's attribution, rule 32); 16: round 18 U5 (the condition outcome of an item in the requirements call, `conditions`); 17: round 18 U6 (the candidates of the requirements call, `candidates`); 18: round 19 U2 (the `<ownership>` fact line of a unit whose evidence's owner is unknown, rule 34); 19: round 19 U2 (that line also tells of a source of another context cited beside the asked one's); 20: round 20 U2 (rule 35: the claims of a table row that holds a defect are its cells); 21: round 20 U3 (the source header names a unit's other names; the ownership line carries the scope and same-property facts)
     ws, a, cache = _valued(), _answer("הנכס פנוי [S1]."), verify.VerdictCache()
     judge, seen = _recording_supported()
     monkeypatch.setattr(verify, "JUDGE_VERSION", 13)
@@ -2128,3 +2128,230 @@ def test_a_cut_of_the_key_cell_or_with_a_qualifier_word_or_a_defect_that_changes
     r = verify_answer(_claims_judge(lambda t: [("100 ₪", "supported"), ("בכפוף לאישור", "unsupported")] if "רכיב א" in t else None),
                       qual, _ws(PART_SOURCE), "?", [])
     assert r.removed_units() == {1}
+
+
+# --- scopes below the property: a datum under another plan, parcel, contract or alternative (round 20 U3, KTD3; R9-R13; AE6-AE8) ----------
+#
+# Every plan number, parcel, name and figure is invented. The sources are read as the verifier holds them: a table read (rows with a
+# header), a passage (lines), and the layout of the blocks above a source that the fetcher preloads (``Workspace.layouts``).
+
+from types import SimpleNamespace  # noqa: E402
+
+from app.chat import scopes  # noqa: E402
+
+PLANS_TABLE = ("טבלה 3.1 — זכויות הבנייה לפי תכנית\nהטבלה: 3 שורות\nרכיב | תכנית ג/11111 | תכנית ג/22222\n"
+               "שטח עיקרי | 1,200 | 1,800\nשטח שירות | 300 | 450")
+PLANS_HEAD = "| רכיב | תכנית ג/11111 | תכנית ג/22222 |\n|---|---|---|\n"
+
+
+def _row(markdown: str, needle: str) -> Unit:
+    return next(u for u in split_units(markdown) if needle in u.text and u.table_span is not None)
+
+
+def _scope_ws(*texts: str, kind: str = "table") -> Workspace:
+    ws = _ws(*texts, kind=kind)
+    return ws
+
+
+def test_a_cell_under_another_plans_column_is_found_by_its_index_and_the_cell_of_its_own_plan_is_not():
+    ws = _scope_ws(PLANS_TABLE)
+    row = _row(PLANS_HEAD + "| שטח שירות | 450 [S1] | 450 [S1] |", "שטח שירות")
+    found = verify._scope_check(row, ws)
+    assert list(found.cells) == [1] and found.reason is None and found.facts == []
+    assert "תכנית 22222" in found.cells[1] and "תכנית 11111" in found.cells[1]
+    assert verify._scope_check(_row(PLANS_HEAD + "| שטח שירות | 300 [S1] | 450 [S1] |", "שטח שירות"), ws).cells == {}
+
+
+def test_ae6_the_cell_of_another_plan_is_cut_to_the_marker_and_the_rest_of_the_row_stays():
+    ws = _scope_ws(PLANS_TABLE)
+    md = PLANS_HEAD + "| שטח עיקרי | 1,800 [S1] | 1,800 [S1] |\n| שטח שירות | 300 [S1] | 450 [S1] |"
+    a = _answer(md)
+    r = verify_answer(_judge(lambda t: "supported"), a, ws, "?", [])
+    assert r.removed_units() == set() and r.cuts
+    text = r.edit(a).doc.text
+    assert "| שטח עיקרי | «[1: חלק שלא אומת הושמט]» [S1] | 1,800 [S1] |" in text  # plan A's cell is cut, plan B's own cell stays
+    assert "| שטח שירות | 300 [S1] | 450 [S1] |" in text and text.count("חלק שלא אומת") == 1
+    (problem,) = [p for p in r.problems if p.check == verify.SCOPE_CHECK_NAME]
+    assert problem.failure_kind == "wrong_subject" and problem.resolution == "cut" and problem.defect == "part"
+
+
+def test_protection_a_cited_cell_naming_another_plan_is_still_removed_when_it_is_the_rows_only_data_cell():
+    ws = _scope_ws(PLANS_TABLE)
+    a = _answer(PLANS_HEAD + "| שטח שירות | 450 [S1] | — |")
+    r = verify_answer(_judge(lambda t: "supported"), a, ws, "?", [])
+    assert 2 in r.removed_units() or any(p.removes_unit and p.check == verify.SCOPE_CHECK_NAME for p in r.problems)
+    assert "450" not in r.apply(a).answer_markdown
+
+
+def test_protection_a_row_whose_key_cell_names_the_wrong_parcel_is_removed_whole():
+    ws = _scope_ws("חלקה 12 — שווי 3,100,000 ₪.\nחלקה 14 — שווי 4,200,000 ₪.", kind="context")
+    a = _answer("| נושא | שווי |\n|---|---|\n| שווי חלקה 12: 4,200,000 [S1] | 3,100,000 [S1] |")
+    r = verify_answer(_judge(lambda t: "supported"), a, ws, "?", [])
+    assert any(p.removes_unit and p.check == verify.SCOPE_CHECK_NAME for p in r.problems) and not r.cuts  # the other cell would describe the wrong thing
+    assert "4,200,000" not in r.apply(a).answer_markdown and "3,100,000" not in r.apply(a).answer_markdown
+
+
+def test_a_unit_with_no_scope_opener_and_a_claim_that_names_no_scope_get_no_scope_decision():
+    ws = _scope_ws("שווי הנכס בגישת ההשוואה לחלקה 12 הוא 6,800,000 ₪.", kind="context")
+    plain = Unit(0, "שווי הנכס הוא 6,800,000 ₪ [S1].", "שווי הנכס הוא 6,800,000 ₪", ["S1"])
+    named = Unit(0, "שווי חלקה 12 הוא 6,800,000 ₪ [S1].", "שווי חלקה 12 הוא 6,800,000 ₪", ["S1"])
+    for unit in (plain, named):
+        found = verify._scope_check(unit, ws)
+        assert found.reason is None and found.cells == {} and found.facts == []
+    a = _answer("שווי חלקה 12 הוא 6,800,000 ₪ [S1].")
+    r = verify_answer(_judge(lambda t: "supported"), a, ws, "?", [])
+    assert r.problems == [] and r.removed_units() == set()
+
+
+PARCELS = "3. שווי הקרקע לפי חלקה\nחלקה 56 — שיעור 3.32% עד 30.10.2025.\nחלקה 57 — שיעור 4.15% עד 4.11.2025."
+
+
+def test_a_value_of_one_parcel_written_under_another_is_found_in_a_sentence_that_names_the_parcel():
+    ws = _scope_ws(PARCELS, kind="context")
+    found = verify._scope_check(Unit(0, "בחלקה 56 השיעור הוא 4.15% [S1].", "בחלקה 56 השיעור הוא 4.15%", ["S1"]), ws)
+    assert found.reason and "חלקה 57" in found.reason and "חלקה 56" in found.reason
+    assert verify._scope_check(Unit(0, "בחלקה 57 השיעור הוא 4.15% [S1].", "בחלקה 57 השיעור הוא 4.15%", ["S1"]), ws).reason is None
+
+
+def test_the_parcel_the_bullets_lead_names_is_the_referent_of_the_sentence_after_it():
+    ws = _scope_ws(PARCELS, kind="context")
+    md = "- חלקה 56: מבנה פינתי. השיעור הוא 4.15% [S1]."
+    units = split_units(md)
+    problems = verify.deterministic(units, ws, "?")
+    (p,) = problems
+    assert p.check == verify.SCOPE_CHECK_NAME and p.failure_kind == "wrong_subject" and p.unit.text.startswith("השיעור") and p.removes_unit
+    right = verify.deterministic(split_units("- חלקה 57: מבנה פינתי. השיעור הוא 4.15% [S1]."), ws, "?")
+    assert right == []
+
+
+def test_the_stored_subject_of_a_measurement_is_the_scope_of_its_datum():
+    ws = _scope_ws(PARCELS, kind="context")
+    row = SimpleNamespace(value_text="3.32%", subject="המבנה בחלקה 56", quote="", section="", metric="שיעור")
+    ws.measurements["M1"] = SimpleNamespace(row=row, context=None, version_id=uuid.uuid4())
+    wrong = verify._scope_check(Unit(0, "בחלקה 57 השיעור הוא 3.32% [M1].", "בחלקה 57 השיעור הוא 3.32%", ["M1"]), ws)
+    assert wrong.reason and "חלקה 56" in wrong.reason
+    assert verify._scope_check(Unit(0, "בחלקה 56 השיעור הוא 3.32% [M1].", "בחלקה 56 השיעור הוא 3.32%", ["M1"]), ws).reason is None
+
+
+def test_a_claim_that_cites_a_source_under_its_own_parcel_beside_one_under_another_is_kept_with_a_fact():
+    ws = _scope_ws(PARCELS, "חלקה 56 — שיעור 4.15% לפי הסכם הארכה.", kind="context")
+    found = verify._scope_check(Unit(0, "בחלקה 56 השיעור הוא 4.15% [S1][S2].", "בחלקה 56 השיעור הוא 4.15%", ["S1", "S2"]), ws)
+    assert found.reason is None and len(found.facts) == 1 and "S1" in found.facts[0] and "חלקה 57" in found.facts[0]
+
+
+def test_a_datum_written_under_its_own_parcel_and_under_none_is_told_to_the_judge_and_never_removes():
+    ws = _scope_ws("שיעור 4.15% בנכס כולו, לרבות חלקה 56.\nחלקה 57 — שיעור 4.15% עד 4.11.2025.", kind="context")
+    found = verify._scope_check(Unit(0, "בחלקה 56 השיעור הוא 4.15% [S1].", "בחלקה 56 השיעור הוא 4.15%", ["S1"]), ws)
+    assert found.reason is None and len(found.facts) == 1 and "חלקה 57" in found.facts[0]
+    units = split_units("בחלקה 56 השיעור הוא 4.15% [S1].")
+    assert verify.deterministic(units, ws, "?") == [] and "חלקה 57" in ws.ownership_facts[verify._fact_key(units[0])]
+
+
+def test_the_scope_a_fetcher_preloaded_above_a_table_is_its_scope_and_the_claims_plan_is_compared_with_it():
+    layout = scopes.Layout((scopes.Piece(1, "ג. בהתאם לתכנית בניין עיר מספר ג/20039 אשר פורסמה", "paragraph", 1, ("7. סיכום",)),
+                            scopes.Piece(2, "טבלת זכויות והוראות הבניה:", "paragraph", 1, ("7. סיכום",)),
+                            scopes.Piece(3, "שימוש | שטח", "table", 1, ("7. סיכום",))), first=3)
+    ws = _scope_ws("הטבלה: 2 שורות\nשימוש | שטח\nמסחר | 11,900", kind="table")
+    ws.layouts["S1"] = layout
+    claim = Unit(0, "שטח המסחר לפי תכנית ג/25083 הוא 11,900 מ״ר [S1].", "שטח המסחר לפי תכנית ג/25083 הוא 11,900 מ״ר", ["S1"])
+    assert "תכנית 20039" in verify._scope_check(claim, ws).reason
+    own = Unit(0, "שטח המסחר לפי תכנית ג/20039 הוא 11,900 מ״ר [S1].", "שטח המסחר לפי תכנית ג/20039 הוא 11,900 מ״ר", ["S1"])
+    assert verify._scope_check(own, ws).reason is None
+    del ws.layouts["S1"]  # without the blocks above it the source states no scope: nothing is decided
+    assert verify._scope_check(claim, ws).reason is None
+
+
+FOOTNOTE_LAYOUT = scopes.Layout((
+    scopes.Piece(10, "ג. חוזה לחלקות 41-45 נחתם בשנת 1994", "paragraph", 1, ("4. חוזים",), ("1",)),
+    scopes.Piece(11, "ד. חוזה למגרשים 1-3, 8", "paragraph", 1, ("4. חוזים",)),
+    scopes.Piece(12, "1 הוצג חוזה אחד בלבד שמייצג את כל המגרשים פרט לתקופת החכירה", "paragraph", 1, ("4. חוזים",), (), "1"),
+    scopes.Piece(13, "2 תנאי נוסף שאין לו סימן במקום אחר בעמוד", "paragraph", 1, ("4. חוזים",), (), "2")), first=11)
+NOTE_PASSAGE = ("ד. חוזה למגרשים 1-3, 8\n1 הוצג חוזה אחד בלבד שמייצג את כל המגרשים פרט לתקופת החכירה\n"
+                "2 תנאי נוסף שאין לו סימן במקום אחר בעמוד")
+
+
+def test_a_claim_that_states_a_footnote_for_another_scope_than_the_one_its_mark_is_in_is_found():
+    ws = _scope_ws(NOTE_PASSAGE, kind="context")
+    ws.layouts["S1"] = FOOTNOTE_LAYOUT
+    text = "לגבי חלקות 1-3 ו-8 הוצג חוזה אחד בלבד שמייצג את כל המגרשים פרט לתקופת החכירה"
+    found = verify._scope_check(Unit(0, text + " [S1].", text, ["S1"]), ws)
+    assert found.reason and "חלקה 41" in found.reason and "חלקה 1, 2, 3, 8" in found.reason
+    own = "לגבי חלקות 41-45 הוצג חוזה אחד בלבד שמייצג את כל המגרשים פרט לתקופת החכירה"
+    assert verify._scope_check(Unit(0, own + " [S1].", own, ["S1"]), ws).reason is None
+
+
+def test_a_footnote_whose_mark_cannot_be_bound_is_told_to_the_judge_and_attached_to_nothing():
+    ws = _scope_ws(NOTE_PASSAGE, kind="context")
+    ws.layouts["S1"] = FOOTNOTE_LAYOUT
+    text = "קיים תנאי נוסף שאין לו סימן במקום אחר בעמוד לגבי חלקות 1-3"
+    found = verify._scope_check(Unit(0, text + " [S1].", text, ["S1"]), ws)
+    assert found.reason is None and len(found.facts) == 1 and "סימן 2" in found.facts[0]
+
+
+# --- the unit's names in the judge's header, and the same-property fact (AE8, R12) ----------------------------------------------------
+
+def _identity_json(*shown: str) -> dict:
+    """The stored identifiers of a unit that shows ``shown`` (as the units derivation writes them)."""
+    from app.chat import contexts, units
+
+    return units._identifiers_json(contexts.identifiers("\n".join(shown)))
+
+
+def _named_file(titled: bool = False):
+    from app.chat import contexts
+    from tests.unit.test_appraisal_context import _unit
+
+    parts = [_unit(1, "appraisal", None, ("מתחם גבעת הרימון", "גבעת הרימון") if titled else (),
+                   ("רחוב גפן 7",), first=0, last=3, pages=(1, 1), identifiers=_identity_json("רחוב גפן 7")),
+             _unit(2, "appraisal", None, (), ("דרך צבר 3",), first=4, last=7, pages=(2, 2), identifiers=_identity_json("דרך צבר 3"))]
+    first = {0: SimpleNamespace(block_index=0, page=1, bbox=[50.0, 40.0, 500.0, 52.0]),
+             4: SimpleNamespace(block_index=4, page=2, bbox=[50.0, 40.0, 500.0, 52.0])}
+    return contexts.from_units(parts, first, [], "v", "r1")
+
+
+TITLES = {("v", 1): ("שמאות דמו (סינתטי)", "לכבוד", "מר נועם הדמיון, דרך צבר 3, כפר הדמה",
+                     "הנדון: שומת מקרקעין — מתחם גבעת הרימון, רחוב גפן 7", "משרד: שמאות הגבעה, רחוב גפן 7"),
+          ("v", 2): ("הנדון: שומת מקרקעין — פרויקט נחל הצבר, דרך צבר 3",)}
+
+
+def _named_ws(titles=TITLES) -> SimpleNamespace:
+    cx = _named_file()
+    src = SimpleNamespace(version_id="v", contexts=[1], text="1. הערכת שווי\nשווי הנכס הוא 6,800,000 ₪.", context=cx.describe(1))
+    return SimpleNamespace(contexts={"v": cx}, unit_titles=dict(titles), sources={"S1": src}, layouts={})
+
+
+def test_the_name_a_title_block_gives_its_unit_beside_its_address_is_a_fact_for_the_judge():
+    ws = _named_ws()
+    question = "מהו השווי של מתחם גבעת הרימון?"
+    fact = verify._name_link(ws.contexts["v"], {1}, [question], ws)
+    assert "מתחם גבעת הרימון" in fact and "רחוב גפן 7" in fact and "wrong_subject" in fact
+    assert verify._name_link(ws.contexts["v"], {2}, [question], ws) == ""  # another unit's block does not write that name
+
+
+def test_protection_the_addressees_or_the_appraisers_address_never_links_a_name_to_a_unit():
+    ws = _named_ws()
+    cx = ws.contexts["v"]
+    # the addressee's street is unit 2's, in unit 1's block: it is no evidence for unit 1, and a name there is no unit 1's
+    assert verify._name_link(cx, {1}, ["מה השווי של מר נועם הדמיון בדרך צבר 3?"], ws) == ""
+    # the office line is the only line with the name, and it is not the unit's
+    assert verify._name_link(cx, {1}, ["מה השווי של שמאות הגבעה?"], ws) == ""
+    # a name that two units' blocks write is no unit's alone
+    both = dict(TITLES) | {("v", 2): ("הנדון: שומת מקרקעין — מתחם גבעת הרימון, דרך צבר 3",)}
+    assert verify._name_link(cx, {1}, ["מהו השווי של מתחם גבעת הרימון?"], _named_ws(both)) == ""
+    # a unit whose neighbours' blocks were not read cannot show the name is its alone
+    assert verify._name_link(cx, {1}, ["מהו השווי של מתחם גבעת הרימון?"], _named_ws({("v", 1): TITLES[("v", 1)]})) == ""
+
+
+def test_the_judges_source_header_also_shows_the_names_the_document_gives_the_unit():
+    cx = _named_file(titled=True)
+    ws = SimpleNamespace(contexts={"v": cx})
+    src = SimpleNamespace(version_id="v", contexts=[1])
+    head = verify._names_head(ws, src)
+    assert head.startswith(" (נקרא במסמך גם: ") and "«מתחם גבעת הרימון»" in head and "«גבעת הרימון»" in head
+    assert verify._names_head(ws, SimpleNamespace(version_id="v", contexts=[2])) == ""  # a unit with no name of its own
+    assert verify._names_head(SimpleNamespace(contexts={}), src) == "" and verify._names_head(ws, SimpleNamespace(version_id="v", contexts=[])) == ""
+    # the passage's header carries them beside the unit's label and before the file's title
+    source = SimpleNamespace(context=cx.describe(1), contexts=[1], version_id="v", location="עמוד 1", title="קובץ", subject="", source_kind="appraisal",
+                             text="x", kind="context", date_line=None, link=None, unit=None)
+    heading = verify._source_parts(SimpleNamespace(sources={"S1": source}, contexts={"v": cx}, declared_handles={}), "S1")[0]
+    assert heading.index("מתחם גבעת הרימון") < heading.index("קובץ: קובץ") and cx.describe(1) in heading

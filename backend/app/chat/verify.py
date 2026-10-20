@@ -208,7 +208,7 @@ from app.answering.numread import NUMBER as _NUM_AT  # one reading of numbers fo
 from app.answering.verify import _DATE as _DATE_AT
 from app.answering.verify import not_an_amount, numbers_in
 from app.chat import dates as chat_dates
-from app.chat import meaning
+from app.chat import meaning, scopes
 from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut
 from app.chat.evidence import (
     HINT,
@@ -298,7 +298,10 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # 18 (round 19 U2, KTD2): a unit whose evidence's owner the context check could not settle is shown with a neutral ``<ownership>`` fact line; rule (34) reads it.
 # 19 (round 19 U2, KTD2): the same line also says that a unit cites a source of another context beside sources of the asked one (``MSG_OWNER_MIXED``).
 # 20 (round 20 U2, KTD2): rule (35) asks for the claims of a table row that holds a defect per cell, so that the final check can cut or mark one cell.
-JUDGE_VERSION = 20
+# 21 (round 20 U3, KTD3): the header of a passage of a file holding several reports also shows the names the document gives its unit
+# (``_names_head``), and the ownership line carries the scope facts (a datum written under another plan, parcel or contract) and the
+# same-property fact (the question's name is a name of the unit its address labels); rule (34) reads them.
+JUDGE_VERSION = 21
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -450,6 +453,10 @@ JUDGE_POLICY = (
     "שייך לנכס שנשאל עליו: איפה הנתון כתוב ואיזה נכס נשאל. זו אינה טענה ואינה פסק דין. מספר ההקשר או הכותרת של היחידה שבה הנתון "
     "כתוב אינם מוכיחים שהוא של נכס אחר; שפוט לפי הקטע המצוטט עצמו: אם הוא מזהה (בשם, בחלקה או בכתובת) את הנכס שנשאל עליו, הנתון "
     "שלו; אם הוא מזהה נכס אחר, wrong_subject; ואם אינו מזהה אף נכס, אל תסיק wrong_subject מההבדל בהקשר לבדו. "
+    "עובדה שאומרת שהשם שנשאל עליו הוא שם של היחידה שמסומנת בכתובת (כותרת היחידה והכינויים שלה במסמך), או שבכותרת המקור כתוב «נקרא במסמך "
+    "גם»: זו אותה יחידה, ואין להסיק wrong_subject מכך שהיא מסומנת בכתובת ולא בשם. עובדה שאומרת שהנתון כתוב במקור גם תחת תכנית, חלקה, "
+    "חוזה או חלופה אחרת מזו שהטענה מייחסת לו, או שהערת שוליים לא נקשרה לסימן שלה: השרת לא הכריע; שפוט לפי הקטע המצוטט עצמו, "
+    "ואם הוא מציין לאיזו תכנית, חלקה או חוזה הנתון שייך, זה מכריע. "
     "(35) שורת טבלה שיש בה תא שאינו נתמך במלואו: ה-claims שלה הם התאים (חריג לכלל 16). החזר claim אחד לכל תא שיש בו נתון או טענה, "
     "ה-span שלו בתוך תא אחד תו בתו (בלי \"|\" ובלי חציית גבול תא), כולל התאים הנתמכים; פגם בתא אחד אינו הופך תא אחר ללא נתמך. "
     "תא שהמקור תומך בו — supported; תא שחלקו נתמך (הנתון נתמך וההסתייגות או ההרחבה אינן) — partial; תא שהמקור אינו תומך בו — "
@@ -1384,9 +1391,12 @@ _SCOPE_NAMED = re.compile(
 
 
 def names_scope(line: str) -> bool:
-    """Whether a line names a scope below the property (``_SCOPE_NAMED``): the lines above a table row that do are part of what its
-    verdict depends on (a plan, an alternative or a state the row is read under)."""
-    return bool(_SCOPE_NAMED.search(_IDS.sub("", line or "")))
+    """Whether a line names a scope below the property: the lines above a table row that do are part of what its verdict depends on (a plan,
+    an alternative or a state the row is read under). Round 20 U3: the scope reader decides (``scopes.mentions``, the one reading the
+    attribution check uses, so the reuse of a verdict and the check agree on what a scope is); the closed lexicon above still adds the
+    sides («נכס א׳») and the bare approved or proposed word it reads with no noun in front."""
+    text = _IDS.sub("", line or "")
+    return bool(scopes.mentions(text)) or bool(_SCOPE_NAMED.search(text))
 
 
 def key_context(unit: Unit) -> str:
@@ -2752,7 +2762,9 @@ class VerifyReport:
                 if p.check in (SCOPE_LIMIT_CHECK, CONDITION_LIMIT_CHECK):  # not verified: said, with where the value was read (R11)
                     edits.append((at, at, f" ({p.annotation})", "scope_note", ()))
                 elif p.check == CONDITION_CHECK:  # the condition the source states, written next to the value with its citation (R4)
-                    edits.append((at, at, f" ({MSG_CONDITION_ADDED.format(phrase=p.annotation)}{cite})", "qualifier", ()))
+                    said = (MSG_CONDITION_LABELLED.format(label=p.named, phrase=p.annotation) if p.named
+                            else MSG_CONDITION_ADDED.format(phrase=p.annotation))
+                    edits.append((at, at, f" ({said}{cite})", "qualifier", ()))
                 elif p.check == SCOPE_CHECK:  # the scope the source states, written next to the value with its citation (R10)
                     edits.append((at, at, f" ({MSG_SCOPE_ADDED.format(phrase=p.annotation)}{cite})", "qualifier", ()))
                 elif p.qualifier == "approx" or not _is_duration_or_count(p.unit, p.number or "", p.at):
@@ -3293,6 +3305,20 @@ def without_part_tags(text: str) -> str:
     return _PART_TAG.sub(" ", text)
 
 
+MSG_ALSO_NAMED = " (נקרא במסמך גם: {names})"
+
+
+def _names_head(ws: Workspace, src) -> str:
+    """The names the document gives the units a passage is in, beside the label that shows their address (round 20 U3, KTD3, R12): the
+    judge reads a passage of «רחוב הארז 9» as the passage of the unit the question calls by its name, since the unit's title block and aliases
+    say it is also that. Empty when the unit's label already shows its names or it has none."""
+    cx = (getattr(ws, "contexts", None) or {}).get(str(src.version_id))
+    if cx is None or not src.contexts:
+        return ""
+    names = list(dict.fromkeys(x for n in src.contexts[:2] for x in cx.names_of(n)))
+    return MSG_ALSO_NAMED.format(names=", ".join(f"«{x}»" for x in names)) if names else ""
+
+
 def _source_parts(ws: Workspace, sid: str, *, dated: bool = True) -> tuple[str, str, str] | None:
     """(heading, body, kind) of a cited id: a passage's title and location and its text; a measurement or a
     computation as one short statement of its meaning. ``dated``: a value's or measurement's record carries the date the
@@ -3306,7 +3332,7 @@ def _source_parts(ws: Workspace, sid: str, *, dated: bool = True) -> tuple[str, 
         if src.context:
             # a file may hold several reports: the header names the appraisal unit's own subject first, and the file's title only
             # as the file (which names the first report), so a passage of the second is never read as the first's (round 18 U3)
-            head = f"{src.context} — {src.location} — {MSG_FILE}: {src.title}"
+            head = f"{src.context}{_names_head(ws, src)} — {src.location} — {MSG_FILE}: {src.title}"
         else:
             head = f"{src.title} — {src.location}"
             if src.subject:
@@ -4184,6 +4210,7 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
     question_numbers = numbers_in(question)
     everything = _all_numbers(ws)
     stated_by: dict[str, set[str]] = {}  # the numbers each cited id states, read once for all units
+    leads = _block_leads(units)  # the lead of each unit's block, which may name the scope of its sentences (round 20 U3)
     for u in units:
         before = len(problems)
         unknown = _unknown_ids(u, ws)
@@ -4239,10 +4266,21 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
         if owner.reason:
             problems.append(Problem(u, owner.reason, failure_kind="wrong_subject", check="context"))
             continue
-        if owner.facts:  # an owner the server could not settle is not removed: the judge reads the facts (rule 34)
-            ws.ownership_facts[_fact_key(u)] = " ".join(owner.facts)
+        # the datum under another plan, parcel, contract or alternative than the claim's (round 20 U3, KTD3, R9): a sentence goes the way a
+        # claim about another property goes; a table row keeps its other cells (``_scope_cells``)
+        scope = _scope_check(u, ws, leads.get(u.index, ""))
+        if scope.reason:
+            problems.append(Problem(u, scope.reason, failure_kind="wrong_subject", check=SCOPE_CHECK_NAME))
+            continue
+        facts = [*owner.facts, *scope.facts]
+        if facts:  # an owner the server could not settle is not removed: the judge reads the facts (rule 34)
+            ws.ownership_facts[_fact_key(u)] = " ".join(facts)
         else:
             ws.ownership_facts.pop(_fact_key(u), None)
+        if scope.cells:
+            _ws_map(ws, "scope_findings")[_fact_key(u)] = dict(scope.cells)
+        else:
+            _ws_map(ws, "scope_findings").pop(_fact_key(u), None)
         for reason in _vat_problems(u, ws) if u.ids else []:
             problems.append(Problem(u, reason, failure_kind="wrong_unit", check="vat"))
         blocking = [m for m in meanings.get(u.index, []) if m.blocking]
@@ -4294,6 +4332,8 @@ REQ_CONDITION_OTHER = ("המשפט שנותן את הפריט «{name}» מיי�
                        "של הפריט עצמו (אם יש לו) והשאר את הערך")
 MSG_CONDITION_FOUND = "הערך מוצג בלי התנאי ש-{sid} מציין לו («{phrase}»); אם התשובה לא תכלול אותו, התנאי ייכתב ליד הערך"
 MSG_CONDITION_ADDED = "התנאי לפי המקור: {phrase}"
+# a condition written into a sentence that speaks of several appraisals or scopes names the one it belongs to (round 20 U3, KTD3, R10)
+MSG_CONDITION_LABELLED = "התנאי לפי המקור של {label}: {phrase}"
 MSG_CONDITION_UNVERIFIED = "התנאי של הערך אינו כתוב בתשובה ולא אומת ({sid}); אם התשובה לא תכלול אותו, ייכתב ליד הערך שהתנאי לא אומת"
 MSG_CONDITION_LIMIT = "התנאי של הערך במקור לא נכלל בתשובה ולא אומת; הערך נקרא ב-{where}"
 MSG_CONDITION_CONTRADICTS = "התנאי של הפריט «{name}» סותר את המקור: {where}"
@@ -4536,7 +4576,8 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
     said = _condition_verdicts(votes)
     units = {u.index: u for u in report.units}
     removed = report.removed_units()
-    for st in report.item_states():
+    states = report.item_states()
+    for st in states:
         verdict = said.get(st["id"])
         unit = units.get(st["condition_unit"])
         if st["condition_check"] == DECIDED_MISSING and st.get("condition_quote"):
@@ -4545,6 +4586,13 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
             verdict = ConditionVerdict(item=st["id"], outcome=MISSING, quote=st["condition_quote"])
         elif st["condition_check"] not in ASKED_CHECKS:
             continue
+        if verdict is not None and verdict.outcome == MISSING and _whole_value(verdict.quote, st):
+            verdict = None  # a "missing" condition that is the item's whole value states no condition at all (round 20 U3, KTD3)
+        if unit is not None and "other_item" in (st.get("condition_hint") or []) and (verdict is None or verdict.outcome == MISSING):
+            # the sentence states an operator clause that the item's own scope does not hold and another item's does: the server's hint
+            # stands without the judge's word (round 20 U3, KTD3)
+            if foreign := _foreign_quote(st, states, unit):
+                verdict = ConditionVerdict(item=st["id"], outcome="other_item", quote=foreign)
         if (verdict is None or verdict.outcome == KEPT or st["state"] != ITEM_COVERED or unit is None
                 or unit.index in removed):
             continue
@@ -4563,6 +4611,11 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
                 name=name, where=f"«{prompt_text(verdict.quote)}»"), kind="requirement", component=st["component"],
                 check=CONDITION_FOUND_CHECK))
         else:
+            # a sentence that speaks of several appraisals or scopes is given the condition of one of them only when no other sentence
+            # that cites the item's own source states it, and then with the name of the one it belongs to (round 20 U3, KTD3, R10)
+            several = _speaks_of_several(unit, ws)
+            if several and _sibling_states(st, unit, report.units, removed, ws):
+                continue
             report.problems.append(Problem(Unit(-1, "", "", []), REQ_CONDITION_FOUND.format(
                 name=name, where=f"{st['source']} «{prompt_text(verdict.quote)}»"), kind="requirement",
                 component=st["component"], check=CONDITION_FOUND_CHECK))
@@ -4574,11 +4627,85 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
             if phrase:
                 report.problems.append(Problem(unit, MSG_CONDITION_FOUND.format(sid=st["source"], phrase=phrase),
                                                kind="missing_qualifier", number=number, annotation=phrase, cite=st["source"],
-                                               check=CONDITION_CHECK))
+                                               check=CONDITION_CHECK, named=_scope_label(source, ws) if several else ""))
             else:
                 report.problems.append(Problem(unit, MSG_CONDITION_UNVERIFIED.format(sid=st["source"]), kind="missing_qualifier",
                                                number=number, annotation=MSG_CONDITION_LIMIT.format(where=_read_in(cited)),
                                                check=CONDITION_LIMIT_CHECK))
+
+
+def _whole_value(quote: str, st: dict) -> bool:
+    """Whether a judge's "missing" quote is the item's whole value or its whole quote (round 20 U3, KTD3): the item's own figure, which
+    the sentence states, is no condition it leaves out."""
+    flat = _flat_quote(quote)
+    return bool(flat) and flat in {_flat_quote(st.get("value") or ""), _flat_quote(st.get("quote") or "")} - {""}
+
+
+def _foreign_quote(st: dict, states: list[dict], unit: Unit) -> str:
+    """The clause of another item's condition span that the sentence ``unit`` states and the item's own context does not hold (the
+    deterministic ``other_item`` hint of the ledger): the quote the repair request carries."""
+    from app.chat import conditions  # conditions reads this module
+
+    for other_id in st.get("condition_foreign") or []:
+        other = next((x for x in states if x["id"] == other_id), None)
+        for span in (other or {}).get("condition_spans") or []:
+            text = span["text"]
+            if conditions.outcome(text, unit.text) == KEPT and not conditions.stated_in(text, st.get("quote") or ""):
+                return conditions.material_clauses(text)[0] if conditions.material_clauses(text) else text
+    return ""
+
+
+def _contexts_of(u: Unit, ws: Workspace) -> set[tuple]:
+    """The appraisal contexts the evidence a unit cites is in, as (version, number) — and, for a source of a file without contexts, the
+    unit it is of — read from the sources it cites and the sources and contexts of the values and measurements it cites."""
+    found: set[tuple] = set()
+    for i in u.ids:
+        if i in ws.sources:
+            src = ws.sources[i]
+            found.update((str(src.version_id), n) for n in src.contexts or ())
+            if not src.contexts and src.unit:
+                found.add((str(src.version_id), src.unit.get("id")))
+        elif i in ws.values:
+            v = ws.values[i]
+            if v.context:
+                found.add((str(v.version_id), v.context.get("number")))
+        elif i in ws.measurements:
+            m = ws.measurements[i]
+            if m.context:
+                found.add((str(m.version_id), m.context.get("number")))
+    return found
+
+
+def _speaks_of_several(unit: Unit, ws: Workspace) -> bool:
+    """Whether a sentence speaks of several appraisals: what it cites is in more than one appraisal context of its files."""
+    return len(_contexts_of(unit, ws)) > 1
+
+
+def _scope_label(src: Source, ws: Workspace) -> str:
+    """How a server note names the appraisal a condition belongs to: the label of the source's context (its address or name), else its
+    unit's label, else the context as the source shows it."""
+    cx = ws.contexts.get(str(src.version_id))
+    if cx is not None and src.contexts:
+        return cx.label(src.contexts[0])
+    return (src.unit or {}).get("label") or (src.context or "").split(":", 1)[-1].strip()
+
+
+def _sibling_states(st: dict, unit: Unit, units: list[Unit], removed: set[int], ws: Workspace) -> bool:
+    """Whether another surviving sentence that cites the item's own source states the item's condition (every span of it, as the
+    sentence that gives the value would have to): the condition is then in the answer, and the sentence that speaks of several appraisals
+    is not given it again (round 20 U3, KTD3, R10)."""
+    from app.chat import conditions  # conditions reads this module
+
+    spans = [x["text"] for x in st.get("condition_spans") or [] if conditions.material_clauses(x["text"]) or conditions.material(x["text"])]
+    if not spans:
+        return False
+    for other in units:
+        if other.index in (unit.index, st["condition_unit"]) or other.index in removed or other.table_header:
+            continue
+        cites = any(i == st["source"] or (i in ws.values and ws.values[i].source_id == st["source"]) for i in other.ids)
+        if cites and all(conditions.outcome(text, other.text) == KEPT for text in spans):
+            return True
+    return False
 
 
 def _plain_label(st: dict) -> str:
@@ -5448,6 +5575,12 @@ def _cited_cells(u: Unit) -> list[tuple[str, Unit]]:
     """For a table row: ``(the heading of the cell's column, the cell as a unit)`` of each cell that cites evidence (round 19 U2, R7:
     a comparison's cell is checked against the side its column names). Empty for anything but a body row whose cells line up with its
     table's header row."""
+    return [(h, cell) for _, h, _, cell in _cited_cell_list(u)]
+
+
+def _cited_cell_list(u: Unit) -> list[tuple[int, str, str, Unit]]:
+    """``_cited_cells`` with each cell's index in its row and the label of its row (round 20 U3, KTD3): ``(index, the heading of the cell's
+    column, the first cell of the row — "" for the first cell itself —, the cell as a unit)``."""
     if u.table_span is None or u.table_header or not u.context:
         return []
     header = u.context.split("\n", 1)[0].strip()
@@ -5456,7 +5589,9 @@ def _cited_cells(u: Unit) -> list[tuple[str, Unit]]:
     heads, cells = meaning._row_cells(header.strip()), meaning._row_cells(u.raw.strip())
     if len(heads) != len(cells):
         return []
-    return [(h, Unit(u.index, c, _IDS.sub("", c).strip(), ids_in(c))) for h, c in zip(heads, cells, strict=True) if ids_in(c)]
+    label = scopes.keyed_label(heads[0], _IDS.sub("", cells[0]).strip()) if cells else ""
+    return [(i, h, label if i else "", Unit(u.index, c, _IDS.sub("", c).strip(), ids_in(c)))
+            for i, (h, c) in enumerate(zip(heads, cells, strict=True)) if ids_in(c)]
 
 
 def _evidence_spans(i: str, ws: Workspace) -> tuple[list[str], bool]:
@@ -5545,6 +5680,79 @@ def _context_check(u: Unit, ws: Workspace, question: str) -> ContextCheck:
     return out
 
 
+def _shared_name(line: str, texts: Sequence[str], ident) -> str:
+    """The name a title-block line and a text share (round 20 U3, KTD3, R12): the longest run of at least two words that both write, with the
+    identifiers of the unit taken out of the line, that holds a word which is not only a kind of property (``contexts.GENERIC_DESIGNATORS``)
+    and no digit; the words as the line writes them. Empty when they share none."""
+    from app.chat import contexts
+
+    cleaned = line
+    for street, number, letter in ident.streets:
+        cleaned = re.sub(rf"(?:{'|'.join(map(re.escape, contexts.STREET_LABELS))})?\s*{re.escape(' '.join(street))}\s*{number}{letter}", " ",
+                         cleaned)
+    mine = contexts.name_key(cleaned).split()
+    best: list[str] = []
+    for text in texts:
+        theirs = contexts.name_key(text).split()
+        for a in range(len(mine)):
+            for b in range(len(theirs)):
+                k = 0
+                while a + k < len(mine) and b + k < len(theirs) and (
+                        mine[a + k] == theirs[b + k] or (k == 0 and len(theirs[b]) > 2 and theirs[b][0] in "הובלמשכ"
+                                                          and theirs[b][1:] == mine[a])):
+                    k += 1
+                run = mine[a:a + k]
+                if k >= 2 and k > len(best) and not any(re.search(r"\d", w) for w in run) \
+                        and any(not contexts._generic_word(w) for w in run):
+                    best = run
+    return " ".join(best)
+
+
+def _title_names(cx, n: int, texts: Sequence[str], titles: Mapping[tuple, Sequence[str]]) -> list[str]:
+    """The names of unit ``n`` that its stored title block gives beside its own address or parcel and that the claim, request or question
+    uses (round 20 U3, KTD3, R12): a line of the block that holds an identifier of the unit and shares a name with the text. A line that
+    addresses the report to someone, or names the appraiser's office, is no evidence of the unit's name."""
+    from app.chat import contexts
+    from app.chat import units as unit_store
+
+    ident = cx.identity(n)
+    found: list[str] = []
+    for line in titles.get((cx.version_id, n), ()):
+        if line.startswith(unit_store.ADDRESSEE_WORDS) or re.match(r"^(?:אל|משרד|שמאי|מאת)\s*[:：]", line) \
+                or not ident.identifier_in(line):
+            continue
+        if name := _shared_name(line, texts, ident):
+            found.append(name)
+    # a name that another unit's title block writes too (a project of several buildings) is no name of this unit alone
+    for other in (m for m in cx.subjects if m != n):
+        if (cx.version_id, other) not in titles:
+            return []  # that unit's block was not read: the name cannot be shown to be this unit's alone
+        theirs = contexts.name_key(" ".join(titles[(cx.version_id, other)]))
+        found = [x for x in found if x not in theirs]
+    return list(dict.fromkeys(found))
+
+
+def _name_link(cx, numbers: set[int], texts: Sequence[str], ws: Workspace) -> str:
+    """The same-property fact for the judge (round 20 U3, KTD3, R12): the evidence is in a unit that the claim, the request or the question
+    names by a name of its own, and the unit is labelled by its address. The link is the unit's stored identity — its title and the aliases
+    the document gives it, the subject fields of its identity card, and the line of its title block that holds both the name and its
+    address; never the addressee or the appraiser's office — and is given as a fact, never as proof by itself. Empty when the unit's label
+    already shows the name, or no stored evidence puts the name on the unit."""
+    from app.chat import contexts
+
+    lines = []
+    for n in sorted(numbers):
+        if n not in cx.subjects:
+            continue
+        label = contexts.name_key(cx.label(n))
+        names = [x for t in texts for x in cx.naming_names(n, t) if contexts.identifiers(x).empty]
+        names += _title_names(cx, n, texts, _ws_map(ws, "unit_titles"))
+        names = [x for x in dict.fromkeys(names) if x not in label]
+        if names:
+            lines.append(MSG_OWNER_NAME.format(names="», «".join(names), where=cx.describe(n)))
+    return " ".join(lines)
+
+
 def _check_evidence(u: Unit, names_from: str, ws: Workspace, question: str, heading: str = "") -> ContextCheck:
     """``_context_check`` of the evidence ``u`` cites; ``names_from``: the words of the claim that name its property (a table
     row's, when ``u`` is one cell of it); ``heading``: the heading of the column of a cell (the side it is attributed to). Removes only when
@@ -5570,6 +5778,10 @@ def _check_evidence(u: Unit, names_from: str, ws: Workspace, question: str, head
             numbers = {n for n in numbers if cx.is_subject(n)}
         if not numbers:
             continue
+        # the name the claim, the request or the question uses for the unit the evidence is in is a name the unit's stored title block gives
+        # it: a fact for the judge, whether or not the server could name the asked property (round 20 U3, KTD3, R12)
+        if not heading and (link := _name_link(cx, numbers, [names_from, question, *subjects], ws)) and link not in out.facts:
+            out.facts.append(link)
         passages = [s.text for s in ws.sources.values()
                     if str(s.version_id) == version and set(s.contexts or ()) & numbers and s.text]
         naming = names_from
@@ -5645,6 +5857,253 @@ MSG_OWNER_UNKNOWN = ("{what} כתוב ב{where}; הטענה עוסקת ב{asked}
 MSG_OWNER_PARTIAL = " (הנושא שנשאל מורכב, ורק חלקו זוהה בקובץ)"
 MSG_OWNER_MIXED = ("{what} כתוב ב{where}, והטענה עוסקת ב{asked}; אבל הטענה מצטטת גם {others}, שכתוב ב{elsewhere} ולא נקבע שהוא של נכס "
                    "אחר. מקור אחד של הטענה הוא של הקשר אחר ומקור אחר שלה של הנכס שנשאל עליו, ולכן השרת לא הכריע.")
+MSG_OWNER_NAME = ("השם «{names}» שנשאל עליו הוא שם של {where}: כותרת היחידה והכינויים שלה במסמך כוללים את השם הזה ואת הכתובת או החלקה שלה, "
+                  "והנתון כתוב בה. זו אותה יחידה, לא נכס אחר; אל תסיק wrong_subject מכך שהיחידה מסומנת בכתובת ולא בשם.")
+
+
+# --- scopes below the property (round 20 U3, KTD3; R9-R13) ---------------------------------------------------------------------
+#
+# The property is right and the datum can still be under the wrong plan, parcel, lot group, contract, alternative, stage or state
+# (``scopes``): a figure of plan B in plan A's column, the value of parcel 57 written for parcel 56. The claim's referent comes from its own
+# words, then the heading of its column, the label of its row, the line before its table, the lead of its block and the headings above it;
+# the evidence's scope from where the cited datum stands (its column and row, the opener above it, the blocks the fetcher preloaded above
+# the source: ``Workspace.layouts``) and, for a measurement, its stored subject. Only a datum that EVERY cited source writes under another
+# identifier of a kind the claim names is wrong (``DIFFERENT``): a sentence goes through the wrong-subject path, a table cell is cut (or
+# marked) alone when the rest of its row stands (``_scope_cells``). An undecided one is a neutral fact for the judge, never a removal.
+
+MSG_SCOPE_DIFFERENT = ("הנתון ב-{ids} כתוב במקור תחת {found}, והטענה מייחסת אותו ל{claimed}: במקור זה נתון של {found}, באותו נכס. קח את "
+                       "הנתון ממה שכתוב במקור ל{claimed}, או ייחס אותו ל{found}")
+MSG_SCOPE_UNKNOWN = ("הנתון ב-{ids} כתוב במקור גם תחת {found}, והטענה מייחסת אותו ל{claimed}. השרת לא מצא ראיה שמכריעה לאיזה מהם הנתון "
+                     "שייך; הכרעה לפי הקטע המצוטט עצמו.")
+MSG_SCOPE_MIXED = ("הנתון ב-{ids} כתוב במקור גם תחת {found}, והטענה מייחסת אותו ל{claimed}; אבל היא מצטטת גם מקור שכותב אותו ל{claimed}. "
+                   "השרת לא הכריע.")
+SCOPE_CHECK_NAME = "scope_mismatch"
+NOTE_WORDS = 4  # the content words a footnote needs for a claim to be read as stating it
+
+
+def _ws_map(ws, name: str) -> dict:
+    """The workspace's dict of that name (``layouts``, ``unit_titles``, ``scope_findings``), made when a stand-in workspace has none."""
+    found = getattr(ws, name, None)
+    if found is None:
+        found = {}
+        try:
+            setattr(ws, name, found)
+        except AttributeError:
+            pass
+    return found
+
+
+@dataclass
+class ScopeCheck:
+    """What the scope check found for a unit: ``reason`` — the claim rests on a datum another scope owns, said only when every cited source
+    writes it under another (a unit that is no table row); ``cells`` — the same for a table row, by the index of the cell (the row keeps its
+    other cells); ``facts`` — the neutral lines for the judge about a datum the server could not place."""
+
+    reason: str | None = None
+    facts: list[str] = field(default_factory=list)
+    cells: dict[int, str] = field(default_factory=dict)
+
+
+class _Segment(NamedTuple):
+    text: str  # the claim's own words (no citations)
+    ids: list[str]  # the evidence it cites
+    cells: tuple[str, ...]  # the heading of its column and the label of its row, which name its referent after its own words
+    openings: tuple[str, ...]  # the lead of its block and the line before its table: they name it only when they open a scope
+    headings: tuple[str, ...]  # the headings above it
+    cell: int | None  # its cell index in a table row
+
+
+def _block_leads(units: Sequence[Unit]) -> dict[int, str]:
+    """For each unit that is not the first of its block, the text of the block's first unit (a list item's lead sentence, a paragraph's first
+    sentence): what names the scope of the sentences after it."""
+    first: dict[int, Unit] = {}
+    out: dict[int, str] = {}
+    for u in units:
+        if u.block >= 0 and first.setdefault(u.block, u) is not u:
+            out[u.index] = _IDS.sub("", first[u.block].text)
+    return out
+
+
+def unit_referent(u: Unit, lead: str = "") -> dict[str, frozenset[str]]:
+    """The scope a whole unit is about (``scopes.referent``): its own words, the key cell of its row under the noun of its column, and what the
+    line before its table, the lead of its block and the headings above it open. What the ledger compares a footnote's scope with."""
+    seg = _segments(u, lead)[0] if not _cited_cell_list(u) else _row_segment(u)
+    return scopes.referent(seg.text, seg.cells, seg.openings, seg.headings)
+
+
+def _row_segment(u: Unit) -> _Segment:
+    """A table row as one claim (the cells that cite apart are ``_segments``'s): the row's words, its key cell under the noun of its column."""
+    heads, cells = meaning._row_cells(u.context.split("\n", 1)[0].strip()), meaning._row_cells(u.raw.strip())
+    label = scopes.keyed_label(heads[0], _IDS.sub("", cells[0]).strip()) if heads and cells and len(heads) == len(cells) else ""
+    table_lead = u.context.split("\n", 1)[1] if "\n" in u.context else ""
+    return _Segment(_IDS.sub("", u.text), u.ids, (label,), (table_lead,), (u.heading,), None)
+
+
+def _segments(u: Unit, lead: str) -> list[_Segment]:
+    """The claims of a unit that are checked apart: each cited cell of a table row against its own column, row and table lead; any other
+    unit as one claim against its block's lead and the headings above it."""
+    cells = _cited_cell_list(u)
+    if cells:
+        table_lead = u.context.split("\n", 1)[1] if "\n" in u.context else ""
+        return [_Segment(cell.text, cell.ids, (head, label), (table_lead,), (u.heading,), i) for i, head, label, cell in cells]
+    return [_Segment(_IDS.sub("", u.text), u.ids, (), (lead,), (u.heading,), None)]
+
+
+@functools.lru_cache(maxsize=8192)
+def _line_numbers(line: str) -> frozenset[str]:
+    """The numbers a line of a source states (its part tags left out), kept per line: every claim of a turn reads the same source lines."""
+    return frozenset(numbers_in(without_part_tags(line)))
+
+
+def _source_occurrences(sid: str, src: Source, numbers: set[str], ws: Workspace) -> list[scopes.Located]:
+    """Where a source states one of the numbers, each with the scope it is written under (``scopes.occurrences``)."""
+    parts, body = context_of_source(src)
+    return scopes.occurrences([(p.place, p.text) for p in parts], body, _ws_map(ws, "layouts").get(sid),
+                              lambda line: bool(_line_numbers(line) & numbers))
+
+
+def _scope_evidence(i: str, numbers: set[str], ws: Workspace) -> list[scopes.Located] | None:
+    """The scope of the datum ``numbers`` in the cited evidence ``i``: a passage or table (``_source_occurrences``), a value (through the
+    source it was verified in, by its own number), a measurement (its stored subject, else its own quote). None for evidence that does not state
+    the datum or has no scope to read (a calculation, an assumption)."""
+    if i in ws.sources:
+        return _source_occurrences(i, ws.sources[i], numbers, ws) or None
+    if i in ws.values:
+        v = ws.values[i]
+        src = ws.sources.get(v.source_id)
+        mine = numbers & numbers_in(v.written)
+        if src is None or not mine:
+            return None
+        return _source_occurrences(v.source_id, src, mine, ws) or None
+    if i in ws.measurements:
+        row = ws.measurements[i].row
+        if not numbers & numbers_in(getattr(row, "value_text", "") or ""):
+            return None
+        scope = scopes.by_kind(scopes.mentions(getattr(row, "subject", "") or "")) \
+            or scopes.by_kind(scopes.mentions(getattr(row, "quote", "") or ""))
+        return [scopes.Located(scope, getattr(row, "quote", "") or "")] if scope else None
+    return None
+
+
+MSG_NOTE_ELSEWHERE = ("הערת השוליים שהטענה מציגה ב-{ids} (סימן {mark}) מסומנת במקור ליד {found}, והטענה מייחסת אותה ל{claimed}. "
+                      "זו הערה של {found}; אל תייחס אותה ל{claimed}")
+MSG_NOTE_OTHER_ITEM = "פסקה אחרת של המקור"  # a footnote whose mark stands in another lettered paragraph than the one the claim is about
+MSG_NOTE_UNBOUND_FACT = ("הטענה מציגה הערת שוליים של {ids} (סימן {mark}) שהשרת לא מצא את הסימן שלה במקום שהיא מתייחסת אליו: לא נקבע לאיזה "
+                         "חלק של הטקסט (לאיזה חוזה, תכנית או קבוצת מגרשים) היא שייכת, ולכן אין לייחס אותה ל{claimed} על סמך סמיכות בלבד.")
+
+
+def _note_reading(seg: _Segment, referent: Mapping, ws: Workspace) -> tuple[str | None, str | None]:
+    """A claim that states the text of a footnote of a cited source (round 20 U3, KTD3, R10, AE7): the note belongs to the block whose mark
+    it carries (``scopes.notes``, from the stored word geometry), so stating it for another contract, lot group or plan is the wrong
+    attribution (the reason); a note whose mark could not be bound is told to the judge (the fact), never attached to anything."""
+    from app.chat import conditions  # conditions reads this module
+
+    layouts = _ws_map(ws, "layouts")
+    for i in dict.fromkeys(seg.ids):
+        sid = ws.values[i].source_id if i in ws.values else i
+        for note in scopes.notes(layouts.get(sid)):
+            body = re.sub(r"^\s*\d{1,2}\)?\s*", "", note.text)
+            if len(conditions.operand_of(body).groups) < NOTE_WORDS or not conditions.stated_in(body, seg.text):
+                continue
+            claimed = scopes.describe(referent)
+            if note.scope is None:
+                return None, MSG_NOTE_UNBOUND_FACT.format(ids=sid, mark=note.mark, claimed=claimed)
+            if scopes.note_conflicts(note, referent, scopes.item_of_referent(layouts.get(sid), referent)):
+                found = scopes.describe({k: v for k, v in note.scope.items() if k in referent}) or MSG_NOTE_OTHER_ITEM
+                return MSG_NOTE_ELSEWHERE.format(ids=sid, mark=note.mark, found=found, claimed=claimed), None
+    return None, None
+
+
+def _scope_segment(seg: _Segment, ws: Workspace) -> tuple[str | None, str | None]:
+    """The reason (the claim is under another scope in EVERY cited source) or the neutral fact (some source writes the datum under another scope
+    and the server could not tell which is the claim's) for one claim; (None, None) when the claim names no scope, states no figure, or its
+    sources write it under its own scope or under none."""
+    referent = scopes.referent(seg.text, seg.cells, seg.openings, seg.headings)
+    if not referent:
+        return None, None
+    if (said := _note_reading(seg, referent, ws)) != (None, None):
+        return said
+    numbers = numbers_in(scopes.without_mentions(seg.text))
+    if not numbers:
+        return None, None
+    read: list[tuple[str, scopes.Reading]] = []
+    for i in dict.fromkeys(seg.ids):
+        evidence = _scope_evidence(i, numbers, ws)
+        if evidence is not None:
+            read.append((i, scopes.read(referent, evidence)))
+    if not read:
+        return None, None
+    claimed = scopes.describe(referent)
+    other = [(i, r) for i, r in read if r.other]
+    if not other:
+        return None, None
+    found_in = other[0][1].other[0]
+    found = scopes.describe({k: v for k, v in found_in.scope.items() if k in referent})
+    ids = ", ".join(i for i, _ in other)
+    if len(other) == len(read) and all(r.state == scopes.DIFFERENT for _, r in other):
+        return MSG_SCOPE_DIFFERENT.format(ids=ids, found=found, claimed=claimed), None
+    if any(r.state == scopes.SAME for _, r in read):
+        return None, MSG_SCOPE_MIXED.format(ids=ids, found=found, claimed=claimed)
+    return None, MSG_SCOPE_UNKNOWN.format(ids=ids, found=found, claimed=claimed)
+
+
+def _scope_check(u: Unit, ws: Workspace, lead: str = "") -> ScopeCheck:
+    """The scope check of a unit (see the section above): a table row's cells apart, any other unit as one claim. A unit with no cited
+    evidence, a table header, and a unit none of whose claims names a scope give an empty check."""
+    out = ScopeCheck()
+    if u.table_header or not u.ids:
+        return out
+    for seg in _segments(u, lead):
+        reason, fact = _scope_segment(seg, ws)
+        if reason is not None:
+            if seg.cell is not None:
+                out.cells[seg.cell] = reason
+            elif out.reason is None:
+                out.reason = reason
+        if fact is not None and fact not in out.facts:
+            out.facts.append(fact)
+    return out
+
+
+def _scope_cells(report: VerifyReport, ws: Workspace, verdicts: dict[int, JudgeVerdict], reasons: dict[str, str]) -> set[str]:
+    """The cells of table rows that sit under another scope than their column names, as failing claims of the row (round 20 U3, KTD3, R9; the
+    cell-level path of round 20 U2, KTD2): a row the judge supported whole becomes one claim per cell, the cells in ``ws.scope_findings``
+    failing with failure ``wrong_subject`` and the others standing as the judge's verdict; a row whose claims the judge gave per cell has
+    the claims that overlap a found cell failed. The edit ladder (``plan_edits``) then cuts the cell to the marker when it is independent
+    (``row_cut_safe``), else removes the row; the reason of each failing claim is in ``reasons`` for its problem. Returns the failing claims' ids."""
+    failed: set[str] = set()
+    for u in report.units:
+        found = _ws_map(ws, "scope_findings").get(_fact_key(u))
+        recs = report.claims.get(u.index)
+        v = verdicts.get(u.index)
+        if not found or not recs or v is None or v.verdict not in ("supported", "partial") or u.table_span is None or u.table_header:
+            continue
+        bounds = cell_bounds(u.raw)
+        if any(i >= len(bounds) for i in found):
+            continue
+        rebuilt = recs
+        if len(recs) == 1 and (recs[0].whole_unit or recs[0].fallback or not recs[0].exact):
+            if v.verdict != "supported":
+                continue  # a row only partly supported keeps its judge's verdict: the cell found is told to the judge as a fact
+            claims = []
+            for i, (a, b) in enumerate(bounds):
+                text = " ".join(_IDS.sub("", u.raw[a:b]).split())
+                if not re.search(r"\w", text) or text not in u.text:
+                    continue
+                bad = i in found
+                claims.append(UnitClaim(text, "datum", "unsupported" if bad else "supported", "wrong_subject" if bad else "none"))
+            if not any(c.verdict == "unsupported" for c in claims):
+                continue
+            rebuilt = claim_records(u, claims)
+            report.claims[u.index] = rebuilt
+        for r in rebuilt:
+            cells = _claim_cells(u, r, bounds)
+            if cells & set(found) and r.verdict in STANDING_VERDICTS:
+                r.fail_as("wrong_subject")
+            if r.verdict in FAILING_VERDICTS and r.failure == "wrong_subject" and cells & set(found):
+                reasons[r.id] = found[min(cells & set(found))]
+                failed.add(r.id)
+    return failed
 
 
 # --- a number derived from the values a unit cites (round 13 U9, KTD9, R12, AE5) -------------------------------------------------
@@ -7432,6 +7891,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     # check and the judge read the unit with it
     fetcher = meaning.Fetcher(ws)
     meanings = {u.index: check_meaning(u, ws, fetcher) for u in units}
+    if getattr(reread, "preload", None) is not None:  # what the scope check reads above the cited sources (round 20 U3, KTD3)
+        reread.preload(dict.fromkeys(i for u in units for i in u.ids))
     report.problems = deterministic(units, ws, question, meanings)
     found_in = _expand_unstated(report, units, meanings, ws, question, deadline, reread, fetcher) \
         if reread is not None else {}
@@ -7581,6 +8042,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         _attach_rereads(report, ws)
         handled: set[int] = set()
         reasons: dict[str, str] = {}
+        scoped_cells = _scope_cells(report, ws, verdicts, reasons)  # the cells of a row that sit under another plan, parcel or contract
         for idx, p in soft.items():
             if idx not in verdicts:  # never judged: it fails for the number, as a unit that is not judged does
                 report.problems.append(p)
@@ -7657,6 +8119,11 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 else:
                     report.problems += [Problem(u, f"נתמך ב-{s}, שהתשובה לא ציטטה", kind="needs_citation", cite=s)
                                         for s in cite_ids]
+        for p in report.problems:  # a cell under another scope is a defect a repair can remove (the cell is cut only if the agent does not)
+            if p.claim_id in scoped_cells:
+                p.check = SCOPE_CHECK_NAME
+                if p.defect in (None, "none"):
+                    p.defect = "part"
         if coverage is not None:
             _check_conditions(report, ws, votes)  # the condition outcome of each covered item (round 18 U5)
         complete_records(report)

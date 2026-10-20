@@ -91,7 +91,6 @@ def test_each_figure_of_a_rights_table_stays_under_the_plan_whose_column_it_is_w
     assert removals(client, m) == [], md
 
 
-@strict_xfail("U3", "plan B's service area (450) written under plan A's column passes: nothing compares a cell with the plan its column names")
 def test_a_figure_of_plan_b_written_under_plan_a_is_cut_and_plan_as_own_figures_stay(client, office, monkeypatch):
     misplaced = "| שטח שירות (מ״ר) | 450 [S1] | — |\n"
     m = ask(client, office, monkeypatch, PLANS, read_table(PLANS["caption"]),
@@ -99,6 +98,18 @@ def test_a_figure_of_plan_b_written_under_plan_a_is_cut_and_plan_as_own_figures_
     md = m["answer"]["markdown"]
     assert "1,200" in md and "1,800" in md, md  # the cells that stand under their own plan
     assert "450" not in md, md  # plan B's figure is not stated for plan A
+
+
+def test_the_figure_of_plan_b_under_plan_a_is_cut_alone_and_the_cell_of_plan_b_beside_it_stays(client, office, monkeypatch):
+    """The cell-level outcome (round 20 U3, KTD3, with U2's path): the row keeps the cell that stands, and the cell of the wrong plan goes."""
+    both = "| שטח שירות (מ״ר) | 450 [S1] | 450 [S1] |\n"
+    m = ask(client, office, monkeypatch, PLANS, read_table(PLANS["caption"]),
+            "זכויות הבנייה לפי כל תכנית:\n\n" + PLANS_HEAD + MAIN_ROW + both, PLANS_QUESTION, PLANS_ASK)
+    md = m["answer"]["markdown"]
+    row = next(ln for ln in md.splitlines() if "שטח שירות" in ln)
+    assert row.count("450") == 1 and "חלק שלא אומת הושמט" in row and row.index("הושמט") < row.index("450"), md  # plan A's cell is the cut one
+    assert "1,200" in md and "1,800" in md, md
+    assert ("scope_mismatch", "wrong_subject") in removals(client, m), removals(client, m)
 
 
 # --- 2. a footnote marked on the first lot group's contract (AE7, U3) -------------------------------------------------------
@@ -117,7 +128,6 @@ def lot_item(row: list[str], condition: str) -> dict:
             "condition": condition, "state": "included", "reason": ""}
 
 
-@strict_xfail("U3", "the footnote marked on group A's contract is attached to group B's item: the agent's condition is kept and the server writes it into B's sentence")
 def test_a_footnote_marked_on_one_lot_groups_contract_is_not_the_condition_of_the_other_groups_items(client, office, monkeypatch):
     m = ask(client, office, monkeypatch, LOTS, read_table(LOTS["caption"]), GROUP_B_ANSWER, LOTS_QUESTION, LOTS_ASK,
             items=[lot_item(GROUP_B_ROW, FOOTNOTE)])
@@ -145,7 +155,6 @@ def test_each_parcels_value_stays_under_the_parcel_its_bullet_names(client, offi
     assert removals(client, m) == [], md
 
 
-@strict_xfail("U3", "parcel 14's value written in the bullet of parcel 12 passes: a value is checked against the property, not against the parcel its bullet names")
 def test_the_value_of_parcel_2_written_in_the_bullet_of_parcel_1_is_flagged(client, office, monkeypatch):
     answer = (f"- חלקה {PARCEL_1['parcel']}: שווי הקרקע {PARCEL_2['value']} ₪ [S1]\n"
               f"- חלקה {PARCEL_2['parcel']}: שווי הקרקע {PARCEL_2['value']} ₪ [S1]")
@@ -155,7 +164,6 @@ def test_the_value_of_parcel_2_written_in_the_bullet_of_parcel_1_is_flagged(clie
     assert PARCEL_2["value"] not in bullet_of_1, md  # parcel 12 is not valued at parcel 14's value
 
 
-@strict_xfail("U3", "a value of parcel 14 stated for parcel 12 in a plain sentence that names the parcel passes: the claim's parcel is never compared with the parcel of the cited passage (no round-19 check flags it)")
 def test_the_value_of_another_parcel_stated_under_the_asked_parcel_in_a_plain_sentence_is_flagged(client, office, monkeypatch):
     """Not a protection test: the round-19 build does not flag this either, so U3 owns it with the bullet case above."""
     m = ask(client, office, monkeypatch, PARCELS, read_pages(1, 1),
@@ -191,7 +199,6 @@ def compare_sides(client, office, monkeypatch, answer: str) -> dict:
     return m
 
 
-@strict_xfail("U3", "the server attaches the first appraisal's condition to the sentence that states the values of both appraisals, although the next sentence states it")
 def test_the_server_writes_no_condition_into_a_sentence_about_two_appraisals_when_a_sibling_sentence_states_it(
         client, office, monkeypatch):
     m = compare_sides(client, office, monkeypatch, f"{SHARED_SENTENCE}\n{SIBLING_SENTENCE}")
@@ -243,7 +250,6 @@ def test_the_value_of_a_unit_is_kept_when_the_question_names_it_by_name_and_the_
     assert any(NAMES["street"] in ln for ln in outside_the_passages(seen[0])), seen[0]
 
 
-@strict_xfail("U3", "the judge is shown the unit by its address only: neither its header nor a fact line names the unit's stored name beside the address")
 def test_the_judge_is_given_the_stored_link_between_the_name_in_the_question_and_the_address_that_labels_the_unit(
         client, office, monkeypatch):
     seen: list[str] = []
@@ -251,3 +257,14 @@ def test_the_judge_is_given_the_stored_link_between_the_name_in_the_question_and
         NAME_ASK, judge=judge_that_records(seen))
     linked = [ln for ln in outside_the_passages(seen[0]) if NAMES["name"] in ln and NAMES["street"] in ln]
     assert linked, [ln for ln in outside_the_passages(seen[0]) if ln.strip()]
+
+
+def test_protection_a_question_that_names_the_addressee_gets_no_fact_that_links_the_addressee_to_the_unit(client, office, monkeypatch):
+    """The addressee's name and street stand in the title block of both reports: they are no name of the unit, and the judge is told no link."""
+    seen: list[str] = []
+    question = "מהו שווי הנכס של מר דוד דמו מרחוב הדמיון 3?"
+    ask(client, office, monkeypatch, MANIFEST["name_address"], open_section("1. הערכת שווי"), f"שווי הנכס בגישת ההשוואה הוא {NAMES['value']} ₪ [S1].",
+        question, "שווי הנכס של מר דוד דמו", judge=judge_that_records(seen))
+    outside = "\n".join(outside_the_passages(seen[0]))
+    assert "<ownership" not in outside or "דוד דמו" not in outside.split("<ownership", 1)[1].split("</ownership>", 1)[0], outside
+
