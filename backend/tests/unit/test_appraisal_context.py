@@ -1060,6 +1060,18 @@ def test_an_appendix_naming_the_asked_address_or_parcel_is_not_another_property(
     assert _appendix_file("נספח ב׳", "הדקל 8", ("40100", "12")).compare(2, [1]) != contexts.DIFFERENT
 
 
+def test_lead_heading_blocks_are_those_of_the_appendix_and_comparables_units_that_hold_a_heading():
+    parts = [_unit(1, "appraisal", "מתחם גבעת האלה", first=0, last=3),
+             _unit(2, "appendix", None, first=4, last=7),
+             _unit(3, "comparables", None, first=8, last=10),
+             _unit(4, "appendix", None, first=11, last=12)]
+    # the headings at 1 (the appraisal's), 5 (inside the appendix, after a body block, with a second one at 6) and 9 (the comparables'):
+    # the first heading inside a unit is its lead; unit 4 holds none (the next heading lies after it), unit 1 is no such part
+    assert contexts.lead_heading_blocks(parts, [1, 5, 6, 9, 14]) == [5, 9]
+    assert contexts.lead_heading_blocks(parts, [1, 14]) == []
+    assert contexts.lead_heading_blocks(parts, []) == []
+
+
 def test_a_page_range_names_the_one_unit_that_holds_it_and_none_when_it_spans_several():
     cx = _ownership_file()
     assert cx.at_pages(5, 6) == [3] and cx.at_pages(3, 4) == [2] and cx.at_pages(1, 2) == [1]
@@ -1078,6 +1090,47 @@ def test_a_compound_subject_is_divided_into_its_sides_and_resolved_side_by_side(
     assert tools.resolved_sides(cx, "מתחם גבעת האלה והשומה בעמודים 7–8") == ({1, 4}, True)
     assert tools.resolved_sides(cx, "מתחם גבעת האלה והשומה בעמודים 90–91") == ({1}, False)  # only in part
     assert tools.resolved_sides(cx, "הנכס") == (set(), True)  # a plain subject that names nothing is no partial compound
+
+
+@pytest.mark.parametrize("street", ["הנכס ברחוב ויצמן 5", "נכס ברחוב ורדים 7", "רחוב וולפסון 12"])
+def test_a_street_that_starts_with_the_conjunction_letter_is_one_side(street):
+    from app.chat import tools
+
+    assert tools.subject_sides(street) == [street]
+
+
+def test_a_subject_of_two_properties_is_still_divided_whatever_their_streets():
+    from app.chat import tools
+
+    assert tools.subject_sides("השומה ברחוב הגפן 3 והשומה ברחוב התאנה 5") == ["השומה ברחוב הגפן 3", "השומה ברחוב התאנה 5"]
+    assert tools.subject_sides("הנכס ברחוב הגפן 3 לעומת הנכס ברחוב ויצמן 5") == ["הנכס ברחוב הגפן 3", "הנכס ברחוב ויצמן 5"]
+    assert tools.subject_sides("הנכס ברחוב הגפן 3 והנכס ברחוב ויצמן 5") == ["הנכס ברחוב הגפן 3", "הנכס ברחוב ויצמן 5"]
+
+
+def test_a_vav_initial_street_asked_resolves_whole_and_gives_different_for_the_other_propertys_datum():
+    from app.chat import tools
+
+    parts = [_unit(1, "appraisal", "פרויקט הצבעוני", ("הצבעוני",), first=0, last=3, pages=(1, 1),
+                   identifiers=_ident("ויצמן 5", ("100", "5"))),
+             _unit(2, "appraisal", "פרויקט האלמוג", ("האלמוג",), first=4, last=7, pages=(2, 2),
+                   identifiers=_ident("הגפן 3", ("100", "6")))]
+    cx = contexts.from_units(parts, {}, [], "v", "r1")
+    named, complete = tools.resolved_sides(cx, "הנכס ברחוב ויצמן 5")
+    assert (named, complete) == ({1}, True)
+    assert cx.compare(2, named, complete=complete) == contexts.DIFFERENT
+
+
+def test_a_subject_whose_whole_text_names_a_context_but_whose_pieces_name_none_is_one_complete_side():
+    from app.chat import tools
+
+    cx = contexts.from_units([_unit(1, "appraisal", "מתחם נחל ושומרון", ("נחל ושומרון",), first=0, last=3),
+                              _unit(2, "appraisal", "מתחם הדגן", ("הדגן",), first=4, last=7)], {}, [], "v", "r1")
+    text = "השומה של נחל ושומרון"
+    assert len(tools.subject_sides(text)) == 2  # the name is divided before its "ושומ"
+    assert not any(cx.resolve(x) for x in tools.subject_sides(text)) and cx.resolve(text) == [1]
+    assert tools.resolved_sides(cx, text) == ({1}, True)  # the whole text names the context: one side, not a partial compound
+    assert cx.compare(2, {1}, complete=True) != contexts.SAME
+
 
 
 def _compound_ws(cx, cited: dict[str, int], subject: str, question: str = "השווה"):

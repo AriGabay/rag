@@ -62,7 +62,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
-from app.answering.numread import NUMBER, read_separators
+from app.answering.numread import NUMBER, _span_end, read_separators
 from app.chat import datum, reader
 from app.chat.meaning import _norm, units_attested
 from app.chat.slots import clip
@@ -208,7 +208,8 @@ def locate_quote(blocks, quote: str, value: Decimal) -> Located | None:
         i = flat.find(q, i + 1)
     if not hits:
         return None
-    in_quote = next((m for m in NUMBER.finditer(read_separators(q)) if _number_value(m.group(0)) == abs(value)), None)
+    read_q = read_separators(q)
+    in_quote = next((m for m in NUMBER.finditer(read_q) if _number_value(m.group(0)) == abs(value)), None)
 
     def raw_at(f: int) -> tuple[int, int]:
         tok = max((t for t in tokens if t[3] <= f), key=lambda t: t[3])
@@ -244,7 +245,8 @@ def locate_quote(blocks, quote: str, value: Decimal) -> Located | None:
     number = None
     if in_quote is not None:
         block, pos = raw_at(hits[0] + in_quote.start())
-        number = [block, pos, pos + len(in_quote.group(0))]
+        # the end is the written number's, not the read one's: "1.234,56" is read "1234.56 " but written eight characters long
+        number = [block, pos, pos + _span_end(read_q, q, in_quote.end()) - in_quote.start()]
     return Located(segments, number, [s[0] for s in segments])
 
 

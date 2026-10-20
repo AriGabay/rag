@@ -1119,11 +1119,12 @@ def located_contexts(ws: Workspace, cx) -> set[int]:
 
 
 # where a request's subject is two (or more) sides: "X ו-Y", "בין X לבין Y", "X מול Y". The Hebrew conjunction is a prefix, so it divides a
-# subject only before the article, a hyphen, a digit, a Latin letter, a word that opens a property's name ("ושומת", "ונכס") or a name
-# that carries a number ("ובית 20"); the explicit connectors divide a free text too (the question)
-_SIDE_WORDS = "נכס|שומ|דוח|חוו|מתחם|פרויקט|בניין|דירה|מגרש|חלק|גוש|רחוב|עמוד|עמ"
+# subject only before the article, a hyphen, a digit, a Latin letter or a word that opens a property's name ("ושומת", "ונכס", "ובית");
+# never before a name that merely carries a number, for a street that starts with the letter ("ויצמן 5") is one side; the explicit
+# connectors divide a free text too (the question)
+_SIDE_WORDS = "נכס|שומ|דוח|חוו|מתחם|פרויקט|בניין|בית|דירה|מגרש|חלק|גוש|רחוב|עמוד|עמ"
 _SIDE_EXPLICIT = r"\s+(?:לבין|לעומת|מול|ובין)\s+|\s+&\s+"
-_SIDE_SPLIT = re.compile(rf"{_SIDE_EXPLICIT}|\s+ו(?=[-־]|ה[א-ת]|\d|[A-Za-z]|(?:{_SIDE_WORDS})|\S+\s+\S*\d)")
+_SIDE_SPLIT = re.compile(rf"{_SIDE_EXPLICIT}|\s+ו(?=[-־]|ה[א-ת]|\d|[A-Za-z]|(?:{_SIDE_WORDS}))")
 _SIDE_SPLIT_EXPLICIT = re.compile(_SIDE_EXPLICIT)
 
 
@@ -1147,7 +1148,8 @@ def resolved_sides(cx, text: str | None, explicit: bool = False) -> tuple[set[in
     # is resolved as written)
     whole = found[0] if len(sides) == 1 and sides[0] == text else set(cx.resolve(text))
     union = whole.union(*found)
-    return union, len(sides) <= 1 or all(found) or len(whole) >= len(sides)
+    # a text that names a context as a whole while none of its pieces does (a name or a street that holds the conjunction letter) is one side
+    return union, len(sides) <= 1 or all(found) or len(whole) >= len(sides) or (bool(whole) and not any(found))
 
 
 def asked_sides(ws: Workspace, cx) -> tuple[set[int], bool]:

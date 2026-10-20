@@ -150,6 +150,18 @@ def test_computed_claim_takes_its_number_from_the_tool_result():
     assert "25,000 ₪" in p.calls[1].input and "ממוצע מחיר" in p.calls[1].input
 
 
+def test_a_computed_claim_reads_a_pair_as_a_decimal_under_a_decimal_comma_source():
+    """The cited source writes its decimals with a comma ("13,2%"): "13,2" in the prose is that decimal, not "13" and "2"."""
+    source = [ev(1, "שטח | 13,2%")]
+    computed = [ComputedValue("C1", "ממוצע שטח", "15 מ״ר", ["E1"])]
+    p = scripted(answer(claim("ההפחתה היא 13,2 והממוצע {C1}", ["E1"], kind="computed"),
+                        claim("ההפחתה היא 13,5 והממוצע {C1}", ["E1"], kind="computed")),
+                 verdicts("supported"))
+    out = compose_answer(p, "q", source, computed=computed)
+    assert [c["text"] for c in out.claims] == ["ההפחתה היא 13,2 והממוצע 15 מ״ר"]  # the number the source writes is kept
+    assert out.dropped == 1  # a number the source does not write is still the model's own: protection still removes it
+
+
 def test_url_or_markup_rejects_the_answer():
     for bad in ("ראו https://evil.example/x", "<script>x</script> הפחתה"):
         p = scripted(answer(claim("השמאי המכריע קבע הפחתה של 10%", ["E1"]), claim(bad, ["E1"])))

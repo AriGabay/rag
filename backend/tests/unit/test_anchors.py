@@ -74,6 +74,14 @@ def test_a_quote_is_located_once_with_its_words_and_its_number():
     assert PARAGRAPH[found.number[1]:found.number[2]] == "12,450,000" and found.blocks == [1]
 
 
+def test_the_cited_number_range_covers_the_whole_written_number_of_a_decimal_comma_source():
+    text = "שווי 1.234,56 ₪"
+    found = A.locate_quote([(0, text)], "שווי 1.234,56 ₪", Decimal("1234.56"))
+    assert text[found.number[1]:found.number[2]] == "1.234,56"
+    plain = A.locate_quote([(0, "שווי 1,250,000 ₪")], "שווי 1,250,000 ₪", Decimal("1250000"))
+    assert "שווי 1,250,000 ₪"[plain.number[1]:plain.number[2]] == "1,250,000"
+
+
 def test_a_quote_twice_in_the_range_with_different_numbers_is_ambiguous():
     blocks = [(0, "השווי הוא 12,000 ₪ לשלב א."), (1, "השווי הוא 15,000 ₪ לשלב ב.")]
     with pytest.raises(A.AmbiguousQuote):
