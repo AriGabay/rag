@@ -285,3 +285,67 @@ export function derivedComputation(id: string, label: string): Json {
     anchor: { v: 1, precision: "computed", precision_label: "תוצאה מחושבת", inputs: ["V1"] },
   };
 }
+
+
+// --- round 21 U10 (R14): a GFM table whose cells carry the server's additions --------------------------------------------
+
+/** The cut marker the server writes for the Nth cut (compose.MARKER). */
+export const cutMarker = (n: number) => `«[${n}: חלק שלא אומת הושמט]»`;
+
+export const TABLE_HEADERS = ["נכס", "שווי למ״ר", "שיעור היוון", "שטח במ״ר", "תאריך הערכה"];
+export const TABLE_CUT_CLAIM = cid(0x61);
+export const TABLE_PARTIAL_CLAIM = cid(0x62);
+/** The cut cell's original claim (what the log keeps and the details show) and the partly verified cell's two halves. */
+export const TABLE_CUT_ORIGINAL = "שיעור ההיוון של נכס א׳ הוא 6.5% לשנה";
+export const TABLE_CUT_REASON = "המקור אינו מציין את שיעור ההיוון של נכס א׳.";
+export const TABLE_SUPPORTED = "שווי נכס ב׳ הוא 8,200 ₪ למ״ר";
+export const TABLE_NOT_VERIFIED = "ושווי זה נכון לתחילת השנה";
+export const TABLE_INTRO = "להלן נתוני שני הנכסים שנבדקו:";
+export const TABLE_OUTRO = "הנתונים לפי השומה הסינתטית.";
+
+/** A text built from pieces, some of them server additions: a piece `{ text, span }` is registered in `server_spans` with
+ * its offsets in code points (as Python counts them) and the `span` fields (kind, ordinal, claim_ids, datum). */
+export function withServerPieces(pieces: (string | { text: string; span: Json })[]): { markdown: string; server_spans: Json[] } {
+  let markdown = "";
+  const server_spans: Json[] = [];
+  for (const piece of pieces) {
+    if (typeof piece === "string") {
+      markdown += piece;
+      continue;
+    }
+    const start = Array.from(markdown).length;
+    markdown += piece.text;
+    server_spans.push({ start, end: start + Array.from(piece.text).length, ...piece.span });
+  }
+  return { markdown, server_spans };
+}
+
+/** An answer whose GFM table has a cell cut to the server's marker (row 1, column 3) and a cell with the partial mark written
+ * INSIDE it, before the cell's closing pipe (row 2, column 2) — both as `compose` registers them: the marker span with its claim
+ * and datum, the partial mark with its ordinal and claim ids. Five columns, so that the table is wider than a phone. */
+export function tableAnswer(): Json {
+  const head = `| ${TABLE_HEADERS.join(" | ")} |\n| ${TABLE_HEADERS.map(() => "---").join(" | ")} |\n`;
+  const { markdown, server_spans } = withServerPieces([
+    `${TABLE_INTRO}\n\n${head}| נכס א׳ | 9,500 ₪ [S1] | `,
+    { text: cutMarker(1), span: { kind: "marker", claim_ids: [TABLE_CUT_CLAIM], datum: "V2" } },
+    " | 120 | 1.1.2025 |\n| נכס ב׳ | 8,200 ₪ [S1]",
+    { text: PARTIAL_MARK, span: { kind: "partial_mark", ordinal: 1, claim_ids: [TABLE_PARTIAL_CLAIM], datum: "V3" } },
+    ` | 7% [S1] | 95 | 1.1.2025 |\n\n${TABLE_OUTRO}`,
+  ]);
+  const removals = [removal("absent_from_source", null, { claim_id: TABLE_CUT_CLAIM, action: "cut", ordinal: 1 })];
+  return answerWith({ markdown, server_spans, status: "answered", gaps: [],
+    components: [component("N1", "השווי למ״ר", "full", { units: [0], related: ["S1"] })] },
+  { removed: 0, partial: 1, correctness: "partial", removals, partials: partialRows([{ claims: [TABLE_PARTIAL_CLAIM] }]),
+    actions: actionsFor(removals, { qualified: 1 }), completeness: { status: "full", requirements: 1, missing: [] } });
+}
+
+/** The diagnostics of `tableAnswer`: the cut cell's log entry (its original claim and what stays) and the partly verified
+ * cell's entry with the structured detail. */
+export function tableDiagnostics(): Json {
+  return diagnostics([
+    decision("absent_from_source", { claim_id: TABLE_CUT_CLAIM, action: "cut", ordinal: 1, text: TABLE_CUT_ORIGINAL,
+      remaining: cutMarker(1), reason: TABLE_CUT_REASON }),
+    partialDecision(TABLE_PARTIAL_CLAIM, { text: `${TABLE_SUPPORTED} ${TABLE_NOT_VERIFIED}`, remaining: TABLE_SUPPORTED,
+      supported: TABLE_SUPPORTED, not_verified: TABLE_NOT_VERIFIED }),
+  ]);
+}
