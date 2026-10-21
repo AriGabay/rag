@@ -910,7 +910,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         shown_documents = (sorted({str(ws.handles[h]["document_id"]) for h in ws.offered_units if h in ws.handles}
                                   | {str(d["document_id"]) for d in (request.offered if request is not None else [])})
                            if final.status == "clarification" else [])
-        report.completeness = coverage.completeness(outcomes)
+        report.completeness = coverage.completeness(outcomes, report.unbound_data())
         # the side effects, once, after the last pass: the documents the final text cites are marked verified
         if final.status != "clarification":
             coverage.touch_verified(ws, final.answer_markdown)

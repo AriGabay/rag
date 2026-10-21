@@ -21,7 +21,9 @@ The spans a kind covers:
   ``qualifier``: a qualifier written next to a number, or after a total row whose component went — also the scope its source
   states for a value the answer showed wider (round 17 U5, R10); ``scope_note``: the note next to a value that its scope in the
   source was not verified, and where it was read (round 17 U5, R11); ``citation``: a
-  ``[S#]`` inserted for support the server found;
+  ``[S#]`` inserted for support the server found; every addition inside the answer (these, the partial mark and the cut marker) is
+  registered with the claims it is about and, for a note of a ledger item or a calculated value, the datum (``ServerSpan.datum``: an
+  item id or a V#/C#), and sits inside that datum's own clause or cell (round 21 U2, KTD1);
 - ``removal_note``: the note that says how many claims were removed; ``replacement``: the sentence that replaces an
   answer nothing of which was supported; ``request_note``: the note that the datum is not the one requested;
 - ``gap_paragraph``: the lines that state each component not given; ``item_gap``: the lines that state each item of the item
@@ -29,7 +31,8 @@ The spans a kind covers:
   ``limit_sentence``: what a limit the turn reached
   means for the answer; ``coverage_note`` and ``membership_note``: the coverage ledger's note; ``unread_notice``: the
   one notice of the files the user may see that were not read, written after the gap paragraph when the turn located
-  no document (round 9 U6, KTD11).
+  no document (round 9 U6, KTD11); ``uncertainty_line``: the one line, in the gap area after the item lines, that names the data a
+  condition or a scope of the source could not be bound to (round 21 U2, KTD2): the server writes nothing inline for them.
 
 ``Doc`` also keeps, for every character of the model's own text, the offset it had in the text the model wrote (``origin``;
 -1 for a server span), so the final check (round 8 U6, ``app.chat.final_check``) can tell which sentence of the answer a
@@ -48,7 +51,7 @@ if TYPE_CHECKING:
 
 SERVER_KINDS = ("marker", "partial_mark", "qualifier", "citation", "removal_note", "request_note", "gap_paragraph",
                 "limit_sentence", "coverage_note", "membership_note", "replacement", "unread_notice",
-                "conditional_note", "item_gap", "scope_note")
+                "conditional_note", "item_gap", "scope_note", "uncertainty_line")
 # the marker a cut span leaves: an ordinal, so the log entry of the claim it replaced is found by it
 MARKER = "«[{n}: חלק שלא אומת הושמט]»"
 PARTIAL_MARK = " *(אומת חלקית)*"
@@ -94,19 +97,33 @@ def strip_server_spans(markdown: str, spans) -> str:
 class ServerSpan:
     """A run of the final Markdown the server wrote: offsets and a fixed kind (``SERVER_KINDS``), never its text. A
     ``partial_mark`` also has its ``ordinal`` (1, 2, ... in the text's order, like the ordinal of a cut marker) and the
-    ``claim_ids`` of the unit it marks (round 14 U7, KTD9); every other kind has neither."""
+    ``claim_ids`` of the unit it marks (round 14 U7, KTD9). Round 21 U2 (KTD1): any addition inside the answer carries the ``claim_ids`` it
+    is about and its ``datum`` (a ledger item id, a V# or a C#) when it has them, so the registry says what each server word belongs to."""
 
     start: int
     end: int
     kind: str
     ordinal: int = 0
     claim_ids: tuple[str, ...] = ()
+    datum: str = ""
 
     def as_dict(self) -> dict:
         out = {"start": self.start, "end": self.end, "kind": self.kind}
         if self.kind == "partial_mark":
             out |= {"ordinal": self.ordinal, "claim_ids": list(self.claim_ids)}
+        elif self.claim_ids:
+            out["claim_ids"] = list(self.claim_ids)
+        if self.datum:
+            out["datum"] = self.datum
         return out
+
+
+DATUM_PREFIX = "@"  # in a ``ref`` tuple: the entry that names the datum (an item id, a V#, a C#) rather than a claim
+
+
+def ref_of(claim_ids=(), datum: str = "") -> tuple[str, ...]:
+    """The ``ref`` of a server addition (``Doc.splice``): the claims it is about, then the datum it is bound to (``DATUM_PREFIX``)."""
+    return (*dict.fromkeys(c for c in claim_ids if c), *((DATUM_PREFIX + datum,) if datum else ()))
 
 
 class Doc:
@@ -179,11 +196,13 @@ class Doc:
                 j += 1
             if tag:
                 kind, ref = self._kind[tag], self._ref[tag]
+                claims = tuple(x for x in ref if not x.startswith(DATUM_PREFIX))
+                datum = next((x[len(DATUM_PREFIX):] for x in ref if x.startswith(DATUM_PREFIX)), "")
                 if kind == "partial_mark":  # the mark's place among the marks of the text, and the claims it covers
                     marks += 1
-                    out.append((ServerSpan(i, j, kind, marks, tuple(ref)), ref))
+                    out.append((ServerSpan(i, j, kind, marks, claims, datum), ref))
                 else:
-                    out.append((ServerSpan(i, j, kind), ref))
+                    out.append((ServerSpan(i, j, kind, 0, claims, datum), ref))
             i = j
         return out
 

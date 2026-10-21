@@ -118,7 +118,7 @@ def _finish(ws: Workspace, answer: FinalAnswer, report, turn: TurnRequirements) 
     """What the engine does with a verified answer (``engine.finish``): removals, the components recomputed from the
     surviving units, the one gap paragraph, completeness."""
     final, outcomes = coverage.state_components(ws, answer, report, turn)
-    report.completeness = coverage.completeness(outcomes)
+    report.completeness = coverage.completeness(outcomes, report.unbound_data())
     return final, outcomes
 
 
@@ -3821,3 +3821,80 @@ def test_u9_review_the_same_note_from_two_appraisals_keeps_one_annotation_for_ea
     r, _, _, _ = _ledger_check(ws, md, raw)
     notes = [p for p in r.problems if p.check == verify.CONDITION_CHECK]
     assert sorted(p.cite for p in notes) == ["S2", "S3"], [(p.cite, p.annotation) for p in notes]
+
+
+# --- round 21 U2: a note is bound to its datum, or it is one uncertainty line (KTD1, KTD2; R1, R2, R3; AE1, AE2, AE8) ---------------------------------
+
+def _five_equal(count: int = 5):
+    """``count`` items of five components, each a row of the same value 300 with a condition of its own, stated by one sentence that writes
+    the value once per item: the value anchors none of them."""
+    names = ["שירות", "מרפסת", "גג", "חניה", "מחסן"][:count]
+    conditions = ["תכנית מאושרת", "היתר בנייה", "פינוי המגרש", "אישור הוועדה", "חתימת החוזה"]  # operands the sentence does not state
+    rows = ["סוג שטח | שטח (מ״ר) | הערה", *(f"שטח {n} | 300 | הזכויות חלות רק על פי {c}" for n, c in zip(names, conditions, strict=False))]
+    raw = [_adj_item(f"שטח {n}", f"שטח {n} | 300", "300", component=f"N{i}") for i, n in enumerate(names, 1)]
+    md = ", ".join(f"שטח ה{n} בנכס הוא 300 מ״ר" for n in names) + " [S2]."  # one sentence: the value stands once per item
+    turn = _turn(*({"id": str(i), "text": f"שטח ה{n} בנכס"} for i, n in enumerate(names, 1)))
+    ws = _plan_file(*rows)
+    answer = _answer(md).model_copy(update={"items": raw})
+    from app.chat import items as ledger_items
+
+    report = verify_answer(_condition_judge(), answer, ws, "?", [], requirements=turn, ledger=ledger_items.Ledger())
+    final, _ = _finish(ws, answer, report, turn)
+    return report, final, md
+
+
+def test_round21_more_than_three_unbound_data_name_three_and_count_the_rest_and_each_is_a_missing_caveat():
+    report, final, md = _five_equal(5)
+    lines = final.answer_markdown.splitlines()
+    assert lines[0] == md  # nothing inline, nothing removed
+    (line,) = [ln for ln in lines[1:] if "«" in ln]
+    assert line.count("«") == verify.UNBOUND_NAMED == 3, line  # three named, in the text's order
+    assert all(n in line for n in ("שירות", "מרפסת", "גג")) and "חניה" not in line and "מחסן" not in line, line
+    assert "ועוד 2 נתונים נוספים" in line and "התנאי" in line, line  # the count of the rest and the kind of detail not placed
+    assert [c["label"] for c in report.completeness["missing_caveats"]] == ["שטח שירות", "שטח מרפסת", "שטח גג", "שטח חניה", "שטח מחסן"]
+    assert report.completeness["status"] == "partial" and final.status == "partial"  # a line that states a caveat is not coverage
+    assert not report.removals()  # unknown never removes
+
+
+def test_round21_the_uncertainty_line_is_a_registered_span_in_the_gap_area_and_no_span_sits_inline():
+    report, final, md = _five_equal(2)
+    ws, turn, answer = report.item_ws, _turn({"id": "1", "text": "x"}), _answer(md)
+    edited, _ = coverage.compose_components(ws, answer, report, turn)
+    spans = edited.doc.spans()
+    assert [s.kind for s in spans if s.start < len(md)] == []  # nothing the server wrote stands inside the model's sentence
+    (span,) = [s for s in spans if s.kind == "uncertainty_line"]
+    assert edited.doc.text[span.start:span.end].strip() == report.uncertainty_line() and edited.doc.text.endswith(report.uncertainty_line())
+
+
+def test_round21_a_list_lead_that_states_a_condition_for_every_item_counts_it_present_and_writes_no_note():
+    lead = "הזכויות חלות רק על פי תכנית מאושרת:"
+    md = f"{lead}\n- השטח הכולל לבנייה בנכס הוא 1,200 מ״ר [S2].\n- השטח למרתף בנכס הוא 340 מ״ר [S2]."
+    rows = ["סוג שטח | שטח (מ״ר) | הערה", f"שטח כולל לבנייה | 1,200 | {PLAN_NOTE}", f"שטח למרתף | 340 | {PLAN_NOTE}"]
+    raw = [_adj_item("שטח כולל", "שטח כולל לבנייה | 1,200", "1,200"), _adj_item("שטח מרתף", "שטח למרתף | 340", "340")]
+    r, _, answer, _ = _plan_check(md, rows=rows, raw=raw, ask="השטחים בנכס")
+    assert [p for p in r.problems if p.check in verify.CONDITION_CHECKS] == [] and r.unbound == []
+    assert {x["condition_check"] for x in r.item_states() if x["condition_check"]} == {"kept"}
+    assert r.edit(answer).doc.text == md  # no condition note, nothing for an uncertainty line to say
+
+
+def test_round21_a_follow_up_verification_starts_with_no_unbound_datum_of_the_earlier_answer():
+    """AE8 at the report: the uncertain data are the verification's own, kept on its report and never in a ledger the turns share."""
+    first, *_ = _five_equal(2)
+    assert first.unbound_data()
+    r, *_ = _plan_check(PLAN_STATED)
+    assert r.unbound == [] and r.unbound_data() == [] and r.uncertainty_line() == ""
+
+
+WORD_ROWS = ["תנאי | פירוט | הערה", "אישור הוועדה | נדרש אישור ועדת התכנון | רק לאחר פרסום ההיתר",
+             "מימון | הלוואה בנקאית | רק לאחר אימות הערבות"]
+WORD_ITEMS = [("אישור הוועדה", "נדרש אישור ועדת התכנון"), ("מימון", "הלוואה בנקאית")]
+
+
+def test_round21_an_item_with_no_figure_has_its_sentence_for_a_clause_only_when_no_other_item_is_given_by_it():
+    raw = [_adj_item(label, f"{label} | {detail}", detail) for label, detail in WORD_ITEMS]
+    alone, _, answer, _ = _plan_check("התנאי הוא נדרש אישור ועדת התכנון [S2].", rows=WORD_ROWS, raw=raw[:1], ask="תנאי העסקה")
+    assert [p.check for p in alone.problems if p.check in verify.CONDITION_CHECKS] == [verify.CONDITION_CHECK]
+    assert "רק לאחר פרסום ההיתר" in alone.edit(answer).doc.text and alone.unbound == []  # the sentence is the item's clause
+    both, _, answer, _ = _plan_check("התנאים: נדרש אישור ועדת התכנון והלוואה בנקאית [S2].", rows=WORD_ROWS, raw=raw, ask="תנאי העסקה")
+    assert [p for p in both.problems if p.check in verify.CONDITION_CHECKS] == []  # one sentence gives both: it is the clause of neither
+    assert {x.label for x in both.unbound} == {"אישור הוועדה", "מימון"} and both.edit(answer).doc.text == answer.answer_markdown

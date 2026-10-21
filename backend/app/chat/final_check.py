@@ -630,12 +630,15 @@ class _Final:
         if len(f.drafts) != 1:
             return False
         d = self.drafts[f.drafts[0]]
-        handled, problem = scope_outcome(d, v.scope, self.ws, f.text)
+        unbound = len(self.report.unbound)
+        handled, problem = scope_outcome(d, v.scope, self.ws, f.text, claims=self.report.claims.get(d.index, []), report=self.report)
         if not handled:
             return False
+        if len(self.report.unbound) > unbound:  # no unique place for the scope: the uncertainty line states it (round 21 U2)
+            res.mutated = True
         if problem is not None and not any(p.unit is d and p.kind == problem.kind and p.annotation == problem.annotation
                                            for p in self.report.problems):
-            problem.claim_id = _primary_claim_id(self.report, d.index)
+            problem.claim_id = problem.claim_id or _primary_claim_id(self.report, d.index)
             self.report.problems.append(problem)
             res.mutated = True
         self.accept(f, "partial")

@@ -1972,3 +1972,53 @@ def test_u9_review_the_own_and_other_context_of_an_item_read_a_note_as_its_condi
     assert STAR_NOTE in items._own_context(src, PLAIN_ROWS[0])
     assert STAR_NOTE not in items._own_context(src, PLAIN_ROWS[0], [STAR_ROW])
     assert STAR_NOTE in items._other_context(src, PLAIN_ROWS[0], [STAR_ROW])
+
+
+# --- round 21 U2: the covering unit by the item's own value tokens, and the list lead in the condition check (KTD1; R1, R6; AE2) ----------
+
+SHARE_CLAUSE = "החלק חל רק לאחר פירוק השיתוף"
+SHARE_TABLE = "\n".join(["בעל זכות | חלק בנכס | הערה", "בעל הקרקע | 1/3 | ", f"הדייר | 2/3 | {SHARE_CLAUSE}"])
+SHARE_ITEMS = (_item(label="חלק בעל הקרקע", quote="בעל הקרקע | 1/3", value="1/3"), _item(label="חלק הדייר", quote="הדייר | 2/3", value="2/3"))
+TWO_SHARES = "- החלק של בעל הקרקע הוא 1/3 [S1]. החלק של הדייר הוא 2/3 [S1]."
+
+
+def _by_value(ws: Workspace, markdown: str, *asked) -> dict[str, dict]:
+    ledger = items.Ledger()
+    ledger.merge(list(asked))
+    return {o["value"]: o for o in ledger.outcomes(_units(markdown), ws)}
+
+
+def test_ae2_a_share_fraction_is_no_headline_number_and_the_item_is_given_by_the_sentence_that_holds_its_own_fraction():
+    assert items.headline("2/3", "הדייר | 2/3") == ()  # n/m is two identifiers to the headline reader
+    assert items.value_tokens("2/3", "הדייר | 2/3") == ((), ("2/3",))
+    ws = _ws(SHARE_TABLE)
+    units = _units(TWO_SHARES)
+    out = _by_value(ws, TWO_SHARES, *SHARE_ITEMS)
+    for value in ("1/3", "2/3"):
+        mine = next(u for u in units if value in u.text)
+        assert out[value]["state"] == "covered" and out[value]["covered_by"] == mine.index, (value, out[value])
+        assert out[value]["condition_unit"] == mine.index, (value, out[value])
+    assert out["2/3"]["condition_check"] == "missing" and out["2/3"]["condition_quote"] == SHARE_CLAUSE
+    assert out["1/3"]["condition_check"] == ""  # its row states no condition
+
+
+def test_a_share_item_whose_fraction_no_sentence_states_keeps_the_first_sentence_as_before_and_no_unit_holds_its_tokens():
+    ws = _ws(SHARE_TABLE)
+    markdown = "- החלק של בעל הקרקע הוא 1/3 [S1]. החלק של הדייר נקבע בהסכם [S1]."
+    out = _by_value(ws, markdown, *SHARE_ITEMS)
+    unit = next(u for u in _units(markdown) if "נקבע" in u.text)
+    assert out["2/3"]["state"] == "covered" and out["2/3"]["condition_unit"] is not None
+    assert "2/3" not in unit.text  # the covering sentence holds no token of the item: ``verify`` writes nothing next to it
+
+
+def test_a_list_lead_that_states_the_condition_for_every_item_is_part_of_the_condition_check_of_each_item():
+    ws = _ws(SHARE_TABLE)
+    tenant = SHARE_ITEMS[1]
+    lead = "החלקים חלים רק לאחר פירוק השיתוף:"
+    kept = _condition(ws, f"{lead}\n- החלק של הדייר הוא 2/3 [S1].", tenant)
+    assert kept["state"] == "covered" and kept["condition_check"] == "kept" and kept["condition_quote"] == ""
+    # a lead that states another thing, or no lead, leaves the condition missing
+    assert _condition(ws, "החלקים נקבעו בהסכם:\n- החלק של הדייר הוא 2/3 [S1].", tenant)["condition_check"] == "missing"
+    assert _condition(ws, "- החלק של הדייר הוא 2/3 [S1].", tenant)["condition_check"] == "missing"
+    # a line before a paragraph leads no list: it is the sentence of another datum, not a condition of the item
+    assert _condition(ws, f"{lead}\n\nהחלק של הדייר הוא 2/3 [S1].", tenant)["condition_check"] == "missing"

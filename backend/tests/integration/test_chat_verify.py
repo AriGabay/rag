@@ -306,9 +306,12 @@ def test_every_handled_claim_has_a_log_entry_with_the_whole_record_and_the_rows_
 def test_the_serialized_answer_holds_no_draft_text_and_its_registry_only_offsets_and_kinds(client, setup, monkeypatch):
     m = _handled_turn(client, setup, monkeypatch)
     spans = m["answer"][SERVER_SPANS_FIELD]
-    # a mark also carries its ordinal and the claims it covers (round 14 U7, KTD9); no other span does
-    assert spans and all(set(s) == ({"start", "end", "kind", "ordinal", "claim_ids"} if s["kind"] == "partial_mark"
-                                    else {"start", "end", "kind"}) for s in spans)
+    # a mark also carries its ordinal and the claims it covers (round 14 U7, KTD9); round 21 U2 (KTD1): any addition inside the answer
+    # registers the claims it is about (and a datum id), as ids; no span carries an ordinal but a partial mark, and none carries text
+    assert spans and all({"start", "end", "kind"} <= set(s) <= {"start", "end", "kind", "ordinal", "claim_ids", "datum"} for s in spans)
+    assert all(("ordinal" in s) == (s["kind"] == "partial_mark") for s in spans)
+    assert all(s.get("claim_ids") for s in spans if s["kind"] in ("marker", "partial_mark"))
+    assert all(isinstance(c, str) and len(c) < 20 for s in spans for c in s.get("claim_ids", []))
     assert {s["kind"] for s in spans} >= {"marker", "partial_mark", "removal_note"}
     assert all(m["content"][s["start"]:s["end"]] for s in spans)
     shown = json.dumps(m["answer"], ensure_ascii=False)

@@ -7,10 +7,11 @@ it, or on what the agent and the verifier are shown. Each open case is marked ``
 that owns the fix and what fails on the round-20 server; the owning unit removes the marker when its fix lands (a strict xfail that starts
 passing fails the suite, so the marker cannot be forgotten). A protection sequence passes on the round-20 build and must keep passing.
 
-1. AE1 (U2): two data with a source condition each, in one sentence — the server writes both after the last number of the sentence.
-2. AE2 (U2): a share fraction (n/m) in a list item — the condition lands in the sibling line that holds the fraction's digits.
-3. Equal values in two components (U2): two conditions are written beside one of two equal numbers, the wrong way round.
-4. A footnote-marked note (U2): the note of the first contract is written in the clause of the second group.
+1. AE1 (U2, fixed): two data with a source condition each, in one sentence — each condition lands in its own datum's clause.
+2. AE2 (U2, fixed): a share fraction (n/m) in a list item — the condition binds to the line that holds the item's own fraction; with no
+   such line nothing is written inline and one uncertainty line names the item.
+3. Equal values in two components (U2, fixed): two equal numbers anchor nothing — no inline condition, one uncertainty line names both.
+4. A footnote-marked note (U2, fixed): the note of the first contract is written in the clause of the first group only.
 5. AE3 (U3): a monthly column header puts "monthly" on a capitalised total.
 6. AE4 (U4): a removal for another lot of the same property says "another property".
 7. Several lots (U4): the same bullet under two lot headings loses its second copy to the tidy-up.
@@ -103,15 +104,21 @@ TWO_CONDITIONS_ROWS = ("סוג שטח | שטח (מ״ר) | הערה", f"שטח ע
 TWO_CONDITIONS = "השטח העיקרי בנכס הוא 1,200 מ״ר והשטח השירות בנכס הוא 300 מ״ר [S2]."
 
 
-@open_case("U2", "both conditions are written after the last number of the sentence, 300, so the first datum's condition sits in the second's clause")
 def test_ae1_each_condition_of_two_data_in_one_sentence_lands_in_its_own_datums_clause():
     raw = [_adj_item("שטח עיקרי", "שטח עיקרי | 1,200", "1,200"), _adj_item("שטח שירות", "שטח שירות | 300", "300")]
     r, _, answer, _ = _plan_check(TWO_CONDITIONS, rows=TWO_CONDITIONS_ROWS, raw=raw, ask="השטח העיקרי והשירות בנכס")
-    text = r.edit(answer).doc.text
+    doc = r.edit(answer).doc
+    text = doc.text
     first, second = text.split("והשטח השירות")
     assert CLAUSE_A in first and CLAUSE_A not in second, text
     assert CLAUSE_B in second and CLAUSE_B not in first, text
     assert "1,200" in first and "300" in second, text
+    # each note is registered with the datum it belongs to (KTD1): the item ids of the two data, in the text's order
+    spans = [sp for sp in doc.spans() if sp.kind == "qualifier"]
+    assert all(sp.claim_ids for sp in spans), spans  # every addition names the claims it is about, the area basis note included
+    notes = [sp for sp in spans if sp.datum]
+    assert [sp.datum for sp in notes] == ["I1", "I2"], spans
+    assert all(len(sp.claim_ids) == 1 and sp.as_dict()["datum"] == sp.datum for sp in notes), notes
 
 
 # --- 2. a share fraction in a list item (AE2, U2) ------------------------------------------------------------------------------------
@@ -121,7 +128,6 @@ SHARE_ROWS = ("בעל זכות | חלק בנכס | הערה", "בעל הקרקע
 SHARES = "- החלק של בעל הקרקע הוא 1/3 [S2]. החלק של הדייר הוא 2/3 [S2]."
 
 
-@open_case("U2", "the condition of the 2/3 item is written after the first sentence, whose 1/3 shares the digit 3 with it")
 def test_ae2_the_condition_of_a_share_item_binds_only_to_the_line_that_holds_its_own_fraction():
     raw = [_adj_item("חלק בעל הקרקע", "בעל הקרקע | 1/3", "1/3"), _adj_item("חלק הדייר", "הדייר | 2/3", "2/3")]
     r, _, answer, _ = _plan_check(SHARES, rows=SHARE_ROWS, raw=raw, ask="החלקים בנכס")
@@ -131,13 +137,34 @@ def test_ae2_the_condition_of_a_share_item_binds_only_to_the_line_that_holds_its
     assert SHARE_CLAUSE in tenant_line and tenant_line.index("2/3") < tenant_line.index(SHARE_CLAUSE), text
 
 
+SHARES_WITHOUT_TENANT_FRACTION = "- החלק של בעל הקרקע הוא 1/3 [S2]. החלק של הדייר נקבע בהסכם [S2]."
+
+
+def test_ae2_a_share_item_whose_fraction_no_line_states_gets_no_inline_note_and_one_uncertainty_line_that_names_it():
+    """The other branch of AE2 (KTD2): the item is covered by its words, no line holds its tokens 2/3, so nothing is written beside any line,
+    the item stays, and one line in the gap area names it and its condition; it counts as a missing caveat, not as coverage."""
+    ws = _plan_file(*SHARE_ROWS)
+    raw = [_adj_item("חלק בעל הקרקע", "בעל הקרקע | 1/3", "1/3"), _adj_item("חלק הדייר", "הדייר | 2/3", "2/3")]
+    turn = requirements_of({"id": "1", "text": "החלקים בנכס"})
+    answer = _answer(SHARES_WITHOUT_TENANT_FRACTION).model_copy(update={"items": raw})
+    report = verify_answer(_condition_judge(), answer, ws, "?", [], requirements=turn, ledger=ledger_items.Ledger())
+    final_answer, _ = _finish(ws, answer, report, turn)
+    lines = final_answer.answer_markdown.splitlines()
+    assert SHARE_CLAUSE not in lines[0] and "התנאי לפי המקור" not in lines[0], lines[0]  # no note beside any line
+    (uncertain,) = [ln for ln in lines[1:] if SHARE_CLAUSE in ln]  # one line, in the gap area after the answer
+    assert "חלק הדייר" in uncertain and "בעל הקרקע" not in uncertain, uncertain  # it names the item and not the one that is fine
+    assert final_answer.status == "partial", final_answer.status
+    assert [c["label"] for c in report.completeness["missing_caveats"]] == ["חלק הדייר"] and report.completeness["status"] == "partial"
+    assert [r.kind for r in report.problems if r.check == "condition"] == []  # nothing was written for it
+    assert not any(p.removes_unit for p in report.problems)  # unknown never removes: the datum stays
+
+
 # --- 3. equal values in two components (U2) ---------------------------------------------------------------------------------------------
 
 EQUAL_ROWS = ("סוג שטח | שטח (מ״ר) | הערה", f"שטח שירות | 300 | {CLAUSE_A}", f"שטח מרפסת | 300 | {CLAUSE_B}")
 EQUAL = "שטח השירות בנכס הוא 300 מ״ר ושטח המרפסת בנכס הוא 300 מ״ר [S2]."
 
 
-@open_case("U2", "both conditions are written beside the first 300, the wrong way round, though the two numbers are equal and anchor nothing")
 def test_two_equal_values_in_two_components_get_no_inline_condition_and_one_line_that_names_both():
     ws = _plan_file(*EQUAL_ROWS)
     raw = [_adj_item("שטח שירות", "שטח שירות | 300", "300", component="N1"),
@@ -149,6 +176,22 @@ def test_two_equal_values_in_two_components_get_no_inline_condition_and_one_line
     lines = final_answer.answer_markdown.splitlines()
     assert CLAUSE_A not in lines[0] and CLAUSE_B not in lines[0], lines[0]  # no equal number anchors a condition
     assert any("שירות" in ln and "מרפסת" in ln for ln in lines[1:]), final_answer.answer_markdown  # one focused line names both data
+    (uncertain,) = [ln for ln in lines[1:] if "שירות" in ln]  # one line, in the gap area, naming each datum with the condition it could not place
+    assert CLAUSE_A in uncertain and CLAUSE_B in uncertain and "300" in uncertain, uncertain
+    assert not report.removals() and "300" in lines[0], lines[0]  # unknown never removes: both data stay
+    # every unbound datum is a missing caveat in completeness, never coverage
+    assert [c["label"] for c in report.completeness["missing_caveats"]] == ["שטח שירות", "שטח מרפסת"], report.completeness
+    assert report.completeness["status"] == "partial" and final_answer.status == "partial"
+    # the spans the composer registered: the uncertainty line sits in the gap area, after the answer, and no server span is inline
+    assert [s.kind for s in spans_of(ws, answer, report, turn)] == ["uncertainty_line"]
+
+
+def spans_of(ws, answer, report, turn):
+    """The registry of the server spans of the finished answer (``compose_components``' own ``Doc``)."""
+    from app.chat import coverage
+
+    edited, _ = coverage.compose_components(ws, answer, report, turn)
+    return edited.doc.spans()
 
 
 # --- 4. a footnote-marked note (U2) -----------------------------------------------------------------------------------------------------
@@ -158,7 +201,6 @@ TWO_GROUPS = (f"שטח קבוצת מגרשים א׳ הוא {GROUP_A_ROW[2]} מ״
 
 
 @pytest.mark.db
-@open_case("U2", "the note marked on the first contract is written after the second group's area, in the second group's clause")
 def test_a_footnote_marked_on_the_first_groups_contract_is_written_in_the_first_groups_clause_only(client, office, monkeypatch):
     m = ask_over_document(client, office, monkeypatch, LOTS, read_table(LOTS["caption"]), TWO_GROUPS,
                           LOTS_QUESTION.replace("ב׳", "א׳ וב׳"), LOTS_ASK, items=[lot_item(GROUP_A_ROW, FOOTNOTE)])

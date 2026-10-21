@@ -622,11 +622,14 @@ def test_ae5_a_table_value_written_as_the_total_gets_the_scope_its_following_par
     a, r = _scoped(SCOPE_UNIT, _tables(_table()), _scope_judge())
     assert r.removed_units() == set() and r.counts()["removed"] == 0 and r.ok  # no repair round, no removal
     (p,) = [x for x in r.problems if x.check == verify.SCOPE_CHECK]
-    assert p.annotatable and p.cite == "S1" and p.annotation == SCOPE and p.number == "11,800" and not p.repairable
+    assert p.annotatable and p.cite == "S1" and p.annotation == SCOPE and p.number is None and p.clause_anchor and p.claim_id and not p.repairable
     out = r.edit(a)
     first = out.doc.text.split("\n")[0]
-    assert first == f"בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪ {SCOPE_ADDED} [S1]."  # the sentence stays; the value is unchanged
+    # every amount of the claim rests on the one cited table and it has one scope: the datum is the claim, the note joins the end of its clause
+    assert first == f"בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪ [S1] {SCOPE_ADDED}."  # the sentence stays; the value is unchanged
     assert _span_kinds(out) == ["qualifier"]
+    (span,) = [x for x in out.doc.spans() if x.kind == "qualifier"]
+    assert span.claim_ids == (p.claim_id,) and span.as_dict()["claim_ids"] == [p.claim_id]  # registered with the claim id as its ref
     # a scope written from the source is counted in ``scoped``; ``annotated`` stays the qualifiers written as the source wrote them
     assert r.counts()["annotated"] == 0 and r.counts()["scoped"] == 1 and [row.action for row in r.logged()] == ["qualified"]
 
@@ -644,6 +647,57 @@ def test_the_scope_is_written_with_its_citation_when_the_sentence_cites_the_valu
     a, r = _scoped("שווי הנכס בשיעור היוון 6.0% הוא 11,800 אלפי ₪ [V1].", ws, _scope_judge())
     assert r.removed_units() == set()
     assert r.edit(a).doc.text.split("\n")[0] == f"שווי הנכס בשיעור היוון 6.0% הוא 11,800 אלפי ₪ {SCOPE_ADDED[:-1]} [S1]) [V1]."
+
+
+TWO_AMOUNTS = "בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪ [S1][S2]."  # a rate and a value over two tables: nothing says which scope is the claim's
+
+
+def test_round21_a_claim_whose_evidence_has_mixed_scopes_gets_no_inline_scope_and_one_uncertainty_line():
+    """Round 21 U2 (KTD1, KTD2; R1, R2): when the cited tables do not have one scope, the claim's scope is undetermined; it is not written after
+    the last number, the value stays, nothing is removed, and the line in the gap area names the datum and the scope."""
+    ws = _tables(_table(), _table(after=None))  # S1 states the scope, S2 does not
+    a, r = _scoped(TWO_AMOUNTS, ws, _scope_judge())
+    assert r.removed_units() == set() and [x for x in r.problems if x.check in verify.NOTE_CHECKS] == []
+    out = r.edit(a)
+    assert out.doc.text == TWO_AMOUNTS and _span_kinds(out) == []
+    (row,) = r.unbound_data()
+    assert (row.kind, row.datum) == ("scope", "") and "11,800" in row.label and SCOPE not in row.detail
+    line = r.uncertainty_line()
+    assert "11,800" in line and "לא אומת" in line and line.count("«") == 1, line
+
+
+def test_round21_the_scope_of_a_uniform_claim_is_the_claims_own_and_sits_at_the_end_of_its_clause_with_its_claim_id():
+    a, r = _scoped("בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪ [S1].", _tables(_table()), _scope_judge())
+    (p,) = r.problems
+    assert p.clause_anchor and p.number is None and p.claim_id and r.unbound == []
+    out = r.edit(a)
+    (span,) = [x for x in out.doc.spans() if x.kind == "qualifier"]
+    assert out.doc.text.endswith(f"[S1] {SCOPE_ADDED}.") and span.claim_ids == (p.claim_id,)
+
+
+def test_round21_a_uniform_claim_in_a_table_row_has_its_scope_at_the_end_of_its_cell():
+    md = "| נתון | ערך |\n|---|---|\n| שווי הנכס | 11,800 אלפי ₪ [S1] |"
+    a, r = _scoped(md, _tables(_table()), _scope_judge())
+    text = r.edit(a).doc.text.splitlines()[-1]
+    assert text.endswith("|") and text.index(SCOPE_ADDED) < text.rindex("|") and r.unbound == [], text
+
+
+def test_round21_a_scope_is_registered_with_its_datum_and_claim_and_sits_at_that_datums_number():
+    ws = _tables(_table())
+    from decimal import Decimal
+
+    from app.chat import calc
+
+    ws.values["V1"] = calc.Value("V1", Decimal(11800), "11,800", "S1", uuid.uuid4(), uuid.uuid4(), None, "שומת הדגמה", "סעיף 5",
+                                 "שווי הנכס", "value", "ILS", "none", "not_stated", "", "נכס הדגמה", "appraiser_determination",
+                                 {"unit": "source", "vat": "source", "area_basis": "source", "period": "source"},
+                                 {"quote": "6.0% | 11,800"}, "6.0% | 11,800")
+    a, r = _scoped("בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪ [V1].", ws, _scope_judge())  # two amounts, but V1 names the datum
+    out = r.edit(a)
+    (span,) = [s for s in out.doc.spans() if s.kind == "qualifier"]
+    assert out.doc.text.index("11,800") < span.start and "6.0%" not in out.doc.text[span.start - 12:span.start]
+    assert span.datum == "V1" and len(span.claim_ids) == 1, span
+    assert span.as_dict()["datum"] == "V1" and span.as_dict()["claim_ids"] == list(span.claim_ids)
 
 
 def test_the_answer_that_already_writes_the_scope_keeps_it_and_nothing_is_added():
@@ -692,8 +746,11 @@ def test_a_value_whose_sources_do_not_all_state_the_scope_is_not_given_it():
     """The sentence cites both tables and states a number both hold: the phrase must stand in each one's own context."""
     ws = _tables(_table(), _table(after=None))
     a, r = _scoped(SCOPE_UNIT.replace("[S1]", "[S1][S2]"), ws, _scope_judge())
-    assert [p.check for p in r.problems] == [verify.SCOPE_LIMIT_CHECK]
-    assert SCOPE not in r.edit(a).doc.text
+    # the evidence has different scopes (one table states the phrase, the other does not): the claim's scope is undetermined, so nothing is
+    # written inline and one uncertainty line says it was not verified (round 21 U2)
+    assert [p.check for p in r.problems] == [] and r.edit(a).doc.text == SCOPE_UNIT.replace("[S1]", "[S1][S2]")
+    (row,) = r.unbound_data()
+    assert row.kind == "scope" and SCOPE not in row.detail and "לא אומת" in row.detail
 
 
 def test_ae6_a_scope_the_judge_names_that_no_context_part_states_keeps_the_value_with_a_limitation_note():
@@ -703,7 +760,7 @@ def test_ae6_a_scope_the_judge_names_that_no_context_part_states_keeps_the_value
     assert p.check == verify.SCOPE_LIMIT_CHECK and p.annotatable and not p.repairable
     out = r.edit(a)
     first = out.doc.text.split("\n")[0]
-    assert first == f"בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪ (היקף הערך במקור לא אומת; הערך נקרא ב-S1 ({SCOPE_WHERE})) [S1]."
+    assert first == f"בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪ [S1] (היקף הערך במקור לא אומת; הערך נקרא ב-S1 ({SCOPE_WHERE}))."
     assert _span_kinds(out) == ["scope_note"] and "תרחיש" not in first
 
 
@@ -748,8 +805,8 @@ def test_the_note_names_the_adjacency_before_the_wording_when_a_paragraph_lacks_
 def test_a_value_of_two_cited_tables_is_noted_for_the_reason_the_paragraph_of_each_fails():
     ws = _tables(_table(marks=(TABLE_NO_REFERENCE,)), _table(marks=(TABLE_NOT_ADJACENT,)))
     a, r = _scoped(SCOPE_UNIT.replace("[S1]", "[S1][S2]"), ws, _scope_judge())
-    assert [p.check for p in r.problems] == [verify.SCOPE_LIMIT_CHECK]
-    assert "בין הפסקה לטבלה יש בלוקים אחרים" in r.edit(a).doc.text
+    assert [p.check for p in r.problems] == [] and r.unbound_data()  # the two tables fail for different reasons: mixed scopes, one line
+    assert "בין הפסקה לטבלה יש בלוקים אחרים" in r.uncertainty_line()
 
 
 def test_a_heading_like_label_before_the_table_is_the_tables_heading_scope_for_a_judge_that_names_it():

@@ -1552,9 +1552,9 @@ def test_a_cut_sentence_the_final_judge_finds_wider_than_its_scope_is_qualified_
     out = _scope_turn(offline, {"verdict": "partial", "defect": "scope", "scope": SCOPE})
     md = out.answer.answer_markdown
     first = md.split("\n")[0]
-    assert first.startswith(f"בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪ {SCOPE_ADDED}") and "[S1]" in first, md
+    assert first.startswith("בשיעור היוון 6.0% שווי הנכס הוא 11,800 אלפי ₪") and first.endswith(f"[S1] {SCOPE_ADDED}.") and "[S1]" in first, md
     assert MARKER in first and out.report.removals() == [] and "הוסרו" not in md
-    assert _kinds(out) == ["qualifier", "marker"], _kinds(out)
+    assert _kinds(out) == ["marker", "qualifier"], _kinds(out)
     assert _purposes(out).count("verify_final") == 1 and out.final_check["passes"] == 2  # recomposed once, nothing judged again
     assert out.final_digest == text_digest(md)  # (the fixed point is asserted by the check itself)
     assert {r.post_check for r in out.report.claims[0] if r.verdict == "supported"} == {"partial"}
@@ -1565,7 +1565,7 @@ def test_a_scope_the_final_judge_names_that_the_source_does_not_state_leaves_the
     md = out.answer.answer_markdown
     first = md.split("\n")[0]
     assert "11,800" in first and "(היקף הערך במקור לא אומת; הערך נקרא ב-S1 (סעיף \"סיכום\"))" in first, md  # the fixture's location
-    assert "תרחיש" not in md and out.report.removals() == [] and _kinds(out) == ["scope_note", "marker"]
+    assert "תרחיש" not in md and out.report.removals() == [] and _kinds(out) == ["marker", "scope_note"]
     assert out.final_digest == text_digest(md)
 
 
@@ -1573,6 +1573,18 @@ def test_a_final_verdict_unsupported_for_the_scope_alone_is_taken_as_partly_supp
     out = _scope_turn(offline, {"verdict": "unsupported", "failure": "absent_from_source", "defect": "scope", "scope": SCOPE})
     md = out.answer.answer_markdown
     assert SCOPE_ADDED in md and "11,800" in md and out.report.removals() == []
+
+
+def test_round21_the_scope_of_a_cut_sentence_is_registered_with_the_claim_that_stands_and_sits_at_the_end_of_its_clause(offline):
+    """Round 21 U2: the claim that stands (the cut clause is gone) rests on one table with one scope, so the scope is the claim's own; it joins
+    the clause end and its span names the claim, not a number of the sentence."""
+    out = _scope_turn(offline, {"verdict": "partial", "defect": "scope", "scope": SCOPE})
+    md = out.answer.answer_markdown
+    (span,) = [s for s in out.server_spans if s.kind == "qualifier"]
+    assert md[span.start:span.end].strip() == SCOPE_ADDED and len(span.claim_ids) == 1 and not span.datum
+    stands = [r for r in out.report.claims[0] if r.verdict == "supported"]
+    assert [r.id for r in stands] == list(span.claim_ids) and out.report.unbound == []
+    assert out.answer.status == "partial" and out.final_digest == text_digest(md)
 
 
 def test_the_scope_is_not_added_twice_when_verification_already_wrote_it(offline):

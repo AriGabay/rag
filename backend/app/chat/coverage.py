@@ -1144,6 +1144,12 @@ def compose_components(ws: Workspace, answer: FinalAnswer, report,
     if item_lines:
         doc.tidy_blank_lines()
         doc.append(("\n\n" if doc.text else "") + "\n".join(x["text"] for x in item_lines), "item_gap")
+    # the data a condition or a scope of the source could not be bound to: one line, in this gap area and never inline (round 21 U2, KTD2;
+    # R2). A pure function of the report's state like the lines above; the answer that carries a caveat it does not state is not complete
+    if line := report.uncertainty_line():
+        doc.tidy_blank_lines()
+        doc.append(("\n\n" if doc.text else "") + line, "uncertainty_line")
+        edited.status = "partial" if edited.status == "answered" else edited.status
     if any(not o["children"] and o["status"] in UNMET for o in outcomes) and edited.status == "answered":
         edited.status = "partial"
     doc.delete(tidy_cuts(doc.text))
@@ -1171,22 +1177,26 @@ def gap_documents(outcomes: list[dict], item_lines: Sequence[dict] = ()) -> list
     return list(out.values())
 
 
-def completeness(outcomes: list[dict]) -> dict | None:
+def completeness(outcomes: list[dict], unbound: Sequence = ()) -> dict | None:
     """The answer's completeness, apart from its correctness (R19), over the components that are leaves (a parent
     takes its status from its children) and relevant: ``full`` (every one given), ``partial`` (some given, in full or
     in part) or ``missing`` (none given); and each one not given with its status and reason key, for the line under
-    the answer — the reason itself is said once, in the answer (KTD4). None when no requirements were judged."""
+    the answer — the reason itself is said once, in the answer (KTD4). None when no requirements were judged. ``unbound``
+    (``VerifyReport.unbound_data``, round 21 U2, KTD2): each datum whose condition or scope the server could not place is a missing
+    caveat (``missing_caveats``) and keeps the answer at ``partial``: an uncertainty line is never coverage."""
     if not outcomes:
         return None
     leaves = [o for o in outcomes if not o.get("children") and o["status"] != "not_relevant"]
     statuses = [o["status"] for o in leaves]
     if all(s == "full" for s in statuses):
-        status = "full"
+        status = "partial" if unbound else "full"  # a datum whose condition or scope was not placed is a caveat missing, never coverage (round 21 U2)
     elif any(s in ("full", "partial") for s in statuses):
         status = "partial"
     else:
         status = "missing"
     return {"status": status, "requirements": len(leaves),
+            **({"missing_caveats": [{"datum": x.datum, "label": x.label, "kind": x.kind, "detail": x.detail} for x in unbound]}
+               if unbound else {}),
             "missing": [{"id": o["id"], "text": o["text"], "status": o["status"], "reason": o["limitation"],
                          "parent": o.get("parent") or "", "conditional": bool(o.get("conditional")),
                          "missing_part": o.get("missing_part") or ""}

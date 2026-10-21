@@ -209,7 +209,7 @@ from app.answering.verify import _DATE as _DATE_AT
 from app.answering.verify import not_an_amount, numbers_in
 from app.chat import dates as chat_dates
 from app.chat import meaning, scopes
-from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut
+from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut, ref_of
 from app.chat.evidence import (
     HINT,
     KEPT,
@@ -1682,6 +1682,9 @@ class Problem:
     # answer (a request or a requirement). And, for ``not_checked``, why it could not be checked
     # (``NOT_CHECKED_CAUSES``).
     claim_id: str = ""
+    # for a note the server writes next to a value (round 21 U2, KTD1): the datum it is bound to — a ledger item id, a V# or a C# —
+    # registered with the span (``ref``); "" for a problem that is about a claim only
+    datum: str = ""
     cause: str = ""
     basis: str = ""  # for a dependency: the id of the claim whose removal took this one's basis away
     # the step of the edit ladder that resolves it without a rewrite (``plan_edits``): "cut" — the failing claim's span
@@ -1691,12 +1694,19 @@ class Problem:
     resolution: str = ""
     # for ``unstated_number``: every number of the unit that no cited source states (the reason names five at most)
     unstated: list[str] = field(default_factory=list)
+    # for a note of a datum that states no figure of its own (round 21 U2): its clause is the unit, so the note joins the unit where a
+    # citation would; a note without it is written only at the datum's own number
+    clause_anchor: bool = False
 
     def __post_init__(self) -> None:
         if self.checked_ids is None:
             self.checked_ids = list(self.unit.ids)
         if self.failure_kind is None:
             self.failure_kind = KIND_FAILURES.get(self.kind)
+
+    def ref(self) -> tuple[str, ...]:
+        """What a server span written for this problem is registered with (``compose.ref_of``): its claim and its datum."""
+        return ref_of([self.claim_id], self.datum)
 
     def unstated_written(self) -> list[str]:
         """The ``unstated`` numbers as the unit writes them (a few, in order of appearance)."""
@@ -1788,6 +1798,22 @@ class QualifierEdit:
     marker: str = ""
 
 
+@dataclass(frozen=True)
+class Unbound:
+    """A datum a condition or a scope of its source could not be bound to (round 21 U2, KTD1, KTD2; R1, R2): the unit that gives it holds
+    no unique place of its own tokens, so the server wrote nothing inline. ``datum``: the ledger item id ("" for a claim without one);
+    ``label`` and ``value``: the datum in its own words; ``detail``: the condition or scope that was not placed; ``kind``: ``condition`` or
+    ``scope``. It is a missing caveat in completeness and one named datum of the uncertainty line, never a removal and never coverage."""
+
+    unit: int
+    datum: str
+    label: str
+    value: str
+    detail: str
+    kind: str
+    claim_id: str = ""
+
+
 @dataclass
 class VerifyReport:
     units: list[Unit]
@@ -1856,6 +1882,8 @@ class VerifyReport:
     # the "verified in part" marks of the final text (round 14 U7, KTD9): each mark's ordinal among the marks and the claim ids
     # of the unit it marks, in the text's order; set by the composer (``mark_partials``), like the markers' ordinals
     partial_marks: list[tuple[int, tuple[str, ...]]] = field(default_factory=list)
+    # the data a condition or a scope could not be bound to (round 21 U2): nothing is written inline for them, ``uncertainty_line`` states them
+    unbound: list[Unbound] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -2103,6 +2131,37 @@ class VerifyReport:
             lines.append(line if line.endswith((".", "!", "?")) else line + ".")
         return "\n".join(lines)
 
+    def unbound_data(self) -> list[Unbound]:
+        """The data of the surviving units whose condition or scope the server could not place (``Unbound``), once each, in the text's
+        order. A datum whose unit was removed is covered by none."""
+        errors = self.removed_units()
+        out: dict[tuple, Unbound] = {}
+        for u in sorted(self.unbound, key=lambda x: x.unit):
+            if u.unit not in errors:
+                out.setdefault((u.kind, u.datum or u.label, _norm(u.detail)), u)
+        return list(out.values())
+
+    def uncertainty_line(self) -> str:
+        """The one line that names the data whose condition or scope was not written beside them (round 21 U2, KTD2; R2): each datum by
+        its own words with the detail that could not be placed, at most ``UNBOUND_NAMED`` of them and then the count of the rest and the kind
+        of detail; "" when there is none. It states a caveat the answer does not carry; it does not make the answer complete."""
+        data = self.unbound_data()
+        if not data:
+            return ""
+        named, rest = data[:UNBOUND_NAMED], data[UNBOUND_NAMED:]
+
+        def kinds(rows: list[Unbound]) -> str:
+            return " או ".join(UNBOUND_WHAT[k] for k in dict.fromkeys(x.kind for x in rows))
+
+        def one(x: Unbound) -> str:
+            who = f"«{x.label}»" + (f" ({x.value})" if x.value and x.value not in x.label else "")
+            detail = _norm(x.detail).rstrip(" .;:")
+            detail = detail if len(detail) <= UNBOUND_DETAIL_CHARS else detail[:UNBOUND_DETAIL_CHARS].rsplit(" ", 1)[0] + "…"
+            return f"{who}: {detail}"
+
+        line = UNBOUND_LINE.format(what=kinds(data), data="; ".join(one(x) for x in named))
+        return line + (UNBOUND_MORE.format(n=len(rest), what=kinds(rest)) if rest else "")
+
     def correctness(self) -> str:
         """``verified`` (every claim supported), ``partial`` (claims removed or only partly supported, or a result
         shown only as conditional on inputs that are not certain) or ``unverified`` (no claim survived) — apart from
@@ -2218,6 +2277,18 @@ class VerifyReport:
             for cid in ref:
                 if cid in by_id:
                     by_id[cid].marker = n
+
+    def _claim_ids(self, index: int, at: int | None = None, unit: Unit | None = None) -> tuple[str, ...]:
+        """The claims of unit ``index`` a server addition written in it is about (round 21 U2, KTD1): those whose own span holds the text
+        offset ``at`` of ``unit`` when it is given and the unit's claims have spans of their own, else every claim of the unit."""
+        recs = self.claims.get(index, [])
+        if at is not None and unit is not None and len(recs) > 1:
+            to_raw = _text_to_raw(unit)
+            if to_raw is not None and 0 <= at < len(to_raw):
+                held = tuple(r.id for r in recs if r.exact and r.start <= unit.start + to_raw[at] < r.end)
+                if held:
+                    return held
+        return tuple(r.id for r in recs)
 
     def partial_claim_ids(self, index: int, cell_end: int | None = None) -> tuple[str, ...]:
         """The claims a unit's partial mark covers (round 14 U7, KTD9), once each: those its partial problems name (a claim
@@ -2376,13 +2447,15 @@ class VerifyReport:
         """The turn's ledger for the diagnostics: each item with its state against the units that stand, what validation excluded and
         what the candidate offer held (``{}`` without items)."""
         ledger = self.item_ledger
+        # round 21 U2: the data a condition or a scope could not be placed next to are recorded, never silent (the uncertainty line states them)
+        unbound = {"unbound": [dataclasses.asdict(x) for x in self.unbound_data()]} if self.unbound_data() else {}
         if ledger is None or not (ledger.items or ledger.excluded or ledger.misattributed):
-            return {}
+            return unbound
         # round 18 U5: the conditions an agent wrote that stand only in another item's context are recorded, never silent
         return {"items": self.item_states() if self.decided is None else [dict(x) for x in self.decided],
                 "excluded": list(ledger.excluded)} | (
             {"misattributed": list(ledger.misattributed)} if ledger.misattributed else {}) | (
-            {"candidates": dict(self.candidate_offer)} if self.candidate_offer.get("offered") else {})
+            {"candidates": dict(self.candidate_offer)} if self.candidate_offer.get("offered") else {}) | unbound
 
     @staticmethod
     def _score_row(v: JudgeRequirement) -> dict:
@@ -2791,7 +2864,7 @@ class VerifyReport:
         qualifiers = self.edits()
         markdown = answer.answer_markdown
         cuts = _sentence_cuts(markdown, self.units, errors)
-        totals = _total_qualifiers(markdown, self.units, errors, set(planned), cuts)
+        totals = _total_qualifiers(markdown, self.units, errors, set(planned), cuts, {i: self._claim_ids(i) for i in self.claims})
         if not (errors or partial or notes or requests or cites or planned or totals or qualifiers):
             return Edited(Doc(markdown), answer.status, answer.claims)
         spans = [(g.start, g.end) for groups in planned.values() for g in groups]
@@ -2809,26 +2882,27 @@ class VerifyReport:
         edits += totals
         # a qualifier of a number the sources back that they do not state goes (or is written as not stated): the number
         # stays (round 12 U10, KTD10)
-        edits += [(q.start, q.end, q.marker, "qualifier" if q.marker else None, ()) for q in qualifiers
-                  if not any(a <= q.start < b for a, b in cuts)]
+        edits += [(q.start, q.end, q.marker, "qualifier" if q.marker else None, ref_of(self._claim_ids(q.unit)))
+                  for q in qualifiers if not any(a <= q.start < b for a, b in cuts)]
         # a qualifier still missing after the repair rounds is written next to its number, marked as the source's;
         # a result of a conditional calculation gets the server's own qualifier, after its number (or, when the
         # unit shows no number of it, where a citation would join the unit)
         tagged: set[tuple[int, int]] = set()
         written: set[tuple[int, str]] = set()
 
-        def note_once(at: int, text: str, kind: str) -> None:
-            # the same text at the same place is written once, however many problems name it (round 20 U9, F2)
+        def note_once(at: int, text: str, kind: str, ref: tuple = ()) -> None:
+            # the same text at the same place is written once, however many problems name it (round 20 U9, F2); it is registered with the
+            # claim and the datum it is about (round 21 U2, KTD1)
             if (at, text) not in written:
                 written.add((at, text))
-                edits.append((at, at, text, kind, ()))
+                edits.append((at, at, text, kind, ref))
 
         for p in notes:
             if p.conditional and p.unit.table_span is None:
                 at = _phrase_end(markdown, p.unit)  # after the sentence, never inside its phrase (round 18 U7)
             else:
                 at = _after_number(p.unit, p.number or "", p.at) if p.number else None
-            if at is None and (p.conditional or p.check in NOTE_CHECKS):
+            if at is None and (p.conditional or (p.check in NOTE_CHECKS and p.clause_anchor)):
                 at = _citation_point(markdown, p.unit)
             if at is not None and not any(a <= at < b for a, b in blocked):
                 if p.conditional:
@@ -2836,27 +2910,28 @@ class VerifyReport:
                     # row, by its number) — none when the unit already says its result is conditional, and one per
                     # place however many calculations
                     if (at, p.unit.index) not in tagged and not _SAYS_CONDITIONAL.search(p.unit.text):
-                        note_once(at, f" ({CONDITIONAL_TAG})", "qualifier")
+                        note_once(at, f" ({CONDITIONAL_TAG})", "qualifier", p.ref() or ref_of(self._claim_ids(p.unit.index), p.cite or ""))
                         tagged.add((at, p.unit.index))
                     continue
                 cite = f" [{p.cite}]" if p.uncited else ""
                 if p.check in (SCOPE_LIMIT_CHECK, CONDITION_LIMIT_CHECK):  # not verified: said, with where the value was read (R11)
-                    note_once(at, f" ({p.annotation})", "scope_note")
+                    note_once(at, f" ({p.annotation})", "scope_note", p.ref())
                 elif p.check == CONDITION_CHECK:  # the condition the source states, written next to the value with its citation (R4)
                     said = (MSG_CONDITION_LABELLED.format(label=p.named, phrase=p.annotation) if p.named
                             else MSG_CONDITION_ADDED.format(phrase=p.annotation))
-                    note_once(at, f" ({said}{cite})", "qualifier")
+                    note_once(at, f" ({said}{cite})", "qualifier", p.ref())
                 elif p.check == SCOPE_CHECK:  # the scope the source states, written next to the value with its citation (R10)
-                    note_once(at, f" ({MSG_SCOPE_ADDED.format(phrase=p.annotation)}{cite})", "qualifier")
+                    note_once(at, f" ({MSG_SCOPE_ADDED.format(phrase=p.annotation)}{cite})", "qualifier", p.ref())
                 elif p.qualifier == "approx" or not _is_duration_or_count(p.unit, p.number or "", p.at):
                     # a source's period is never a duration's; its approximation is also a count's (round 20 U2, KTD2)
-                    note_once(at, f" ({p.annotation}, כפי שנכתב במקור{cite})", "qualifier")
+                    note_once(at, f" ({p.annotation}, כפי שנכתב במקור{cite})", "qualifier",
+                              p.ref() or ref_of(self._claim_ids(p.unit.index, p.at, p.unit)))
         # evidence the server found in the same calculation is cited with the unit it supports
         for u, ids in _cites_by_unit(cites):
             at = _citation_point(markdown, u)
             if not any(a <= at < b for a, b in blocked):
                 space = "" if at > 0 and markdown[at - 1] in "] " else " "
-                edits.append((at, at, space + "".join(f"[{i}]" for i in ids), "citation", ()))
+                edits.append((at, at, space + "".join(f"[{i}]" for i in ids), "citation", ref_of(self._claim_ids(u.index))))
         doc = Doc(markdown)
         doc.edit(edits)
         if cuts:
@@ -3033,7 +3108,8 @@ def _first_cell_end(u: Unit) -> int | None:
 
 
 def _total_qualifiers(markdown: str, units: list[Unit], errors: set[int], cut: set[int],
-                      cuts: list[tuple[int, int]]) -> list[tuple[int, int, str, str | None, tuple]]:
+                      cuts: list[tuple[int, int]], claim_ids: Mapping[int, tuple[str, ...]] | None = None
+                      ) -> list[tuple[int, int, str, str | None, tuple]]:
     """The qualifier a total or summary row gets when a row of its table went or lost a claim (R12): the total was
     written over what the table showed, so it says it includes a row the answer no longer shows. A total is a row whose
     first cell holds ``calc.TOTAL_WORDS``; one that was itself removed or cut gets nothing."""
@@ -3054,9 +3130,9 @@ def _total_qualifiers(markdown: str, units: list[Unit], errors: set[int], cut: s
                 continue
             others = [u for u in rows if u is not total]
             if any(u.index in errors for u in others):
-                out.append((at, at, TOTAL_ROW_REMOVED, "qualifier", ()))
+                out.append((at, at, TOTAL_ROW_REMOVED, "qualifier", ref_of((claim_ids or {}).get(total.index, ()))))
             elif any(u.index in cut for u in others):
-                out.append((at, at, TOTAL_ROW_CUT, "qualifier", ()))
+                out.append((at, at, TOTAL_ROW_CUT, "qualifier", ref_of((claim_ids or {}).get(total.index, ()))))
     return out
 
 
@@ -4405,6 +4481,14 @@ NOTE_CHECKS = SCOPE_CHECKS + CONDITION_CHECKS  # the checks of a server note wri
 SUBREFERENT_CHECK = "scope_mismatch"  # a datum the source writes under another plan, parcel, contract or alternative than the claim's (round 20 U3)
 SCOPE_PHRASE_WORDS = (2, 16)  # the words a scope phrase has: a phrase, not one word and not a paragraph
 SCOPE_PHRASE_CHARS = 160
+# the one uncertainty line (round 21 U2, KTD2): the data a condition or a scope of the source could not be bound to are named once, here, and
+# nothing is written beside their values; at most UNBOUND_NAMED data are named and the rest are counted
+UNBOUND_NAMED = 3
+UNBOUND_LABEL_CHARS = 60
+UNBOUND_DETAIL_CHARS = 90
+UNBOUND_WHAT = {"condition": "התנאי", "scope": "ההיקף"}
+UNBOUND_LINE = "לא נכתב ליד הערך {what} של המקור, כי לא ניתן היה לשייך אותו לנתון מסוים בתשובה: {data}."
+UNBOUND_MORE = " ועוד {n} נתונים נוספים ש{what} שלהם לא שויך."
 MSG_SCOPE_ADDED = "היקף הערך לפי המקור: {phrase}"
 MSG_SCOPE_FOUND = "הערך מוצג בלי ההיקף ש-{sid} מציין לו («{phrase}»); ההיקף נכתב ליד הערך"
 MSG_SCOPE_LIMIT = "היקף הערך במקור לא אומת; הערך נקרא ב-{where}"
@@ -4546,17 +4630,49 @@ def _value_sources(u: Unit, ws: Workspace) -> list[tuple[str, Source]]:
     return [(k, s) for k, s in cited if wanted & _body_numbers(s)] or cited
 
 
-def _value_number(u: Unit, sources: list[tuple[str, Source]]) -> str | None:
-    """The number of the unit a scope is written after: the last one the value's sources state in their body (the value, after the
-    labels and conditions that come before it in a sentence), as written."""
-    body: set[str] = set()
-    for _, s in sources:
-        body |= _body_numbers(s)
-    pick = None
-    for m in _NUM_AT.finditer(u.text):
-        if numbers_in(m.group(0)) & body and not not_an_amount(u.text, m.start(), m.end()):
-            pick = m.group(0)
-    return pick
+def datum_anchor(unit: Unit, groups: Sequence[frozenset[str]], fractions: Sequence[str] = ()) -> tuple[str, int] | None:
+    """Where a note about a datum is anchored in a unit (round 21 U2, KTD1; R1, R2, R6): the ONE place in the unit's text where the
+    datum's own value tokens stand — its headline forms (``items.value_tokens``), its share fractions n/m, as ``(written, at)`` with ``at``
+    an offset of ``unit.text``. With several tokens, each must stand exactly once and the anchor is the end-most of them (the note
+    follows the whole datum). None when a token is missing from the unit (the unit does not state the datum) or stands twice (the
+    anchor is ambiguous): the server then writes nothing inline. Never the last number of the unit, the number nearest a label, or a
+    number the source also states: a number is evidence of the datum only through the datum's own tokens."""
+    from app.chat.items import token_places
+
+    places = token_places(unit.text, groups, fractions)
+    if not places or any(len(p) != 1 for p in places):
+        return None
+    a, b = max((p[0] for p in places), key=lambda x: x[1])
+    return unit.text[a:b], a
+
+
+def _claim_anchor(u: Unit, ws: Workspace, claims: Sequence, report: VerifyReport | None = None) -> tuple[str, int] | None:
+    """The anchor of a claim's datum for the note about its scope (``scope_outcome``; round 21 U2, KTD1; R1, R2), from the datum's own tokens
+    in this order: the written form of the V# the unit cites; the value tokens of the ledger items the unit gives; the one amount the
+    claim's own text writes. Each step that has candidates decides: exactly one place anchors, several (or a token the unit does not state
+    once) anchor nothing — the next step is not tried, and the number nearest, last or shared with the source is never a reason."""
+    from app.chat.items import token_places, value_tokens
+
+    def unique(places: list[list[tuple[int, int]]]) -> tuple[str, int] | None:
+        if not places or any(len(p) != 1 for p in places):
+            return None
+        a, b = max((p[0] for p in places), key=lambda x: x[1])
+        return u.text[a:b], a
+
+    written = [ws.values[i].written for i in dict.fromkeys(u.ids) if i in ws.values and ws.values[i].written]
+    if written:
+        found = {unique(token_places(u.text, [g], ())) for g in (frozenset(numbers_in(w)) for w in dict.fromkeys(written)) if g}
+        return found.pop() if len(found) == 1 else None
+    given = [st for st in (report.item_states() if report is not None and report.item_ledger is not None else [])
+             if st["state"] == ITEM_COVERED and u.index in (st.get("covered_by"), st.get("condition_unit"))]
+    if given:
+        found = {unique(token_places(u.text, *value_tokens(st.get("value") or "", st.get("quote") or ""))) for st in given}
+        return found.pop() if len(found) == 1 else None
+    base = u.text
+    own = [c.text.strip() for c in claims if not c.whole_unit and c.text.strip() and c.text.strip() in base]
+    lo, hi = (base.find(own[0]), base.find(own[0]) + len(own[0])) if len(own) == 1 else (0, len(base))
+    amounts = [m for m in _NUM_AT.finditer(base) if lo <= m.start() < hi and not not_an_amount(base, m.start(), m.end())]
+    return (amounts[0].group(0), amounts[0].start()) if len(amounts) == 1 else None
 
 
 def _balanced(text: str) -> bool:
@@ -4600,31 +4716,97 @@ def _read_in(sources: list[tuple[str, Source]]) -> str:
     return ", ".join(k + (f" ({s.location})" if s.location else "") for k, s in sources)
 
 
-def scope_outcome(u: Unit, phrase: str, ws: Workspace, text: str | None = None) -> tuple[bool, Problem | None]:
+def scope_outcome(u: Unit, phrase: str, ws: Workspace, text: str | None = None, claims: Sequence = (),
+                  report: VerifyReport | None = None) -> tuple[bool, Problem | None]:
     """What the server does with a judge's defect ``scope`` on ``u`` (KTD5): (``handled``, the problem to add). The phrase
     is attached next to the value, with the citation, when it stands verbatim in the context of EVERY source that holds the
     value (R12: the trailing note of one table is never applied to a value of another); otherwise the value stays with a note
     that its scope was not verified and where it was read (R11) — also for a phrase found only in a block between two tables,
     which is no scope of either. ``handled`` and no problem: the unit already states the phrase. Not handled: the unit cites no
-    source, so there is nowhere to say it was read. ``text``: the unit's words as saved when they are not its draft's."""
+    source, so there is nowhere to say it was read. ``text``: the unit's words as saved when they are not its draft's.
+    Round 21 U2 (KTD1, KTD2; R1, R2): the note is written next to the value only where the claim's own datum stands in the unit
+    (``_claim_anchor``: the V# it cites, or the one amount its text writes); with no unique place nothing is written inline, the
+    value stays, and the datum is recorded as ``report.unbound`` for the one uncertainty line (``VerifyReport.uncertainty_line``) — except
+    when every amount of the claim rests on the cited evidence and that evidence has one scope (``_uniform_scope``): the claim itself is the
+    datum, and the note joins the end of its clause, registered with the claim id."""
     sources = _value_sources(u, ws)
     if not sources:
         return False, None
-    number = _value_number(u, sources)
     scope = _clean_scope(phrase)
     if scope and scope in _norm(_IDS.sub("", text if text is not None else u.text)):
         return True, None
     standing = [_scope_standing(scope, s) for _, s in sources] if scope else ["absent"]
+    anchor = _claim_anchor(u, ws, claims, report)
+    if anchor is None and _uniform_scope(u, sources, standing, [c for c in claims if c.verdict not in FAILING_VERDICTS]):
+        # every amount of the claim rests on the cited evidence and that evidence has one scope: the datum is the claim itself, bound by its
+        # claim id, and the note joins the end of the claim's own clause (its sentence, or its cell in a table row) — no number is guessed
+        # (round 21 U2, KTD1; orchestrator decision)
+        live = [c for c in claims if c.verdict not in FAILING_VERDICTS]
+        claim = live[0].id if len(live) == 1 else ""
+        first = sources[0][0]
+        if all(x == "ok" for x in standing):
+            return True, Problem(u, MSG_SCOPE_FOUND.format(sid=first, phrase=scope), kind="missing_qualifier", annotation=scope, cite=first,
+                                 defect="scope", check=SCOPE_CHECK, claim_id=claim, clause_anchor=True)
+        reasons = [x for x in standing if x in SCOPE_REASONS]
+        note = SCOPE_LIMIT_NOTES[_reason_of(reasons)] if reasons and "absent" not in standing else MSG_SCOPE_LIMIT
+        return True, Problem(u, MSG_SCOPE_UNVERIFIED.format(sid=", ".join(k for k, _ in sources)), kind="missing_qualifier",
+                             annotation=note.format(where=_read_in(sources)), defect="scope", check=SCOPE_LIMIT_CHECK, claim_id=claim,
+                             clause_anchor=True)
+    if anchor is None:
+        if report is not None:
+            # the line states the scope only as far as the sources do: a phrase the context does not state is not asserted as the source's
+            reasons = [x for x in standing if x in SCOPE_REASONS]
+            limit = SCOPE_LIMIT_NOTES[_reason_of(reasons)] if reasons and "absent" not in standing else MSG_SCOPE_LIMIT
+            detail = scope if all(x == "ok" for x in standing) else limit.format(where=_read_in(sources))
+            report.unbound.append(Unbound(u.index, "", _unit_label(u, claims), "", detail, "scope", claims[0].id if len(claims) == 1 else ""))
+        return True, None
+    number, at = anchor
+    datum = next((i for i in dict.fromkeys(u.ids) if i in ws.values), "")
+    claim = _claim_id_at(u, at, claims)
     first = sources[0][0]
     if all(x == "ok" for x in standing):
-        return True, Problem(u, MSG_SCOPE_FOUND.format(sid=first, phrase=scope), kind="missing_qualifier", number=number,
-                             annotation=scope, cite=first, defect="scope", check=SCOPE_CHECK)
+        return True, Problem(u, MSG_SCOPE_FOUND.format(sid=first, phrase=scope), kind="missing_qualifier", number=number, at=at,
+                             annotation=scope, cite=first, defect="scope", check=SCOPE_CHECK, datum=datum, claim_id=claim)
     reasons = [x for x in standing if x in SCOPE_REASONS]
     note = (SCOPE_LIMIT_NOTES[_reason_of(reasons)] if reasons and "absent" not in standing
             else MSG_SCOPE_LIMIT)
     return True, Problem(u, MSG_SCOPE_UNVERIFIED.format(sid=", ".join(k for k, _ in sources)), kind="missing_qualifier",
-                         number=number, annotation=note.format(where=_read_in(sources)), defect="scope",
-                         check=SCOPE_LIMIT_CHECK)
+                         number=number, at=at, annotation=note.format(where=_read_in(sources)), defect="scope",
+                         check=SCOPE_LIMIT_CHECK, datum=datum, claim_id=claim)
+
+
+def _uniform_scope(u: Unit, sources: Sequence[tuple[str, Source]], standing: Sequence[str], claims: Sequence) -> bool:
+    """Whether the scope of a value is the scope of the CLAIM as a whole (round 21 U2): the unit holds one claim (or none of its own), every
+    amount it writes is stated by the cited evidence, and every cited source stands the same way for the phrase (all state it, or all fail for
+    the same reason). Mixed scopes, an amount no cited source states, or several claims that stand leave the datum undetermined."""
+    if len(claims) > 1 or len(set(standing)) != 1:
+        return False
+    body: set[str] = set()
+    for _, src in sources:
+        body |= _body_numbers(src)
+    amounts = [m for m in _NUM_AT.finditer(u.text) if not not_an_amount(u.text, m.start(), m.end())]
+    return bool(amounts) and all(numbers_in(m.group(0)) & body for m in amounts)
+
+
+def _claim_id_at(u: Unit, at: int, claims: Sequence) -> str:
+    """The claim of the unit whose own span holds the text offset ``at`` (the claim a note written there is about); the unit's one claim
+    when it has one; else "" (a note is never linked to a claim it may not be about)."""
+    if len(claims) == 1:
+        return claims[0].id
+    to_raw = _text_to_raw(u)
+    if to_raw is None or not 0 <= at < len(to_raw):
+        return ""
+    pos = u.start + to_raw[at]
+    held = [c.id for c in claims if c.exact and c.start <= pos < c.end]
+    return held[0] if len(held) == 1 else ""
+
+
+def _unit_label(u: Unit, claims: Sequence = (), limit: int = UNBOUND_LABEL_CHARS) -> str:
+    """A datum of a unit named by its own words, for the uncertainty line: the text of the unit's claims that stand (a claim the server cut
+    is not shown again), else the unit's text; without list markup, cut at ``limit`` characters."""
+    standing = [c.text for c in claims if not c.whole_unit and c.verdict in STANDING_VERDICTS and c.text.strip()]
+    text = _norm(re.sub(r"^\s*(?:[-*+•]|\d{1,3}[.)])\s+", "", "; ".join(standing) if standing else u.text)).strip(" |")
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
 
 
 def _condition_verdicts(votes: Iterable[JudgeRequirement]) -> dict[str, ConditionVerdict]:
@@ -4667,7 +4849,9 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
     by_id: dict[str, dict] = {}
     for x in states:
         by_id.setdefault(x["id"], x)
-    annotated: set[tuple[int, str, str]] = set()  # (unit, source, flat condition quote) already written into the unit
+    # the notes to write, by (unit, source, flat condition): the same condition missing from several items of one sentence is ONE note
+    # (round 20 U9, F2), placed after the last of the data it is about (round 21 U2)
+    pending: dict[tuple[int, str, str], list[tuple[dict, tuple[str, int], str, str]]] = {}
     for st in states:
         verdict = said.get(st["id"])
         unit = units.get(st["condition_unit"])
@@ -4714,20 +4898,52 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
                 continue
             phrase = _condition_span([x["text"] for x in st["condition_spans"]], verdict.quote)
             cited = [(st["source"], source)]
-            number = _value_number(unit, cited)
-            # the same condition is written into one unit once, however many items of its table it is missing from (round 20 U9, F2)
-            once = (unit.index, st["source"], _flat_quote(phrase or MSG_CONDITION_LIMIT.format(where=_read_in(cited))))
-            if once in annotated:
+            anchor = _item_anchor(unit, st, states)
+            if anchor is None:
+                # no unique place of the item's own tokens in the sentence that gives it: nothing is written inline, the item stays as it is
+                # and one uncertainty line names it (round 21 U2, KTD2, R2); it counts as a missing caveat, never as coverage
+                report.unbound.append(Unbound(unit.index, st["id"], _item_label(st), st.get("value") or "",
+                                              phrase or verdict.quote or MSG_CONDITION_LIMIT.format(where=_read_in(cited)), "condition",
+                                              (only[0].id if len(only := report.claims.get(unit.index, [])) == 1 else "")))
                 continue
-            annotated.add(once)
-            if phrase:
-                report.problems.append(Problem(unit, MSG_CONDITION_FOUND.format(sid=st["source"], phrase=phrase),
-                                               kind="missing_qualifier", number=number, annotation=phrase, cite=st["source"],
-                                               check=CONDITION_CHECK, named=_scope_label(source, ws) if several else ""))
-            else:
-                report.problems.append(Problem(unit, MSG_CONDITION_UNVERIFIED.format(sid=st["source"]), kind="missing_qualifier",
-                                               number=number, annotation=MSG_CONDITION_LIMIT.format(where=_read_in(cited)),
-                                               check=CONDITION_LIMIT_CHECK))
+            key = (unit.index, st["source"], _flat_quote(phrase or MSG_CONDITION_LIMIT.format(where=_read_in(cited))))
+            pending.setdefault(key, []).append((st, anchor, phrase, _scope_label(source, ws) if several and phrase else ""))
+    for (index, sid, _), group in pending.items():
+        unit = units[index]
+        st, (number, at), phrase, named = max(group, key=lambda g: g[1][1] if g[1][0] else len(unit.text) + 1)
+        source = ws.sources[sid]
+        cited = [(sid, source)]
+        datum = ",".join(x[0]["id"] for x in group)
+        claim = _claim_id_at(unit, at, report.claims.get(unit.index, [])) if number else ""
+        common = dict(number=number or None, at=at if number else None, datum=datum, claim_id=claim, clause_anchor=not number)
+        if phrase:
+            report.problems.append(Problem(unit, MSG_CONDITION_FOUND.format(sid=sid, phrase=phrase), kind="missing_qualifier",
+                                           annotation=phrase, cite=sid, check=CONDITION_CHECK, named=named, **common))
+        else:
+            report.problems.append(Problem(unit, MSG_CONDITION_UNVERIFIED.format(sid=sid), kind="missing_qualifier",
+                                           annotation=MSG_CONDITION_LIMIT.format(where=_read_in(cited)), check=CONDITION_LIMIT_CHECK,
+                                           **common))
+
+
+def _item_label(st: dict) -> str:
+    """An item named by its own words for the uncertainty line: the first cell of its source row, as a server line names it, else the
+    agent's label, else its value; cut at ``UNBOUND_LABEL_CHARS``."""
+    text = _norm(st.get("label") or "") or _norm(st.get("value") or "")
+    return text if len(text) <= UNBOUND_LABEL_CHARS else text[:UNBOUND_LABEL_CHARS].rsplit(" ", 1)[0] + "…"
+
+
+def _item_anchor(unit: Unit, st: dict, states: Sequence[dict]) -> tuple[str, int] | None:
+    """Where a note about the item ``st`` is anchored in the sentence ``unit`` that gives it (round 21 U2, KTD1; R1, R6): the one place of
+    the item's own value tokens (``datum_anchor``; ``("", 0)`` is no place). An item with no figure of its own (asked by its words) has the
+    sentence for its clause, and only when no other covered item of another evidence is given by the same sentence. None: no unique place."""
+    from app.chat.items import value_tokens
+
+    groups, fractions = value_tokens(st.get("value") or "", st.get("quote") or "")
+    if groups or fractions:
+        return datum_anchor(unit, groups, fractions)
+    sharing = [x for x in states if x["state"] == ITEM_COVERED and x.get("evidence_id") != st.get("evidence_id")
+               and unit.index in (x.get("covered_by"), x.get("condition_unit"))]
+    return None if sharing else ("", 0)
 
 
 def _whole_value(quote: str, st: dict) -> bool:
@@ -8531,7 +8747,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
             # its limitation is — the sentence is never removed for it (R10), and no repair round is spent
             scoped = False
             if v.defect == "scope" and v.verdict in STANDING_VERDICTS:
-                scoped, problem = scope_outcome(u, v.scope, ws)
+                scoped, problem = scope_outcome(u, v.scope, ws, claims=recs, report=report)
                 if problem is not None:
                     report.problems.append(problem)
             if v.verdict in ("not_factual", "navigation"):

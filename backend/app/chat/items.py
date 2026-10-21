@@ -1237,6 +1237,40 @@ def headline(value: str, quote: str) -> tuple[frozenset[str], ...]:
     return tuple(out)
 
 
+# a share written as a fraction ("2/3"): the item's own value token though no headline number (``_not_headline`` reads n and m as identifiers)
+_FRACTION = re.compile(r"(?<![\d/.,])(\d{1,4})\s*/\s*(\d{1,4})(?![\d]|\s*/\s*\d)")
+
+
+def fractions_in(text: str) -> tuple[str, ...]:
+    """The share fractions ``text`` writes ("1/3"), as n/m with no blanks, once each, in order."""
+    return tuple(dict.fromkeys(f"{m.group(1)}/{m.group(2)}" for m in _FRACTION.finditer(text or "")))
+
+
+@functools.lru_cache(maxsize=2048)
+def value_tokens(value: str, quote: str) -> tuple[tuple[frozenset[str], ...], tuple[str, ...]]:
+    """The datum's own value tokens (round 21 U2, KTD1): its headline forms (``headline``) and the share fractions n/m of its value that
+    its quote writes too. What the server looks for inside a sentence to bind a note to the item, never a number that merely stands near it."""
+    written = set(fractions_in(quote))
+    return headline(value, quote), tuple(f for f in fractions_in(value) if f in written)
+
+
+def token_places(text: str, groups: Sequence[frozenset[str]], fractions: Sequence[str]) -> list[list[tuple[int, int]]]:
+    """For each value token of a datum (a headline group, then each fraction), where ``text`` states it, as (start, end) offsets of
+    ``text``, in the text's order; an empty list for a token the text does not state. A number inside a stated fraction counts for the
+    fraction only."""
+    frac = [(m.start(), m.end(), f"{m.group(1)}/{m.group(2)}") for m in _FRACTION.finditer(text)]
+    inside = lambda a, b: any(fa <= a and b <= fb for fa, fb, _ in frac)  # noqa: E731
+    blank = text  # the dates blanked in place, so the offsets stay the text's own
+    for p in sorted(shared_dates.find_all(text), key=lambda x: x.span[0], reverse=True):
+        blank = blank[:p.span[0]] + " " * (p.span[1] - p.span[0]) + blank[p.span[1]:]
+    out: list[list[tuple[int, int]]] = []
+    for group in groups:
+        out.append([(a, b) for a, b, forms in _numbers_with_scale(blank) if forms & group and not inside(a, b)])
+    for f in fractions:
+        out.append([(a, b) for a, b, g in frac if g == f])
+    return out
+
+
 # --- the datum of an item: what two overlapping fills must share to be one (round 20 U1, KTD1; R1-R4) -----------------------------------
 
 class Datum(NamedTuple):
@@ -1483,6 +1517,10 @@ def _giving_parts(item: Item, block: Block, ws=None) -> list[Unit]:
         mine = [u for u in block.parts if any(p.iso.startswith(parsed.iso) for p in shared_dates.find_all(u.text))]
     elif groups := headline(item.value, item.quote):
         mine = [u for u in block.parts if any(_stated(item, (t := _without_list_number(u.text)), _have(t), g) for g in groups)]
+    elif fractions := value_tokens(item.value, item.quote)[1]:
+        # a share ("2/3") is no headline number, so every sibling sentence of the block gave the item: the sentence that holds the item's own
+        # fraction is the one that gives it (round 21 U2, KTD1, R1, R6); none holds it: all of them, and nothing is written next to any
+        mine = [u for u in block.parts if set(fractions) & set(fractions_in(u.text))]
     else:
         mine = []
     chosen = mine or list(block.parts)
@@ -1872,7 +1910,25 @@ def _condition_check(item: Item, got: Coverage | None, spans: dict, gave: dict, 
         for block in wide.get(item.evidence, ()):
             if all(conditions.read(sp.text, block.text)[0] == conditions.KEPT for sp in mine):
                 return best | {"condition_check": conditions.KEPT, "condition_quote": "", "condition_unit": best["condition_unit"]}
+        # a lead-in line that states a condition for every item of its list is part of the item's own reading (round 21 U2, R3): each span is
+        # kept by the item's sentence or by the lead of the list the sentence is an item of, and the item then carries the condition
+        lead = _list_lead(by_index[best["condition_unit"]], by_index)
+        if lead is not None and all(conditions.read(sp.text, by_index[best["condition_unit"]].text)[0] == conditions.KEPT
+                                    or conditions.read(sp.text, lead.text)[0] == conditions.KEPT for sp in mine):
+            return best | {"condition_check": conditions.KEPT, "condition_quote": "", "condition_unit": best["condition_unit"]}
     return best or dict(_NO_CHECK)
+
+
+def _list_lead(unit: Unit, by_index: Mapping[int, Unit]) -> Unit | None:
+    """The lead-in line of the list ``unit`` is an item of (round 21 U2): the nearest earlier unit that is no list item itself, through the
+    items directly before it, when it leads the list (``Unit.leads_list``: the next line is a list item or a heading). None for a unit
+    that is no list item or whose list has no lead-in line. (A list item followed by another also has ``leads_list``; it is no lead.)"""
+    if not unit.list_item:
+        return None
+    prev = by_index.get(unit.index - 1)
+    while prev is not None and prev.list_item:
+        prev = by_index.get(prev.index - 1)
+    return prev if prev is not None and prev.leads_list else None
 
 
 @functools.lru_cache(maxsize=4096)

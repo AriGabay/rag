@@ -2708,3 +2708,36 @@ def test_u9_review_a_mixed_absence_and_qualifier_cell_and_a_label_with_a_figure_
     a = _answer("- **שטח 40 מ״ר:** הנכס מושכר לטווח ארוך [S1]. הנכס פנוי [S1].")
     out = verify_answer(p, a, _ws(SOURCE), "?", []).apply(a).answer_markdown
     assert "**שטח 40 מ״ר:**" in out and "מושכר" not in out
+
+
+# --- round 21 U2: a note is anchored at the datum's own tokens, or nowhere (KTD1, KTD2; R1, R2, R6) ---------------------------------------------
+
+def _anchor(markdown: str, value: str, quote: str | None = None):
+    from app.chat import items
+
+    unit = split_units(markdown)[0]
+    groups, fractions = items.value_tokens(value, quote or value)
+    return verify.datum_anchor(unit, groups, fractions), unit
+
+
+def test_round21_the_anchor_is_the_datums_own_number_and_never_the_last_number_of_the_sentence():
+    got, unit = _anchor("השטח העיקרי הוא 1,200 מ״ר בקומה 3 ובחדר 4.", "1,200")
+    assert got == ("1,200", unit.text.index("1,200"))
+
+
+def test_round21_a_token_the_sentence_states_twice_or_not_at_all_anchors_nothing():
+    assert _anchor("השטח הוא 300 מ״ר והמרפסת היא 300 מ״ר.", "300")[0] is None  # two equal values: the anchor is ambiguous
+    assert _anchor("השטח הוא 400 מ״ר.", "300")[0] is None  # the sentence does not state the datum
+
+
+def test_round21_a_share_fraction_is_found_whole_and_its_digits_alone_anchor_nothing():
+    got, unit = _anchor("החלק של בעל הקרקע הוא 1/3 והחלק של הדייר הוא 2/3.", "2/3", "הדייר | 2/3")
+    assert got == ("2/3", unit.text.index("2/3"))
+    assert _anchor("החלק הוא 1/3 וגם 3 דירות.", "3", "דירות | 3")[0] is not None  # a lone 3 is a number of its own
+    assert _anchor("החלק הוא 1/3 בלבד.", "3", "בעל | 3")[0] is None  # the 3 inside 1/3 is the fraction's, not a datum
+
+
+def test_round21_several_tokens_each_stand_once_and_the_note_follows_the_last_of_them():
+    got, unit = _anchor("השטח הוא 100 מ״ר ושווי השטח הוא 5,000 ₪.", "100 מ״ר; 5,000 ₪", "שטח | 100 | שווי | 5,000")
+    assert got == ("5,000", unit.text.index("5,000"))
+    assert _anchor("השטח הוא 100 מ״ר ושווי השטח הוא 5,000 ₪ ושוב 100.", "100 מ״ר; 5,000 ₪", "שטח | 100 | שווי | 5,000")[0] is None
