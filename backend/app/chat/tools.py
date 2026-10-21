@@ -1138,15 +1138,37 @@ def located_contexts(ws: Workspace, cx) -> set[int]:
 # connectors divide a free text too (the question)
 _SIDE_WORDS = "נכס|שומ|דוח|חוו|מתחם|פרויקט|בניין|בית|דירה|מגרש|חלק|גוש|רחוב|עמוד|עמ"
 _SIDE_EXPLICIT = r"\s+(?:לבין|לעומת|מול|ובין)\s+|\s+&\s+"
-_SIDE_SPLIT = re.compile(rf"{_SIDE_EXPLICIT}|\s+ו(?=[-־]|ה[א-ת]|\d|[A-Za-z]|(?:{_SIDE_WORDS}))")
+_DASHES = "-־‐‑‒–—―"  # a hyphen, a maqaf, and the dashes a pasted or typed subject carries in its place (round 21 R3)
+_SIDE_SPLIT = re.compile(rf"{_SIDE_EXPLICIT}|\s+ו(?=[{_DASHES}]|ה[א-ת]|\d|[A-Za-z]|(?:{_SIDE_WORDS}))")
 _SIDE_SPLIT_EXPLICIT = re.compile(_SIDE_EXPLICIT)
+# a conjunction before a word the subject already named ("X 12 וX 14-18"): the project word repeated opens the second side (round 21 R3)
+_SIDE_REPEAT = re.compile(rf"\s+ו[{_DASHES}]?(?=([א-ת]{{3,}}))")
+
+
+def _side_word(word: str) -> str:
+    return word[1:] if len(word) > 3 and word[0] == "ה" else word
+
+
+def _repeat_split(part: str) -> list[str]:
+    """``part`` divided before a "ו" that opens a word standing earlier in it (round 21 R3). A street whose name starts with the
+    conjunction letter ("ויצמן 5") is no such word: its rest stands nowhere before it."""
+    cuts, seen = [], 0
+    for m in _SIDE_REPEAT.finditer(part):
+        earlier = {_side_word(w) for w in re.findall(r"[א-ת]{3,}", part[:m.start()])}
+        if _side_word(m.group(1)) in earlier:
+            cuts.append((seen, m.start()))
+            seen = m.end()
+    return [part[a:b] for a, b in cuts] + [part[seen:]] if cuts else [part]
 
 
 def subject_sides(text: str | None, explicit: bool = False) -> list[str]:
     """The sides a subject is written as (round 19 U2, KTD2, R7): "appraisals X and Y" is two; a subject with no conjunction is one.
     ``explicit``: divide only where a connector says it ("בין X לבין Y"), as a free text (the question) needs."""
     split = _SIDE_SPLIT_EXPLICIT if explicit else _SIDE_SPLIT
-    parts = [x.strip(" -־,.") for x in split.split(text or "") if x and x.strip(" -־,.")]
+    pieces = split.split(text or "")
+    if not explicit:
+        pieces = [y for x in pieces for y in _repeat_split(x)]
+    parts = [x.strip(f" {_DASHES},.") for x in pieces if x and x.strip(f" {_DASHES},.")]
     return parts if len(parts) > 1 else ([text.strip()] if text and text.strip() else [])
 
 

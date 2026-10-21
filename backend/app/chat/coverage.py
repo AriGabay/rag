@@ -697,12 +697,12 @@ def _missing_parameters(ws: Workspace, o: dict, ev: dict) -> list[str]:
 
 def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict | None = None,
               opened: dict[str, tuple[str, dict]] | None = None, signal: dict | None = None,
-              shown: Collection[str] = ()) -> dict:
+              shown: Collection[str] = (), given_text: str = "") -> dict:
     """Why a component is not given, chosen from the turn's evidence by the reason table (first match wins; the
     module docstring lists it): {"reason", "variant", "place", "document", "searched", "detail"}. ``claim``: the
     model's validated claim about it, which adds evidence and never upgrades. ``opened``: the turn's openings
     (``_openings``), and ``signal``: the turn's unit signal (``unit_signal``), when the caller already has them. ``shown``: the ids
-    the final answer cites (``_uncertain_value``)."""
+    the final answer cites (``_uncertain_value``). ``given_text``: the text of the units that give the component (round 21 G5)."""
     ev = related_evidence(ws, o, turn)
     kinds = {f["kind"] for f in ev["failures"]}
     # covered only by a search or reading the judge tied to it: a model's "not found in the search" proves none
@@ -785,13 +785,16 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
         docs = set(ev["documents"]) | set((claim or {}).get("document_ids") or [])
         if signal["multi"] and (not docs or docs & signal["multi"]) and not signal["located"]:
             return out | {"reason": "unit_not_located"}
+    partly_stated = o.get("status") == "partial" and bool(o.get("units")) and _part_stated(o, given_text)
     for sid, doc, o_ in readings:
         if ws.read_complete(o_.get("target")) is True and _inside_unit(ws, sid, signal):
+            if partly_stated:
+                return out | {"reason": None}
             return out | {"reason": "not_in_part_read", "searched": True,
                           "place": {"sid": sid, "scope": o_.get("scope"), "name": o_.get("name")},
                           "document_id": doc}
     if gap is not None and gap["reason"] == "not_in_part_read" and _inside_unit(ws, gap["place"]["sid"], signal):
-        return out | gap | {"searched": True}
+        return out | {"reason": None} if partly_stated else out | gap | {"searched": True}
     if ws.unread_named:  # the documents the turn's lookups matched by title were not read: nothing was searched in them
         return out | _not_read_gap(ws)
     documents = list(dict.fromkeys(ev["documents"] + ((claim or {}).get("document_ids") or [])))
@@ -803,9 +806,25 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
                           "document": a.get("title"), "document_id": doc}
     # a reading outside the located unit searched nothing of the appraisal asked about
     outside = [sid for sid in ev["checks"] if sid in ws.sources and not _inside_unit(ws, sid, signal)]
+    if partly_stated:
+        return out | {"reason": None}
     if out["searched"] and len(outside) < len(ev["checks"]):
         return out | {"reason": "not_located", "variant": "searched"}
     return out | {"reason": "not_located", "searched": False}
+
+
+def _part_stated(o: dict, given_text: str) -> bool:
+    """Whether the units that give a partly given component state the part the judge named missing (round 21 G5): the part has words or
+    numbers of its own beyond the component's (the property, the plot, the period it narrows the request by) and every one of them stands in
+    the units. "Not in the part read" and "not located, no search covered it" both say the datum was not found; of such a component they
+    are false, and it keeps its status with no reason and no line of the server's. A part that is only the component's own words
+    ("the rates") narrows nothing, so the units cannot be said to state it."""
+    from app.chat.verify import _loose_forms, _part_words, words_stand_in
+
+    part = o.get("missing_part") or ""
+    asked = {f for w in _part_words(o.get("text") or "") for f in _loose_forms(w)}
+    own = [w for w in _part_words(part) if not _loose_forms(w) & asked]
+    return bool(own) and words_stand_in(" ".join(own), given_text)
 
 
 def _read_not_used(ws: Workspace, sid: str, quote: str = "") -> dict:
@@ -976,6 +995,7 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
     outcomes = report.requirement_outcomes(applied, None if states is None else list(states))
     signal = None  # the turn's unit signal, computed once for the first component that needs a reason
     shown = cited_ids(applied.answer_markdown)  # the ids the final answer cites: a value among them is not called uncertain by its kind
+    texts = {u.index: u.text for u in report.units}
     for o in outcomes:
         o |= {"limitation": None, "limitation_text": None, "place": None, "document": None, "document_id": None,
               "document_title": None,
@@ -991,7 +1011,8 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
             continue
         if signal is None:
             signal = unit_signal(ws)
-        why = reason_of(ws, o, turn, claims.get(o["id"]), opened, signal, shown)
+        given = "\n".join(texts.get(i, "") for i in o.get("units") or [])
+        why = reason_of(ws, o, turn, claims.get(o["id"]), opened, signal, shown, given)
         o |= {"limitation": why["reason"], "limitation_text": REASONS.get(why["reason"]), "place": why.get("place"),
               "document": why.get("document"), "document_id": why.get("document_id"), "searched": why["searched"],
               "detail": why.get("detail") or "", "variant": why.get("variant") or "", "read_part": why.get("part") or ""}
@@ -1021,6 +1042,23 @@ _LEADING_QUESTION = re.compile(r"^\s*(?:מהו|מהי|מהם|מהן|מה|איז�
 SHORT_COMPONENT_WORDS = 8  # a component of at most this many words, in one clause, is its own label
 
 
+# a preposition that opens a word of its own ("של כל מבנה", "ב-X") or a one-letter prefix joined by a hyphen: a phrase that opens with one is a tail
+# cut out of a longer one, not a noun phrase that names a part (round 21 G6)
+_PREPOSITION_OPEN = re.compile(r"\A\s*(?:(?:של|על|אל|מן|עם|את|בין|לבין|עד|לפי|ללא|בלי|לאחר|לפני|אצל)\s|[בלמכשו][-־])")
+_TRIM = " \t\n?!.,;:\"'()"
+
+
+def _garbled_part(part: str, text: str) -> bool:
+    """Whether the part the judge named missing is a fragment and no noun phrase (round 21 G6): it opens with a preposition ("של כל מבנה")
+    or it is a tail of the component's own text (the words after the component's first words, cut off its head)."""
+    if _PREPOSITION_OPEN.match(part):
+        return True
+    named, asked = part.split(), text.split()
+    clean = lambda ws_: [w.strip(_TRIM) for w in ws_]  # noqa: E731
+    named, asked = clean(named), clean(asked)
+    return 0 < len(named) < len(asked) and asked[-len(named):] == named
+
+
 def gap_label(o: dict) -> str:
     """What a component's gap line names (R24): never the whole request or a long or multi-clause question. In order:
     the part of a partly given component the answer does not give (R20; validated, so a noun phrase), else, for the part a read
@@ -1031,7 +1069,7 @@ def gap_label(o: dict) -> str:
     "הנתון המבוקש" alone as the last resort."""
     from app.chat.verify import _QUESTION_WORD, MISSING_PART_CHARS, is_request_clause
 
-    if o.get("status") == "partial" and o.get("missing_part"):
+    if o.get("status") == "partial" and o.get("missing_part") and not _garbled_part(o["missing_part"], o.get("text") or ""):
         return o["missing_part"]
     if o.get("status") == "partial" and o.get("variant") == "read_not_used" and o.get("read_part"):
         return o["read_part"]  # the part a read passage states, as the source names it: the component is partly given, not wholly unused

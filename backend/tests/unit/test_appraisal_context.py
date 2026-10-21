@@ -1155,6 +1155,38 @@ def test_a_compound_subject_that_resolves_only_in_part_is_unknown_and_nothing_is
     assert verify._context_check(unit, _compound_ws(cx, {"V1": 4}, "מתחם גבעת האלה והשומה בעמודים 7–8"), "השווה") == verify.ContextCheck()
 
 
+@pytest.mark.parametrize("text", ["פרויקט גפן 12 וגפן 14-18", "פרויקט גפן 12 ו–גפן 14-18", "פרויקט הגפן 12 ו‑הגפן 14-18",
+                                  "פרויקט גפן 12 ו־גפן 14-18"])
+def test_a_repeated_project_word_after_a_number_and_a_conjunction_divides_the_subject_into_its_two_sides(text):
+    """(round 21 R3) "X 12 ו-X 14-18" is two sides whether the conjunction has a plain hyphen, another dash or none: a word that already
+    stands earlier in the subject, right after a "ו", opens the second side."""
+    from app.chat import tools
+
+    assert len(tools.subject_sides(text)) == 2
+    cx = contexts.from_units([_unit(1, "appraisal", "פרויקט גפן 12", ("גפן 12",), first=0, last=3),
+                              _unit(2, "appraisal", "פרויקט הלוטם", ("הלוטם",), first=4, last=7)], {}, [], "v", "r1")
+    named, complete = tools.resolved_sides(cx, text)
+    assert named == {1} and not complete  # the second side is in no unit: the compound is not resolved
+
+
+def test_a_subject_whose_repeated_word_follows_no_conjunction_or_a_new_word_follows_it_stays_as_it_was():
+    from app.chat import tools
+
+    assert tools.subject_sides("פרויקט גפן 12 גפן 14") == ["פרויקט גפן 12 גפן 14"]  # a repeated word with no conjunction is one name
+    assert tools.subject_sides("הנכס ברחוב ויצמן 5") == ["הנכס ברחוב ויצמן 5"]  # a vav-initial street whose rest stands nowhere earlier
+
+
+def test_a_compound_subject_with_a_repeated_project_word_is_unknown_for_the_other_sides_datum_and_never_removed(enforced):
+    """(round 21 R3) the other side of "X 12 ו-X 14-18" resolves to no unit: a value of another unit is not provably another property's."""
+    from app.chat import verify
+
+    cx = contexts.from_units([_unit(1, "appraisal", "פרויקט גפן 12", ("גפן 12",), first=0, last=3),
+                              _unit(2, "appraisal", "פרויקט הלוטם", ("הלוטם",), first=4, last=7)], {}, [], "v", "r1")
+    unit = verify.Unit(0, "שווי הנכס 14,850,000 ₪ [V1].", "שווי הנכס 14,850,000 ₪", ["V1"])
+    found = verify._context_check(unit, _compound_ws(cx, {"V1": 2}, "פרויקט גפן 12 וגפן 14-18"), "השווה")
+    assert found.reason is None and len(found.facts) == 1 and verify.MSG_OWNER_PARTIAL in found.facts[0]
+
+
 def _cells_ws(cx, cited: dict[str, tuple[int, str]], subject: str = "השוואת שתי השומות") -> SimpleNamespace:
     ws = _declared_ws(cx, {}, "השווה")
     ws.requirement_items = [{"subject": subject}]

@@ -550,6 +550,23 @@ def test_a_source_named_but_not_shown_is_still_refused_and_a_candidate_is_accept
     assert verify._shown_support({0: v}, unit_batch, ws)[0].verdict == "unsupported"  # S1 was not shown for it
 
 
+def test_a_named_support_the_turn_read_for_a_unit_with_no_number_is_accepted_and_one_unknown_to_the_turn_is_not():
+    """(round 21 R4) a lead-in sentence ("the surveyed buildings are listed below") has no number to pick a candidate by and too few words to
+    rank one, so the source the judge names for it was never among the shown candidates; a source the turn read stands, one it never saw does not."""
+    unit_batch = verify._Batch(verify.split_units("להלן המבנים שנסקרו."))
+    ws = _salted(UNRELATED, "נספח: 3 מבנים נסקרו בפרויקט: מבנה א, מבנה ב, מבנה ג.")
+    assert verify._candidate_ids(unit_batch, ws) == {}  # nothing was shown for it
+    for named, verdict in (("S2", "supported"), ("S1", "supported"), ("S9", "unsupported")):
+        v = JudgeVerdict.model_validate({"index": 0, "verdict": "supported", "reason": "x", "supported_by": [named]})
+        assert verify._shown_support({0: v}, unit_batch, ws)[0].verdict == verdict, named
+    # a unit with a number still needs a source that holds it
+    numbered = verify._Batch(verify.split_units("נסקרו 3 מבנים בפרויקט."))
+    v = JudgeVerdict.model_validate({"index": 0, "verdict": "supported", "reason": "x", "supported_by": ["S1"]})
+    assert verify._shown_support({0: v}, numbered, ws)[0].verdict == "unsupported"  # S1 holds no 3
+    v = JudgeVerdict.model_validate({"index": 0, "verdict": "supported", "reason": "x", "supported_by": ["S2"]})
+    assert verify._shown_support({0: v}, numbered, ws)[0].verdict == "supported"
+
+
 def test_a_cited_number_the_named_candidate_does_not_hold_is_not_attached():
     def respond(input: str) -> dict:  # names S1 for a number it does not hold
         return {"verdicts": [{"index": i, "verdict": "supported", "reason": "x", "supported_by": ["S1"]}

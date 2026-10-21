@@ -1206,6 +1206,28 @@ def test_a_complete_read_of_a_one_unit_file_is_still_not_present_in_that_section
     assert o["limitation"] == "not_in_part_read"
 
 
+def test_g5_a_component_the_judge_scored_partial_for_a_part_its_units_state_gets_no_absence_reason():
+    """(round 21 G5) «not located, no search covered it» says the part was not found; the unit that gives the component writes it (plot 2's
+    service areas), so the turn's evidence supports no such reason: the component keeps its status with no line of the server's. A part the
+    units do not write (plot 1) keeps its reason, as before."""
+    _, a, r, final, outcomes = _partial_case("שטחי השירות בתא שטח 2")
+    (o,) = outcomes
+    assert o["status"] == "partial" and o["units"]
+    assert o["limitation"] is None and o["stated"] is False and o["gap"] is None
+    assert _gap(final, a) == "" and r.gaps == []
+    # the same in a section read to its end: «not in the part read» is false as well
+    ws = _ws("תא שטח 2: שטחי השירות הם 300 מ״ר.")
+    _opened(ws)
+    turn = _partial_turn()
+    answer = _answer(PLOT2_SERVICE)
+    report = verify_answer(_judge(_partial_score("שטחי השירות בתא שטח 2", related=("S1",))), answer, ws, SERVICE_QUESTION, [], requirements=turn)
+    final, outcomes = _finish(ws, answer, report, turn)
+    assert outcomes[0]["limitation"] is None and "לא מופיע" not in _gap(final, answer)
+    # the protection: the part the units do not write keeps its reason (AE7)
+    _, _, _, _, kept = _partial_case(PLOT1_SERVICE)
+    assert kept[0]["limitation"] == "not_located"
+
+
 def test_the_new_reasons_come_before_not_in_part_read_and_not_located_in_the_gap_paragraph():
     keys = list(coverage.REASONS)
     assert keys.index("region_not_read") < keys.index("limit_reached") < keys.index("unit_not_located") \
@@ -1240,6 +1262,17 @@ def test_a_single_question_component_is_named_by_its_noun_phrase_and_a_clause_wi
     assert label({"text": "האם הפרויקט כדאי כלכלית לאור כל העלויות והתמורות שנקבעו בדוח השמאי של הנכס", "subject": "הנכס"}) \
         == "הנתון המבוקש (הנכס)"
     assert label({"text": "האם הפרויקט כדאי?", "subject": ""}) == "הנתון המבוקש"
+    assert label({"text": "שטחי שירות", "status": "partial", "missing_part": PLOT1_SERVICE}) == PLOT1_SERVICE
+
+
+def test_g6_a_missing_part_that_opens_with_a_preposition_or_is_a_tail_of_the_component_is_no_label():
+    """(round 21 G6) the judge's «of every building» is a tail cut out of the component's text: the line names the component."""
+    label = coverage.gap_label
+    component = "שטח המבנה ותאריך הקמה של כל מבנה"
+    assert label({"text": component, "status": "partial", "missing_part": "של כל מבנה"}) == component
+    assert label({"text": component, "status": "partial", "missing_part": "ב-רחוב הגפן"}) == component
+    assert label({"text": component, "status": "partial", "missing_part": "הקמה של כל מבנה"}) == component  # a tail of the text
+    assert label({"text": component, "status": "partial", "missing_part": "תאריך הקמה"}) == "תאריך הקמה"  # a part inside it stands
     assert label({"text": "שטחי שירות", "status": "partial", "missing_part": PLOT1_SERVICE}) == PLOT1_SERVICE
 
 
@@ -1968,6 +2001,16 @@ def test_the_requirements_trace_records_each_support_entry_with_the_first_condit
     assert vote["support"][0]["quote"] == long_quote[:160] and len(vote["support"][0]["quote"]) == 160
 
 
+def test_a_heading_line_the_judge_quotes_as_a_missing_part_is_no_support_and_the_component_is_not_capped_by_it():
+    """(round 21 G1) the line that opens the rates of the asked unit is a heading: it names what follows, it is not a rate the answer omits."""
+    ws, _ = _trace_ws()
+    heading = RATES.splitlines()[0]
+    r = _trace_of(ws, [{"id": "S2", "quote": heading}, {"id": "S2", "quote": MISSING_RATE}])
+    assert r.text_support == {"N1": [{"id": "S2", "quote": MISSING_RATE}]}  # the omitted rate is still a part; the heading is not
+    (vote,) = r.requirements_trace()[0]["votes"]
+    assert [(x["quote"], x["outcome"]) for x in vote["support"]] == [(heading, "heading_only"), (MISSING_RATE, "accepted")]
+
+
 def test_the_requirements_trace_records_support_on_a_full_vote_as_ignored_and_a_status_per_call():
     ws, _ = _trace_ws()
     r = _trace_of(ws, [{"id": "S2", "quote": MISSING_RATE}], status="full")
@@ -2231,6 +2274,27 @@ def test_ae3_a_ledger_of_three_items_with_two_covered_caps_a_full_vote_at_partia
     assert "מיקום | 5%" not in p.reason and "קומה | 3%" not in p.reason  # only the omitted item is listed
     assert r.text_completion_only() is True  # the repair round runs with its tools off (R14)
     assert [(i.id, i.state) for i in ledger.items.values()] == [("I1", "included"), ("I2", "included"), ("I3", "included")]
+
+
+ADJ_BULLETS = "- ההתאמה למיקום היא 5% [S2].\n- ההתאמה לקומה היא 3% [S2].\n- ההתאמה לגיל הבניין היא 2% [S2]."
+
+
+def test_g1_a_support_quote_whose_rows_the_covered_items_of_the_component_give_caps_nothing_and_asks_for_nothing():
+    """(round 21 G1) a call that scored the component partial named two rows of the table; the answer gives each in a bullet of its own and
+    the ledger's items for them are covered: the quote is no part the answer omits (no block holds both rows, so the presence test alone
+    called it one)."""
+    ws = _adj_file()
+    both = "קומה | 3%\nגיל הבניין | 2%"
+    r, _, _, _ = _ledger_check(ws, ADJ_BULLETS, _adj_items(), status="partial", support=[{"id": "S2", "quote": both}])
+    assert r.text_support == {"N1": [{"id": "S2", "quote": both}]}  # the entry was accepted as support
+    (o,) = r.requirement_outcomes()
+    assert o["support"] == [] and not o.get("omitted_items") and _completions(r) == []
+    # a row no covered item holds stays the evidence of a gap
+    ws = _adj_file(FOURTH_ADJ)
+    mixed = "גיל הבניין | 2%\n" + FOURTH_ADJ
+    r, _, _, _ = _ledger_check(ws, ADJ_BULLETS, _adj_items(), status="partial", support=[{"id": "S2", "quote": mixed}])
+    (o,) = r.requirement_outcomes()
+    assert o["support"] == [{"id": "S2", "quote": mixed}]
 
 
 def test_after_the_repair_adds_the_third_item_the_same_ledger_makes_the_component_full_with_no_problem():

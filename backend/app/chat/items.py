@@ -1207,8 +1207,10 @@ def _enough(wanted: str, have: frozenset[str]) -> bool:
 
 
 def _condition_dates(item: Item) -> frozenset[str]:
-    """The dates (ISO) the item's own condition and label state: what tells it apart from a twin that states other dates (round 19 U4)."""
-    return frozenset(p.iso for p in shared_dates.find_all(f"{item.condition} ; {item.label}"))
+    """The dates (ISO) the item states: what tells it apart from a twin that states other dates (round 19 U4). Its own words — condition,
+    label and, since round 21 G2c, its value — and, when it writes none, the one date of its quote (``_item_dates``): "33 years, 2012 to
+    2045" is told from "33 years" of the extension by its value's date, and "9.75% on 3.8.2031" from "9.75% on 3.8.2030" by its quote's."""
+    return frozenset(_item_dates(item))
 
 
 def _tells_apart(item: Item, have: frozenset[str], rivals: frozenset[str], rival_dates: frozenset[str] = frozenset()) -> bool:
@@ -1264,6 +1266,62 @@ def _number_forms(text: str) -> tuple[frozenset[str], ...]:
 def _have(text: str) -> frozenset[str]:
     """Every form of every number ``text`` writes, outside its dates."""
     return frozenset().union(*_number_forms(text))
+
+
+# a range of lots, floors or units ("61-65", "1 עד 3"): the numbers inside it are stated too (round 21 G1)
+_RANGE = re.compile(r"(?<![\d.,/:\-–־—])(\d{1,4})\s*(?:[-–־—]|\s+עד\s+)\s*(\d{1,4})(?![\d.,/:\-–־—%])")
+RANGE_MAX = 60  # a range wider than this is a span of years or an amount, not an enumeration
+
+
+@functools.lru_cache(maxsize=2048)
+def _ranged(text: str) -> frozenset[str]:
+    """The numbers inside the ranges ``text`` writes ("61-65" states 62, 63 and 64 too), outside its dates: a quote that enumerates
+    "61, 62, 63, 64, 65" is stated by the answer's "61-65" (round 21 G1)."""
+    out: set[str] = set()
+    for m in _RANGE.finditer(_outside_dates(text)):
+        a, b = int(m.group(1)), int(m.group(2))
+        if a < b <= a + RANGE_MAX and a < 1900:
+            out.update(str(n) for n in range(a, b + 1))
+    return frozenset(out)
+
+
+def _stated_dates(quote: str, text: str) -> bool:
+    """Whether ``text`` states every date of ``quote``."""
+    stated = [p.iso for p in shared_dates.find_all(text)]
+    return all(any(s.startswith(p.iso) for s in stated) for p in shared_dates.find_all(quote))
+
+
+def figures_stated(quote: str, text: str) -> bool | None:
+    """Whether ``text`` states a quote by its figures and dates alone (round 21 G1): None when the quote's figures are too few to tell it
+    from another passage of the answer (no date, fewer than two amounts, fewer than three numbers) — its words then decide; else whether
+    every figure of the quote (ranges and enumerations expanded to the same set) and every date of it stands in ``text``. A judge's
+    quote ("9.75% ... 3.8.2031", "lots 61, 62, 63, 64, 65 ...") is written in the source's words and the answer in its own, so the
+    words half of a quote that is its figures says nothing about it."""
+    groups = headline(quote, quote)
+    dated = bool(shared_dates.find_all(quote))
+    if not (dated or len(groups) >= 3 or sum(1 for g in groups if not _stray(g)) >= 2):
+        return None
+    if dated and not _stated_dates(quote, text):
+        return False
+    have = _have(text) | _ranged(text)
+    return all(g & have for g in groups)
+
+
+_HEADING_MARK = re.compile(r"\A\s*(?:#{1,6}\s|(?:[א-ת]|\d{1,2})[.)]\s|\d{1,2}(?:\.\d{1,3})+\.?\s)")
+HEADING_WORDS = 10  # a heading line has few words
+
+
+def heading_only(quote: str) -> bool:
+    """Whether a quoted part of a source is only a heading line (round 21 G1): one line of at most ``HEADING_WORDS`` words that is marked
+    as a heading — a markdown mark, a section number or letter ("ד.", "3.2"), or a closing colon — and states no amount and no date
+    (the digits of a lot list "4-6, 9" or of the heading's number are not one). A heading names what follows it; the part that follows
+    is the item, never the line, so a heading is no part of the asked kind that the answer omits."""
+    text = quote.strip()
+    if not text or "\n" in text or len(_TOKEN.findall(text)) > HEADING_WORDS:
+        return False
+    if not (_HEADING_MARK.match(text) or text.endswith(":")):
+        return False
+    return not shared_dates.find_all(text) and all(_stray(g) for g in headline(text, text))
 
 
 # a count written as a word ("שתי קומות", two floors) is the digit the source writes ("2 קומות"), when it stands directly before the noun the
@@ -1566,6 +1624,10 @@ def quote_in_blocks(quote: str, units: Sequence[Unit], component: str = "", *, b
     groups = headline(quote, quote)
 
     def stated(block: Block) -> bool:
+        # a quote that is its figures (a date, several amounts, an enumeration of lots) is asked by them, a range and an enumeration read as
+        # one set; its words are the source's and the answer's own (round 21 G1)
+        if (by_figures := figures_stated(quote, _without_list_number(block.unit.text))) is not None:
+            return by_figures
         if not all(g & _have(_without_list_number(block.unit.text)) for g in groups):
             return False
         have = _words(block.unit.text)
@@ -1631,6 +1693,10 @@ def _value_check(item: Item, text: str, words: frozenset[str]) -> _Check:
         if all(_stray(g) for g in given) and not any(_whole_duration(item, text, g) or _names_row(item, words) for g in given):
             return _Check("value_not_stated")
         return _Check("partial", missing)
+    # an item with NO value is asked by the figures and dates of its quote first, a range and an enumeration of lots read as one set (round 21
+    # G1): a judge's quote is the source's wording, and half of its words are not the answer's
+    if not item.value.strip() and figures_stated(item.quote, text):
+        return _Check("")
     # the words that ask for it: its value's, else its label's, else its quote's; a value with figures the quote does not write is the agent's
     # own, and its words are not the source's: the label and the quote come first. A value with no number is asked by its own words, and then
     # by the quote's — the source's words — before the agent's label, which the answer need not write ("פינוי" for a row the answer states
@@ -2002,8 +2068,10 @@ class Ledger:
             sig = signatures[id(item)]
             # an item that states the same row (a server twin of the agent's item that the source spells with another marker, a truncated tail,
             # another closing mark or the other bracket direction) is no rival that shares the value (round 21 U7, KTD7)
+            # nor is a row the server built from a cited span (round 21 G2b): the sentence that cites it gives it and it is never an open
+            # item, so it cannot be mistaken for the agent's own item and must not force that item to show its label words
             rivals = [j for j in standing.get((item.component, sig), ()) if j is not item and not _overlap(j.evidence, item.evidence)
-                      and not _same_row(j.evidence, item.evidence)]
+                      and not _same_row(j.evidence, item.evidence) and not (item.origin == ORIGIN_AGENT and is_server_item(j))]
             shared = bool(sig) and bool(rivals)
             got = None
             if item.state in (ITEM_INCLUDED, OMITTED, *NEEDS_REASON):  # a declared item passes the same check (R16)

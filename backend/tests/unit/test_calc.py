@@ -936,3 +936,12 @@ def test_a21_q5_a_registered_values_context_reaches_its_operand():
                   context={"key": "v1:1", "label": "שומה א", "described": "שומה א", "subject": True})
     (leaf,) = value.operand().leaves
     assert leaf.context == ("v1:1", "שומה א")
+
+
+def test_a21_q5_a_request_that_compares_the_contexts_allows_their_values_to_combine():
+    a = _valuation("V1", "9000000", "הנכס", context=A_CONTEXT)
+    b = _valuation("V2", "7000000", "הנכס", context=B_CONTEXT)
+    ev = calc.evaluate(calc.parse("V1 + V2"), ops(a, b), contexts=[frozenset({"v1:1", "v1:2"})])
+    assert ev.value == Decimal("16000000") and not ev.conditional
+    with pytest.raises(CalcError):  # a request that allows other contexts does not
+        calc.evaluate(calc.parse("V1 + V2"), ops(a, b), contexts=[frozenset({"v1:1", "v1:3"})])

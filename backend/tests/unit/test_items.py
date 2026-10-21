@@ -2291,3 +2291,89 @@ def test_a21_q4_a_sentence_that_shares_no_word_with_the_unit_is_not_its_own_cond
     # the figure coincides, the sentence is about something else, and the only condition it holds is itself
     passage = "בכל מקרה לא יגבו עמלה נוספת של 12 אחוז על קנסות ופיצויים."
     assert _built(passage, "שכר הטרחה הוא עלויות ישירות בתוספת 12% [S1].") == []
+
+
+# --- round 21 G1: a judge's quote with figures or dates is asked by them first; a heading is no item --------------------------------
+
+LOTS_QUOTE = "חלקות מס': 61, 62, 63, 64, 65 | נרשמה הערת אזהרה"
+DATED_QUOTE = "שיעור 9.75% מהמחזור החל ביום 3.8.2031 לפי ההסכם"
+
+
+def test_g1_a_quote_that_enumerates_lots_is_present_when_the_answer_writes_them_as_a_range_and_the_reverse():
+    assert items.quote_in_blocks(LOTS_QUOTE, _units("בחלקות 61-65 נרשם דבר [S1]."))  # the range is the enumeration
+    assert items.quote_in_blocks("חלקות 61-65 | נרשמה הערת אזהרה", _units("הערה על חלקות 61, 62, 63, 64 ו-65 [S1]."))
+    assert not items.quote_in_blocks(LOTS_QUOTE, _units("בחלקות 61-64 נרשם דבר [S1]."))  # a lot the range leaves out
+    assert not items.quote_in_blocks(LOTS_QUOTE, _units("נרשמה הערת אזהרה [S1]."))  # words alone, no lot, is no presence
+
+
+def test_g1_a_valueless_quote_with_a_figure_and_a_date_is_asked_by_them_before_its_words():
+    ws = _ws(DATED_QUOTE)
+    assert items.quote_in_blocks(DATED_QUOTE, _units("9.75% החל מ-3.8.2031 [S1]."))
+    assert not items.quote_in_blocks(DATED_QUOTE, _units("9.75% החל מ-3.8.2030 [S1]."))  # the date is another
+    assert not items.quote_in_blocks(DATED_QUOTE, _units("9.75% החל מיום מאוחר [S1]."))  # no date at all
+    ledger = items.Ledger()
+    judged = items.support_item("N1", "S1", DATED_QUOTE, ledger, ws=ws)
+    ledger.merge([judged])
+    assert ledger.outcomes(_units("9.75% החל מ-3.8.2031 [S1]."), ws)[0]["state"] == items.COVERED
+    assert ledger.outcomes(_units("9.75% החל מ-3.8.2030 [S1]."), ws)[0]["state"] == items.OMITTED
+
+
+def test_g1_a_valueless_judge_item_with_lots_is_asked_by_the_lots_in_the_ledger_check():
+    ws = _ws(LOTS_QUOTE)
+    ledger = items.Ledger()
+    ledger.merge([items.support_item("N1", "S1", LOTS_QUOTE, ledger, ws=ws)])
+    assert ledger.outcomes(_units("בחלקות 61-65 נרשם דבר [S1]."), ws)[0]["state"] == items.COVERED
+    assert ledger.outcomes(_units("בחלקות 61-64 נרשם דבר [S1]."), ws)[0]["state"] == items.OMITTED
+
+
+@pytest.mark.parametrize("quote", ["ג. הסכמי שימוש במבנים 4-6, 9:", "## שיעורי ההיוון שנקבעו בשומה:", "3.2 תנאי התשלום"])
+def test_g1_a_heading_line_with_no_amount_is_a_heading_only_quote(quote):
+    assert items.heading_only(quote)
+
+
+@pytest.mark.parametrize("quote", ["שיעור היוון למשרדים 6.5%", "ג. הסכם שימוש בתוקף עד 3.8.2031:", "ג. הסכם שימוש:\nשיעור 6.5%",
+                                   "חלקות 61-65 | נרשמה הערת אזהרה", "ב. תנאי הסדר הם כמפורט להלן בסעיפי ההסכם השונים של כל אחד מן המבנים בפרויקט:"])
+def test_g1_a_row_a_dated_line_a_multi_line_quote_or_a_long_line_is_no_heading(quote):
+    assert not items.heading_only(quote)
+
+
+def test_g2b_a_row_the_server_built_from_a_cited_span_is_no_rival_of_the_agents_item_that_shares_its_value():
+    """(round 21 G2b) the server's span item is given by the sentence that cites it and is never an open item; it must not force the
+    agent's own item to show its label words (a candidate a component asked for is an open item and still does)."""
+    ws = _ws(TWIN_TABLE)
+    agent = _item(**TWIN_AGENT)
+    spans = items.Item("N1", "הלוואה פרטית", "S1", "הלוואה פרטית | 5 שנים | בכפוף לאישור הבנק", "5", "בכפוף לאישור הבנק", "included", "",
+                       items.ORIGIN_SOURCE, candidate=False)
+    ledger = items.Ledger()
+    ledger.merge([agent, spans])
+    out = {o["id"]: o for o in ledger.outcomes(_units("התקופה היא 5 שנים [S1]."), ws)}
+    assert out[ledger.items[agent.key].id]["state"] == "covered"
+
+
+# dated twins: the same figure at two dates, each told apart by the date its own value or quote states (round 21 G2c)
+DATED_TERMS = "\n".join(["תקופות הזכות", "סוג | תקופה | הערה", "מחזור ראשון | 33 שנים | 2012-2045", "מחזור שני | 33 שנים | בהארכה"])
+INSTALMENTS = "\n".join(["תשלומים", "מועד | שיעור", "הראשון ביום 3.8.2030 | 9.75%", "השני ביום 3.8.2031 | 9.75%"])
+
+
+def test_g2c_dated_twins_are_told_apart_by_the_dates_of_the_value_and_the_quote_and_not_only_by_the_condition_and_label():
+    ws = _ws(DATED_TERMS)
+    first = _item(label="מחזור ראשון", quote="מחזור ראשון | 33 שנים | 2012-2045", value="33 שנים, מ-2012 עד 2045", condition="")
+    second = _item(label="מחזור שני", quote="מחזור שני | 33 שנים | בהארכה", value="33 שנים", condition="")
+    assert items._condition_dates(first) == frozenset({"2012"}) and items._condition_dates(second) == frozenset()
+    ledger = items.Ledger()
+    ledger.merge([first, second])
+    out = {o["id"]: o for o in ledger.outcomes(_units("הזכות היא ל-33 שנים, מ-2012 עד 2045 [S1]."), ws)}
+    assert out[ledger.items[first.key].id]["state"] == "covered"  # its date tells it from the extension, which states none
+    assert out[ledger.items[second.key].id]["state"] == "omitted"  # the extension is not given by the sentence of the first term
+
+
+def test_g2c_an_item_with_no_date_of_its_own_is_told_apart_by_the_one_date_of_its_quote():
+    ws = _ws(INSTALMENTS)
+    first = _item(label="תשלום ראשון", quote="הראשון ביום 3.8.2030 | 9.75%", value="9.75%", condition="")
+    second = _item(label="תשלום שני", quote="השני ביום 3.8.2031 | 9.75%", value="9.75%", condition="")
+    assert items._condition_dates(second) == frozenset({"2031-08-03"})
+    ledger = items.Ledger()
+    ledger.merge([first, second])
+    out = {o["id"]: o for o in ledger.outcomes(_units("שיעור של 9.75% ב-3.8.2031 [S1]."), ws)}
+    assert out[ledger.items[second.key].id]["state"] == "covered"
+    assert out[ledger.items[first.key].id]["state"] == "omitted"

@@ -2819,6 +2819,7 @@ class VerifyReport:
         omitted_by: dict[str, list[dict]] = {}
         unchecked_by: dict[str, list[dict]] = {}
         closed: set[tuple[str, tuple[str, str, str]]] = set()
+        covered_ev: dict[str, list[tuple[str, str, str]]] = {}  # the evidence of the items a surviving unit gives, by component (round 21 G1)
         for st in self.item_states(kept) if states is None else states:
             if is_server_item(st):
                 continue  # an item the server built from a cited span is given by the sentence that cites it: it never caps a component
@@ -2831,6 +2832,9 @@ class VerifyReport:
                 unchecked_by.setdefault(st["component"], []).append(st)
             else:
                 closed.add((st["component"], evidence_key(st["document_id"], st["unit_id"], st["source"], st["quote"])))
+                if st["state"] == ITEM_COVERED:
+                    covered_ev.setdefault(st["component"], []).append(
+                        evidence_key(st["document_id"], st["unit_id"], st["source"], st["quote"]))
         out: dict[str, dict] = {}
         for r in self.requirements:
             votes = self.requirement_votes.get(r["id"], [])
@@ -2859,7 +2863,8 @@ class VerifyReport:
                  # the judge's validated support, less what the ledger closed; and the omitted items, which are the same kind of
                  # evidence (a part of the asked kind that a read source states and the answer does not give)
                  "support": [x for x in self.text_support.get(r["id"], [])
-                             if (r["id"], self._evidence_of(x["id"], x["quote"])) not in closed]}
+                             if (r["id"], self._evidence_of(x["id"], x["quote"])) not in closed
+                             and not _rows_covered(self._evidence_of(x["id"], x["quote"])[:2], x["quote"], covered_ev.get(r["id"], []))]}
             validated = list(o["support"]) if kind in SEARCHABLE_KINDS else []  # the judge's validated part: evidence of a gap (R2)
             omitted = omitted_by.get(r["id"], []) if kind in SEARCHABLE_KINDS else []
             unchecked = unchecked_by.get(r["id"], []) if kind in SEARCHABLE_KINDS else []
@@ -7731,7 +7736,7 @@ def _read_passages(coverage: _Coverage, ws: Workspace, shown: dict[str, tuple[st
 class _VoteTrace:
     """What one vote's support entries became (diagnostics only): an entry per support quote the judge returned, in its order,
     with its ``outcome`` — ``accepted``, or the first condition it failed (``not_returned_source``, ``too_short``, ``too_long``,
-    ``other_document``, ``outside_asked_unit``, ``already_in_answer``, ``not_verbatim``), or why it was never weighed
+    ``other_document``, ``outside_asked_unit``, ``heading_only``, ``already_in_answer``, ``not_verbatim``), or why it was never weighed
     (``not_partial_or_missing``: support on a vote that is neither; ``duplicate``; ``over_cap``). Notes the entry as the judge
     wrote it, a quote prefix at most; ``None`` outcome: not decided yet. Bounded by ``TRACE_SUPPORT_PER_VOTE``."""
 
@@ -8412,7 +8417,14 @@ def _shown_support(verdicts: dict[int, JudgeVerdict], batch: _Batch, ws: Workspa
             shown = {sid for u in batch.units for sid in u.ids if any(sid in d for d in evidence)}
         # a source the batch cites, or one shown for this unit among the turn's already-read sources (``_candidate_ids``)
         mine = set(_candidate_ids(batch, ws).get(i, []))
-        wrong = [s for s in named if not (s in shown or s in mine) or not _EVIDENCE_ID.fullmatch(s)]
+        # a source the turn read and returned with text also stands (round 21 R4): a unit with no number (the connector sentence of a list)
+        # has no candidate to be shown, and the one the judge named is a source of this turn; it must hold the unit's numbers when it has
+        # any. Only a source the turn never saw is refused; the server's checks of the named support still run (``_named_support``)
+        read = returned_text_sources(ws)
+        numbers = numbers_in(_stated_text(units[i]))
+        turn_read = {s for s in named if s in read and _EVIDENCE_ID.fullmatch(s)
+                     and (not numbers or numbers & _source_terms(ws, s, (_source_parts(ws, s) or ("", "", ""))[1])[0])}
+        wrong = [s for s in named if not (s in shown or s in mine or s in turn_read) or not _EVIDENCE_ID.fullmatch(s)]
         if wrong:
             out[i] = v.model_copy(update={"verdict": "unsupported", "supported_by": [], "reason": (
                 f"הטענה אינה מצטטת מקור, והמקור שצוין כתומך בה ({', '.join(wrong)}) לא הוצג לבדיקה; צטט את המקור "
@@ -10135,6 +10147,21 @@ class SupportScope:
         return flat in self._flat[sid]
 
 
+def _rows_covered(place: tuple[str, str], quote: str, covered: list[tuple[str, str, str]]) -> bool:
+    """Whether the judge's support ``quote`` is only rows the answer already gives (round 21 G1): every line of it that is not a heading
+    holds, or is held by, the quote of an item of the same component that a surviving unit gives, in the same document and appraisal unit.
+    A call that scored the component partial named a passage whose rows the ledger's own items cover; the validated passage is then no
+    part the answer omits and caps nothing. A quote with a line no covered item holds stays evidence of a gap."""
+    from app.chat.items import heading_only
+
+    lines = [_flat_span(x) for x in quote.splitlines() if x.strip() and not heading_only(x)]
+    mine = [c[2] for c in covered if c[:2] == place and len(c[2]) >= ROW_MIN]
+    return bool(lines) and bool(mine) and all(any(m in x or x in m for m in mine) for x in lines)
+
+
+ROW_MIN = 6  # a quote shorter than this names no row
+
+
 def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> dict[str, list[dict]]:
     """The judge's ``support`` (round 16 U1) that the server accepts as evidence of a part the answer omits (KTD2), by
     component id, merged across the judge calls: for a ``partial`` or ``missing`` vote, an entry [{"id", "quote"}] is kept
@@ -10145,6 +10172,8 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
     numbers with half of the words that name the item, ``_in_answer``). An invalid entry is dropped silently, never failing a
     unit; the first condition it fails is kept on its vote's trace (``VerifyReport.requirements_trace``). ``failed``: the
     indexes of the units removed (not in the answer)."""
+    from app.chat.items import heading_only
+
     votes = {cid: [v for v in vs if v.status in ("partial", "missing") and v.support]
              for cid, vs in report.requirement_votes.items()}
     if not any(votes.values()):
@@ -10169,7 +10198,9 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
                 seen.add((sid, flat))
                 src = ws.sources[sid]
                 why = scope.place_problem(src)
-                if why is None and _in_answer(quote, units, components.get(cid, ""), blocks=blocks):
+                if why is None and heading_only(quote):
+                    why = "heading_only"  # a heading names what follows it: it is no part the answer omits (round 21 G1)
+                elif why is None and _in_answer(quote, units, components.get(cid, ""), blocks=blocks):
                     why = "already_in_answer"
                 elif why is None and not scope.verbatim(sid, src, flat):
                     why = "not_verbatim"

@@ -554,8 +554,9 @@ MSG_RECURRING = ("ערך לתקופה (לחודש/לשנה, כמו דמי שכי
 
 
 class _Eval:
-    def __init__(self, operands: dict[str, Operand]):
+    def __init__(self, operands: dict[str, Operand], contexts: list[frozenset[str]] | None = None):
         self.operands = operands
+        self.contexts = contexts  # the appraisal contexts a request that compares appraisals allows to be combined (``_check_contexts``)
         self.needs: list[str] = []
         self.steps: list[tuple[str, Decimal]] = []
         self.step_scales: list[int] = []
@@ -667,7 +668,7 @@ class _Eval:
     def additive(self, op: str, a: Operand, b: Operand) -> Operand:
         self._additive_checks([a, b], op)
         if a.subject and b.subject and not (
-                op == "+" and a.role == "component" and b.role == "component") and _subjects_differ(a, b):
+                op == "+" and a.role == "component" and b.role == "component") and _subjects_differ(a, b, self.contexts):
             self.need(f"נושא: «{a.subject}» מול «{b.subject}»")
         (va, vb), scale = self.same_scale([a, b])
         value = va + vb if op == "+" else va - vb
@@ -876,18 +877,20 @@ def _subject_words(subject: str) -> set[str]:
     return {_SUBJECT_PREFIX.sub("", w) for w in re.findall(r"[\w\"']+", _norm(subject)) if not metric_word(w)}
 
 
-def _subjects_differ(a: Operand, b: Operand) -> bool:
+def _subjects_differ(a: Operand, b: Operand, allowed: list[frozenset[str]] | None = None) -> bool:
     """Whether two operands that are added or subtracted name different scopes, decided by evidence first (round 21 packet A, Q5): when every
     input of both lies in an appraisal context the sources locate (``Leaf.context``), the same context is no mismatch whatever strings the
     model wrote for the two subjects, and disjoint contexts are one as before; when either is unknown the model's own strings decide, as before
-    (``same_subject``)."""
+    (``same_subject``). A value of an appendix or a comparables part has no subject context (``Value.operand``), so it is never located and the
+    strings decide, as before."""
     ca = {lf.context[0] for lf in a.leaves if lf.context is not None}
     cb = {lf.context[0] for lf in b.leaves if lf.context is not None}
     if ca and cb and all(lf.context is not None for lf in (*a.leaves, *b.leaves)):
         if ca == cb:
             return False
         if ca.isdisjoint(cb):
-            return True
+            # two appraisals are two properties, unless the request compares exactly these (``_check_contexts`` governs the combination)
+            return not (allowed and any(ca | cb <= a_ for a_ in allowed))
     return not same_subject(a.subject, b.subject)
 
 
@@ -913,7 +916,7 @@ def evaluate(node, operands: dict[str, Operand], justification: str | None = Non
     justification (a different VAT status, area basis or subject) is refused without one, and with one the result
     is conditional on it. ``contexts``: when enforced, the sets of appraisal contexts the turn's comparison
     components allow to be combined (``_check_contexts``); None leaves contexts unchecked."""
-    ev = _Eval(operands)
+    ev = _Eval(operands, contexts)
     with localcontext(_PRECISION):
         try:
             out = ev.eval(node)
