@@ -609,7 +609,8 @@ def test_ae6_a_date_the_server_does_not_hold_for_the_unit_is_not_supported(db, c
 # =======================================================================================================================
 
 LEAD = "מקדמי ההפחתה בחלקה 31:"
-BULLETS = ["- מקדם הפחתה בשל זכויות בנייה חלקיות הוא 0.8 [V1]", "- מקדם הפחתה בשל שיתוף במקרקעין הוא 0.9 [V2]"]
+# (the bullets carry a word the source does not write: a claim the scripted judge fails here is held by no sentence of the source, round 20 U9, F5)
+BULLETS = ["- מקדם הפחתה מחושב בשל זכויות בנייה חלקיות הוא 0.8 [V1]", "- מקדם הפחתה מחושב בשל שיתוף במקרקעין הוא 0.9 [V2]"]
 BACK = "שני המקדמים לעיל חלים על כל החלקה [S1]."
 LIST_ANSWER = "\n".join([LEAD, *BULLETS, BACK])
 

@@ -91,7 +91,7 @@ def _kinds_report():
     """One answer with a span cut, a citation the server inserts, a partly supported sentence, a removed sentence and
     a request that does not match: every kind ``VerifyReport.edit`` writes but the replacement."""
     a = _answer("הנכס פנוי, והוא מושכר [S1].\nהשווי למ\"ר הוא 9,500 ₪.\nדמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\n"
-                "דמי הניהול הם 12 ₪ למ\"ר [S1].")
+                "דמי הניהול הם 14 ₪ למ\"ר [S1].")
 
     def respond(text: str) -> dict:
         if "מושכר" in text:

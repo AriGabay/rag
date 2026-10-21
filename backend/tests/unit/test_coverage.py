@@ -13,6 +13,7 @@ what the server does with its requirements and scores, not the model's judgement
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import uuid
@@ -2825,6 +2826,27 @@ def test_ae1_a_condition_the_sentence_plainly_leaves_out_is_completed_with_a_sil
     # the repair that writes the condition: nothing more is requested or written
     again, _, repaired, _ = _plan_check(PLAN_STATED)
     assert _condition_problems(again) == [] and again.edit(repaired).doc.text.split("\n")[0] == PLAN_STATED
+
+
+def test_u9_f2_three_items_missing_the_same_condition_in_one_sentence_write_one_annotation():
+    """Round 20 U9, F2: the same server annotation is never written twice into one unit, however many items of its table lack it."""
+    rows = ["סוג שטח | שטח (מ״ר)", "שטח כולל לבנייה | 1,200", "שטח עיקרי | 900", "שטח שירות | 300", PLAN_NOTE]
+    ws = _file(SOURCE, "\n".join(rows), units=(1, 1), declared=(1,))
+    ws.sources["S2"].kind = "table"
+    raw = [_adj_item("שטח כולל", "שטח כולל לבנייה | 1,200", "1,200"), _adj_item("שטח עיקרי", "שטח עיקרי | 900", "900"),
+           _adj_item("שטח שירות", "שטח שירות | 300", "300")]
+    md = "השטח הכולל לבנייה הוא 1,200 מ״ר, העיקרי 900 מ״ר והשירות 300 מ״ר [S2]."
+    r, _, answer, _ = _ledger_check(ws, md, raw)
+    notes = [p for p in r.problems if p.check == verify.CONDITION_CHECK]
+    assert len(notes) == 1 and notes[0].annotation == PLAN_NOTE, [p.annotation for p in notes]
+    assert r.edit(answer).doc.text.count(PLAN_NOTE) == 1
+
+
+def test_u9_f2_the_same_note_at_the_same_place_is_written_once_by_the_edit():
+    r, _, answer, _ = _plan_check(PLAN_BARE, lambda iid, attrs, block: ("missing", PLAN_NOTE))
+    (note,) = [p for p in r.problems if p.check == verify.CONDITION_CHECK]
+    r.problems.append(dataclasses.replace(note))  # a second problem naming the same note at the same place
+    assert r.edit(answer).doc.text.count(PLAN_NOTE) == 1
 
 
 def test_the_same_class_in_another_word_is_not_completed_by_the_server():

@@ -36,8 +36,16 @@ _DATE = re.compile(r"(?<![\d.,/])(\d{1,2})[./-](\d{1,2})[./-](\d{4}|\d{2})(?!\d)
 _IDENTIFIER_BEFORE = re.compile(r"(?:(?<![א-ת])(?:מס|מספר|מס\"ד)[׳'’.]?|\bNo\.?|\bNr\.?|#)\s*:?\s*$")
 # a number right after the label of a plot, a unit or a place in a document names it, whatever the table around it says about its
 # neighbours ("תא שטח 101", "גוש 6004", "סעיף 4"): an identifier, unless a unit or a currency follows it (``_QUANTITY_AFTER``: "מגרש 450 מ״ר")
+# (round 20 U9, F3: a form, a regulation, a floor, a basement, a parking level and an elevation too - "טופס 4", "בקומת החניון 1"; the
+# prefix letters may be two, "ובקומה"; a unit or a currency after the number keeps it a quantity, "מרתף 250 מ״ר")
+_PREFIX = r"(?<![א-ת])[ובלמהש]{0,2}"
+_LEVEL_NOUNS = r"(?:טופס|תקנה|קומה|קומת|מרתף|חניון|מפלס)"
 _LABEL_BEFORE = re.compile(
-    r"(?<![א-ת])[בלמ]?(?:תא[\s-]+שטח|תא|מגרש|תת[\s-]*חלקה|חלקה|גוש|סעיף|עמוד|נספח)[׳']?\s*:?\s*$")
+    rf"{_PREFIX}(?:תא[\s-]+שטח|תא|מגרש|תת[\s-]*חלקה|חלקה|גוש|סעיף|עמוד|נספח|{_LEVEL_NOUNS})[׳']?\s*:?\s*$")
+# the nouns added in round 20 label a short number (a floor, a form, a regulation): "שכר קומה 1200" is an amount
+_LEVEL_BEFORE = re.compile(rf"{_PREFIX}{_LEVEL_NOUNS}[׳']?\s*:?\s*$")
+# a counted noun right after the number of a floor label makes it a count ("בכל קומה 8 דירות"), not the floor's name
+_COUNTED_AFTER = re.compile(r"\s*(?:דירות|דירה|חדרים|חדר|מקומות|מקום|יחידות|יחידה|חנויות|חנות|משרדים|חניות|מחסנים|יח[\"״]ד)(?![א-ת])")
 _QUANTITY_AFTER = re.compile(r"\s*(?:₪|ש[\"״]ח|מ[\"״]ר|דונם|%|אלף|מיליון|מטר)")
 _YEAR = re.compile(r"(?:19|20)\d\d")
 # Counts written as words ("שתי קומות"); used on the evidence side only, so a claim's digit can match them.
@@ -106,8 +114,10 @@ def not_an_amount(text: str, start: int, end: int, *, years: bool = True) -> boo
     The period, basis and VAT checks give a number a meaning only when it is a quantity (round 9 U12, R22)."""
     if _IDENTIFIER_BEFORE.search(text[max(0, start - 12):start]):
         return True
-    if _LABEL_BEFORE.search(text[max(0, start - 14):start]) and "," not in text[start:end] \
-            and not _QUANTITY_AFTER.match(text, end):
+    before = text[max(0, start - 14):start]
+    if _LABEL_BEFORE.search(before) and "," not in text[start:end] and not _QUANTITY_AFTER.match(text, end) \
+            and not (_LEVEL_BEFORE.search(before) and (not re.fullmatch(r"\d{1,3}", text[start:end])
+                                                    or _COUNTED_AFTER.match(text, end))):
         return True
     if any(d.start() <= start and end <= d.end() for d in _DATE.finditer(text)):
         return True

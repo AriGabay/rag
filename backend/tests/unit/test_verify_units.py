@@ -84,7 +84,8 @@ def test_claims_are_not_structural(raw):
 # --- a lead-in before list items is structure, not a claim (round 13 U10, KTD12, R15) ------------------------------------
 
 LEAD_IN = "הנתונים לחלקה 7 הם:"  # invented: a lot number in a short line ending with a colon
-LEAD_SOURCE = "חלקה 7: מקדם א 0.8, מקדם ב 0.9."
+# the labels and the values stand in sentences of their own: a claim the scripted judge fails here is held by no sentence of the source (round 20 U9, F5)
+LEAD_SOURCE = "חלקה 7: מקדם א ומקדם ב. הערכים הם 0.8 ו-0.9."
 
 
 @pytest.mark.parametrize("tail", ["- מקדם א\n- מקדם ב", "* מקדם א\n* מקדם ב", "1. מקדם א\n2. מקדם ב", "## פירוט"])
@@ -721,6 +722,23 @@ def test_the_first_sentence_of_a_bullet_goes_and_the_bullet_keeps_its_marker():
     a = _answer(md)
     out = verify_answer(p, a, _ws(SOURCE), "?", []).apply(a).answer_markdown
     assert out.startswith("- הנכס פנוי [S1].")
+
+
+def test_u9_f7_a_removed_first_sentence_leaves_the_bold_label_of_its_list_item_with_the_sentence_that_stays():
+    md = "- **תווית:** הנכס מושכר לטווח ארוך [S1]. הנכס פנוי [S1]."
+    p = _judge(lambda t: "unsupported" if "מושכר" in t else "supported")
+    a = _answer(md)
+    out = verify_answer(p, a, _ws(SOURCE), "?", []).apply(a).answer_markdown
+    assert out.startswith("- **תווית:** הנכס פנוי [S1]."), out
+    assert "מושכר" not in out
+
+
+def test_u9_f7_a_label_that_is_the_whole_removed_sentence_goes_with_it():
+    md = "- **תווית:** הנכס מושכר לטווח ארוך [S1].\n- הנכס פנוי [S1]."
+    p = _judge(lambda t: "unsupported" if "מושכר" in t else "supported")
+    a = _answer(md)
+    out = verify_answer(p, a, _ws(SOURCE), "?", []).apply(a).answer_markdown
+    assert "תווית" not in out and "- הנכס פנוי [S1]." in out
 
 
 def test_a_heading_whose_whole_content_went_goes_with_it():
@@ -2130,6 +2148,40 @@ def test_a_cut_of_the_key_cell_or_with_a_qualifier_word_or_a_defect_that_changes
     assert r.removed_units() == {1}
 
 
+ABSENCE_CELL = "לא מופיע שיעור הפחת בקטע שנקרא."
+
+
+def test_u9_f1_a_cell_that_states_an_absence_is_cut_alone_and_the_supported_cell_of_the_row_stays():
+    """The negation of an absence statement is the statement itself, not a qualifier the other cells rest on."""
+    head = "| רכיב | הערה | משך |\n|---|---|---|\n"
+    a = _answer(f"{head}| רכיב א | {ABSENCE_CELL} | 100 ₪ [S1] |")
+    r = verify_answer(_claims_judge(lambda t: [(ABSENCE_CELL, "unsupported"), ("100 ₪", "supported")] if "רכיב א" in t else None),
+                      a, _ws(PART_SOURCE), "?", [])
+    assert r.removed_units() == set() and r.cuts
+    out = r.apply(a).answer_markdown
+    assert f"| רכיב א | {MARKER_1} | 100 ₪ [S1] |" in out and ABSENCE_CELL not in out
+
+
+def test_u9_f1_a_qualifier_inside_a_cell_still_removes_the_row():
+    head = "| רכיב | סכום | הערה |\n|---|---|---|\n"
+    a = _answer(f'{head}| רכיב א | 15% (לא כולל מע"מ) [S1] | 100 ₪ [S1] |')
+    r = verify_answer(_claims_judge(lambda t: [('(לא כולל מע"מ)', "unsupported"), ("100 ₪", "supported")] if "רכיב א" in t else None),
+                      a, _ws(PART_SOURCE), "?", [])
+    assert r.removed_units() == {1} and "100" not in r.apply(a).answer_markdown
+
+
+def test_u9_f1_row_cut_safe_reads_the_absence_cell_and_the_inner_qualifier_apart():
+    head = "| רכיב | הערה | משך |\n|---|---|---|\n"
+    for cell, bad, expected in [(ABSENCE_CELL, ABSENCE_CELL, True), ('15% (לא כולל מע"מ)', '(לא כולל מע"מ)', False)]:
+        row = next(u for u in split_units(f"{head}| רכיב א | {cell} | 36 חודשים [S1] |") if "רכיב א" in u.text and u.table_span)
+        recs = []
+        for i, (span, verdict) in enumerate([(bad, "contradicts"), ("36 חודשים", "supported")]):
+            at = row.raw.index(span)
+            recs.append(verify.ClaimRecord(id=f"c{i}", unit_id="u", unit=row.index, start=row.start + at, end=row.start + at + len(span),
+                                           text=span, kind="fact", verdict=verdict, exact=True))
+        assert verify.row_cut_safe(row, recs, "part") is expected, cell
+
+
 # --- scopes below the property: a datum under another plan, parcel, contract or alternative (round 20 U3, KTD3; R9-R13; AE6-AE8) ----------
 #
 # Every plan number, parcel, name and figure is invented. The sources are read as the verifier holds them: a table read (rows with a
@@ -2411,3 +2463,134 @@ def test_the_components_subject_and_the_users_question_are_words_of_the_request_
     assert verify.valid_missing(part, "partial", component, request, "נכס אינדג'יה") == part
     assert verify.valid_missing(part, "partial", component, request, "", "מי השוכר באינדג'יה ובקרגוייבץ?") == part
     assert verify.valid_missing("השוכר באילת", "partial", component, request, "נכס אינדג'יה") == ""  # still never a word nobody wrote
+
+
+# --- round 20 U9, F5: a claim the judge failed that a source cited beside it holds is kept, cited and marked --------------------------
+
+MARK = "*(אומת חלקית)*"
+
+
+def _two_sources(first: str, second: str):
+    ws = _ws(first, second)
+    return ws
+
+
+def test_u9_f5_a_claim_stated_in_a_source_the_sibling_sentence_cites_is_kept_cited_and_marked_not_removed_as_contradicting():
+    ws = _two_sources("הערך הראשון הוא 3,900 ₪. סכום נוסף 4,100 ₪.", "הערך השני הוא 2,200 ₪. הערך הראשון הוא 4,100 ₪ לפי החוזה.")
+    a = _answer("- הערך הראשון הוא 4,100 ₪ [S1]. הערך השני הוא 2,200 ₪ [S2].")
+    r = verify_answer(_judge(lambda t: "contradicts" if "הראשון" in t else "supported"), a, ws, "?", [])
+    out = r.apply(a).answer_markdown
+    assert r.removed_units() == set() and "סותר" not in out and "הערך הראשון הוא 4,100 ₪" in out, out
+    assert "[S1][S2]" in out and MARK in out, out
+    (rec,) = r.claims[0]
+    assert rec.verdict == "partial" and rec.rescue == "S2" and r.verdicts[0] == "partial"
+    assert [p.check for p in r.problems if p.severity == "partial"] == [verify.RESCUE_CHECK]
+    assert not any(p.repairable for p in r.problems)  # no repair round is spent on a rescued claim
+
+
+@pytest.mark.parametrize("enforced, rescued", [(True, False), (False, True)])
+def test_u9_f5_the_same_claim_with_the_holding_source_in_another_context_is_removed_as_before(monkeypatch, enforced, rescued):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_appraisal_context_enforced", enforced)
+    ws, _ = _owner_ws("חישוב ההכנסה: הכנסה נטו שנתית 590,000 ₪. סכום נוסף 610,000 ₪.", 1)
+    other = ws.add_source(document_id=uuid.uuid4(), version_id=next(iter(ws.contexts)), title="שומה", section=None,
+                          location="עמוד 5", kind="context",
+                          text="הכנסה נטו שנתית 610,000 ₪.")
+    other.contexts = [3]
+    a = _answer("ההכנסה נטו השנתית היא 610,000 ₪ [S1]. הערה על המתחם [S2].")
+    r = verify_answer(_judge(lambda t: "contradicts" if "610,000" in t else "supported"), a, ws, ws.user_messages[0]["text"], [])
+    assert (0 not in r.removed_units()) is rescued and bool(r.claims[0][0].rescue) is rescued  # context not enforced: the holder is accepted
+
+
+def test_u9_f5_a_number_only_a_source_cited_by_the_next_sentence_states_keeps_the_sentence_cited_and_marked():
+    ws = _two_sources("נתון א הוא 4,000 ₪.", "נתון ב הוא 700 ₪. נתון א הוא 5,000 ₪ לפי הסכם.")
+    a = _answer("- נתון א הוא 5,000 ₪ [S1]. נתון ב הוא 700 ₪ [S2].")
+    r = verify_answer(_judge(lambda t: "supported"), a, ws, "?", [])
+    out = r.apply(a).answer_markdown
+    assert r.removed_units() == set() and "נתון א הוא 5,000 ₪ [S1][S2]" in out and MARK in out, out
+    assert r.claims[0][0].verdict == "partial" and r.claims[0][0].rescue == "S2" and r.claims[1][0].verdict == "supported"
+
+
+def test_u9_f5_a_number_no_cited_source_of_the_answer_states_in_that_sentence_is_removed_as_before():
+    ws = _two_sources("נתון א הוא 4,000 ₪.", "נתון ב הוא 700 ₪. נתון א הוא 5,000 ₪ לפי הסכם.")
+    a = _answer("- נתון ב הוא 5,000 ₪ [S1]. נתון ב הוא 700 ₪ [S2].")  # 5,000 stands in S2, but under another label
+    r = verify_answer(_judge(lambda t: "supported"), a, ws, "?", [])
+    assert r.removed_units() == {0} and "5,000" not in r.apply(a).answer_markdown
+
+
+ROW_SOURCE = "טבלת היוון\nמקדם ערך נוכחי סידרתי (8 שנים) | 4.62\nמקדם היוון קבוע | 7.10"
+
+
+def test_u9_f5_a_cited_row_that_holds_the_claims_number_under_its_label_is_kept_with_the_mark_when_the_judge_failed_it():
+    a = _answer("במקדם ערך נוכחי 4.62 [S1].")
+    r = verify_answer(_judge(lambda t: "unsupported"), a, _ws(ROW_SOURCE, kind="table"), "?", [])
+    out = r.apply(a).answer_markdown
+    assert r.removed_units() == set() and "במקדם ערך נוכחי 4.62 [S1]" in out and MARK in out, out
+    assert r.claims[0][0].verdict == "partial" and r.claims[0][0].rescue == "S1"
+
+
+def test_u9_f5_the_same_number_under_another_label_is_cut_or_removed_as_before():
+    a = _answer("במקדם ערך נוכחי 7.10 [S1].")
+    r = verify_answer(_judge(lambda t: "unsupported"), a, _ws(ROW_SOURCE, kind="table"), "?", [])
+    assert r.removed_units() == {0} and "7.10" not in r.apply(a).answer_markdown
+
+
+def test_u9_f5_a_claim_with_no_number_and_a_claim_that_states_an_absence_are_not_rescued():
+    ws = _two_sources("הנכס מושכר לטווח ארוך.", "הנכס פנוי. הנכס מושכר לטווח ארוך.")
+    a = _answer("- הנכס מושכר לטווח ארוך [S1]. הנכס פנוי [S2].")
+    r = verify_answer(_judge(lambda t: "unsupported" if "מושכר" in t else "supported"), a, ws, "?", [])
+    assert r.removed_units() == {0}
+    ws = _two_sources("שיעור הפחתה כלשהו.", "לא מופיע שיעור הפחתה של 15% בקטע שנקרא. הנכס פנוי.")
+    a = _answer("- לא מופיע שיעור הפחתה של 15% בקטע שנקרא [S1]. הנכס פנוי [S2].")
+    r = verify_answer(_judge(lambda t: "unsupported" if "הפחתה" in t else "supported"), a, ws, "?", [])
+    assert 0 in r.removed_units() and not r.claims[0][0].rescue
+
+
+def test_u9_f5_the_key_cell_of_a_table_row_is_not_rescued():
+    ws = _two_sources("טבלה: מקדם ערך נוכחי | 4.62", "מקדם ערך נוכחי 4.62")
+    a = _answer("| נתון | ערך |\n|---|---|\n| מקדם ערך נוכחי 4.62 [S1] | 36 חודשים [S2] |")
+    r = verify_answer(_claims_judge(lambda t: [("מקדם ערך נוכחי 4.62", "unsupported"), ("36 חודשים", "supported")]
+                                    if "מקדם" in t else None), a, ws, "?", [])
+    assert 1 in r.removed_units() and not any(x.rescue for recs in r.claims.values() for x in recs)  # the key cell is the row's: it goes whole
+
+
+def test_u9_f5_a_rescued_cell_of_a_table_row_carries_the_mark_inside_its_own_cell():
+    ws = _two_sources("רכיב א | 36 חודשים", ROW_SOURCE)
+    a = _answer("| נתון | ערך | משך |\n|---|---|---|\n| רכיב א | מקדם ערך נוכחי 4.62 [S2] | 36 חודשים [S1] |")
+    r = verify_answer(_claims_judge(lambda t: [("מקדם ערך נוכחי 4.62", "unsupported"), ("36 חודשים", "supported")] if "4.62" in t else None),
+                      a, ws, "?", [])
+    row = next(ln for ln in r.apply(a).answer_markdown.splitlines() if "4.62" in ln)
+    assert row == f"| רכיב א | מקדם ערך נוכחי 4.62 [S2] {MARK} | 36 חודשים [S1] |", row
+    assert r.removed_units() == set() and len(verify.cell_bounds(row)) == 3
+
+
+def test_u9_f5_a_source_sentence_holds_a_claim_only_with_its_numbers_words_and_negations_in_one_place():
+    held = verify._holds_claim
+    assert held("הזכויות כוללות מרתף 340", "הזכויות כוללות מרתף 340 מ״ר.")
+    assert not held("הזכויות כוללות מרתף 340", "הזכויות לא כוללות מרתף 340.")  # the source negates what the claim states
+    assert not held("הזכויות לא כוללות מרתף 340", "הזכויות כוללות מרתף 340.")
+    assert not held("הזכויות כוללות מרתף 340", "הזכויות כוללות מרתף. נתון אחר 340.")  # the number stands in another sentence
+    assert not held("הזכויות כוללות מרתף 340", "הזכויות כוללות מרתף 350.")  # another number
+    assert not held("מרתף", "מרתף 340")  # no number, no rescue
+    assert not held("340", "מרתף 340")  # no word beside the number
+
+
+def test_u9_f5_a_holder_the_sentence_itself_cites_has_its_own_check_and_wording_and_a_sibling_holder_keeps_the_other():
+    own = _answer("במקדם ערך נוכחי 4.62 [S1].")
+    r = verify_answer(_judge(lambda t: "unsupported"), own, _ws(ROW_SOURCE, kind="table"), "?", [])
+    (p,) = [x for x in r.problems if x.severity == "partial"]
+    assert p.check == verify.RESCUE_OWN_CHECK == "rescue_own"
+    assert verify.partial_reason_class(None, p.check) == "rescued_own"
+    assert verify.partial_summary(None, p.check)["text"] == (
+        "אומת חלקית: המספר והמילים של הטענה נמצאים בשורה של המקור שהמשפט מצטט, אך הבדיקה לא אישרה את מלוא הטענה.")
+    assert "ליד המשפט" not in verify.PARTIAL_SENTENCES["rescued_own"]
+    assert "שהיחידה מצטטת" in p.reason
+
+    ws = _two_sources("הערך הראשון הוא 3,900 ₪. סכום נוסף 4,100 ₪.", "הערך השני הוא 2,200 ₪. הערך הראשון הוא 4,100 ₪ לפי החוזה.")
+    a = _answer("- הערך הראשון הוא 4,100 ₪ [S1]. הערך השני הוא 2,200 ₪ [S2].")
+    r = verify_answer(_judge(lambda t: "contradicts" if "הראשון" in t else "supported"), a, ws, "?", [])
+    (p,) = [x for x in r.problems if x.severity == "partial"]
+    assert p.check == verify.RESCUE_CHECK == "rescue"
+    assert verify.partial_summary(None, p.check)["text"] == (
+        "אומת חלקית: הנתון נמצא במקור שהתשובה מצטטת ליד המשפט, ולא במקור שהמשפט עצמו מצטט.")

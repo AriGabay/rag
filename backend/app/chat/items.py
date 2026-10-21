@@ -418,11 +418,12 @@ def _row_conditions(row: str, body: Sequence[str], flat: str) -> Iterable[tuple[
     yield from (("row", c) for c in conditions.material_clauses(sentence))
 
 
-def condition_spans(src, quote: str) -> list[Span]:
+def condition_spans(src, quote: str, elsewhere: Sequence[str] = ()) -> list[Span]:
     """The condition spans of the item whose quote is ``quote`` in ``src``, from its own context only: an operator clause of the
     quote, the clauses and note of its row (or its sentence), the headings that name a method, a status, a component or a time, and
     the paragraphs and notes attributed to its table (``TablePart.attributed``: a paragraph that is not attributed is no condition
-    of its values). Each span once, in that order."""
+    of its values). Each span once, in that order. ``elsewhere``: the quotes of the other items of the turn: a note whose mark one of
+    them carries and the item's own quote and row do not is the note of that item (round 20 U9, F2)."""
     parts, body = context_of_source(src)
     flat = SupportScope.flat(quote)
     out: list[Span] = []
@@ -445,22 +446,29 @@ def condition_spans(src, quote: str) -> list[Span]:
         if part.place == "heading":
             if conditions.material(part.text):
                 add("heading", part.text)
-        elif part.place in ("before", "after", "note") and not part.reason and _note_of_row(part.text, body, row):
+        elif part.place in ("before", "after", "note") and not part.reason and _note_of_row(part.text, body, row, quote, elsewhere):
             for sentence in _SENTENCE_END.split(part.text):
                 if conditions.material(sentence):
                     add("paragraph", sentence)
     return out
 
 
-def _note_of_row(note: str, body: Sequence[str], row: str | None) -> bool:
-    """Whether a note beside a table limits the item whose row is ``row`` (round 20 U3, KTD3, R10, AE7): a note that opens with a mark
-    («*», «**», «(1)») belongs to the cells that carry the same mark, so it is no condition of a row that carries none of them; a mark in
-    a header cell belongs to every row. A note without a mark, a mark no cell carries, and an item that is no table row keep the note."""
+def _note_of_row(note: str, body: Sequence[str], row: str | None, quote: str = "", elsewhere: Sequence[str] = ()) -> bool:
+    """Whether a note beside a table limits the item whose row is ``row`` (round 20 U3, KTD3, R10, AE7; round 20 U9, F2): a note that opens
+    with a mark («*», «**», «(1)», «(***)») belongs to the cells that carry the same mark, so it is no condition of a row that carries none
+    of them; a mark in a header cell belongs to every row. A mark that the quote of another item (``elsewhere``) carries, and the item's own
+    quote and row do not, is the mark of that item's row, even in another table: the note is no condition of this item. A note without a
+    mark, a mark nobody carries, and an item that is no table row keep the note."""
     mark = scopes.note_mark(note)
-    if not mark or row is None or "|" not in row:
+    if not mark:
         return True
+    elsewhere_holds = any(mark in scopes.marks_of(q) for q in elsewhere)
+    if row is None or "|" not in row:
+        return mark in scopes.marks_of(quote) or not elsewhere_holds
     rows, held = _rows_marked(tuple(body), mark)
-    return held is None or row in {rows[i] for i in held}
+    if held is None:
+        return mark in scopes.marks_of(quote) or not elsewhere_holds
+    return row in {rows[i] for i in held}
 
 
 @functools.lru_cache(maxsize=256)
@@ -667,7 +675,7 @@ def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledge
                 if (made >= ROWS_PER_UNIT or scope.source_problem(sid, flat) or scope.place_problem(src)
                         or any(_holds(i, sid, ws, flat, component) for i in [*held, *built])):
                     continue
-                spans = condition_spans(src, quote)
+                spans = condition_spans(src, quote, [i.quote for i in held])
                 if not spans or _note_of_another_scope(ws, sid, src, quote, quote, against=referent):
                     continue
                 made += 1
@@ -1367,8 +1375,18 @@ def quote_in_blocks(quote: str, units: Sequence[Unit], component: str = "", *, b
     words = words - _words(component) or words
     need = (len(words) + 1) // 2
     groups = headline(quote, quote)
-    return any(all(g & _have(_without_list_number(b.unit.text)) for g in groups) and len(words & _words(b.unit.text)) >= need
-               for b in blocks)
+
+    def stated(block: Block) -> bool:
+        if not all(g & _have(_without_list_number(block.unit.text)) for g in groups):
+            return False
+        have = _words(block.unit.text)
+        if len(words & have) >= need:
+            return True
+        # every headline value stands in the block: the label may be inflected ("שווי" / "שוויו"), a word of three letters or more that a
+        # block word starts with is the same word (round 20 U9, F8); a block that holds the value under another noun still needs the words
+        return bool(groups) and sum(1 for w in words if w in have or (len(w) >= 3 and any(h.startswith(w) for h in have))) >= need
+
+    return any(stated(b) for b in blocks)
 
 
 class _Check(NamedTuple):
@@ -1719,7 +1737,8 @@ class Ledger:
         leads = _leads(units)
         # per evidence, once: of the LAST fill that rests on it (the fills of one evidence may name it by another S# or write its quote
         # with other blanks, and the later fill's reading is the one that stood)
-        spans = {ev: _spans_of(ws, i) for ev, i in {i.evidence: i for i in scored}.items()}
+        quotes = [i.quote for i in scored]  # a note whose mark another item's quote carries is that item's (round 20 U9, F2)
+        spans = {ev: _spans_of(ws, i, quotes) for ev, i in {i.evidence: i for i in scored}.items()}
         rows: list[tuple[Item, Coverage | None]] = []
         gave: dict[Evidence, frozenset[int]] = {}  # the sentences that give each covered evidence (the first is the covering sentence)
         wide: dict[Evidence, tuple[Unit, ...]] = {}  # the multi-sentence blocks that give it, each as one unit
@@ -1802,9 +1821,9 @@ _NO_CHECK = {"condition_check": "", "condition_hint": [], "condition_spans": [],
 _RANK = {conditions.KEPT: 0, conditions.UNDECIDED: 1, conditions.MISSING: 2, conditions.HINT: 3}
 
 
-def _spans_of(ws, item: Item) -> list[Span]:
+def _spans_of(ws, item: Item, elsewhere: Sequence[str] = ()) -> list[Span]:
     src = ws.sources.get(item.source)
-    return condition_spans(src, item.quote) if src is not None else []
+    return condition_spans(src, item.quote, elsewhere) if src is not None else []
 
 
 def _own_text(ws, item: Item) -> str:

@@ -68,6 +68,7 @@ from typing import TYPE_CHECKING
 
 from app.answering.numread import NUMBER as _NUM_AT
 from app.answering.numread import number_spans, read_separators
+from app.answering.verify import _QUANTITY_AFTER as _QUANTITY_AT
 from app.answering.verify import not_an_amount, numbers_in
 from app.chat.datum import STATUS_NOT_READ
 from app.chat.evidence import _content_words
@@ -461,10 +462,22 @@ def _owner(nums: list, amounts: list[int], pos: int, clause: str) -> int | None:
     return before[-1] if before else eligible[0]
 
 
-def attached(text: str) -> tuple[list[tuple[frozenset[str], int, Qualifiers]], Qualifiers]:
+def _noun_period(clause: str, owner: tuple, after: int) -> bool:
+    """Whether a period word that ends at ``after`` is a noun's ("הרווח השנתי הממוצע"), not the percent's that the owner is (round 20 U9, F4): the
+    owner is a percent that stands after the word, with a Hebrew word between them ("בשיעור 7.15%"). An adjacent rate ("שנתי 7.15%") and
+    a rate with its noun before the word (``_of_rate``) are the percent's."""
+    a, b, _ = owner
+    if a < after or not (_PERCENT_AFTER.match(clause, b) or clause[max(0, a - 1):a] == "%"):
+        return False
+    return any(w != "של" for w in re.findall(r"[א-ת]{2,}", clause[after:a]))
+
+
+def attached(text: str, noun_period: bool = True) -> tuple[list[tuple[frozenset[str], int, Qualifiers]], Qualifiers]:
     """For each number in the text, its forms, position and the qualifiers attached to it; and the qualifiers of
     clauses with no number (what the text states beyond its own numbers). A rate's period word ("בריבית שנתית")
-    belongs to a percent of its clause — the first after it, else the last before it — and with none, to nothing."""
+    belongs to a percent of its clause — the first after it, else the last before it — and with none, to nothing. ``noun_period``
+    (the answer's side; a source is read without it, round 20 U9, F4): a period word of a noun that stands before a percent with a
+    Hebrew word between them is the clause's, not the percent's."""
     text = _read(text)
     out: list[tuple[frozenset[str], int, Qualifiers]] = []
     general = Qualifiers()
@@ -484,7 +497,7 @@ def attached(text: str) -> tuple[list[tuple[frozenset[str], int, Qualifiers]], Q
                     quals[after[0] if after else percents[-1]].add(kind, key, written)
                 continue
             owner = _owner(nums, amounts, pos, clause) if nums else None
-            if owner is None:
+            if owner is None or (noun_period and kind == "period" and _noun_period(clause, nums[owner], pos + len(written))):
                 general.add(kind, key, written)
                 continue
             quals[owner].add(kind, key, written)
@@ -609,7 +622,7 @@ def _period_lines(lines: list[str], is_row: list[bool]):
     - for a table's row: its title, caption and notes — every line around the table when they are few
       (``TABLE_AROUND``), else the line above it by the rule above and the lines with no number right after it."""
     has_num = [bool(_numbers(_ENUMERATION.sub("", ln))) for ln in lines]
-    stated = [Qualifiers() if row else _only(attached(ln)[1], "period") for ln, row in zip(lines, is_row, strict=True)]
+    stated = [Qualifiers() if row else _only(attached(ln, noun_period=False)[1], "period") for ln, row in zip(lines, is_row, strict=True)]
 
     def opening(j: int) -> Qualifiers:  # a period word that opens line j, continuing the sentence of the line above
         if j <= 0 or j >= len(lines) or is_row[j] or is_row[j - 1] or not has_num[j - 1] \
@@ -790,6 +803,29 @@ def _caption_lines(lines: list[str], is_row: list[bool], tables: list[_Table]) -
     return near
 
 
+_NOTE_WORD = re.compile(r"\s+([א-ת][א-ת\"״׳']*)")
+
+
+def note_mark_at(text: str, at: int, end: int) -> bool:
+    """Whether the number at ``text[at:end]`` is the mark of a footnote and no quantity (round 20 U9, F3): one or two digits that open the
+    line and are followed by a Hebrew word that is no unit, no noun of a count or a duration and no currency or area word ("1 שטח ברוטו
+    (עילי + תחתי)"), or one or two digits after a word and before " :" ("שטח בנוי 1 : כ-12,480 מ״ר"). The source writes it as a mark, so
+    it carries no period or basis word of the line around it."""
+    if not 1 <= end - at <= 2 or not text[at:end].isdigit():
+        return False
+    if not text[:at].strip():
+        word = _NOTE_WORD.match(text, end)
+        return (bool(word) and not after_kind(text, end) and not _QUANTITY_AT.match(text, end) and word.group(1) != "אחוז"
+                and not units_attested(word.group(1)) and not _all(word.group(1)).keys("period"))
+    return text.startswith(" :", end) and bool(re.search(r"[א-ת]\s+$", text[:at]))
+
+
+def _specific_number(forms: frozenset[str], written: str) -> bool:
+    """Whether a number is specific enough to be the same figure in another table of an appraisal (round 20 U9, F6): five digits or more
+    in the whole part, or written with a thousands separator. A short number ("12", "3.5") recurs everywhere with other meanings."""
+    return bool(re.search(r"\d,\d{3}(?!\d)", written)) or any(len(re.sub(r"\D", "", f.split(".")[0])) >= 5 for f in forms)
+
+
 @lru_cache(maxsize=256)
 def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ...], Qualifiers]:
     """Every number a source states with what it attaches to it there, and what the source states for all its
@@ -825,9 +861,10 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
             own_heads, upper_heads = _column_heads(tbl, cells)
             for i, cell in enumerate(cells):
                 head = f"{own_heads[i]} {upper_heads[i]}".strip()
-                found, _ = attached(cell)
+                found, _ = attached(cell, noun_period=False)
                 for f, at, q in found:
-                    if not_an_amount(cell, at, at + len(written_at(cell, at)), years=False):
+                    if not_an_amount(cell, at, at + len(written_at(cell, at)), years=False) \
+                            or note_mark_at(cell, at, at + len(written_at(cell, at))):
                         # a plot, a unit or a section label (תא שטח 101): the source writes it as a name, so no row, header or
                         # caption qualifier belongs to it (round 19 U1, KTD3)
                         occurrences.append((f, Occurrence(Qualifiers(), line, identifier=True)))
@@ -860,13 +897,14 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                         q.merge(period(n, row_meaning))
                     occurrences.append((f, Occurrence(q, line, area=area)))
             continue
-        found, _ = attached(line)
+        found, _ = attached(line, noun_period=False)
         # a table's title, caption or notes state an area basis for its numbers — a period, for the numbers it governs
         # (``_period_lines``); a sentence with no number elsewhere gives no basis to other numbers
         if n in captions:
             general.merge(_only(_all(line), "period", keep=False), "paragraph")
         for i, (f, at, q) in enumerate(found):
-            if not_an_amount(line, at, at + len(written_at(line, at)), years=False):
+            if not_an_amount(line, at, at + len(written_at(line, at)), years=False) \
+                    or note_mark_at(line, at, at + len(written_at(line, at))):
                 occurrences.append((f, Occurrence(Qualifiers(), line, identifier=True)))
                 continue
             q = _tagged(q, "sentence")
@@ -1260,8 +1298,9 @@ class Fetcher:
                 pass
         return adopted.mid
 
-    def attesting(self, unit: Unit, forms: frozenset[str], kind: str, key: str, words: set[str]) -> str | None:
-        """The id of evidence that states ``kind`` ``key`` for the number, beyond the unit's citations."""
+    def attesting(self, unit: Unit, forms: frozenset[str], kind: str, key: str, words: set[str], written: str = "") -> str | None:
+        """The id of evidence that states ``kind`` ``key`` for the number, beyond the unit's citations. ``written``: the number as the
+        unit writes it, which decides whether it is specific enough to be looked for in the rest of the appraisal (round 20 U9, F6)."""
         def states(cand) -> bool:
             if cand is None or cand.sid in unit.ids:
                 return False
@@ -1284,6 +1323,13 @@ class Fetcher:
                 continue
             if key in measurement_qualifiers(row).keys(kind) and words & _content_words(f"{row.metric} {row.quote}"):
                 return self.adopt(row)
+        if _specific_number(forms, written):
+            # another table of the same appraisal states it ("תוספת שנתית | 846,215" beside a paragraph that gives no period): the
+            # sources of the unit's version and context, never those of another appraisal of the file (round 20 U9, F6)
+            own = {(str(self.ws.sources[i].version_id), c) for i in cited for c in self.ws.sources[i].contexts}
+            for cand in self.ws.sources.values():
+                if own and any((str(cand.version_id), c) in own for c in cand.contexts) and states(cand):
+                    return self.adopt(cand)
         return None
 
     def subject_statement(self, unit: Unit, forms: frozenset[str], kind: str, words: set[str]):
@@ -1387,7 +1433,7 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
             if kind == "period" and shape:
                 continue
             extra = claimed.keys(kind) - attested.keys(kind)
-            found_in = {k: fetcher.attesting(unit, forms, kind, k, words) for k in sorted(extra)} if fetcher else {}
+            found_in = {k: fetcher.attesting(unit, forms, kind, k, words, written) for k in sorted(extra)} if fetcher else {}
             for k, where in found_in.items():
                 if where is not None:
                     # stated in the same calculation: judged and shown with that evidence, not removed

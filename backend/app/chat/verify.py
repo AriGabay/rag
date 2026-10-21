@@ -268,6 +268,8 @@ _NO_END = re.compile(r"(?:^|[\s(\-–—:*])(?:\d{1,2}(?:\.\d{1,2})*|[א-תA-Za-
 # the markup a line starts with that stays when its first sentence goes and another stays: a heading, quote or
 # bullet mark, and a list item's own number ("- A. B." without A is "- B.")
 _LINE_LEAD = re.compile(r"\s*(?:#{1,6}\s+|>\s*|[-*+]\s+)?(?:\d{1,3}\.\s+)?")
+# the bold label that opens a list item ("- **תווית:** משפט"): it stays with the sentence that stays (round 20 U9, F7)
+_CUT_LABEL = re.compile(r"\*\*[^*\n]{1,80}?(?::\*\*|\*\*:)\s*")
 # a numbered heading's number ("9. השומה", "9.1 שיטת השומה", "**9.2.** ..."): part of the heading, never a claim
 _HEADING_NUMBER = re.compile(r"^(?:#{1,6}\s+)?(?:\*\*)?(?:\d{1,3}\.|\d{1,3}(?:\.\d{1,3})+\.?)(?:\*\*)?\s+(?=\S)")
 _EVIDENCE_ID = re.compile(r"[SMVC]\d+")  # what a judge may name as a unit's support: a turn's evidence, no assumption
@@ -1603,6 +1605,8 @@ PARTIAL_SENTENCES = {
     "context_not_read": "אומת חלקית: ההקשר שמגדיר חלק מהטענה לא נקרא.",
     "recency": "אומת חלקית: לא אומת שהנתון הוא העדכני ביותר.",
     "final": "אומת חלקית: הטענה, כפי שנוסחה בסוף, נתמכת במקורות רק בחלקה.",
+    "rescued": "אומת חלקית: הנתון נמצא במקור שהתשובה מצטטת ליד המשפט, ולא במקור שהמשפט עצמו מצטט.",
+    "rescued_own": "אומת חלקית: המספר והמילים של הטענה נמצאים בשורה של המקור שהמשפט מצטט, אך הבדיקה לא אישרה את מלוא הטענה.",
     "unspecified": "אומת חלקית: המקורות תומכים בטענה רק בחלקה.",
 }
 
@@ -1617,6 +1621,8 @@ def partial_reason_class(failure_kind: str | None, check: str | None = None) -> 
     the final check; any other mark is ``unspecified``. One rule for the answer's mark (``partial_summary``) and a claim's state
     (``timeline._unit_claim``)."""
     kind = failure_kind if failure_kind in FAILURE_KINDS else None
+    if check in (RESCUE_CHECK, RESCUE_OWN_CHECK):
+        return "rescued" if check == RESCUE_CHECK else "rescued_own"
     return "recency" if check == RECENCY_CHECK else kind or ("final" if check == "final" else "unspecified")
 
 
@@ -2809,6 +2815,14 @@ class VerifyReport:
         # a result of a conditional calculation gets the server's own qualifier, after its number (or, when the
         # unit shows no number of it, where a citation would join the unit)
         tagged: set[tuple[int, int]] = set()
+        written: set[tuple[int, str]] = set()
+
+        def note_once(at: int, text: str, kind: str) -> None:
+            # the same text at the same place is written once, however many problems name it (round 20 U9, F2)
+            if (at, text) not in written:
+                written.add((at, text))
+                edits.append((at, at, text, kind, ()))
+
         for p in notes:
             if p.conditional and p.unit.table_span is None:
                 at = _phrase_end(markdown, p.unit)  # after the sentence, never inside its phrase (round 18 U7)
@@ -2822,21 +2836,21 @@ class VerifyReport:
                     # row, by its number) — none when the unit already says its result is conditional, and one per
                     # place however many calculations
                     if (at, p.unit.index) not in tagged and not _SAYS_CONDITIONAL.search(p.unit.text):
-                        edits.append((at, at, f" ({CONDITIONAL_TAG})", "qualifier", ()))
+                        note_once(at, f" ({CONDITIONAL_TAG})", "qualifier")
                         tagged.add((at, p.unit.index))
                     continue
                 cite = f" [{p.cite}]" if p.uncited else ""
                 if p.check in (SCOPE_LIMIT_CHECK, CONDITION_LIMIT_CHECK):  # not verified: said, with where the value was read (R11)
-                    edits.append((at, at, f" ({p.annotation})", "scope_note", ()))
+                    note_once(at, f" ({p.annotation})", "scope_note")
                 elif p.check == CONDITION_CHECK:  # the condition the source states, written next to the value with its citation (R4)
                     said = (MSG_CONDITION_LABELLED.format(label=p.named, phrase=p.annotation) if p.named
                             else MSG_CONDITION_ADDED.format(phrase=p.annotation))
-                    edits.append((at, at, f" ({said}{cite})", "qualifier", ()))
+                    note_once(at, f" ({said}{cite})", "qualifier")
                 elif p.check == SCOPE_CHECK:  # the scope the source states, written next to the value with its citation (R10)
-                    edits.append((at, at, f" ({MSG_SCOPE_ADDED.format(phrase=p.annotation)}{cite})", "qualifier", ()))
+                    note_once(at, f" ({MSG_SCOPE_ADDED.format(phrase=p.annotation)}{cite})", "qualifier")
                 elif p.qualifier == "approx" or not _is_duration_or_count(p.unit, p.number or "", p.at):
                     # a source's period is never a duration's; its approximation is also a count's (round 20 U2, KTD2)
-                    edits.append((at, at, f" ({p.annotation}, כפי שנכתב במקור{cite})", "qualifier", ()))
+                    note_once(at, f" ({p.annotation}, כפי שנכתב במקור{cite})", "qualifier")
         # evidence the server found in the same calculation is cited with the unit it supports
         for u, ids in _cites_by_unit(cites):
             at = _citation_point(markdown, u)
@@ -2922,6 +2936,9 @@ def _sentence_cuts(markdown: str, units: list[Unit], errors: set[int]) -> list[t
         if siblings[0] is u and any(x.index not in errors for x in siblings):
             lead = _LINE_LEAD.match(markdown, line_start, line_end)
             a = max(a, lead.end() if lead else a)
+            label = _CUT_LABEL.match(markdown, a, b)
+            if label is not None and label.end() < b:
+                a = label.end()  # the label stays, and the sentence that stays reads under it
         while b < line_end and markdown[b] in " \t":
             b += 1
         if b == line_end:
@@ -4650,6 +4667,7 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
     by_id: dict[str, dict] = {}
     for x in states:
         by_id.setdefault(x["id"], x)
+    annotated: set[tuple[int, str]] = set()  # (unit, flat condition quote) already written into the unit
     for st in states:
         verdict = said.get(st["id"])
         unit = units.get(st["condition_unit"])
@@ -4697,6 +4715,11 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
             phrase = _condition_span([x["text"] for x in st["condition_spans"]], verdict.quote)
             cited = [(st["source"], source)]
             number = _value_number(unit, cited)
+            # the same condition is written into one unit once, however many items of its table it is missing from (round 20 U9, F2)
+            once = (unit.index, _flat_quote(phrase or MSG_CONDITION_LIMIT.format(where=_read_in(cited))))
+            if once in annotated:
+                continue
+            annotated.add(once)
             if phrase:
                 report.problems.append(Problem(unit, MSG_CONDITION_FOUND.format(sid=st["source"], phrase=phrase),
                                                kind="missing_qualifier", number=number, annotation=phrase, cite=st["source"],
@@ -5230,6 +5253,170 @@ def _written_forms(text: str, numbers: set[str]) -> list[str]:
 def _has_number(text: str, numbers: list[str]) -> bool:
     here = numbers_in(text)
     return any(n in here or re.search(rf"(?<![\d,.]){re.escape(n)}(?![\d])", text) for n in numbers)
+
+
+# --- a claim the judge failed that another cited source of the answer holds (round 20 U9, F5) ----------------------------------------
+#
+# The judge reads a unit with its own citations only. A sentence that cites one source while its claim is stated in a source that a
+# sentence of the same list item or paragraph cites (or, for a number no cited source states, a source cited anywhere in the answer) is
+# judged unsupported or contradicted and removed, though the answer holds the claim. One deterministic rescue runs before such a claim is
+# cut or removed: a candidate source holds it when all its numbers stand in ONE sentence or table row of it, the claim's content words
+# stand there too, the source is not another property's (``_context_check``) and does not write the datum under another scope
+# (``_scope_check``). The claim is kept, the holding source is cited (the existing ``needs_citation`` path) and the unit carries the
+# "partly verified" mark: it is never counted fully verified. A claim with no number, a table row's key cell and a claim that states
+# an absence are not rescued. No model call, no judge input.
+
+RESCUE_CHECK = "rescue"  # the check of the partial mark of a claim a source cited beside the sentence (or elsewhere in the answer) holds
+RESCUE_OWN_CHECK = "rescue_own"  # ... and of one that a source the sentence itself cites holds
+RESCUABLE_FAILURES = ("none", "absent_from_source", "contradicts_source")  # the failures of a claim a held source may rescue
+MSG_RESCUED = "נתמך במקור {sid}, שיחידה סמוכה בתשובה מצטטת, ולא במקור שהיחידה עצמה מצטטת; הנתון נשאר מסומן כמאומת חלקית"
+MSG_RESCUED_OWN = "המספר והמילים של הטענה נמצאים בשורה של {sid}, שהיחידה מצטטת, אך הבדיקה לא אישרה את מלוא הטענה; הנתון נשאר מסומן כמאומת חלקית"
+MSG_RESCUE_CITE = "נתמך ב-{sid}, שהתשובה לא ציטטה ליד המשפט"
+_NEGATIONS = frozenset({"לא", "אין", "אינו", "אינה", "אינם", "אינן", "ללא", "בלי"})
+_NUMBER_RUN = re.compile(r"\d[\d.,%/:-]*")
+_RESCUE_SENTENCE = re.compile(r"(?<=[.!?;])\s+(?=\S)")  # (a colon does not end the sentence: "מתחם גבעת האלה: הכנסה נטו שנתית 610,000")
+
+
+@functools.lru_cache(maxsize=1024)
+def _rescue_segments(text: str) -> tuple[str, ...]:
+    """The sentences and the table rows of a source text: the places where all the numbers of a claim must stand together."""
+    out: list[str] = []
+    for line in without_part_tags(text).splitlines():
+        line = line.strip()
+        if line:
+            out.extend([line] if "|" in line else _RESCUE_SENTENCE.split(line))
+    return tuple(out)
+
+
+def _negations(text: str) -> frozenset[str]:
+    return frozenset(w for w in _MISSING_TOKEN.findall(text or "") if w in _NEGATIONS)  # (the stop words "לא" and "אין" count here)
+
+
+def _holds_claim(claim: str, source_text: str) -> bool:
+    """Whether one sentence or table row of ``source_text`` holds ``claim``: every number of the claim (as ``numbers_in`` reads it, signs and
+    all), every content word of it (``words_stand_in``), and the same negations, in that one place. A claim with no number or no content word
+    besides its numbers, or one that states an absence, is held by nothing."""
+    claim = _IDS.sub(" ", claim)
+    numbers = numbers_in(claim)
+    words = _NUMBER_RUN.sub(" ", claim)
+    if not numbers or not source_text or states_absence(claim) or not _missing_words(words):
+        return False
+    wanted = _negations(claim)
+    for seg in _rescue_segments(source_text):
+        if (numbers <= (numbers_in(seg, words=True) | scaled_numbers_in(seg)) and _negations(seg) == wanted
+                and words_stand_in(words, seg)):
+            return True
+    return False
+
+
+def _rescue_sources(u: Unit, units: list[Unit], ws: Workspace, *, anywhere: bool = False) -> list[str]:
+    """The sources a claim of ``u`` may be rescued by: those the unit cites, then those the other units of its block (a list item or a
+    paragraph) cite; with ``anywhere``, those any unit of the answer cites."""
+    pool = units if anywhere else [x for x in units if x.block >= 0 and x.block == u.block and x is not u]
+    out: list[str] = []
+    for x in [u, *pool]:
+        for i in x.ids:
+            sid = evidence_source_id(ws, i)
+            if sid in ws.sources and sid not in out:
+                out.append(sid)
+    return out
+
+
+def _holding_source(u: Unit, claim: str, sids: list[str], ws: Workspace, question: str) -> str | None:
+    """The first of ``sids`` that holds ``claim`` (``_holds_claim``) and is not another property's or another scope's for the unit."""
+    for sid in sids:
+        if not _holds_claim(claim, ws.sources[sid].text or ""):
+            continue
+        probe = dataclasses.replace(u, ids=[sid])
+        scope = _scope_check(probe, ws)
+        if _context_check(probe, ws, question).reason is None and scope.reason is None and not scope.cells:
+            return sid
+    return None
+
+
+def rescue_unstated(report: VerifyReport, units: list[Unit], ws: Workspace, question: str, meanings: dict,
+                    fetcher: meaning.Fetcher) -> dict[int, str]:
+    """A unit failed only because no passage it cites states its numbers (``unstated_number``) whose numbers and words stand in one sentence
+    of a source cited anywhere in the answer: that source is cited with the unit (as ``_expand_unstated`` cites an expansion) and the checks
+    run again with it; the unit is judged with it and carries the partly verified mark. Returns the unit index -> the source."""
+    cites: dict[int, str] = {}
+    for p in list(report.problems):
+        u = p.unit
+        if (p.check != "unstated_number" or not p.unstated or u.index < 0 or u.table_span is not None or u.table_header
+                or p.resolution == "qualifier"):
+            continue
+        sid = _holding_source(u, _stated_text(u), [x for x in _rescue_sources(u, units, ws, anywhere=True) if x not in u.ids], ws, question)
+        if sid is None:
+            continue
+        before = meanings.get(u.index, [])
+        u.ids.append(sid)
+        meanings[u.index] = check_meaning(u, ws, fetcher)
+        again = deterministic([u], ws, question, meanings)
+        if any(x.check != RECENCY_CHECK for x in again):
+            u.ids.remove(sid)
+            meanings[u.index] = before
+            continue
+        report.problems = [x for x in report.problems if x is not p] + again
+        cites[u.index] = sid
+    return cites
+
+
+def _rescue_own(u: Unit, sid: str, rescued_in: Mapping[int, str]) -> bool:
+    """Whether the source that holds a rescued claim is one the sentence itself cites (not one a sibling cites or ``rescue_unstated`` added)."""
+    return sid in u.ids and rescued_in.get(u.index) != sid
+
+
+def _rescue_check(u: Unit, sid: str, rescued_in: Mapping[int, str]) -> str:
+    return RESCUE_OWN_CHECK if _rescue_own(u, sid, rescued_in) else RESCUE_CHECK
+
+
+def _rescue_message(u: Unit, sid: str, rescued_in: Mapping[int, str]) -> str:
+    return (MSG_RESCUED_OWN if _rescue_own(u, sid, rescued_in) else MSG_RESCUED).format(sid=sid)
+
+
+def _cell_mark_end(u: Unit, r: ClaimRecord) -> int | None:
+    """Where the partly verified mark of a claim of a table row goes: the end of its own cell's content (``Problem.cell_end``); None for any
+    other unit."""
+    if u.table_span is None or u.table_header or not r.exact:
+        return None
+    bounds = cell_bounds(u.raw)
+    cells = _claim_cells(u, r, bounds)
+    if not cells:
+        return None
+    a, b = bounds[min(cells)]
+    return u.start + a + len(u.raw[a:b].rstrip())
+
+
+def rescue_judged(report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: Workspace, question: str, skip: set[int],
+                  anywhere: set[int], reasons: dict[str, str], rescued_in: Mapping[int, str] = {}) -> dict[int, dict[str, str]]:
+    """The claims the judge failed (unsupported, contradicts or a number no cited source states) that a source cited beside them holds
+    (see the section above). All or nothing for a unit: when every failing claim has a holder, each becomes a partly supported claim
+    (``ClaimRecord.rescue``), the unit's verdict is partial, and the holding sources are returned (unit index -> claim id -> source) for
+    their citation. ``skip``: the units already decided; ``anywhere``: the units whose candidates are any source of the answer."""
+    held: dict[int, dict[str, str]] = {}
+    for u in report.units:
+        v, recs = verdicts.get(u.index), report.claims.get(u.index)
+        if v is None or not recs or u.index in skip or u.table_header or v.verdict in ("not_factual", "navigation"):
+            continue
+        failing = [r for r in recs if r.verdict in FAILING_VERDICTS]
+        if not failing or any(r.verdict == "unchecked" or r.failure not in RESCUABLE_FAILURES or r.needs_context != "none" or r.rereads
+                              for r in failing):
+            continue  # (a claim the judge needed more context for, or that was read again with it, is the judge's to settle)
+        if u.table_span is not None and any(r.whole_unit or not r.exact or 0 in _claim_cells(u, r, cell_bounds(u.raw)) for r in failing):
+            continue  # a row's key cell, or a claim of a row that is not placed in a cell
+        sources = _rescue_sources(u, report.units, ws, anywhere=u.index in anywhere)
+        found = {r.id: _holding_source(u, u.text if r.whole_unit else r.text, sources, ws, question) for r in failing}
+        if not sources or None in found.values():
+            continue
+        for r in failing:
+            r.verdict, r.failure, r.rescue = "partial", "none", found[r.id]
+            reasons[r.id] = _rescue_message(u, found[r.id], rescued_in)
+        if v.verdict in ("unsupported", "contradicts"):
+            v = verdicts[u.index] = v.model_copy(update={"verdict": "partial", "defect": "none",
+                                                          "reason": _rescue_message(u, next(iter(found.values())), rescued_in)})
+            report.verdicts[u.index], report.unit_verdicts[u.index] = v.verdict, v
+        held[u.index] = found
+    return held
 
 
 def _fail_unstated(report: VerifyReport, p: Problem, v: JudgeVerdict, reasons: dict[str, str]) -> bool:
@@ -8008,6 +8195,9 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         if reread is not None else {}
     # a number the sources back whose only fault is a qualifier they do not state is edited, not removed (round 12 U10)
     plan_qualifier_edits(report, ws, question, meanings)
+    # a number only a source cited beside the unit states, in one sentence with the unit's words: that source is cited with the unit and the
+    # unit is judged with it, marked as partly verified (round 20 U9, F5)
+    rescued_in = rescue_unstated(report, units, ws, question, meanings, fetcher)
     # a unit failed only for numbers no cited source states, that holds more than those numbers, is not removed up front:
     # the judge splits it into claims and the claim holding such a number fails (``_fail_unstated``)
     soft = {p.unit.index: p for p in report.problems if p.check == "unstated_number" and p.unstated
@@ -8142,6 +8332,10 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         report.verdicts = {u.index: verdicts[u.index].verdict for u in to_judge if u.index in verdicts}
         report.claims = {u.index: claim_records(u, unit_claims(u, verdicts[u.index], ws))
                          for u in to_judge if u.index in verdicts}
+        for idx, sid in rescued_in.items():  # a unit the judge read with the source that holds its numbers is never fully verified
+            for r in report.claims.get(idx, []):
+                if r.verdict == "supported":
+                    r.verdict, r.rescue = "partial", sid
         if reread is not None:
             _reread(provider, report, verdicts, ws, usage, deadline, reread, cache, keys)
             mark_context_unread(report, ws)
@@ -8158,6 +8352,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 continue
             elif _fail_unstated(report, p, verdicts[idx], reasons):
                 handled.add(idx)
+        # a claim the judge failed that a source cited beside it holds is kept, cited and marked, before it is cut or removed (round 20 U9, F5)
+        rescues = rescue_judged(report, verdicts, ws, question, handled, set(soft) | set(rescued_in), reasons, rescued_in)
         for u in to_judge:
             if u.index in handled:
                 continue
@@ -8203,6 +8399,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
             elif v.verdict == "partial" or failing:
                 # a unit holding claims that differ: one problem per claim that fails, so each is linked to its claim
                 # by id (R5); the unit stays, marked, until the edit ladder cuts the claim (U4)
+                held = rescues.get(u.index, {})
                 for r in failing or [None]:
                     why = (reasons.get(r.id) if r is not None else None) or v.reason + (
                         f" («{r.text}»)" if r is not None else "")
@@ -8210,6 +8407,12 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                     kind = (r.failure_kind() if r is not None and (r.verdict in ("unsupported", "contradicts")
                                                                    or r.failure == CONTEXT_NOT_READ)
                             else DEFECT_FAILURES.get(v.defect))
+                    if (r.id in held) if r is not None else bool(held):  # a rescued claim: marked in place, no repair round (U9, F5)
+                        report.problems.append(Problem(u, PARTIAL_REASON_PREFIX + why, "partial", defect="none",
+                                                       check=_rescue_check(u, held[r.id] if r is not None else next(iter(held.values())), rescued_in),
+                                                       claim_id=r.id if r is not None else recs[0].id,
+                                                       cell_end=_cell_mark_end(u, r) if r is not None else None))
+                        continue
                     report.problems.append(Problem(u, PARTIAL_REASON_PREFIX + why, "partial", defect=v.defect,
                                                    failure_kind=kind, check="judge",
                                                    claim_id=r.id if r is not None else recs[0].id))
@@ -8226,6 +8429,15 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 else:
                     report.problems += [Problem(u, f"נתמך ב-{s}, שהתשובה לא ציטטה", kind="needs_citation", cite=s)
                                         for s in cite_ids]
+        for u in to_judge:  # the source that holds a rescued claim is cited with its unit, and the unit carries the partly verified mark
+            sids = list(dict.fromkeys([*rescues.get(u.index, {}).values(), *([rescued_in[u.index]] if u.index in rescued_in else [])]))
+            if not sids or u.index in report.removed_units():
+                continue
+            report.problems += [Problem(u, MSG_RESCUE_CITE.format(sid=sid), kind="needs_citation", cite=sid)
+                                for sid in sids if f"[{sid}]" not in u.raw]
+            if not any(p.unit.index == u.index and p.severity == "partial" and p.kind == "claim" for p in report.problems):
+                report.problems.append(Problem(u, PARTIAL_REASON_PREFIX + _rescue_message(u, sids[0], rescued_in), "partial", defect="none",
+                                               check=_rescue_check(u, sids[0], rescued_in)))
         for p in report.problems:  # a cell under another scope is a defect a repair can remove (the cell is cut only if the agent does not)
             if p.claim_id in scoped_cells:
                 p.check = SUBREFERENT_CHECK
@@ -8391,7 +8603,8 @@ def row_cut_safe(u: Unit, recs: list[ClaimRecord], defect: str | None = None) ->
     - it is not the row's key cell, the first column (the unit, the plan, the side or the property the row speaks of: with it wrong,
       the other cells would describe the wrong thing, and the row goes whole);
     - no other claim of the row rests on it, and the verdict names no defect that changes how the other cells read (``CELL_DEFECTS``);
-    - its cut text holds no qualifier word (a negation, a condition, a status, a date or a caveat that the other cells may rest on);
+    - its cut text holds no qualifier word (a negation, a condition, a status, a date or a caveat that the other cells may rest on),
+      unless the cut text is a statement of an absence (``states_absence``);
     - at least one supported claim stands in a data cell (a cell other than the key cell; one a cut only takes a span from stays with it).
     The table's cells must line up with its header row (else the cells cannot be told apart). True for anything but a table body row."""
     if u.table_span is None or u.table_header:
@@ -8409,7 +8622,10 @@ def row_cut_safe(u: Unit, recs: list[ClaimRecord], defect: str | None = None) ->
             return False
         if any(s is not r and s.verdict in STANDING_VERDICTS and _rests_on(s, r) for s in recs):
             return False
-        if r.verdict in FAILING_VERDICTS and has_qualifier(u.raw[r.start - u.start:r.end - u.start]):
+        span = u.raw[r.start - u.start:r.end - u.start]
+        # the negation of an absence cell ("X does not appear in the passage read") is the statement itself, no qualifier the other
+        # cells rest on (round 20 U9, F1); a qualifier inside a cell ("15% (excluding VAT)") still guards the row
+        if r.verdict in FAILING_VERDICTS and has_qualifier(span) and not states_absence(span):
             return False
     return any(r.verdict == "supported" and cells[r.id] - {0} for r in recs)
 
@@ -8623,6 +8839,7 @@ class ClaimRecord:
     context_key: str = ""  # the unit's heading and table context, for matching a repaired claim to its parent
     exact: bool = False  # ``start``/``end`` are the span's own place in the answer (not the whole unit's)
     marker: int = 0  # for a cut claim: the ordinal of the marker that replaced it in the final text
+    rescue: str = ""  # for a claim the judge failed that another cited source holds: that source (``rescue_judged``, round 20 U9, F5)
     # the bounded re-reads of the claim (U5, R13-R15): {"source", "scope", "outcome" (``REREAD_OUTCOMES``), and for
     # the outcomes that have them "reason", "expanded_source"}, for the log
     rereads: list[dict] = field(default_factory=list)

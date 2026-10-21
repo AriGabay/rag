@@ -1172,3 +1172,145 @@ def test_a_plot_label_before_a_quantity_is_still_a_quantity():
     assert not occ.identifier and occ.qualifiers.keys("basis") == {"אקוו"}
     (occ,), _ = meaning.source_occurrences(source, {"1250000"})
     assert not occ.identifier
+
+
+# --- round 20 U9, F3: a digit after a label noun or a footnote mark is no quantity ---------------------------------------------------
+
+@pytest.mark.parametrize("text", ["הצפי לקבלת טופס 4", "ובקומת החניון 1", "לפי תקנה 12", "במרתף 2", "ומפלס 3", "קומה 2"])
+def test_u9_f3_a_number_after_a_form_floor_basement_level_or_regulation_label_is_no_amount(text):
+    start = text.rindex(" ") + 1
+    assert meaning.not_an_amount(text, start, len(text))
+
+
+@pytest.mark.parametrize("text, number", [("קומה 1 (משרדים) | 2,341 מ״ר", "2,341"), ("מרתף 250 מ״ר", "250"), ("קומת קרקע 120 מ״ר", "120"),
+                                          ("בקומה 3 1,500 ₪", "1,500")])
+def test_u9_f3_a_quantity_beside_a_floor_label_stays_a_quantity(text, number):
+    start = text.index(number)
+    assert not meaning.not_an_amount(text, start, start + len(number))
+
+
+def test_u9_f3_a_floor_label_before_a_number_with_a_unit_stays_a_quantity():
+    assert not meaning.not_an_amount("מרתף 250 מ״ר", 5, 8)  # the unit right after the number keeps it an amount
+
+
+FOOTNOTE_SOURCE = "שטח בנוי 1 : כ-12,480 מ\"ר\n1 שטח ברוטו (עילי + תחתי)"
+
+
+def test_u9_f3_a_footnote_mark_and_a_mark_before_a_colon_are_identifiers_in_the_source():
+    occurrences, _ = meaning.source_occurrences(FOOTNOTE_SOURCE, {"1"})
+    assert len(occurrences) == 2 and all(o.identifier for o in occurrences)
+    (area,), _ = meaning.source_occurrences(FOOTNOTE_SOURCE, {"12480"})
+    assert not area.identifier  # the quantity of the line stays one
+
+
+@pytest.mark.parametrize("line", ["3 קומות", "12 דירות", "5 לחודש", "20 מטר", "2 אחוז", "10 שנים"])
+def test_u9_f3_a_line_that_opens_with_a_number_and_a_unit_or_count_word_is_no_footnote(line):
+    (occ,), _ = meaning.source_occurrences(line, set(meaning.numbers_in(line.split()[0])))
+    assert not occ.identifier, line
+
+
+def test_u9_f3_a_floor_label_digit_takes_no_basis_or_period_from_an_unrelated_occurrence_of_the_source():
+    source = FOOTNOTE_SOURCE + "\nבקומת החניון 1: הריסת 23.40 מ\"ר שטח מסחר"
+    assert [p for p in _problems("בקומת החניון 1: הריסת 23.40 מ\"ר שטח מסחר [S1].", _ws(source)) if p.number == "1"] == []
+
+
+# --- round 20 U9, F4: the period word of a noun is not the period of the percent that follows it ----------------------------------
+
+def _period_of(text: str, number: str) -> set[str]:
+    (q,) = [q for forms, _, q in meaning.attached(text)[0] if number in forms]
+    return q.keys("period")
+
+
+def test_u9_f4_a_period_word_of_a_noun_is_not_attached_to_the_percent_after_other_words():
+    assert _period_of("היוונה את הרווח השנתי הממוצע בשיעור 7.15%", "7.15") == set()
+
+
+def test_u9_f4_an_adjacent_period_word_a_trailing_one_and_a_rate_noun_still_attach():
+    assert _period_of("רווח שנתי מייצג של 514,300 ₪, שהוון בשיעור 7.15%", "514300") == {"year"}
+    assert _period_of("רווח שנתי מייצג של 514,300 ₪, שהוון בשיעור 7.15%", "7.15") == set()
+    assert _period_of("ריבית שנתית 5%", "5") == {"year"}
+    assert _period_of("שנתי 7.15%", "7.15") == {"year"}
+    assert _period_of("7.15% לשנה", "7.15") == {"year"}
+    assert _period_of("שיעור ההיוון השנתי הוא 7.15%", "7.15") == {"year"}  # the rate noun before the word (``_of_rate``)
+
+
+def test_u9_f4_the_server_writes_no_period_after_a_percent_whose_noun_carries_the_word():
+    ws = _ws("היוון הרווח בשיעור 7.15%.")
+    assert _problems("היוונה את הרווח השנתי הממוצע בשיעור 7.15% [S1].", ws) == []
+
+
+# --- round 20 U9, F6: a period stated in another table of the same appraisal ----------------------------------------------------------
+
+def _appraisal_ws(*texts: str, contexts: tuple[int, ...] = ()) -> Workspace:
+    """Sources S1… of one document version; ``contexts``: the appraisal context of each (by position)."""
+    ws = Workspace(ctx=None)
+    document, version = uuid.uuid4(), uuid.uuid4()
+    for t in texts:
+        ws.add_source(document_id=document, version_id=version, title="שומת בדיקה", section="", location="", kind="context", text=t)
+    for sid, n in zip(ws.sources, contexts, strict=False):
+        ws.sources[sid].contexts = [n]
+    return ws
+
+
+PARAGRAPH = "בשומה נקבעה תוספת של 846,215 ₪ בגין הזכויות."
+ROW = "תוספת שנתית | 846,215"
+CLAIM = "תוספת שנתית של 846,215 ₪ [S1]."
+
+
+def test_u9_f6_a_period_stated_in_another_source_of_the_same_context_is_cited_and_does_not_block():
+    ws = _appraisal_ws(PARAGRAPH, ROW, contexts=(1, 1))
+    (unit,) = split_units(CLAIM)
+    (p,) = meaning.check(unit, ws, meaning.Fetcher(ws))
+    assert p.kind == "period" and not p.blocking and p.needs_citation and p.cite == "S2"
+
+
+@pytest.mark.parametrize("case, texts, contexts, claim", [
+    ("another context", (PARAGRAPH, ROW), (1, 2), CLAIM),
+    ("another period", (PARAGRAPH, "תוספת חודשית | 846,215"), (1, 1), CLAIM),
+    ("a short number", ("בשומה נקבעה תוספת של 12 ₪.", "תוספת שנתית | 12"), (1, 1), "תוספת שנתית של 12 ₪ [S1]."),
+    ("no context", (PARAGRAPH, ROW), (), CLAIM),
+])
+def test_u9_f6_the_search_beyond_the_calculation_keeps_its_guards(case, texts, contexts, claim):
+    ws = _appraisal_ws(*texts, contexts=contexts)
+    (unit,) = split_units(claim)
+    (p,) = meaning.check(unit, ws, meaning.Fetcher(ws))
+    assert p.kind == "period" and p.blocking and not p.needs_citation, case
+
+
+# --- round 20 U9: the noun-period rule is the answer's side only; a counted noun after a floor label keeps a count ---------------------
+
+def test_u9_f4_a_source_line_keeps_its_old_reading_the_noun_rule_is_for_the_answer_only():
+    source = "ההכנסה השנתית 1,200,000 ₪ ושיעור 7%"
+    (income,), _ = meaning.source_occurrences(source, {"1200000"})
+    (rate,), _ = meaning.source_occurrences(source, {"7"})
+    assert income.qualifiers.keys("period") == {"year"} and rate.qualifiers.keys("period") == set()
+    line = "הרווח השנתי הממוצע בשיעור 7.15%"
+    (occ,), _ = meaning.source_occurrences(line, {"7.15"})
+    assert occ.qualifiers.keys("period") == {"year"}  # as the source wrote it, before the answer-side rule
+    assert meaning.attached(line, noun_period=False)[0][0][2].keys("period") == {"year"}
+    assert meaning.attached(line)[0][0][2].keys("period") == set() and meaning.attached(line)[1].keys("period") == {"year"}
+
+
+def test_u9_f4_a_source_table_cell_and_the_period_lines_are_read_without_the_noun_rule():
+    table = "טבלה\nסעיף | הערה\nרווח שנתי ממוצע בשיעור 7.15% | 12"
+    (occ,), _ = meaning.source_occurrences(table, {"7.15"})
+    assert occ.qualifiers.keys("period") == {"year"}
+
+
+@pytest.mark.parametrize("text, number", [("בכל קומה 8 דירות", "8"), ("קומה 5 דירות", "5"), ("בקומה 2 חדרים", "2"),
+                                          ("מרתף 3 מקומות חניה", "3"), ("קומה 4 מ״ר 250", "4")])
+def test_u9_f3_a_number_after_a_floor_label_that_counts_a_noun_stays_a_quantity(text, number):
+    start = text.index(number)
+    assert not meaning.not_an_amount(text, start, start + len(number))
+
+
+@pytest.mark.parametrize("text, number", [("בקומת החניון 1", "1"), ("הצפי לקבלת טופס 4", "4"), ("קומה 2", "2"), ("ובקומה 3: משרדים", "3")])
+def test_u9_f3_a_floor_or_form_label_without_a_counted_noun_still_names_its_number(text, number):
+    start = text.index(number)
+    assert meaning.not_an_amount(text, start, start + len(number))
+
+
+def test_u9_f4_a_noun_period_word_of_a_source_line_is_not_spread_to_the_other_numbers_of_the_line():
+    for source in ("הרווח השנתי הממוצע בשיעור 7.15% ומקדם 0.9", "הרווח השנתי הממוצע בשיעור 7.15%. משך ההסכם 36 חודשים. מקדם 0.9"):
+        (coef,), _ = meaning.source_occurrences(source, {"0.9"})
+        assert coef.qualifiers.keys("period") == set(), source

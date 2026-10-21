@@ -1676,6 +1676,52 @@ def test_a_numbered_mark_binds_like_an_asterisk_and_two_marks_bind_to_their_own_
     assert _spans(ws, "קבוצה ב׳ | חוזה שני (2) | 2,100") == [("paragraph", "(2) החכירה בלבד עד שנת 2040")]
 
 
+STAR_NOTE = "(***) שיעור הבעלות לא יפחת מ-31%"
+STAR_ROW = "ניכוי (***) | 1,480,000"
+PLAIN_ROWS = ["נתון א׳ | 1,000", "נתון ב׳ | 2,000", "נתון ג׳ | 3,000"]
+PLAIN_TABLE = "\n".join(["הטבלה: 3 שורות", "נתון | ערך", *PLAIN_ROWS, STAR_NOTE])
+
+
+@pytest.mark.parametrize("cell, marks", [
+    ("ניכוי (***)", {"***"}), ("ניכוי ( ***)", {"***"}), ("(*) שטח", {"*"}), ("ניכוי ***", {"***"}), ("ניכוי (1)", {"#1"}),
+    ("ניכוי (a)", set()), ("ניכוי (***) ושוב", set()),
+])
+def test_u9_f2_a_star_mark_in_brackets_is_the_bare_stars(cell, marks):
+    assert scopes.cell_marks(cell) == frozenset(marks)
+
+
+@pytest.mark.parametrize("note, mark", [("(***) אחזקה", "***"), ("( * ) אחזקה", "*"), ("(**) אחזקה", "**"), ("*** אחזקה", "***")])
+def test_u9_f2_a_note_marked_with_stars_in_brackets_opens_with_the_bare_stars(note, mark):
+    assert scopes.note_mark(note) == mark
+
+
+def test_u9_f2_a_note_whose_mark_another_items_row_carries_is_no_condition_of_a_table_with_no_marks():
+    ws = _ws(STAR_ROW, PLAIN_TABLE)
+    found = items.condition_spans(ws.sources["S2"], PLAIN_ROWS[0], [STAR_ROW])
+    assert found == []  # the mark belongs to a row of another table, cited by another item
+    assert [(s.place, s.text) for s in items.condition_spans(ws.sources["S2"], PLAIN_ROWS[0])] == [("paragraph", STAR_NOTE)]  # nobody carries it: the table's, as before
+
+
+def test_u9_f2_the_three_rows_of_a_table_with_no_marks_get_no_missing_condition_from_a_note_of_another_tables_row():
+    ws = _ws(STAR_ROW, PLAIN_TABLE)
+    answer = "נתון א׳ הוא 1,000 [S2]. נתון ב׳ הוא 2,000 [S2]. נתון ג׳ הוא 3,000 [S2]. הניכוי הוא 1,480,000 [S1]."
+    ledger = items.Ledger()
+    ledger.merge([_item(label="הניכוי", source="S1", quote=STAR_ROW, value="1,480,000"),
+                  *(_item(label=r.split(" | ")[0], source="S2", quote=r, value=r.split(" | ")[1]) for r in PLAIN_ROWS)])
+    out = ledger.outcomes(_units(answer), ws)
+    assert [o["state"] for o in out] == ["covered"] * 4
+    plain = [o for o in out if o["source"] == "S2"]
+    assert len(plain) == 3 and all(o["condition_check"] == "" and o["condition_spans"] == [] for o in plain)
+
+
+def test_u9_f2_a_mark_in_the_items_own_row_binds_the_note_to_that_row_only():
+    marked = "\n".join(["הטבלה: 3 שורות", "נתון | ערך", "נתון א׳ (***) | 1,000", "נתון ב׳ | 2,000", "נתון ג׳ | 3,000", STAR_NOTE])
+    ws = _ws(STAR_ROW, marked)
+    others = [STAR_ROW]
+    assert [(s.place, s.text) for s in items.condition_spans(ws.sources["S2"], "נתון א׳ (***) | 1,000", others)] == [("paragraph", STAR_NOTE)]
+    assert items.condition_spans(ws.sources["S2"], "נתון ב׳ | 2,000", others) == []
+
+
 def test_ae7_an_agent_condition_that_is_the_note_of_another_row_is_dropped_and_recorded_not_attached():
     ws = _ws(LOT_TABLE)
     res = _validate(ws, "שטח קבוצה ב׳ הוא 2,100 מ״ר [S1].", _raw(label="קבוצה ב׳", quote=LOT_B, value="2,100",
@@ -1825,6 +1871,17 @@ def test_protection_an_item_is_never_covered_by_the_number_of_its_list_member():
     assert got["שטח עיקרי"]["state"] == got["שטח גג"]["state"] == "covered"
     assert items._without_list_number("2. שטח 340") .strip() == "שטח 340" and items._without_list_number("שטח 3. 340") == "שטח 3. 340"
     assert items.quote_in_blocks("שטח מרתף | 2 | ג/4521", _units("2. שטח המרתף")) is False  # the same for a quote looked for in the blocks
+
+
+def test_u9_f8_a_summary_row_whose_label_the_answer_inflects_is_in_the_answer_when_its_number_is():
+    quote = "סה״כ שווי במעוגל | 6,400,000 ₪"
+    assert items.quote_in_blocks(quote, _units("שוויו הכולל של הנכס במעוגל הוא 6,400,000 ₪ [S1]."))
+
+
+def test_u9_f8_a_block_that_holds_the_number_under_another_label_noun_still_needs_the_words():
+    quote = "סה״כ שווי במעוגל | 6,400,000 ₪"
+    assert not items.quote_in_blocks(quote, _units("הערך החציוני של הנכס הוא 6,400,000 ₪ [S1]."))
+    assert not items.quote_in_blocks(quote, _units("שוויו הכולל של הנכס במעוגל הוא 8,100,000 ₪ [S1]."))  # the number is not there
 
 
 TWO_LEVEL = "\n".join(["הכנסות מהנכס", "שימוש | הכנסה | הכנסה", " | חודשית | שנתית", "משרדים | 100,000 | 1,200,000", "מסחר | 45,000 | 540,000"])

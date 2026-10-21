@@ -361,7 +361,7 @@ def test_without_time_a_cut_heading_never_lets_the_sentence_below_it_stay_unjudg
     """The safety case of the heading-removal test, with no time to judge again: the heading line is cut ("ושטח 900 דונם"
     holds no qualifier, so it stays), but the heading the sentence below was judged under changed — so the sentence is
     withheld with the time-limit cause and "proposed" is never read as approved."""
-    offline.texts = ["נתוני תכנון: מצב מוצע. תכסית 40% מותרת. שטח 900 דונם."]
+    offline.texts = ["נתוני תכנון: מצב מוצע. תכסית 40% מותרת. 900 דונם בסך הכול."]
     monkeypatch.setattr(final_check, "FINAL_MIN_SECONDS", 10**6)
     heading = "## נתוני תכנון: מצב מוצע ושטח 900 דונם"
 
@@ -1293,7 +1293,8 @@ LEAD = "הנתונים לחלקה 7 הם:"
 BULLET_A = "- מקדם א הוא 0.8 [S1]"
 BULLET_B = "- מקדם ב הוא 0.9 [S1]"
 BACK = "שני המקדמים לעיל חלים על כל החלקה [S1]."
-COEFFICIENTS = "חלקה 7: מקדם א 0.8, מקדם ב 0.9. שני המקדמים חלים על כל החלקה."
+# the labels and the values stand in sentences of their own: a claim the scripted judge fails is held by no sentence of the source (round 20 U9, F5)
+COEFFICIENTS = "חלקה 7: מקדם א ומקדם ב. הערכים הם 0.8 ו-0.9. שני המקדמים חלים על כל החלקה."
 COEFFICIENT_QUESTION = "מה המקדמים בחלקה 7?"
 
 
@@ -1872,6 +1873,17 @@ def test_the_row_goes_whole_when_no_safe_partial_keep_exists(offline, reply, why
     assert "9,500" not in md and "55 ₪" in md, (why, md)
     assert [p.check for p in out.report.removals() if "9,500" in p.unit.text] == ["final"], why
     assert out.final_check["cell_cuts"] == out.final_check["cell_marks"] == 0, why
+
+
+def test_u9_f1_the_final_check_cuts_an_absence_cell_alone_and_keeps_the_supported_cell(offline):
+    """The absence statement's own negation is no qualifier: the row stays with the supported cell, the same ``row_cut_safe`` as the report's."""
+    absence = "לא מופיע שיעור הפחת בקטע שנקרא."
+    row = f"| השווי למ\"ר | {absence} | 9,500 ₪ [S1] | — |"
+    reply = _claims((absence, "unsupported", ABSENT), ("9,500 ₪", "supported"))
+    out, _ = _cell_turn(offline, _after_lead_rule("9,500", reply), f"{PLAN_LEAD}\n{WIDE_HEAD}{row}\n{RENT_ROW}")
+    md = out.answer.answer_markdown
+    assert absence not in md and "9,500" in md and "55 ₪" in md, md
+    assert out.final_check["cell_cuts"] == 1, out.final_check
 
 
 def test_a_key_cell_the_judge_finds_wrong_is_removed_with_its_row_even_when_another_cell_also_fails(offline):

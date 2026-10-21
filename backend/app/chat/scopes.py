@@ -363,15 +363,19 @@ def _sentences(line: str) -> tuple[str, ...]:
 # --- the footnotes ----------------------------------------------------------------------------------------------------------
 
 _SUPER = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
-_NOTE_START = re.compile(r"^\s*(?P<m>\*{1,4}|\(\d{1,2}\)|\d{1,2}\)|[⁰¹²³⁴⁵⁶⁷⁸⁹]+)\s*(?=\S)")
-_CELL_MARK_END = re.compile(r"(?P<m>\*{1,4}|\(\d{1,2}\)|\d{1,2}\)|[⁰¹²³⁴⁵⁶⁷⁸⁹]+)\s*$")
-_CELL_MARK_START = re.compile(r"^\s*(?P<m>\*{1,4}|\(\d{1,2}\)|[⁰¹²³⁴⁵⁶⁷⁸⁹]+)(?=\s*[^\s\d])")
+# a star mark may stand in brackets, with spaces inside ("(***)", "( ***)"): the note and the cell carry the same mark as the bare stars
+_STARS = r"\(\s*\*{1,4}\s*\)"
+_NOTE_START = re.compile(rf"^\s*(?P<m>{_STARS}|\*{{1,4}}|\(\d{{1,2}}\)|\d{{1,2}}\)|[⁰¹²³⁴⁵⁶⁷⁸⁹]+)\s*(?=\S)")
+_CELL_MARK_END = re.compile(rf"(?P<m>{_STARS}|\*{{1,4}}|\(\d{{1,2}}\)|\d{{1,2}}\)|[⁰¹²³⁴⁵⁶⁷⁸⁹]+)\s*$")
+_CELL_MARK_START = re.compile(rf"^\s*(?P<m>{_STARS}|\*{{1,4}}|\(\d{{1,2}}\)|[⁰¹²³⁴⁵⁶⁷⁸⁹]+)(?=\s*[^\s\d])")
 
 
 def _mark_key(mark: str) -> str:
-    """A mark as it is compared: «(1)», «1)» and the superscript one are the note 1; asterisks stay as they are."""
+    """A mark as it is compared: «(1)», «1)» and the superscript one are the note 1; asterisks, bare or in brackets («(***)», «( ***)»),
+    are the bare stars."""
     mark = mark.translate(_SUPER)
-    return "*" * len(mark) if set(mark) == {"*"} else "#" + re.sub(r"\D", "", mark)
+    bare = re.sub(r"[\s()]", "", mark)
+    return bare if bare and set(bare) == {"*"} else "#" + re.sub(r"\D", "", mark)
 
 
 def note_mark(line: str) -> str:
@@ -385,6 +389,12 @@ def cell_marks(cell: str) -> frozenset[str]:
     """The note marks a table cell carries at its end or its start («חוזה חכירה ראשון*», «מעל מפלס הכניסה**», «(1) שטח»)."""
     flat = _clean(cell)
     return frozenset(_mark_key(m.group("m")) for p in (_CELL_MARK_END, _CELL_MARK_START) if (m := p.search(flat)))
+
+
+def marks_of(text: str) -> frozenset[str]:
+    """The note marks a quote carries: those of its cells when it is a table row («ניכוי (***) | 1,480,000»), else of the text itself."""
+    cells = row_cells(text) if "|" in text else [text]
+    return frozenset().union(*(cell_marks(c) for c in cells)) if cells else frozenset()
 
 
 def row_cells(line: str) -> list[str]:

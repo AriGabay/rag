@@ -245,7 +245,8 @@ def second_bullet_judge(input: str) -> dict:
 def test_r16_when_verification_removes_the_only_claim_citing_a_value_its_row_leaves_and_the_other_is_text_only(
         db, client, monkeypatch, calls, live):
     o = world13(db, client, monkeypatch, calls, ("land_table",))
-    ans = answer_of("\n".join([BULLET_1, BULLET_2]), "הצבעוני 14")
+    # (the second bullet carries a word the source does not write: a claim the scripted judge fails is held by no sentence, round 20 U9, F5)
+    ans = answer_of("\n".join([BULLET_1, BULLET_2.replace("מקדם הפחתה", "מקדם הפחתה מחושב")]), "הצבעוני 14")
     steps = [search_for(o, "מקדם הפחתה", ("land_table",), LAND), registering(o, LAND), ans, ans, ans]
     t = ask13(o, LAND_Q, steps, judge=second_bullet_judge)
     a = t.answer
