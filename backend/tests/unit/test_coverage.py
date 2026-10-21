@@ -3982,3 +3982,43 @@ def test_u4_a_note_that_some_documents_gave_no_datum_keeps_the_old_wording():
                 "pages": 1, "pages_read": set()}
     ledger, _ = coverage.build(ws, _set_answer("הנכס פנוי [S1]."), "?")
     assert "התשובה מבוססת על 1 מהם, ולכן אינה מכסה את כל התחום" in ledger["note"]
+
+
+# --- round 21 U7: the gap lines write only what the answer really omits (KTD7; R7, R8) -----------------------------------------------
+
+def test_u7_r7_an_item_listed_under_an_instruction_to_attach_a_source_is_unassigned_and_gets_no_gap_line():
+    """«צרף מקור לכל נתון» is an execution instruction: scored against the answer, never searched for, never a component an item rests on."""
+    from app.chat import items as ledger_items
+
+    ws = _adj_file(FOURTH_ADJ)
+    turn = _turn({"id": "1", "text": ADJ_ASK}, {"id": "2", "text": "צרף מקור לכל נתון", "kind": "instruction", "aspect": "citation"})
+    raw = [*_adj_items(), _adj_item("מרפסת", FOURTH_ADJ, "1%", component="N2")]  # the answer never states it: a line if it were an item
+    answer = _answer(THREE_ADJ).model_copy(update={"items": raw})
+    ledger = ledger_items.Ledger()
+
+    def score(frozen, units):
+        return [_req("", "full", list(units), id=i) for i, _ in frozen]
+
+    r = verify_answer(_judge(score), answer, ws, "?", [], requirements=turn, ledger=ledger)
+    final, outcomes = _finish(ws, answer, r, turn)
+    assert [x.id for x in ledger.items.values()] == ["I1", "I2", "I3"] and all(i.component == "N1" for i in ledger.items.values())
+    assert _item_lines(final) == [] and final.status == "answered", final.answer_markdown
+    assert [(o["id"], o["status"]) for o in outcomes if o["id"] == "N1"] == [("N1", "full")]
+
+
+STRAY_FLOORS = "- בבניין 2 קומות [S2]."  # the «2» is another row's count of floors: the basement row's own figure (340) is not there
+PART_OF_BASEMENT = "- שטח המרתף בנכס כולל 2 קומות [S2]."  # the row is named, with one of its two figures
+
+
+def test_u7_a_stray_digit_of_another_row_is_no_part_of_an_item_so_its_line_says_read_and_not_used_and_not_given_in_part():
+    ws, r, turn, answer, _ = _rights_check(STRAY_FLOORS)
+    final, _ = _finish(ws, answer, r, turn)
+    line = next(ln for ln in _item_lines(final) if ln.startswith("«שטח מרתף"))
+    assert "ולא נעשה בו שימוש בתשובה" in line and "בחלקו" not in line, line
+
+
+def test_u7_the_row_named_with_one_of_its_figures_is_still_given_in_part_and_its_line_names_what_is_left_out():
+    ws, r, turn, answer, _ = _rights_check(PART_OF_BASEMENT)
+    final, _ = _finish(ws, answer, r, turn)
+    line = next(ln for ln in _item_lines(final) if ln.startswith("«שטח מרתף"))
+    assert "בחלקו" in line and "340" in line and "ולא נעשה בו שימוש" not in line, line

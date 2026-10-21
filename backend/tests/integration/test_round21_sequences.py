@@ -387,7 +387,6 @@ NUMBERED = ("1. אישור הוועדה: נדרש אישור ועדת התכנו
             "3. המגרש יפונה לפני המסירה [S2].")  # the second item is omitted; the third is stated with its label inflected
 
 
-@open_case("U7", "the omitted item gets its line, and so does the third item, whose label «פינוי» the answer inflects («יפונה»)")
 def test_ae7_a_numbered_item_stated_with_its_label_inflected_gets_no_read_and_not_used_line_and_an_omitted_one_still_does():
     lines, md = condition_list_lines(NUMBERED)
     assert [ln.split("»")[0] for ln in lines] == ["«מימון"], md  # exactly the omitted item

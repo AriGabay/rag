@@ -266,6 +266,9 @@ def validate(raw: Iterable[object], ws, units: Sequence[Unit], components: Seque
     ``components``: the turn's frozen requirements ({"id", "text"})."""
     scope = SupportScope(ws, list(units))
     frozen = {c["id"]: c.get("text") or "" for c in components}
+    # an instruction about the answer itself ("צרף מקור לכל נתון") is scored against the answer and never searched for: no item rests on it,
+    # so no gap line is written for it (round 21 U7, R7)
+    instructions = {c["id"] for c in components if c.get("kind") == "instruction"}
     kept: list[Item] = []
     excluded: list[dict] = []
     misattributed: list[dict] = []
@@ -275,6 +278,8 @@ def validate(raw: Iterable[object], ws, units: Sequence[Unit], components: Seque
         f = _fields(entry)
         flat = SupportScope.flat(f["quote"])
         component = _component(f["component"], frozen)
+        if component in instructions:
+            component = None
         sid = f["source"]
         if f["state"] not in STATES:
             why = "bad_state"
@@ -367,22 +372,55 @@ MISSING_DETAIL_CHARS = 60  # the source words that name a missing figure, at mos
 _WORDS_AROUND = 3  # a missing figure of a passage is named with this many words on each side of it
 
 
+def _tokens(text: str) -> list[str]:
+    """The blank-separated tokens of ``text``, a run of single letters ("W A L E": a word the source spaces out) being one token."""
+    out: list[str] = []
+    spaced = False
+    for token in text.split():
+        single = len(token) == 1 and token.isalpha()
+        if single and spaced:
+            out[-1] += " " + token
+        else:
+            out.append(token)
+        spaced = single
+    return out
+
+
+def _whole_tokens(text: str, limit: int) -> str:
+    """``text`` cut after the last whole token that keeps it within ``limit`` characters (``_tokens``): never a half word, and never the
+    letters of a spaced word ("W A L E") cut in the middle (round 21 U7, KTD7); the first token alone when it is longer than the limit
+    (clipped)."""
+    tokens = _tokens(text)
+    out: list[str] = []
+    for token in tokens:
+        if len(" ".join([*out, token])) > limit:
+            break
+        out.append(token)
+    return " ".join(out) if out else (tokens[0][:limit] if tokens else "")
+
+
 def missing_detail(src, quote: str, group: frozenset[str]) -> str:
     """How the source names the figure of the item's quote that the answer leaves out (round 19 U4, R15): for a table row the figure's cell with
-    the header of its column, for a passage the figure with the words next to it. Every word is the source's own."""
+    the header of its column, for a passage the figure with the words next to it. Every word is the source's own, and a whole token of it:
+    the figure's token is taken to the blanks around it ("ריבית5.4%שנתית" is one), and the cut at ``MISSING_DETAIL_CHARS`` falls between tokens
+    (round 21 U7, KTD7)."""
     cells = _row_cells(quote) if "|" in quote else []
     if len(cells) >= 2:
         at = next((i for i, c in enumerate(cells) if group & number_forms(c, source=True)), None)
         if at is not None:
             head = _header_cells(context_of_source(src)[1]) if src is not None else []
             named = f"{head[at]}: {cells[at]}" if len(head) == len(cells) and head[at] else cells[at]
-            return " ".join(named.split())[:MISSING_DETAIL_CHARS]
+            return _whole_tokens(" ".join(named.split()), MISSING_DETAIL_CHARS)
     for start, end, forms in number_spans(quote, source=True):
         if group & forms:
-            left, right = quote[:start].split()[-_WORDS_AROUND:], quote[end:].split()[:_WORDS_AROUND]
+            while start > 0 and not quote[start - 1].isspace():
+                start -= 1
+            while end < len(quote) and not quote[end].isspace():
+                end += 1
+            left, right = _tokens(quote[:start])[-_WORDS_AROUND:], _tokens(quote[end:])[:_WORDS_AROUND]
             near = " ".join([*left, quote[start:end].strip(), *right])
-            return " ".join(re.sub(r"[\[\]]", " ", near).split())[:MISSING_DETAIL_CHARS]
-    return " ".join(quote.split())[:MISSING_DETAIL_CHARS]
+            return _whole_tokens(" ".join(re.sub(r"[\[\]]", " ", near).split()), MISSING_DETAIL_CHARS)
+    return _whole_tokens(" ".join(quote.split()), MISSING_DETAIL_CHARS)
 
 
 def _header_cells(body: Sequence[str]) -> list[str]:
@@ -987,9 +1025,23 @@ def _leaves(ws, cid: str) -> list[str]:
     return list(getattr(c, "leaves", None) or []) if c is not None else []
 
 
+_SUM_DIGITS = 4  # a number of this many digits (a sum, an area, a price) is the item's own datum in another passage of its unit
+
+
+def _holds_value(item: Item, src) -> bool:
+    """Whether the passage ``src`` of the item's document and unit holds the item's value: every headline value of the item, each written with
+    four digits or more (round 21 U7, KTD7, R8). One datum can stand under two quotes (a row of the main table and the sum of a notes table),
+    and the sentence that cites the one gives the item; a short figure ("12", "6.5%") is common to many data and attributes nothing."""
+    groups = headline(item.value, item.quote)
+    if not groups or not all(any(f.isdigit() and len(f) >= _SUM_DIGITS for f in g) for g in groups):
+        return False
+    have = _have(src.text or "")
+    return all(g & have for g in groups)
+
+
 def _attributed(item: Item, unit: Unit, ws) -> bool:
     """Whether the unit cites the item's source, or a value or calculation registered from it, or another passage of the item's
-    document and unit that holds its quote — and nothing of another document or appraisal unit."""
+    document and unit that holds its quote or its value (``_holds_value``) — and nothing of another document or appraisal unit."""
     home = _place(ws, item.source)
     if home is None:
         return False
@@ -1000,7 +1052,7 @@ def _attributed(item: Item, unit: Unit, ws) -> bool:
             place = _place(ws, cid)
             if place is None or not _same_place(home, place):
                 continue
-            if _same_source(ws, cid, item.source) or flat in _flat_span(src.text or ""):
+            if _same_source(ws, cid, item.source) or flat in _flat_span(src.text or "") or _holds_value(item, src):
                 return True
         elif cid in ws.values:
             v = ws.values[cid]
@@ -1042,7 +1094,8 @@ def _signature(item: Item) -> frozenset[str]:
     return frozenset()
 
 
-_TOKEN = re.compile(r"[^\W\d_]+")
+# a word, with the abbreviations that carry a quote mark inside (בע"מ, בע״מ, סה"כ, מס'): one token, the way the block's side reads it (round 21 U7)
+_TOKEN = re.compile(r"[^\W\d_]+(?:[\"״'׳][^\W\d_]+)*")
 # a plan, permit or file identifier writes letters and digits around a slash ("ג/4521", "בי/1/483", "483/2"): it is no content word
 _CODE = re.compile(r"[א-תA-Za-z]{1,4}\s?[/\\]\s?\d[\d/\\.\-]*|\d+(?:\s?[/\\]\s?\d+)+")
 
@@ -1193,6 +1246,12 @@ _ORDINAL_AT_START = re.compile(r"\s*(?:[-*+•]\s+)?\d{1,3}[.)]\s")
 _LIST_NUMBER = re.compile(r"\A\s*(?:[-*+•]\s+)?\d{1,3}[.)]\s")  # the number a numbered list item opens with: its place in the list
 
 
+# a heading's numbering at the start of a text ("4.2 תנאי תשלום", "## 4.2.1 …"): dotted groups, then a word. The number names the section and states
+# no amount - unless a unit, a currency or a duration follows it ("3.5 שנים", "4.5 מ״ר"; round 21 U7, KTD7)
+_SECTION_NUMBER = re.compile(r"\s*(?:#{1,6}\s+|[-*+•]\s+)?(\d{1,3}(?:\.\d{1,3})+)\.?(?=\s+[^\W\d_])")
+_DURATION_AFTER = re.compile(r"\s*(?:שנה|שנים|שנות|חודש|חודשים|ימים|יום|שבוע|שבועות|קומות|חדרים|מ[\"״]ר)")
+
+
 def _without_list_number(text: str) -> str:
     """``text`` without the number a numbered list item opens with ("2. …"): the number is the item's place in the list, not a figure it
     states, so an item is matched on its text and never on its list number (round 20 U5, KTD5; R17)."""
@@ -1201,8 +1260,8 @@ def _without_list_number(text: str) -> str:
 
 def _not_headline(text: str, start: int, end: int) -> bool:
     """Whether the number at ``text[start:end]`` names a thing and states no amount of the item: an identifier (a plot, a unit, a section,
-    after מס׳; a plan, a permit or a file; letters or digits and a slash around it), a footnote mark ("(1)") or an ordinal opening the
-    text ("2. …")."""
+    after מס׳; a plan, a permit or a file; letters or digits and a slash around it), a footnote mark ("(1)"), an ordinal opening the
+    text ("2. …") or the numbering of a section heading opening it ("4.2 …"; round 21 U7, KTD7)."""
     if not_an_amount(text, start, end, years=False):
         return True
     before = text[max(0, start - 28):start]
@@ -1214,7 +1273,11 @@ def _not_headline(text: str, start: int, end: int) -> bool:
             and text[start:end].isdigit()):
         return True
     ordinal = _ORDINAL_AT_START.match(text)
-    return bool(ordinal and start < ordinal.end())
+    if ordinal and start < ordinal.end():
+        return True
+    section = _SECTION_NUMBER.match(text)
+    return bool(section and section.start(1) <= start and end <= section.end(1)
+                and not (_QUANTITY_AFTER.match(text, section.end(1)) or _DURATION_AFTER.match(text, section.end(1))))
 
 
 @functools.lru_cache(maxsize=2048)
@@ -1403,17 +1466,30 @@ def blocks_of(units: Sequence[Unit]) -> list[Block]:
     return out
 
 
+_PREFIX_LETTERS = "ובהלמכש"  # the one-letter prefixes of a Hebrew word: and, in, the, to, from, as, that
+
+
+def _unprefixed(word: str) -> str:
+    """``word`` without its one leading prefix letter when a stem of three letters or more is left ("לחלקות" is "חלקות"); else ``word``."""
+    return word[1:] if len(word) >= 4 and word[0] in _PREFIX_LETTERS else word
+
+
 def quote_in_blocks(quote: str, units: Sequence[Unit], component: str = "", *, blocks: Sequence[Block] | None = None) -> bool:
     """Whether a quoted part of a source is in the answer (round 16 KTD2, by block since round 19 U4): one block holds all the quote's headline
     values (``headline`` of the quote itself: no identifier, footnote mark or ordinal) with at least half of its content words, the words
     that name the item (its label) — not those of the component's own text, which every item of a list shares — and its value. Another
     item with the same value is no presence. A quote with neither numbers nor words counts as present, so it supports nothing. ``blocks``:
     the blocks of ``units`` when the caller has them already (``blocks_of(model_units(units))``), for a caller that tests many quotes
-    against the same answer."""
+    against the same answer.
+
+    Round 21 U7 (KTD7, R8): a word is the component's when it or its stem without a prefix letter is one of the component's words ("לחלקות"
+    under "חלקות", "בגוש" under "גוש"), so the prefixed forms of a component's word are not left among the words the answer must write; and
+    the label may be inflected for a quote with no number as well as for one with numbers."""
     if blocks is None:
         blocks = blocks_of(model_units(units))
     words = _words(quote)
-    words = words - _words(component) or words
+    asked = _words(component)
+    words = frozenset(w for w in words if w not in asked and _unprefixed(w) not in asked) or words
     need = (len(words) + 1) // 2
     groups = headline(quote, quote)
 
@@ -1423,9 +1499,10 @@ def quote_in_blocks(quote: str, units: Sequence[Unit], component: str = "", *, b
         have = _words(block.unit.text)
         if len(words & have) >= need:
             return True
-        # every headline value stands in the block: the label may be inflected ("שווי" / "שוויו"), a word of three letters or more that a
-        # block word starts with is the same word (round 20 U9, F8); a block that holds the value under another noun still needs the words
-        return bool(groups) and sum(1 for w in words if w in have or (len(w) >= 3 and any(h.startswith(w) for h in have))) >= need
+        # every headline value stands in the block (the quote has none, or each of them does): the label may be inflected ("שווי" / "שוויו"), a
+        # word of three letters or more that a block word starts with is the same word (round 20 U9, F8); a block that holds the value under
+        # another noun still needs the words
+        return sum(1 for w in words if w in have or (len(w) >= 3 and any(h.startswith(w) for h in have))) >= need
 
     return any(stated(b) for b in blocks)
 
@@ -1440,6 +1517,28 @@ class CoverageUnavailable(Exception):
     ``unchecked`` of the fill, never "omitted"."""
 
 
+_DURATION = re.compile(r"(\d{1,2}(?:\.\d+)?)\s*(?:שנה|שנים|שנות|חודש|חודשים|ימים|יום|שבוע|שבועות)(?![א-ת])")
+
+
+def _stray(group: frozenset[str]) -> bool:
+    """Whether a headline value is a bare number of one or two digits ("2", "12"): a count that many rows of a table share."""
+    return any(f.isdigit() and len(f) <= 2 for f in group)
+
+
+def _whole_duration(item: Item, text: str, group: frozenset[str]) -> bool:
+    """Whether the item's value writes the number of ``group`` as a duration ("5 שנים") and ``text`` writes the same duration."""
+    def durations(source: str) -> set[str]:
+        return {f for m in _DURATION.finditer(source) for f in number_forms(m.group(1))}
+
+    return bool(group & durations(item.value) & durations(text))
+
+
+def _names_row(item: Item, words: frozenset[str]) -> bool:
+    """Whether the block's words state every content word of the item's label: the block speaks of the item's own row."""
+    named = _word_groups(item.label)
+    return bool(named) and all(g & words for g in named)
+
+
 def _value_check(item: Item, text: str, words: frozenset[str]) -> _Check:
     """Whether the block's ``text`` states the item's value: a date value by its date; else every headline value (``headline``), and, for an item
     with none, half of the words of its value, its label or its quote (the first that has content words)."""
@@ -1452,10 +1551,19 @@ def _value_check(item: Item, text: str, words: frozenset[str]) -> _Check:
         missing = tuple(g for g in groups if not _stated(item, text, have, g))
         if not missing:
             return _Check("")
-        return _Check("partial", missing) if len(missing) < len(groups) else _Check("value_not_stated")
+        if len(missing) == len(groups):
+            return _Check("value_not_stated")
+        given = [g for g in groups if g not in missing]
+        # a block gives an item in part by a figure of it; the digits one or two of an unrelated row also write ("2" floors, "6" rooms) are
+        # no part of this item unless they are its whole duration ("5 שנים") or the block states the item's whole row label (round 21 U7, KTD7)
+        if all(_stray(g) for g in given) and not any(_whole_duration(item, text, g) or _names_row(item, words) for g in given):
+            return _Check("value_not_stated")
+        return _Check("partial", missing)
     # the words that ask for it: its value's, else its label's, else its quote's; a value with figures the quote does not write is the agent's
-    # own, and its words are not the source's: the label and the quote come first
-    order = (item.label, item.quote, item.value) if re.search(r"\d", item.value) else (item.value, item.label, item.quote)
+    # own, and its words are not the source's: the label and the quote come first. A value with no number is asked by its own words, and then
+    # by the quote's — the source's words — before the agent's label, which the answer need not write ("פינוי" for a row the answer states
+    # as "המגרש יפונה …"; round 21 U7, KTD7, R8)
+    order = (item.label, item.quote, item.value) if re.search(r"\d", item.value) else (item.value, item.quote, item.label)
     wanted = next((t for t in order if _word_groups(t)), "")
     return _Check("" if _enough(wanted, words) else "value_not_stated")
 
@@ -1580,6 +1688,30 @@ def _coverage(item: Item, units: Sequence[Unit], ws, shared: bool, leads: Mappin
 def _overlap(a: Evidence, b: Evidence) -> bool:
     """Whether two pieces of evidence are one passage: the same document and appraisal unit, and a quote that holds or is held by the other."""
     return a[:2] == b[:2] and (a[2] in b[2] or b[2] in a[2])
+
+
+_ROW_MARKER = re.compile(r"\A\s*(?:[-*+•·–—]|\d{1,3}[.)])\s+")  # a list marker a quote opens with
+_ROW_BRACKETS = re.compile(r"[()\[\]{}<>]")  # a bracket in either direction (a right-to-left line draws "(" for ")" and back)
+_ROW_END = re.compile(r"[\s.,;:!?…]+\Z")
+_ROW_KEY_MIN = 6  # a normalised quote shorter than this names no row
+
+
+def _row_key(quote: str) -> str:
+    """The row a quote names, whichever way the source or the agent spelled its edges (round 21 U7, KTD7): without a leading list marker
+    ("- ", "* ", "2. "), without the brackets (their direction is a drawing matter) and without the marks that close it."""
+    flat = _ROW_BRACKETS.sub(" ", _ROW_MARKER.sub("", quote, count=1))
+    return _ROW_END.sub("", " ".join(flat.split())).casefold()
+
+
+def _same_row(a: Evidence, b: Evidence) -> bool:
+    """Whether two pieces of evidence are one row (round 21 U7, KTD7; R8): the same document and appraisal unit, and quotes that differ only
+    by a leading list marker, the end punctuation, the direction of a bracket or a truncated tail — one normalised quote holds the other.
+    A server-built twin of an agent's item is the same row, not another item that shares its value, and asks no words of it."""
+    if a[:2] != b[:2]:
+        return False
+    x, y = _row_key(a[2]), _row_key(b[2])
+    short, long = sorted((x, y), key=len)
+    return len(short) >= _ROW_KEY_MIN and short in long
 
 
 def _inside(narrow: Evidence, wide: Evidence) -> bool:
@@ -1789,7 +1921,10 @@ class Ledger:
         wide: dict[Evidence, tuple[Unit, ...]] = {}  # the multi-sentence blocks that give it, each as one unit
         for item in scored:
             sig = signatures[id(item)]
-            rivals = [j for j in standing.get((item.component, sig), ()) if j is not item and not _overlap(j.evidence, item.evidence)]
+            # an item that states the same row (a server twin of the agent's item that the source spells with another marker, a truncated tail,
+            # another closing mark or the other bracket direction) is no rival that shares the value (round 21 U7, KTD7)
+            rivals = [j for j in standing.get((item.component, sig), ()) if j is not item and not _overlap(j.evidence, item.evidence)
+                      and not _same_row(j.evidence, item.evidence)]
             shared = bool(sig) and bool(rivals)
             got = None
             if item.state in (ITEM_INCLUDED, OMITTED, *NEEDS_REASON):  # a declared item passes the same check (R16)

@@ -2022,3 +2022,201 @@ def test_a_list_lead_that_states_the_condition_for_every_item_is_part_of_the_con
     assert _condition(ws, "- החלק של הדייר הוא 2/3 [S1].", tenant)["condition_check"] == "missing"
     # a line before a paragraph leads no list: it is the sentence of another datum, not a condition of the item
     assert _condition(ws, f"{lead}\n\nהחלק של הדייר הוא 2/3 [S1].", tenant)["condition_check"] == "missing"
+
+
+# --- round 21 U7: the gap-line matching (KTD7; R7, R8; AE7) ---------------------------------------------------------------------------
+# A "read and not used" line is written only for an item the answer really omits: a wrong line flips off here, and a correct one stays.
+
+CONDITION_TABLE = "\n".join(["תנאי העסקה", "תנאי | פירוט", "אישור הוועדה | נדרש אישור ועדת התכנון", "מימון | הלוואה בנקאית",
+                             "פינוי | פינוי המגרש לפני המסירה"])
+CONDITION_ROWS = (("אישור הוועדה", "נדרש אישור ועדת התכנון"), ("מימון", "הלוואה בנקאית"), ("פינוי", "פינוי המגרש לפני המסירה"))
+
+
+def _worded(label: str, detail: str, **kw) -> items.Item:
+    """A row with no figure: its value is empty, so it is asked by words (the quote's own words)."""
+    return _item(label=label, quote=f"{label} | {detail}", value="", **kw)
+
+
+def _condition_states(markdown: str) -> dict[str, str]:
+    got = _states(_ws(CONDITION_TABLE), markdown, *(_worded(*row) for row in CONDITION_ROWS))
+    return {k: o["state"] for k, o in got.items()}
+
+
+def test_u7_ae7_a_numbered_item_stated_with_its_label_inflected_is_covered_and_the_truly_omitted_item_is_not():
+    states = _condition_states("1. אישור הוועדה: נדרש אישור ועדת התכנון [S1].\n3. המגרש יפונה לפני המסירה [S1].")
+    assert states == {"אישור הוועדה": "covered", "מימון": "omitted", "פינוי": "covered"}, states
+
+
+def test_u7_a_value_with_no_number_asks_the_quotes_words_before_the_agents_label_words():
+    """The label «פינוי» is the agent's word for the row; the answer writes the row's own words («המגרש … לפני המסירה») and not that label."""
+    item = _worded("פינוי", "פינוי המגרש לפני המסירה")
+    ws = _ws(CONDITION_TABLE)
+    assert _covered(ws, "- המגרש יפונה לפני המסירה [S1].", item).ok
+    # the quote's words decide, not a label that happens to stand in the block
+    assert not _covered(ws, "- אישור הפינוי נדרש [S1].", item).ok
+    # the figure-bearing order is unchanged: the label comes first there, and the value's words come first when it has words
+    figured = _item(label="גיל הבניין", quote="גיל הבניין | 2%", value="2%")
+    assert _covered(_ws(ADJUSTMENTS), "ההתאמה לגיל הבניין היא 2% [S1].", figured).ok
+
+
+def test_u7_a_quote_with_no_number_is_present_when_the_answer_writes_its_label_inflected_or_a_component_word_unprefixed():
+    quote = "פינוי | פינוי המגרש"
+    assert items.quote_in_blocks(quote, _units("פינויו של המגרש נדרש [S1]."))  # inflected: the number-less quote is as tolerant as a numbered one
+    assert not items.quote_in_blocks(quote, _units("הערת אזהרה רשומה [S1]."))
+    # the component's words are subtracted after the prefix letter: «בגוש» / «ולחלקות» are the component's «הגוש» / «והחלקות»
+    row = "בגוש | ולחלקות | נרשמה הערה"
+    assert items.quote_in_blocks(row, _units("נרשמה הערה [S1]."), "הגוש והחלקות")
+    assert not items.quote_in_blocks(row, _units("הערה אחרת [S1]."), "הגוש והחלקות")
+    assert not items.quote_in_blocks(row, _units("נרשמה הערה [S1]."), "")  # without the component the prefixed words are still asked
+
+
+def test_u7_a_block_that_holds_the_number_under_another_label_noun_still_needs_the_words():
+    quote = "סה״כ שווי במעוגל | 6,400,000 ₪"
+    assert not items.quote_in_blocks(quote, _units("הערך החציוני של הנכס הוא 6,400,000 ₪ [S1]."))
+    assert items.quote_in_blocks(quote, _units("שוויו הכולל של הנכס במעוגל הוא 6,400,000 ₪ [S1]."))
+
+
+# a server twin of an agent's row that the source writes a little differently: the same row
+TWIN_TABLE = "\n".join(["הלוואות", "סוג | תקופה | הערה", "הלוואה ממשלתית | 5 שנים | בכפוף לאישור הבנק", "הלוואה פרטית | 5 שנים | בכפוף לאישור הבנק"])
+TWIN_AGENT = dict(label="תקופת הלוואה ממשלתית", quote="- הלוואה ממשלתית | 5 שנים | (בכפוף לאישור הבנק)", value="5 שנים", condition="בכפוף לאישור הבנק")
+
+
+def _twin(quote: str, label: str = "הלוואה ממשלתית") -> items.Item:
+    """What the server builds from the source for the row: origin source, a candidate, its condition read off the row."""
+    return items.Item("N1", label, "S1", quote, "5", "בכפוף לאישור הבנק", "included", "", items.ORIGIN_SOURCE, candidate=True)
+
+
+@pytest.mark.parametrize("twin_quote", [
+    "הלוואה ממשלתית | 5 שנים | )בכפוף לאישור הבנק(",   # the bracket drawn in the other direction
+    "הלוואה ממשלתית | 5 שנים | (בכפוף לאישור הבנק);",  # another closing mark
+    "* הלוואה ממשלתית | 5 שנים | (בכפוף לאישור",      # another list marker, the tail truncated
+])
+def test_u7_a_server_twin_whose_quote_differs_only_by_marker_tail_punctuation_or_bracket_direction_is_no_rival(twin_quote):
+    ws = _ws(TWIN_TABLE)
+    agent = _item(**TWIN_AGENT)
+    twin = _twin(twin_quote)
+    markdown = "התקופה היא 5 שנים [S1]."
+    ledger = items.Ledger()
+    ledger.merge([agent, twin])
+    assert len(ledger.items) == 2  # the twin's quote is not a substring of the agent's, so the ledger holds both
+    by_id = {o["id"]: o for o in ledger.outcomes(_units(markdown), ws)}
+    mine = by_id[ledger.items[agent.key].id]
+    assert mine["state"] == "covered", mine  # the twin writes the same row: it is no other item that asks the condition words
+
+
+def test_u7_a_second_row_with_the_same_value_is_still_a_rival_and_asks_the_words():
+    ws = _ws(TWIN_TABLE)
+    agent = _item(**TWIN_AGENT)
+    other = _twin("הלוואה פרטית | 5 שנים | בכפוף לאישור הבנק", "הלוואה פרטית")
+    ledger = items.Ledger()
+    ledger.merge([agent, other])
+    out = {o["id"]: o for o in ledger.outcomes(_units("התקופה היא 5 שנים [S1]."), ws)}
+    mine = out[ledger.items[agent.key].id]
+    assert mine["state"] == "omitted" and mine["why"] == "condition_not_stated", mine
+
+
+def test_u7_the_row_key_ignores_the_marker_the_closing_mark_the_bracket_direction_and_the_truncated_tail():
+    same = items._same_row
+    ev = lambda q: ("d", "u", q)  # noqa: E731
+    assert same(ev("- א ב | 5 (גג)"), ev("א ב | 5 )גג("))
+    assert same(ev("א ב | 5 שנים."), ev("א ב | 5 שנים"))
+    assert same(ev("א ב | 5 שנים ועוד פרט"), ev("* א ב | 5 שנים ועו"))
+    assert not same(ev("א ב | 5 שנים"), ev("ג ד | 5 שנים"))
+    assert not same(("d", "u", "א ב | 5"), ("d", "other", "א ב | 5"))  # another document or unit is never the same row
+    assert not same(ev(""), ev("א ב | 5"))
+
+
+def test_u7_an_abbreviation_with_a_quote_mark_is_one_word_on_both_sides():
+    groups = items._word_groups('אלפא בע"מ ניהול')
+    assert len(groups) == 3 and any("בע״מ" in g for g in groups), groups
+    assert items._word_groups("בע״מ") == items._word_groups('בע"מ') and items._word_groups('סה"כ') == items._word_groups("סה״כ")
+    assert items._word_groups('סה"כ')[0] & items._words('סה״כ שווי')
+    row = _item(label="שם החברה", quote='שם | אלפא בע"מ ניהול נכסים', value='אלפא בע"מ ניהול נכסים')
+    ws = _ws('סוג | פירוט\nשם | אלפא בע"מ ניהול נכסים')
+    assert _covered(ws, 'החברה היא אלפא בע"מ [S1].', row).ok  # «אלפא» and «בע"מ» are two of the four words; before, the mark split the second
+    assert _covered(ws, "החברה היא אלפא בע״מ [S1].", row).ok  # the gershayim spelling is the same word
+    assert not _covered(ws, "החברה היא אלפא [S1].", row).ok  # the abbreviation is a word the answer must write too
+
+
+def test_u7_a_section_number_at_the_start_of_a_text_is_no_value_but_a_decimal_quantity_is():
+    assert items._first_value("4.2 תנאי תשלום ומסירה") == "" and items._first_value("## 4.2.1 תנאי תשלום") == ""
+    assert items.headline("4.2", "4.2 תנאי תשלום") == ()
+    assert items._first_value("4.5 מ״ר הם השטח") == "4.5" and items._first_value("3.5 שנים הוא הממוצע") == "3.5"
+    assert items._first_value("הריבית 4.2% בשנה") == "4.2%" and items._first_value("סעיף 4.2 קובע 120 מ״ר") == "120"
+    ws = _ws("4.2 תנאי תשלום\nהשטח הבנוי הוא 120 מ״ר.", kind="context")
+    spans = items._raws(ws.sources["S1"])[0]
+    assert [(r.value, r.kind) for r in spans] == [("120", "sentence")], spans  # the heading is no candidate with the value 4.2
+
+
+def test_u7_missing_detail_names_whole_tokens_of_the_quote_only():
+    group = frozenset(items.numbers_in("5.4"))
+    spaced = "הנתון W A L E 5.4 שנים לפי אומדן המנהל והערכת הצד השלישי"
+    assert items.missing_detail(None, spaced, group) == "הנתון W A L E 5.4 שנים לפי אומדן", "the spaced letters are one word of the source"
+    far = "ברמת התיק W A L E 5.4 שנים לפי אומדן המנהל"
+    assert items.missing_detail(None, far, group) == "ברמת התיק W A L E 5.4 שנים לפי אומדן"  # not «A L E»: the spaced word is one of the three words
+    assert items.missing_detail(None, "כתוב: W A L E 5.4", group).count("W") == 1
+    assert items.missing_detail(None, "W A L E הממוצע 5.4 שנים", group) == "W A L E הממוצע 5.4 שנים"
+    # the cell of a table row is cut between its tokens, not in the middle of one
+    long_row = "תקופה | 5.4 שנים לפי אומדן המנהל והערכת הצד השלישי של הנכס כולו ועוד פרטים נוספים על התיק"
+    cut = items.missing_detail(None, long_row, group)
+    assert len(cut) <= items.MISSING_DETAIL_CHARS and cut == "5.4 שנים לפי אומדן המנהל והערכת הצד השלישי של הנכס כולו ועוד", cut
+    assert all(t in long_row.split() for t in cut.split())
+    glued = items.missing_detail(None, "ריבית5.4%שנתית קבועה", group)
+    assert glued == "ריבית5.4%שנתית קבועה", glued  # a number glued to letters is one token of the source: it is named whole
+
+
+UNIT_TABLE = "סיכום\nסוג | סכום\nסה״כ שטח | 1,350 מ״ר"
+UNIT_NOTES = "הערות לטבלה\nסכום השטחים בטבלה הוא 1,350 מ״ר\nהערה אחרת על 12 מ״ר"
+SUM_ITEM = dict(label="שטח כולל", quote="סה״כ שטח | 1,350 מ״ר", value="1,350 מ״ר")
+
+
+def test_u7_one_datum_under_two_quotes_is_given_by_a_sentence_citing_the_source_of_the_same_unit_that_holds_its_value():
+    ws = _ws(UNIT_TABLE, UNIT_NOTES, same_file=True, kind="context")
+    item = _item(**SUM_ITEM)
+    assert _covered(ws, "השטח הכולל הוא 1,350 מ״ר [S2].", item).ok
+    # the source cited must hold the value: another source of the unit, without it, attributes nothing
+    other = _ws(UNIT_TABLE, "הערות לטבלה\nהערה אחרת על 12 מ״ר", same_file=True, kind="context")
+    got = _covered(other, "השטח הכולל הוא 1,350 מ״ר [S2].", item)
+    assert not got.ok and got.why == "not_attributed", got
+    # and the source must be the item's document: a source of another document that holds the number attributes nothing
+    away = _ws(UNIT_TABLE, UNIT_NOTES, kind="context")
+    assert not _covered(away, "השטח הכולל הוא 1,350 מ״ר [S2].", item).ok
+    # a short figure of one source is no datum of the other: a stray «12» in a cited source of the unit attributes nothing
+    small = _item(label="חדרים", quote="סה״כ חדרים | 12", value="12")
+    ws_small = _ws("סיכום\nסוג | כמות\nסה״כ חדרים | 12", UNIT_NOTES, same_file=True, kind="context")
+    assert not _covered(ws_small, "יש 12 חדרים [S2].", small).ok
+
+
+def test_u7_stray_small_digits_of_other_rows_give_no_part_of_an_item_without_its_whole_duration_or_its_row():
+    ws = _ws(RIGHTS)
+    got = _states(ws, "- בבניין 2 מרפסות [S1].", _item(**BASEMENT))["שטח מרתף"]
+    assert got["state"] == "omitted" and got["outcome"] == "omitted" and got["missing"] == [], got
+    # the row's own words give the part that is there: the basement is named, with its 2 floors, and its area is what the answer leaves out
+    named = _states(ws, "- שטח המרתף בנכס כולל 2 קומות [S1].", _item(**BASEMENT))["שטח מרתף"]
+    assert named["outcome"] == "partial" and named["missing"], named
+    # a whole duration is a part: «5 שנים» stands for the item's «5 שנים», whatever else is there
+    lease = _item(label="תקופת החכירה", quote="תקופת חכירה | 5 שנים | 2,400", value="5 שנים; 2,400 ₪")
+    ws2 = _ws("חכירה\nסוג | תקופה | דמי חכירה\nתקופת חכירה | 5 שנים | 2,400")
+    kept = _states(ws2, "- הנכס מוחכר ל-5 שנים [S1].", lease)["תקופת חכירה"]
+    assert kept["outcome"] == "partial" and kept["missing"], kept
+    # a bare 5 that is not a duration (5 floors) is a stray
+    assert _states(ws2, "- הבניין בן 5 קומות [S1].", lease)["תקופת חכירה"]["outcome"] == "omitted"
+    # a figure of three digits or more is never a stray: the 340 gives the basement in part, as before
+    assert _states(ws, "- שטח המרתף בנכס הוא 340 מ״ר [S1].", _item(**BASEMENT))["שטח מרתף"]["outcome"] == "partial"
+
+
+def test_u7_r7_an_instruction_to_attach_a_source_is_no_component_to_cover_and_no_gap_line():
+    """The execution instruction of a request is a component of kind ``instruction``: it is scored against the answer and never searched, so
+    it is not an item's component (``asked_components``), no candidate is offered for it, and an item an agent assigns to it is unassigned."""
+    components = [{"id": "N1", "text": "ההתאמות שהשומה יישמה", "kind": "information"},
+                  {"id": "N2", "text": "צרף מקור לכל נתון", "kind": "instruction", "aspect": "citation"}]
+    from app.chat.verify import asked_components
+
+    assert [c["id"] for c in asked_components(components)] == ["N1"]
+    ws = _ws(ADJUSTMENTS)
+    markdown = "ההתאמה לגיל הבניין היא 2% [S1]."
+    by_id = _validate(ws, markdown, _raw(component="N2"), _raw(component="צרף מקור לכל נתון"), components=components)
+    assert by_id.kept == [] and [e["reason"] for e in by_id.excluded] == ["component_unassigned"] * 2
+    assert [i.component for i in _validate(ws, markdown, _raw(), components=components).kept] == ["N1"]
+    offer = _offer(ws, markdown, [components[1]], request="צרף מקור לכל נתון")
+    assert offer.candidates == []  # a request that asks only for citations asks for no row of a table
