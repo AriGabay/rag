@@ -592,6 +592,9 @@ class TurnOutcome:
     # the turn's item ledger (round 17 U3, KTD2, KTD3): each item with its state against the units that stand, and the items
     # validation excluded with their reasons (``VerifyReport.item_diagnostics``); diagnostics only, {} when the turn had none
     item_ledger: dict = field(default_factory=dict)
+    # each verified draft with the locator of every source it cites (round 21 U1, KTD9: ``draft_record``); diagnostics only, so a replay
+    # rebuilds each source's text from stored data without the model
+    drafts: list[dict] = field(default_factory=list)
 
 
 def usage_summary(usage: list[dict], **extra) -> dict:
@@ -735,6 +738,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     pre_mixed = None  # the first answer of a mixed question, kept while that extra round runs (round 13 U14)
     rounds: list[list[dict]] = []
     traces: list[dict] = []  # the requirements trace of each verification round (diagnostics only)
+    drafts: list[dict] = []  # the full draft of each verification round with its sources' locators (round 21 U1, KTD9)
     # the request's requirements, frozen for the turn (the request's components, or the judge's derivation when there
     # are none), and its tool failures
     turn = TurnRequirements()
@@ -920,7 +924,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                            _summary(usage, rounds, reused, turn),
                            _pending(ws, turn, final), composed.spans, done.digest, done.stats, ws.clock.summary(),
                            unit, offered_units=offered, shown_documents=shown_documents, requirements_trace=traces,
-                           item_ledger=report.item_diagnostics())
+                           item_ledger=report.item_diagnostics(), drafts=drafts)
 
     def adopt_analysis() -> None:
         """The collected analysis as the turn's requirements: its components frozen and appended as one item, or the
@@ -1137,6 +1141,10 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             raise TurnCancelled
         rounds.append([p.as_dict() for p in report.problems])
         try:
+            drafts.append(draft_record(ws, answer.answer_markdown, len(rounds), attempt + 1))
+        except Exception:  # noqa: BLE001 - a diagnostics record never fails the turn
+            logger.warning("chat draft capture failed", exc_info=True)
+        try:
             if components := report.requirements_trace():
                 # ``round``: the number in ``rounds`` (restored-claim entries count there too); ``version``: the answer version the
                 # scores were cast on (the decisions and votes of the trace are tagged with it, round 17 U1)
@@ -1242,6 +1250,47 @@ def _summary(usage: list[dict], rounds: list, reused: int, turn: TurnRequirement
                             requirements_origin=origin["origin"], requirements_fallback=origin["fallback"])
     logger.info("chat turn: %s", json.dumps(summary))
     return summary
+
+
+# the stable place of a cited id, as a replay finds its text again (round 21 U1, KTD9): the version and reading it was read from,
+# its block range, table, table row and chunk, whether it is a part of a table, and its kind; None for what the id does not hold
+LOCATOR_FIELDS = ("version_id", "reading_id", "block_start", "block_end", "table_index", "row_index", "chunk_id", "table_part",
+                  "kind")
+
+
+def _locator_of(ws: T.Workspace, sid: str) -> dict | None:
+    """The locator of one cited id (S#, V#, M# or C#): ``type``, its document and ``LOCATOR_FIELDS`` (null for what it lacks).
+    A V# and an M# are placed by the anchor stub the workspace kept for them; a C# by the values and measurements it rests on.
+    Ids, offsets and kinds only: no text of any document."""
+    def uuid_text(v):
+        return str(v) if v is not None else None
+
+    if (src := ws.sources.get(sid)) is not None:
+        return {"type": "source", "document_id": uuid_text(src.document_id), "version_id": uuid_text(src.version_id),
+                "reading_id": src.reading_id, "block_start": src.block_start, "block_end": src.block_end,
+                "table_index": src.table_index, "row_index": src.row_index, "chunk_id": uuid_text(src.chunk_id),
+                "table_part": src.table_part, "kind": src.kind}
+    holder = ws.values.get(sid) or ws.measurements.get(sid)
+    if holder is not None:
+        stub = ws.anchors.get(sid) or {}
+        return {"type": "value" if sid in ws.values else "measurement", "document_id": uuid_text(holder.document_id),
+                "version_id": uuid_text(holder.version_id), "reading_id": stub.get("reading_id"),
+                "block_start": stub.get("block_start"), "block_end": stub.get("block_end"),
+                "table_index": stub.get("table_index"), "row_index": stub.get("row"), "chunk_id": None,
+                "table_part": None, "kind": stub.get("kind") or getattr(holder, "kind", None)} | (
+            {"source_id": holder.source_id} if sid in ws.values else {})
+    if (comp := ws.computations.get(sid)) is not None:
+        return {"type": "computation", "leaves": list(comp.leaves)}
+    return None
+
+
+def draft_record(ws: T.Workspace, markdown: str, round_no: int, version: int) -> dict:
+    """One verified draft kept for replay (round 21 U1, KTD9): its full Markdown and, per cited id, the stable locator of its
+    source. ``round``: the number of the verification round in ``rounds``; ``version``: the answer version. The text is the
+    answer's own, so the record is held behind the diagnostics permission with the documents it cites (``api._diagnostics``)."""
+    cited = sorted(coverage.cited_ids(markdown), key=lambda i: (i[0], int(i[1:])))
+    sources = {sid: loc for sid in cited if (loc := _locator_of(ws, sid)) is not None}
+    return {"round": round_no, "version": version, "markdown": markdown, "sources": sources}
 
 
 def _settle_unit(ctx: TenantContext, ws: T.Workspace, request: resolve.Request) -> None:

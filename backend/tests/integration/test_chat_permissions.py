@@ -10,6 +10,7 @@ text below is unique to the revoked document, so its absence is checked literall
 from __future__ import annotations
 
 import json
+import re
 import uuid
 
 import pytest
@@ -307,6 +308,49 @@ def test_removed_claims_reach_the_owner_and_an_admin_only_through_diagnostics(cl
     with tenant_tx(setup.system) as conn:
         assert conn.execute(text("SELECT count(*) FROM audit_events WHERE action = 'chat.diagnostics.read'"
                                  " AND target_id = :m"), {"m": mid}).scalar_one() == 1
+
+
+def test_the_drafts_of_a_turn_stay_behind_the_diagnostics_permission_and_the_documents_they_cite(client, setup, monkeypatch):
+    """Round 21 U1 (KTD9): the first draft cites the secret document and the repair round drops that sentence, so the final answer and
+    its removals no longer name it. The draft is kept with its locators, readable by the owner and an office admin only, and it hides
+    with the message once the document it cites is revoked."""
+    draft = final(f"השווי למ\"ר בנוי הוא 9,500 ₪ [S1].\nדמי הניהול במגדל {MARKER} הם 41 ₪ למ\"ר לחודש [S2].",
+                  documents=[setup.public, setup.secret])
+    repaired = final("השווי למ\"ר בנוי הוא 9,500 ₪ [S1].", documents=[setup.public])
+
+    def judge(input: str) -> dict:
+        units = re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S)
+        return {"verdicts": [{"index": int(i), "verdict": "unsupported" if MARKER in t else "supported", "reason": "בדיקה"}
+                             for i, t in units]}
+
+    agent = ScriptedAgent([[call("search", query="שווי", document_ids=[setup.public], limit=None),
+                            call("search", query="דמי ניהול", document_ids=[setup.secret], limit=None)], draft, repaired],
+                          judge=judge)
+    cloud(monkeypatch, setup, agent)
+    login(client, "emp@example.test")
+    m = send(client, new_conversation(client), "מה השווי ודמי הניהול?")
+    assert m["status"] == "done" and MARKER not in json.dumps(m["answer"], ensure_ascii=False), m
+    mid = m["id"]
+    d = client.get(f"/api/chat/messages/{mid}/diagnostics")
+    assert d.status_code == 200
+    first, second = d.json()["drafts"]
+    assert MARKER in first["markdown"] and MARKER not in second["markdown"], (first, second)
+    assert {loc["document_id"] for loc in first["sources"].values()} == {setup.public, setup.secret}
+    assert {loc["document_id"] for loc in second["sources"].values()} == {setup.public}
+    assert "drafts" not in json.dumps(client.get(f"/api/chat/messages/{mid}").json())  # no draft on the normal path
+    with tenant_tx(setup.system) as conn:
+        docs = conn.execute(text("SELECT document_ids FROM message_diagnostics WHERE message_id = :m"), {"m": mid}).scalar_one()
+    assert setup.secret in {str(x) for x in docs}  # the document a draft cites is behind the diagnostics
+    # another employee of the office: not theirs; the office admin reads it
+    make_user(setup, "emp2@example.test", [setup.g2])
+    login(client, "emp2@example.test")
+    assert client.get(f"/api/chat/messages/{mid}/diagnostics").status_code == 404
+    login(client, "admin-a@example.test")
+    assert client.get(f"/api/chat/messages/{mid}/diagnostics").json()["drafts"][0]["markdown"] == first["markdown"]
+    # the owner loses the document the draft cites: the drafts are hidden with the message
+    _revoke(setup, setup.secret)
+    login(client, "emp@example.test")
+    assert client.get(f"/api/chat/messages/{mid}/diagnostics").status_code == 404
 
 
 def test_an_admin_of_another_office_never_reads_diagnostics(client, db, setup, monkeypatch):

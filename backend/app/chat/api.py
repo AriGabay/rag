@@ -21,8 +21,9 @@ path (``verification.removals``) carry the same claim id, the action and a cut's
 citation state and offsets stay in the log. The turn's time per stage and per tool call (round 9 R16, KTD9;
 ``timing.StageClock``) is kept with it, as ``timing`` (stored in the resolution's jsonb, which has no other use on a first turn), and
 so is ``requirements_trace`` (round 16: per verification round and component, what the requirements judge returned and what the
-server did with its support, a quote prefix at most). ``GET /messages/{id}/diagnostics`` returns the detail to the message's owner and
-to an office admin (audited), and only while every document behind the answer — the documents every entry was checked
+server did with its support, a quote prefix at most), and ``drafts`` (round 21 U1, KTD9: each verified draft's full Markdown and the
+locator of every source it cites, served apart, for a replay without the model; the documents it cites are behind the message).
+``GET /messages/{id}/diagnostics`` returns the detail to the message's owner and to an office admin (audited), and only while every document behind the answer — the documents every entry was checked
 against and every re-read reached included — is visible to them; those documents are behind the message too
 (``removal_documents``), so revoking one hides both. The registry of the spans the server wrote in the text is saved with
 the answer (``compose.SERVER_SPANS_FIELD``: offsets and a fixed kind, never text; a partial mark also holds its ordinal and
@@ -483,8 +484,9 @@ def get_diagnostics(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> d
     resolution = dict(row.resolution) if row.resolution else {}
     timing = resolution.pop("timing", None)  # the stage clock (round 9 KTD9) is stored beside the resolution
     trace = resolution.pop("requirements_trace", None)  # so is the requirements trace (round 16), served apart
+    drafts = resolution.pop("drafts", None)  # and the verified drafts with their sources' locators (round 21 U1, KTD9)
     return {"message_id": str(mid), "rounds": row.rounds, "removed": row.removed, "resolution": resolution or None,
-            "timing": timing, "requirements_trace": trace or [], "limits_hit": row.limits_hit or []}
+            "timing": timing, "requirements_trace": trace or [], "drafts": drafts or [], "limits_hit": row.limits_hit or []}
 
 
 @router.post("/conversations/{conversation_id}/messages")
@@ -1227,8 +1229,15 @@ def _diagnostics(outcome: engine.TurnOutcome, payload: dict, removals: _Removals
     checked |= {str(i["document_id"]) for i in outcome.item_ledger.get("items", []) if i.get("document_id")}
     checked |= documents_of(e.get("source") for e in outcome.item_ledger.get("excluded", []))
     checked |= documents_of(m.get("source") for m in outcome.item_ledger.get("misattributed", []))  # round 18 U5
+    # each verified draft's full text and its sources' locators (round 21 U1, KTD9), for a replay without the model: beside the timing,
+    # in the resolution's jsonb, served apart by ``get_diagnostics``. A draft may cite a source the final answer dropped, so the
+    # documents of every id a draft cites are behind the message too (the draft text is the answer's own words about them)
+    drafted = {"drafts": outcome.drafts} if outcome.drafts else {}
+    checked |= {str(loc["document_id"]) for d in outcome.drafts for loc in d["sources"].values() if loc.get("document_id")}
+    checked |= documents_of(leaf for d in outcome.drafts for loc in d["sources"].values() if loc.get("type") == "computation"
+                            for leaf in loc["leaves"])
     return {"rounds": outcome.rounds, "removed": removed,
-            "resolution": (resolution or {}) | {"timing": timing} | registrations | trace | item_ledger,
+            "resolution": (resolution or {}) | {"timing": timing} | registrations | trace | item_ledger | drafted,
             "document_ids": _answer_documents(payload) | found | checked,
             "limits_hit": list(outcome.workspace.limits_hit)}
 

@@ -13,7 +13,7 @@ import re
 import pytest
 from sqlalchemy import text
 
-from app.chat import verify
+from app.chat import engine, verify
 from app.db import tenant_tx
 from tests.conftest import login
 from tests.factories import make_office
@@ -83,6 +83,31 @@ def test_a_repair_round_that_changes_one_sentence_re_judges_one_unit(client, off
     assert "בסיכום השומה" in a["markdown"] and "גישת ההכנסות" not in a["markdown"]
     assert a["verification"]["removed"] == 0
     assert [u["purpose"] for u in m["usage"]] == ["agent", "request", "agent", "verify", "agent", "verify"]
+
+
+def test_a_two_round_turn_keeps_both_drafts_and_the_locator_of_each_cited_source_in_its_diagnostics(client, office, monkeypatch):
+    """Round 21 U1 (KTD9): each verified draft is recorded in full, with the stable locator of every source it cites, so a replay
+    rebuilds the sources from stored data without the model. The drafts are served apart from the resolution."""
+    first_text = f"{VALUE}\n{RENT}\nהשווי נקבע לפי גישת ההכנסות [S1]."
+    repaired_text = f"{VALUE}\n{RENT}\nהנתונים מופיעים בסיכום השומה [S1]."
+    agent = ScriptedAgent([SEARCH, final(first_text), final(repaired_text)], judge=_judge("גישת ההכנסות", []))
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), "מה השווי ודמי השכירות, ולפי איזו גישה?")
+    assert m["status"] == "done", m
+    d = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()
+    first, second = d["drafts"]
+    assert (first["round"], first["version"], second["round"], second["version"]) == (1, 1, 2, 2)
+    assert "גישת ההכנסות" in first["markdown"] and "גישת ההכנסות" not in second["markdown"]  # the draft the repair replaced is kept
+    assert first["markdown"] == first_text and second["markdown"] == repaired_text
+    for draft in (first, second):
+        assert list(draft["sources"]) == ["S1"], draft["sources"]
+        locator = draft["sources"]["S1"]
+        assert set(locator) >= {"type", "document_id", *engine.LOCATOR_FIELDS}, locator
+        assert (locator["type"], locator["document_id"], locator["version_id"]) == ("source", office.doc, str(office.ver)), locator
+        assert locator["kind"] and locator["chunk_id"], locator  # a search hit is placed by its chunk
+    assert "drafts" not in (d["resolution"] or {})  # served apart, like the timing and the trace
+    assert "גישת ההכנסות" not in json.dumps(client.get(f"/api/chat/messages/{m['id']}").json(), ensure_ascii=False)
 
 
 def test_a_repair_that_changes_a_tables_column_header_re_judges_the_rows_under_it(client, office, monkeypatch):
