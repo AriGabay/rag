@@ -1877,7 +1877,8 @@ class Problem:
     def mark_only(self) -> bool:
         """A partial mark the server writes and no repair fixes (round 21 U9): the judge named no defect a repair could remove, or the
         number it doubts only in its unit or scope (``KEPT_NUMBER_DEFECTS``) is one the sources back. The sentence stays, marked."""
-        return self.severity == "partial" and self.defect == "none" and self.kind == "claim" and self.check == "judge"
+        return (self.severity == "partial" and self.defect == "none" and self.kind == "claim" and self.check == "judge"
+                and self.failure_kind != CONTEXT_NOT_READ)  # unread context keeps its repair note: the repair may read it (protected, not mark-only)
 
     @property
     def completable_offline(self) -> bool:
