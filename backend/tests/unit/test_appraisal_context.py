@@ -456,7 +456,8 @@ def _claim_ws(cx: contexts.Contexts, cited: dict[str, int], asked: str) -> Simpl
     values = {vid: SimpleNamespace(context=_real_value(cx, n, vid, "1").context, written="14,850,000", version_id="v",
                                    subject_from="", subject="הנכס") for vid, n in cited.items()}
     return SimpleNamespace(requirement_items=[], user_messages=[{"text": asked, "current": True}], values=values,
-                           measurements={}, computations={}, sources={}, contexts={"v": cx})
+                           measurements={}, computations={}, sources={}, contexts={"v": cx}, layouts={}, unit_titles={},
+                           scope_findings={})
 
 
 def test_a_claim_about_appraisal_one_citing_a_comparables_row_is_not_removed_as_wrong_subject(monkeypatch):

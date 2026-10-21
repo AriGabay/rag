@@ -108,7 +108,7 @@ _ADDRESS = re.compile(
     r"(?!\s*(?:מ״ר|מטר|מ׳|ס״מ|%|₪|קומות|קומה|חדרים|שנים|שנה|דונם|יח׳))")
 _NOT_STREET = frozenset({"גוש", "חלקה", "חלקות", "מגרש", "תכנית", "דירה", "קומה", "בניין"})
 _CANDIDATE_SQL = "גוש|רחוב|רח׳|רח'|שד׳|שד'|שדרות|שדרת|דרך|סמטת|כיכר"
-_SKIP_STATUS = ("decorative", "unread", "no_text")
+SKIP_STATUS = ("decorative", "unread", "no_text")  # the statuses of a block that holds no text to read (the block readers skip them)
 CACHE_MAX = 256
 
 
@@ -294,7 +294,18 @@ class Contexts:
 
     def segment(self, number: int) -> Segment:
         """The first segment of a context (StopIteration for a number no segment has)."""
-        return next(s for s in self.segments if s.number == number)
+        found = self._first_segments.get(number)
+        if found is None:
+            raise StopIteration
+        return found
+
+    @cached_property
+    def _first_segments(self) -> dict[int, Segment]:
+        """The first segment of every context, once (the segments are never changed after they are built)."""
+        out: dict[int, Segment] = {}
+        for s in self.segments:
+            out.setdefault(s.number, s)
+        return out
 
     def kind(self, number: int) -> str:
         return self.segment(number).kind
@@ -538,6 +549,18 @@ class Contexts:
         its label does not show (round 20 U3, KTD3, R12): what the judge's source header adds to the unit's label, so a unit labelled by its
         address is also known by the name its title block gives it. A name that holds an identifier (a card's address quote kept as a name)
         or that the label already holds is left out; at most ``limit``."""
+        found = self._shown_names.get(n)
+        if found is None:
+            found = self._shown_names[n] = self._names_not_in_label(n)
+        return found[:limit]
+
+    @cached_property
+    def _shown_names(self) -> dict[int, tuple[str, ...]]:
+        """``_names_not_in_label`` of the contexts asked so far (the judge's header asks for the same few units again and again)."""
+        return {}
+
+    def _names_not_in_label(self, n: int) -> tuple[str, ...]:
+        """Every DISTINGUISHING name of subject context ``n`` that its label does not show and that holds no identifier (``names_of``, without a limit)."""
         if n not in self.subjects:
             return ()
         label = name_key(self.label(n))
@@ -546,7 +569,7 @@ class Contexts:
             if not identifiers(name).empty or name in label or len(name) > NAME_SHOWN_CHARS:
                 continue
             out.append(name)
-        return tuple(out[:limit])
+        return tuple(out)
 
     def naming_names(self, n: int, words: str | None) -> tuple[str, ...]:
         """The DISTINGUISHING names (title and aliases, not addresses or parcels) of subject context ``n`` that a free text
@@ -740,7 +763,7 @@ def derive(blocks: Iterable, version_id: str = "") -> Contexts:
     if not every:
         return Contexts(version_id, (Segment(1, Identity(), 0, 0, None, None, None, None),))
     rows = [r for r in every if r.kind not in ("table", "image") and r.table_index is None
-            and (r.status or "read") not in _SKIP_STATUS]
+            and (r.status or "read") not in SKIP_STATUS]
     lead = _first_heading(rows)
     title = Identity()
     # the title block: the blocks before the first heading, and that heading (a title set as a heading)

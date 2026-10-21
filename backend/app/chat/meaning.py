@@ -71,6 +71,7 @@ from app.answering.numread import number_spans, read_separators
 from app.answering.verify import not_an_amount, numbers_in
 from app.chat.datum import STATUS_NOT_READ
 from app.chat.evidence import _content_words
+from app.chat.scopes import row_cells as _row_cells
 from app.measurements.extract import (
     _MONTH_WORDS,
     _YEAR_WORDS,
@@ -432,6 +433,15 @@ def after_kind(text: str, end: int) -> str:
     return "count" if _COUNT_AFTER.match(text, end) else ""
 
 
+def after_noun_end(text: str, end: int) -> int | None:
+    """Where the noun of a count or a duration ends, when the words right after the number that ends at ``end`` make it one ("59 דירות",
+    "36 חודשים"; ``after_kind``); None for any other number."""
+    if not after_kind(text, end):
+        return None
+    noun = _COUNT_AFTER.match(text, end) or _DURATION_AFTER.match(text, end)
+    return noun.end() if noun else None
+
+
 def _owner(nums: list, amounts: list[int], pos: int, clause: str) -> int | None:
     """The number a qualifier at ``pos`` belongs to: the nearest amount before it, else the first amount after
     it — unless a comma separates it from the amount before and not from the one after ("בשטח 120 מ"ר, דמי
@@ -523,18 +533,6 @@ class Occurrence:
     @cached_property
     def context_words(self) -> set[str]:
         return _content_words(self.context)
-
-
-def _row_cells(line: str) -> list[str]:
-    """The cells of a table row line. A markdown row ("| a | b |") has its outer pipes as delimiters, at the line's edge; a
-    row as the table text renders it (cells joined by " | ") has none, so an empty first or last cell leaves a pipe with
-    a space before it or after it (" | x | ") and stays a cell — dropping it shifts every later cell one column left."""
-    raw = line.rstrip() if line.startswith("|") else line
-    if raw.startswith("|"):
-        raw = raw[1:]
-    if raw.endswith("|"):
-        raw = raw[:-1]
-    return [c.strip() for c in raw.split("|")]
 
 
 # a per-area amount: its row or column says "למ״ר", "/מ״ר", "למטר", "לדונם"

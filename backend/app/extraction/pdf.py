@@ -85,8 +85,8 @@ from app.extraction.fontmap import FontMapFix, WordSample
 from app.extraction.hebrew import (
     QUALITY_THRESHOLD,
     fix_text_lines,
-    has_hebrew,
     orientation_evidence,
+    page_has_hebrew,
     page_is_visual,
     quality_score,
     strip_bidi_controls,
@@ -426,6 +426,7 @@ def _text_layer(page, index: int, fix: FontMapFix | None = None) -> _TextLayer:
             spacing.add_uncertain(what)
         out.lines.append(line)
     out.spaced = spacing.counts
+    hebrew_page = page_has_hebrew(raw_texts)
     for t in page.find_tables():
         grid = t.extract()
         if not grid or max(len(r) for r in grid) < 2:
@@ -433,7 +434,7 @@ def _text_layer(page, index: int, fix: FontMapFix | None = None) -> _TextLayer:
         grid = [[strip_bidi_controls(c) if c else c for c in row] for row in grid]
         # pdfplumber returns columns left -> right: reverse to logical order, fix each cell's text. A table with no Hebrew
         # on a page with no Hebrew that shows a left-to-right cue keeps its columns in the order they are stored in.
-        ltr = reads_left_to_right(grid, any(has_hebrew(t) for t in raw_texts))
+        ltr = reads_left_to_right(grid, hebrew_page)
         rows = [logical_row(r, visual_default=True if visual is None else visual, left_to_right=ltr) for r in grid]
         reason = _uncertain_in(page.chars, t.bbox) if fix is not None else None
         # ``extract`` reads ``t.rows`` cell by cell, so its grid and the cell boxes line up (None: a merged cell)

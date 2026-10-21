@@ -214,6 +214,7 @@ from app.chat.evidence import (
     HINT,
     KEPT,
     MISSING,
+    OTHER_ITEM,
     PART_REASON_MARKS,
     TABLE_AFTER,
     TABLE_BEFORE,
@@ -964,6 +965,11 @@ def shares_request_word(text: str, forms: set[str]) -> bool:
     return any(_loose_forms(w) & forms for w in _missing_words(text) if not w[0].isdigit())
 
 
+def shared_request_words(text: str, forms: Collection[str]) -> int:
+    """How many distinct content words of ``text`` (not numbers) have a comparable form among ``forms`` (``request_word_forms``)."""
+    return len({w for w in _missing_words(text) if not w[0].isdigit() and not _loose_forms(w).isdisjoint(forms)})
+
+
 def words_stand_in(phrase: str, *texts: str) -> bool:
     """Whether every content word of ``phrase`` (a Hebrew or latin word, or a number) stands in one of ``texts``, compared by the loose
     forms of ``request_word_forms`` (round 18 U7, KTD6): model text in a server line is shown only when this holds, else the server's
@@ -1434,11 +1440,18 @@ def names_scope(line: str) -> bool:
     return bool(scopes.mentions(text)) or bool(_SCOPE_NAMED.search(text))
 
 
+def table_context(u: Unit) -> tuple[str, str]:
+    """What a table row's context holds, as ``(the table's header row, the line before the table)``, each as ``Unit.context`` writes it
+    (both empty for a unit with no context)."""
+    header, _, lead = u.context.partition("\n")
+    return header, lead
+
+
 def key_context(unit: Unit) -> str:
     """The context a table row's verdict is reused under (round 20 U2, KTD2, R7): the table's header row, and the line before the table
     only when it names a scope (``names_scope``). A line that carries neither a header nor a scope is left out of that memory, so the
     removal of such a line elsewhere in the answer does not by itself judge a row again. A unit that is no table row has no context."""
-    header, _, lead = unit.context.partition("\n")
+    header, lead = table_context(unit)
     return header + ("\n" + lead if names_scope(lead) else "")
 
 
@@ -3037,12 +3050,18 @@ def _cites_by_unit(problems: list[Problem]) -> list[tuple[Unit, list[str]]]:
 def _mark_point(markdown: str, unit: Unit) -> int:
     """Where the "partly verified" mark joins a unit (round 20 U2, KTD2, R5): at its end, and in a table row inside its last cell, before
     the closing bar — after it the mark would be one more cell and the row would stop lining up with its header."""
+    at = _last_cell_end(markdown, unit)
+    return unit.end if at is None else at
+
+
+def _last_cell_end(markdown: str, unit: Unit) -> int | None:
+    """In a table row that ends with its closing bar, where its last cell's text ends: a mark or a citation joins the row there, before the
+    bar - after it, it would be one more cell and the row would stop lining up with its header. None for a unit that is no table row or
+    has no closing bar."""
     if unit.table_span is None:
-        return unit.end
+        return None
     body = markdown[unit.start:unit.end].rstrip()
-    if body.endswith("|") and len(body) > 1:
-        return unit.start + len(body[:-1].rstrip())
-    return unit.end
+    return unit.start + len(body[:-1].rstrip()) if body.endswith("|") else None
 
 
 def _citation_point(markdown: str, unit: Unit) -> int:
@@ -3052,10 +3071,8 @@ def _citation_point(markdown: str, unit: Unit) -> int:
     last = list(_IDS.finditer(span))
     if last:
         return unit.start + last[-1].end()
-    stripped = span.rstrip()
-    if unit.table_span is not None and stripped.endswith("|"):
-        stripped = stripped[:-1].rstrip()
-    return _before_closing_punctuation(markdown, unit.start, unit.start + len(stripped))
+    at = _last_cell_end(markdown, unit)
+    return _before_closing_punctuation(markdown, unit.start, unit.start + len(span.rstrip()) if at is None else at)
 
 
 def _phrase_end(markdown: str, unit: Unit) -> int:
@@ -3097,11 +3114,9 @@ def _after_number(unit: Unit, written: str, at: int | None = None) -> int | None
     end = start + len(written)
     tail = _AFTER_NUMBER.match(unit.raw, scale_after(unit.raw, start, end)[1])
     at = tail.end() if tail else end
-    if meaning.after_kind(unit.raw, end):
-        # a count or a duration: its noun is part of the quantity ("59 דירות"), and a note belongs after it (round 20 U2, KTD2)
-        noun = meaning._COUNT_AFTER.match(unit.raw, end) or meaning._DURATION_AFTER.match(unit.raw, end)
-        at = max(at, noun.end() if noun else at)
-    return unit.start + at
+    # a count or a duration: its noun is part of the quantity ("59 דירות"), and a note belongs after it (round 20 U2, KTD2)
+    noun_end = meaning.after_noun_end(unit.raw, end)
+    return unit.start + (at if noun_end is None else max(at, noun_end))
 
 
 def _shown_result(unit: Unit, written: str | None) -> str | None:
@@ -4319,7 +4334,7 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
         # claim about another property goes; a table row keeps its other cells (``_scope_cells``)
         scope = _scope_check(u, ws, leads.get(u.index, ""))
         if scope.reason:
-            problems.append(Problem(u, scope.reason, failure_kind="wrong_subject", check=SCOPE_CHECK_NAME))
+            problems.append(Problem(u, scope.reason, failure_kind="wrong_subject", check=SUBREFERENT_CHECK))
             continue
         facts = [*owner.facts, *scope.facts]
         if facts:  # an owner the server could not settle is not removed: the judge reads the facts (rule 34)
@@ -4327,9 +4342,9 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
         else:
             ws.ownership_facts.pop(_fact_key(u), None)
         if scope.cells:
-            _ws_map(ws, "scope_findings")[_fact_key(u)] = dict(scope.cells)
+            ws.scope_findings[_fact_key(u)] = dict(scope.cells)
         else:
-            _ws_map(ws, "scope_findings").pop(_fact_key(u), None)
+            ws.scope_findings.pop(_fact_key(u), None)
         for reason in _vat_problems(u, ws) if u.ids else []:
             problems.append(Problem(u, reason, failure_kind="wrong_unit", check="vat"))
         blocking = [m for m in meanings.get(u.index, []) if m.blocking]
@@ -4365,6 +4380,7 @@ CONDITION_CHECKS = (CONDITION_CHECK, CONDITION_LIMIT_CHECK)
 CONDITION_FOUND_CHECK = "condition_found"  # a repair request about a condition: the repair step turns its tools off for it
 CONDITION_CONTRADICTED_CHECK = "condition_contradicted"
 NOTE_CHECKS = SCOPE_CHECKS + CONDITION_CHECKS  # the checks of a server note written next to a value, where a citation would join
+SUBREFERENT_CHECK = "scope_mismatch"  # a datum the source writes under another plan, parcel, contract or alternative than the claim's (round 20 U3)
 SCOPE_PHRASE_WORDS = (2, 16)  # the words a scope phrase has: a phrase, not one word and not a paragraph
 SCOPE_PHRASE_CHARS = 160
 MSG_SCOPE_ADDED = "היקף הערך לפי המקור: {phrase}"
@@ -4386,7 +4402,7 @@ MSG_CONDITION_LABELLED = "התנאי לפי המקור של {label}: {phrase}"
 MSG_CONDITION_UNVERIFIED = "התנאי של הערך אינו כתוב בתשובה ולא אומת ({sid}); אם התשובה לא תכלול אותו, ייכתב ליד הערך שהתנאי לא אומת"
 MSG_CONDITION_LIMIT = "התנאי של הערך במקור לא נכלל בתשובה ולא אומת; הערך נקרא ב-{where}"
 MSG_CONDITION_CONTRADICTS = "התנאי של הפריט «{name}» סותר את המקור: {where}"
-_CONDITION_RANK = {"contradicted": 0, "other_item": 1, MISSING: 2, KEPT: 3}
+_CONDITION_RANK = {"contradicted": 0, OTHER_ITEM: 1, MISSING: 2, KEPT: 3}
 # why a paragraph beside a table is not attributed to it (``tools.TablePart.reasons``), the most telling first: the note names the
 # first that a source of the value has, and the message for it
 SCOPE_REASONS = ("not_adjacent", "no_reference", "between")
@@ -4626,6 +4642,9 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
     units = {u.index: u for u in report.units}
     removed = report.removed_units()
     states = report.item_states()
+    by_id: dict[str, dict] = {}
+    for x in states:
+        by_id.setdefault(x["id"], x)
     for st in states:
         verdict = said.get(st["id"])
         unit = units.get(st["condition_unit"])
@@ -4637,11 +4656,11 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
             continue
         if verdict is not None and verdict.outcome == MISSING and _whole_value(verdict.quote, st):
             verdict = None  # a "missing" condition that is the item's whole value states no condition at all (round 20 U3, KTD3)
-        if unit is not None and "other_item" in (st.get("condition_hint") or []) and (verdict is None or verdict.outcome == MISSING):
+        if unit is not None and OTHER_ITEM in (st.get("condition_hint") or []) and (verdict is None or verdict.outcome == MISSING):
             # the sentence states an operator clause that the item's own scope does not hold and another item's does: the server's hint
             # stands without the judge's word (round 20 U3, KTD3)
-            if foreign := _foreign_quote(st, states, unit):
-                verdict = ConditionVerdict(item=st["id"], outcome="other_item", quote=foreign)
+            if foreign := _foreign_quote(st, by_id, unit):
+                verdict = ConditionVerdict(item=st["id"], outcome=OTHER_ITEM, quote=foreign)
         if (verdict is None or verdict.outcome == KEPT or st["state"] != ITEM_COVERED or unit is None
                 or unit.index in removed):
             continue
@@ -4655,7 +4674,7 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
                 if r.verdict in RECORD_VERDICTS and r.verdict not in FAILING_VERDICTS:
                     r.verdict, r.failure = "contradicts", "none"
             removed.add(unit.index)
-        elif verdict.outcome == "other_item":
+        elif verdict.outcome == OTHER_ITEM:
             report.problems.append(Problem(Unit(-1, "", "", []), REQ_CONDITION_OTHER.format(
                 name=name, where=f"«{prompt_text(verdict.quote)}»"), kind="requirement", component=st["component"],
                 check=CONDITION_FOUND_CHECK))
@@ -4690,14 +4709,13 @@ def _whole_value(quote: str, st: dict) -> bool:
     return bool(flat) and flat in {_flat_quote(st.get("value") or ""), _flat_quote(st.get("quote") or "")} - {""}
 
 
-def _foreign_quote(st: dict, states: list[dict], unit: Unit) -> str:
+def _foreign_quote(st: dict, by_id: Mapping[str, dict], unit: Unit) -> str:
     """The clause of another item's condition span that the sentence ``unit`` states and the item's own context does not hold (the
     deterministic ``other_item`` hint of the ledger): the quote the repair request carries."""
     from app.chat import conditions  # conditions reads this module
 
     for other_id in st.get("condition_foreign") or []:
-        other = next((x for x in states if x["id"] == other_id), None)
-        for span in (other or {}).get("condition_spans") or []:
+        for span in by_id.get(other_id, {}).get("condition_spans") or []:
             text = span["text"]
             if conditions.outcome(text, unit.text) == KEPT and not conditions.stated_in(text, st.get("quote") or ""):
                 return conditions.material_clauses(text)[0] if conditions.material_clauses(text) else text
@@ -5632,15 +5650,42 @@ def _cited_cell_list(u: Unit) -> list[tuple[int, str, str, Unit]]:
     column, the first cell of the row — "" for the first cell itself —, the cell as a unit)``."""
     if u.table_span is None or u.table_header or not u.context:
         return []
-    header = u.context.split("\n", 1)[0].strip()
-    if not header.startswith("|"):
+    row = _table_row(u.context, u.raw)
+    if not row.header.startswith("|") or len(row.heads) != len(row.cells):
         return []
-    heads, cells = meaning._row_cells(header.strip()), meaning._row_cells(u.raw.strip())
-    if len(heads) != len(cells):
-        return []
-    label = scopes.keyed_label(heads[0], _IDS.sub("", cells[0]).strip()) if cells else ""
+    label = _row_label(row)
     return [(i, h, label if i else "", Unit(u.index, c, _IDS.sub("", c).strip(), ids_in(c)))
-            for i, (h, c) in enumerate(zip(heads, cells, strict=True)) if ids_in(c)]
+            for i, (h, c) in enumerate(zip(row.heads, row.cells, strict=True)) if ids_in(c)]
+
+
+class _TableRow(NamedTuple):
+    """A table body row with its table, parsed once: the header row's text, its cells, the row's cells and the line before the table."""
+
+    header: str
+    heads: tuple[str, ...]
+    cells: tuple[str, ...]
+    lead: str
+
+
+@functools.lru_cache(maxsize=1024)
+def _table_row(context: str, raw: str) -> _TableRow:
+    """``_TableRow`` of the unit whose context and raw text these are (``table_context``; the cells as ``scopes.row_cells`` reads them)."""
+    header, _, lead = context.partition("\n")
+    header = header.strip()
+    return _TableRow(header, tuple(scopes.row_cells(header)), tuple(scopes.row_cells(raw.strip())), lead)
+
+
+def _row_label(row: _TableRow) -> str:
+    """The label of a table row: its key cell without the citations, under the noun of its column's header (``scopes.keyed_label``);
+    empty when the row's cells do not line up with its header."""
+    if len(row.heads) != len(row.cells):
+        return ""
+    return scopes.keyed_label(row.heads[0], _IDS.sub("", row.cells[0]).strip())
+
+
+def evidence_source_id(ws: Workspace, i: str) -> str:
+    """The source a cited id is read from: a value (V#) through the source it was verified in, any other id as it is."""
+    return ws.values[i].source_id if i in ws.values else i
 
 
 def _evidence_spans(i: str, ws: Workspace) -> tuple[list[str], bool]:
@@ -5729,6 +5774,23 @@ def _context_check(u: Unit, ws: Workspace, question: str) -> ContextCheck:
     return out
 
 
+@functools.lru_cache(maxsize=2048)
+def _name_words(text: str) -> tuple[str, ...]:
+    """The words of a text as names are compared (``contexts.name_key``), kept per text: the same few texts (the claim, the request, the question)
+    are compared with every line of every title block."""
+    from app.chat import contexts
+
+    return tuple(contexts.name_key(text).split())
+
+
+@functools.lru_cache(maxsize=512)
+def _block_key(lines: tuple[str, ...]) -> str:
+    """The title block of a unit as names are compared, kept per block (``_title_names`` reads the blocks of every other unit of the file)."""
+    from app.chat import contexts
+
+    return contexts.name_key(" ".join(lines))
+
+
 def _shared_name(line: str, texts: Sequence[str], ident) -> str:
     """The name a title-block line and a text share (round 20 U3, KTD3, R12): the longest run of at least two words that both write, with the
     identifiers of the unit taken out of the line, that holds a word which is not only a kind of property (``contexts.GENERIC_DESIGNATORS``)
@@ -5739,10 +5801,10 @@ def _shared_name(line: str, texts: Sequence[str], ident) -> str:
     for street, number, letter in ident.streets:
         cleaned = re.sub(rf"(?:{'|'.join(map(re.escape, contexts.STREET_LABELS))})?\s*{re.escape(' '.join(street))}\s*{number}{letter}", " ",
                          cleaned)
-    mine = contexts.name_key(cleaned).split()
+    mine = list(_name_words(cleaned))
     best: list[str] = []
     for text in texts:
-        theirs = contexts.name_key(text).split()
+        theirs = _name_words(text)
         for a in range(len(mine)):
             for b in range(len(theirs)):
                 k = 0
@@ -5761,7 +5823,6 @@ def _title_names(cx, n: int, texts: Sequence[str], titles: Mapping[tuple, Sequen
     """The names of unit ``n`` that its stored title block gives beside its own address or parcel and that the claim, request or question
     uses (round 20 U3, KTD3, R12): a line of the block that holds an identifier of the unit and shares a name with the text. A line that
     addresses the report to someone, or names the appraiser's office, is no evidence of the unit's name."""
-    from app.chat import contexts
     from app.chat import units as unit_store
 
     ident = cx.identity(n)
@@ -5776,7 +5837,7 @@ def _title_names(cx, n: int, texts: Sequence[str], titles: Mapping[tuple, Sequen
     for other in (m for m in cx.subjects if m != n):
         if (cx.version_id, other) not in titles:
             return []  # that unit's block was not read: the name cannot be shown to be this unit's alone
-        theirs = contexts.name_key(" ".join(titles[(cx.version_id, other)]))
+        theirs = _block_key(tuple(titles[(cx.version_id, other)]))
         found = [x for x in found if x not in theirs]
     return list(dict.fromkeys(found))
 
@@ -5795,7 +5856,7 @@ def _name_link(cx, numbers: set[int], texts: Sequence[str], ws: Workspace) -> st
             continue
         label = contexts.name_key(cx.label(n))
         names = [x for t in texts for x in cx.naming_names(n, t) if contexts.identifiers(x).empty]
-        names += _title_names(cx, n, texts, _ws_map(ws, "unit_titles"))
+        names += _title_names(cx, n, texts, ws.unit_titles)
         names = [x for x in dict.fromkeys(names) if x not in label]
         if names:
             lines.append(MSG_OWNER_NAME.format(names="», «".join(names), where=cx.describe(n)))
@@ -5920,26 +5981,13 @@ MSG_OWNER_NAME = ("השם «{names}» שנשאל עליו הוא שם של {wher
 # identifier of a kind the claim names is wrong (``DIFFERENT``): a sentence goes through the wrong-subject path, a table cell is cut (or
 # marked) alone when the rest of its row stands (``_scope_cells``). An undecided one is a neutral fact for the judge, never a removal.
 
-MSG_SCOPE_DIFFERENT = ("הנתון ב-{ids} כתוב במקור תחת {found}, והטענה מייחסת אותו ל{claimed}: במקור זה נתון של {found}, באותו נכס. קח את "
+MSG_SUBREFERENT_DIFFERENT = ("הנתון ב-{ids} כתוב במקור תחת {found}, והטענה מייחסת אותו ל{claimed}: במקור זה נתון של {found}, באותו נכס. קח את "
                        "הנתון ממה שכתוב במקור ל{claimed}, או ייחס אותו ל{found}")
-MSG_SCOPE_UNKNOWN = ("הנתון ב-{ids} כתוב במקור גם תחת {found}, והטענה מייחסת אותו ל{claimed}. השרת לא מצא ראיה שמכריעה לאיזה מהם הנתון "
+MSG_SUBREFERENT_UNKNOWN = ("הנתון ב-{ids} כתוב במקור גם תחת {found}, והטענה מייחסת אותו ל{claimed}. השרת לא מצא ראיה שמכריעה לאיזה מהם הנתון "
                      "שייך; הכרעה לפי הקטע המצוטט עצמו.")
-MSG_SCOPE_MIXED = ("הנתון ב-{ids} כתוב במקור גם תחת {found}, והטענה מייחסת אותו ל{claimed}; אבל היא מצטטת גם מקור שכותב אותו ל{claimed}. "
+MSG_SUBREFERENT_MIXED = ("הנתון ב-{ids} כתוב במקור גם תחת {found}, והטענה מייחסת אותו ל{claimed}; אבל היא מצטטת גם מקור שכותב אותו ל{claimed}. "
                    "השרת לא הכריע.")
-SCOPE_CHECK_NAME = "scope_mismatch"
 NOTE_WORDS = 4  # the content words a footnote needs for a claim to be read as stating it
-
-
-def _ws_map(ws, name: str) -> dict:
-    """The workspace's dict of that name (``layouts``, ``unit_titles``, ``scope_findings``), made when a stand-in workspace has none."""
-    found = getattr(ws, name, None)
-    if found is None:
-        found = {}
-        try:
-            setattr(ws, name, found)
-        except AttributeError:
-            pass
-    return found
 
 
 @dataclass
@@ -5976,16 +6024,14 @@ def _block_leads(units: Sequence[Unit]) -> dict[int, str]:
 def unit_referent(u: Unit, lead: str = "") -> dict[str, frozenset[str]]:
     """The scope a whole unit is about (``scopes.referent``): its own words, the key cell of its row under the noun of its column, and what the
     line before its table, the lead of its block and the headings above it open. What the ledger compares a footnote's scope with."""
-    seg = _segments(u, lead)[0] if not _cited_cell_list(u) else _row_segment(u)
+    seg = _row_segment(u) if _cited_cell_list(u) else _plain_segment(u, lead)
     return scopes.referent(seg.text, seg.cells, seg.openings, seg.headings)
 
 
 def _row_segment(u: Unit) -> _Segment:
     """A table row as one claim (the cells that cite apart are ``_segments``'s): the row's words, its key cell under the noun of its column."""
-    heads, cells = meaning._row_cells(u.context.split("\n", 1)[0].strip()), meaning._row_cells(u.raw.strip())
-    label = scopes.keyed_label(heads[0], _IDS.sub("", cells[0]).strip()) if heads and cells and len(heads) == len(cells) else ""
-    table_lead = u.context.split("\n", 1)[1] if "\n" in u.context else ""
-    return _Segment(_IDS.sub("", u.text), u.ids, (label,), (table_lead,), (u.heading,), None)
+    row = _table_row(u.context, u.raw)
+    return _Segment(_IDS.sub("", u.text), u.ids, (_row_label(row),), (row.lead,), (u.heading,), None)
 
 
 def _segments(u: Unit, lead: str) -> list[_Segment]:
@@ -5993,9 +6039,14 @@ def _segments(u: Unit, lead: str) -> list[_Segment]:
     unit as one claim against its block's lead and the headings above it."""
     cells = _cited_cell_list(u)
     if cells:
-        table_lead = u.context.split("\n", 1)[1] if "\n" in u.context else ""
+        table_lead = table_context(u)[1]
         return [_Segment(cell.text, cell.ids, (head, label), (table_lead,), (u.heading,), i) for i, head, label, cell in cells]
-    return [_Segment(_IDS.sub("", u.text), u.ids, (), (lead,), (u.heading,), None)]
+    return [_plain_segment(u, lead)]
+
+
+def _plain_segment(u: Unit, lead: str) -> _Segment:
+    """A unit that is no table row (or whose cells do not cite apart) as one claim against its block's lead and the headings above it."""
+    return _Segment(_IDS.sub("", u.text), u.ids, (), (lead,), (u.heading,), None)
 
 
 @functools.lru_cache(maxsize=8192)
@@ -6007,7 +6058,7 @@ def _line_numbers(line: str) -> frozenset[str]:
 def _source_occurrences(sid: str, src: Source, numbers: set[str], ws: Workspace) -> list[scopes.Located]:
     """Where a source states one of the numbers, each with the scope it is written under (``scopes.occurrences``)."""
     parts, body = context_of_source(src)
-    return scopes.occurrences([(p.place, p.text) for p in parts], body, _ws_map(ws, "layouts").get(sid),
+    return scopes.occurrences([(p.place, p.text) for p in parts], body, ws.layouts.get(sid),
                               lambda line: bool(_line_numbers(line) & numbers))
 
 
@@ -6047,17 +6098,17 @@ def _note_reading(seg: _Segment, referent: Mapping, ws: Workspace) -> tuple[str 
     attribution (the reason); a note whose mark could not be bound is told to the judge (the fact), never attached to anything."""
     from app.chat import conditions  # conditions reads this module
 
-    layouts = _ws_map(ws, "layouts")
     for i in dict.fromkeys(seg.ids):
-        sid = ws.values[i].source_id if i in ws.values else i
-        for note in scopes.notes(layouts.get(sid)):
+        sid = evidence_source_id(ws, i)
+        layout = ws.layouts.get(sid)
+        for note in scopes.notes(layout):
             body = re.sub(r"^\s*\d{1,2}\)?\s*", "", note.text)
             if len(conditions.operand_of(body).groups) < NOTE_WORDS or not conditions.stated_in(body, seg.text):
                 continue
             claimed = scopes.describe(referent)
             if note.scope is None:
                 return None, MSG_NOTE_UNBOUND_FACT.format(ids=sid, mark=note.mark, claimed=claimed)
-            if scopes.note_conflicts(note, referent, scopes.item_of_referent(layouts.get(sid), referent)):
+            if scopes.note_conflicts(note, referent, scopes.item_of_referent(layout, referent)):
                 found = scopes.describe({k: v for k, v in note.scope.items() if k in referent}) or MSG_NOTE_OTHER_ITEM
                 return MSG_NOTE_ELSEWHERE.format(ids=sid, mark=note.mark, found=found, claimed=claimed), None
     return None, None
@@ -6090,10 +6141,10 @@ def _scope_segment(seg: _Segment, ws: Workspace) -> tuple[str | None, str | None
     found = scopes.describe({k: v for k, v in found_in.scope.items() if k in referent})
     ids = ", ".join(i for i, _ in other)
     if len(other) == len(read) and all(r.state == scopes.DIFFERENT for _, r in other):
-        return MSG_SCOPE_DIFFERENT.format(ids=ids, found=found, claimed=claimed), None
+        return MSG_SUBREFERENT_DIFFERENT.format(ids=ids, found=found, claimed=claimed), None
     if any(r.state == scopes.SAME for _, r in read):
-        return None, MSG_SCOPE_MIXED.format(ids=ids, found=found, claimed=claimed)
-    return None, MSG_SCOPE_UNKNOWN.format(ids=ids, found=found, claimed=claimed)
+        return None, MSG_SUBREFERENT_MIXED.format(ids=ids, found=found, claimed=claimed)
+    return None, MSG_SUBREFERENT_UNKNOWN.format(ids=ids, found=found, claimed=claimed)
 
 
 def _scope_check(u: Unit, ws: Workspace, lead: str = "") -> ScopeCheck:
@@ -6122,10 +6173,10 @@ def _scope_cells(report: VerifyReport, ws: Workspace, verdicts: dict[int, JudgeV
     (``row_cut_safe``), else removes the row; the reason of each failing claim is in ``reasons`` for its problem. Returns the failing claims' ids."""
     failed: set[str] = set()
     for u in report.units:
-        found = _ws_map(ws, "scope_findings").get(_fact_key(u))
+        found = ws.scope_findings.get(_fact_key(u))
         recs = report.claims.get(u.index)
         v = verdicts.get(u.index)
-        if not found or not recs or v is None or v.verdict not in ("supported", "partial") or u.table_span is None or u.table_header:
+        if not found or not recs or v is None or v.verdict not in STANDING_VERDICTS or u.table_span is None or u.table_header:
             continue
         bounds = cell_bounds(u.raw)
         if any(i >= len(bounds) for i in found):
@@ -7032,7 +7083,7 @@ class _Coverage:
                 why = None
             elif len(quote) < SUPPORT_QUOTE_MIN:
                 why = "too_short"
-            elif c.outcome == "other_item":
+            elif c.outcome == OTHER_ITEM:
                 mine = _span_flat(item["spans"])
                 others = [s for o in self.items if o["id"] != item["id"] for s in _span_flat(o["spans"])]
                 why = None if any(quote in s for s in others) and not any(quote in s for s in mine) else "not_in_other_span"
@@ -7121,7 +7172,7 @@ def _item_ledger_block(items: list[dict]) -> str:
                 if i.get(name) and not (name == "condition" and i["id"] in asked and i.get("origin") == ORIGIN_SOURCE):
                     attrs += f' {name}="{prompt_attr(i[name])}"'
             if i["id"] in asked:
-                hint = [h if h != "other_item" else "other_item:" + ",".join(i.get("foreign", ())) for h in i.get("hint", ())]
+                hint = [h if h != OTHER_ITEM else f"{OTHER_ITEM}:" + ",".join(i.get("foreign", ())) for h in i.get("hint", ())]
                 attrs += f' check="{i["check"]}" unit="{i["unit"]}"' + (f' hint="{prompt_attr(" ".join(hint))}"' if hint else "")
             if i["id"] in both and i.get("spans"):
                 attrs += f' span="{prompt_attr(" ; ".join(i["spans"])[:ITEM_SPAN_CHARS])}"'
@@ -7215,7 +7266,7 @@ def _unit_context(u: Unit) -> str:
     """What stands above a unit, for the judge (R7): the chain of headings above it, and for a table row the table's
     header row and the line before the table. Beside the unit, never in its text, so a span is judged on the text
     alone; empty (nothing rendered) for a unit with neither."""
-    header, _, intro = u.context.partition("\n")
+    header, intro = table_context(u)
     parts = [(tag, value.strip()) for tag, value in (("heading", u.heading), ("table_header", header),
                                                      ("table_intro", intro)) if value.strip()]
     if not parts:
@@ -7943,7 +7994,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     fetcher = meaning.Fetcher(ws)
     meanings = {u.index: check_meaning(u, ws, fetcher) for u in units}
     if getattr(reread, "preload", None) is not None:  # what the scope check reads above the cited sources (round 20 U3, KTD3)
-        reread.preload(dict.fromkeys(i for u in units for i in u.ids))
+        reread.preload(dict.fromkeys(i for u in units for i in u.ids), deadline)
     report.problems = deterministic(units, ws, question, meanings)
     found_in = _expand_unstated(report, units, meanings, ws, question, deadline, reread, fetcher) \
         if reread is not None else {}
@@ -8120,7 +8171,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
             # the value is shown wider than the scope its source states (round 17 U5, KTD5): the scope is written next to it, or
             # its limitation is — the sentence is never removed for it (R10), and no repair round is spent
             scoped = False
-            if v.defect == "scope" and v.verdict in ("supported", "partial"):
+            if v.defect == "scope" and v.verdict in STANDING_VERDICTS:
                 scoped, problem = scope_outcome(u, v.scope, ws)
                 if problem is not None:
                     report.problems.append(problem)
@@ -8172,7 +8223,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                                         for s in cite_ids]
         for p in report.problems:  # a cell under another scope is a defect a repair can remove (the cell is cut only if the agent does not)
             if p.claim_id in scoped_cells:
-                p.check = SCOPE_CHECK_NAME
+                p.check = SUBREFERENT_CHECK
                 if p.defect in (None, "none"):
                     p.defect = "part"
         if coverage is not None:
@@ -8265,6 +8316,14 @@ def _leaves_words(u: Unit, groups: list[CutGroup]) -> bool:
 _CONNECTOR_WORDS = frozenset("של כי אשר".split())
 
 
+def _apply_cut(report: VerifyReport, idx: int, groups: list[CutGroup], failing: Iterable[ClaimRecord]) -> None:
+    """Record the cut of unit ``idx``: its cut groups in ``report.cuts`` and the action ``cut`` of the failing claims whose spans they replace
+    by a marker (the edit ladder's ``plan_edits`` and the final check's cell cuts both make a cut this way)."""
+    report.cuts[idx] = groups
+    for r in failing:
+        r.action = "cut"
+
+
 def _cut_groups(u: Unit, recs: list[ClaimRecord]) -> list[CutGroup] | None:
     """The cuts that remove every failing claim of the unit and nothing else, or None when one cannot be made: the
     unit keeps no supported claim, a claim has no exact span, or a standing claim overlaps a failing claim's span or
@@ -8333,8 +8392,8 @@ def row_cut_safe(u: Unit, recs: list[ClaimRecord], defect: str | None = None) ->
     if u.table_span is None or u.table_header:
         return True
     bounds = cell_bounds(u.raw)
-    heads = u.context.split("\n", 1)[0].strip()
-    if heads.startswith("|") and len(meaning._row_cells(heads)) != len(bounds):
+    heads = table_context(u)[0].strip()
+    if heads.startswith("|") and len(scopes.row_cells(heads)) != len(bounds):
         return False
     if defect not in CELL_DEFECTS or any(r.whole_unit or r.fallback or not r.exact for r in recs):
         return False
@@ -8383,11 +8442,9 @@ def plan_edits(report: VerifyReport) -> None:
                                            resolution="cut"))
             continue
         if groups is not None:
-            report.cuts[idx] = groups
+            _apply_cut(report, idx, groups, failing.values())
             for p in mine:
                 p.resolution = "cut"
-            for r in failing.values():
-                r.action = "cut"
             continue
         for p in mine:  # nothing of the unit can stay: it is removed whole, after the rewrite round
             rec = failing[p.claim_id]

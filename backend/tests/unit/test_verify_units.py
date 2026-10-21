@@ -2171,7 +2171,7 @@ def test_ae6_the_cell_of_another_plan_is_cut_to_the_marker_and_the_rest_of_the_r
     text = r.edit(a).doc.text
     assert "| שטח עיקרי | «[1: חלק שלא אומת הושמט]» [S1] | 1,800 [S1] |" in text  # plan A's cell is cut, plan B's own cell stays
     assert "| שטח שירות | 300 [S1] | 450 [S1] |" in text and text.count("חלק שלא אומת") == 1
-    (problem,) = [p for p in r.problems if p.check == verify.SCOPE_CHECK_NAME]
+    (problem,) = [p for p in r.problems if p.check == verify.SUBREFERENT_CHECK]
     assert problem.failure_kind == "wrong_subject" and problem.resolution == "cut" and problem.defect == "part"
 
 
@@ -2179,7 +2179,7 @@ def test_protection_a_cited_cell_naming_another_plan_is_still_removed_when_it_is
     ws = _scope_ws(PLANS_TABLE)
     a = _answer(PLANS_HEAD + "| שטח שירות | 450 [S1] | — |")
     r = verify_answer(_judge(lambda t: "supported"), a, ws, "?", [])
-    assert 2 in r.removed_units() or any(p.removes_unit and p.check == verify.SCOPE_CHECK_NAME for p in r.problems)
+    assert 2 in r.removed_units() or any(p.removes_unit and p.check == verify.SUBREFERENT_CHECK for p in r.problems)
     assert "450" not in r.apply(a).answer_markdown
 
 
@@ -2187,7 +2187,7 @@ def test_protection_a_row_whose_key_cell_names_the_wrong_parcel_is_removed_whole
     ws = _scope_ws("חלקה 12 — שווי 3,100,000 ₪.\nחלקה 14 — שווי 4,200,000 ₪.", kind="context")
     a = _answer("| נושא | שווי |\n|---|---|\n| שווי חלקה 12: 4,200,000 [S1] | 3,100,000 [S1] |")
     r = verify_answer(_judge(lambda t: "supported"), a, ws, "?", [])
-    assert any(p.removes_unit and p.check == verify.SCOPE_CHECK_NAME for p in r.problems) and not r.cuts  # the other cell would describe the wrong thing
+    assert any(p.removes_unit and p.check == verify.SUBREFERENT_CHECK for p in r.problems) and not r.cuts  # the other cell would describe the wrong thing
     assert "4,200,000" not in r.apply(a).answer_markdown and "3,100,000" not in r.apply(a).answer_markdown
 
 
@@ -2219,7 +2219,7 @@ def test_the_parcel_the_bullets_lead_names_is_the_referent_of_the_sentence_after
     units = split_units(md)
     problems = verify.deterministic(units, ws, "?")
     (p,) = problems
-    assert p.check == verify.SCOPE_CHECK_NAME and p.failure_kind == "wrong_subject" and p.unit.text.startswith("השיעור") and p.removes_unit
+    assert p.check == verify.SUBREFERENT_CHECK and p.failure_kind == "wrong_subject" and p.unit.text.startswith("השיעור") and p.removes_unit
     right = verify.deterministic(split_units("- חלקה 57: מבנה פינתי. השיעור הוא 4.15% [S1]."), ws, "?")
     assert right == []
 
@@ -2259,6 +2259,26 @@ def test_the_scope_a_fetcher_preloaded_above_a_table_is_its_scope_and_the_claims
     assert verify._scope_check(own, ws).reason is None
     del ws.layouts["S1"]  # without the blocks above it the source states no scope: nothing is decided
     assert verify._scope_check(claim, ws).reason is None
+
+
+def test_a_row_with_an_empty_edge_cell_has_one_cell_index_in_the_scope_reader_and_in_the_verifiers_cell_list():
+    from app.chat import meaning
+
+    # the rendered text of a table joins its cells with " | ": an empty first cell leaves " | x | y", with no outer bar to drop
+    line = " | 450 | 1,800"
+    assert scopes.row_cells(line) == meaning._row_cells(line) == ["", "450", "1,800"]
+    assert scopes.row_cells("שטח | 450 | ") == meaning._row_cells("שטח | 450 | ") == ["שטח", "450", ""]
+    assert scopes.row_cells("| a | b |") == ["a", "b"]
+    # the scope reader gives each cell the plan of its own column (the empty key cell is the column of the row's label, no plan)
+    body = ["רכיב | תכנית ג/11111 | תכנית ג/22222", line]
+    found = scopes.occurrences([], body, None, lambda cell: bool(re.search(r"\d", cell)))
+    assert [(o.line, sorted(o.scope["plan"])) for o in found] == [(line, ["11111"]), (line, ["22222"])]
+    # the verifier's cell list names the same two cells of the same row
+    row = _row(PLANS_HEAD + "|  | 1,800 [S1] | 1,800 [S1] |", "1,800")
+    assert [i for i, *_ in verify._cited_cell_list(row)] == [1, 2]
+    # and the cell of the wrong plan, found by that index, is the first one: 1,800 is plan 22222's figure
+    ws = _scope_ws("טבלה 3.1 — זכויות הבנייה לפי תכנית\nהטבלה: 2 שורות\nרכיב | תכנית ג/11111 | תכנית ג/22222\nמסחר | 450 | 1,800")
+    assert list(verify._scope_check(row, ws).cells) == [1]
 
 
 FOOTNOTE_LAYOUT = scopes.Layout((

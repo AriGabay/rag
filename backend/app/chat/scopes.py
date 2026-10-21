@@ -37,6 +37,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
+from typing import NamedTuple
 
 SAME, DIFFERENT, UNKNOWN = "same", "different", "unknown"
 PLAN, PARCEL, LOT, GROUP, CONTRACT, ALTERNATIVE, STAGE, STATE = (
@@ -386,9 +387,17 @@ def cell_marks(cell: str) -> frozenset[str]:
     return frozenset(_mark_key(m.group("m")) for p in (_CELL_MARK_END, _CELL_MARK_START) if (m := p.search(flat)))
 
 
-def row_cells(row: str) -> list[str]:
-    """The cells of a table row as the source writes it (``a | b | c``), the outer bars left out."""
-    return [c.strip() for c in row.strip().strip("|").split("|")]
+def row_cells(line: str) -> list[str]:
+    """The cells of a table row line, the one reading every cell index of a row comes from (the scope reader's, the verifier's cell list and
+    ``meaning``'s). A markdown row ("| a | b |") has its outer pipes as delimiters, at the line's edge; a row as the table text renders it
+    (cells joined by " | ") has none, so an empty first or last cell leaves a pipe with a space before it or after it (" | x | ") and stays a
+    cell - dropping it shifts every later cell one column left."""
+    raw = line.rstrip() if line.startswith("|") else line
+    if raw.startswith("|"):
+        raw = raw[1:]
+    if raw.endswith("|"):
+        raw = raw[:-1]
+    return [c.strip() for c in raw.split("|")]
 
 
 def note_rows(mark: str, header: Sequence[str], rows: Sequence[str]) -> frozenset[int] | None:
@@ -463,14 +472,12 @@ def bind_geometry(layout: Layout) -> dict[int, int]:
     """The note blocks of a layout and the block each belongs to: a block that opens with a small digit is bound to the nearest EARLIER block
     of its page that writes the same small digit after a word. A note with no such block is absent from the result."""
     bound: dict[int, int] = {}
-    pieces = layout.pieces
-    for at, piece in enumerate(pieces):
-        if not piece.note:
-            continue
-        for earlier in reversed(pieces[:at]):
-            if earlier.page == piece.page and piece.note in earlier.small:
-                bound[piece.index] = earlier.index
-                break
+    latest: dict[tuple[int | None, str], int] = {}  # (page, small digit) -> the nearest block so far that writes it after a word
+    for piece in layout.pieces:
+        if piece.note and (earlier := latest.get((piece.page, piece.note))) is not None:
+            bound[piece.index] = earlier
+        for mark in piece.small:
+            latest[(piece.page, mark)] = piece.index
     return bound
 
 
@@ -481,12 +488,23 @@ def merge(base: Mapping[str, frozenset[str]], found: Mapping[str, frozenset[str]
     return {**base, **found}
 
 
+def _related_sections(a: tuple[str, ...], b: tuple[str, ...]) -> bool:
+    """Whether two section paths are one section or one is inside the other: the blocks of related sections share their scopes."""
+    return a == b or a[:len(b)] == b or b[:len(a)] == a
+
+
+def _own_first(layout: Layout) -> list[Piece]:
+    """The pieces of a layout, the source's own blocks first in reading order, then the blocks above it nearest first."""
+    first = layout.first if layout.first is not None else 0
+    return sorted(layout.pieces, key=lambda p: (p.index < first, -p.index if p.index < first else p.index))
+
+
 def _openers(pieces: Sequence[Piece], section: tuple[str, ...]) -> dict[str, frozenset[str]]:
     """The scope the ``pieces`` (in reading order) set by their openers, inside ``section``: a heading that changes the section path ends every
     scope above it; a table, a picture and a note open nothing."""
     out: dict[str, frozenset[str]] = {}
     for piece in pieces:
-        if piece.section != section and piece.section[:len(section)] != section and section[:len(piece.section)] != piece.section:
+        if not _related_sections(piece.section, section):
             out = {}
             continue
         if piece.kind in ("table", "image") or piece.note:
@@ -526,8 +544,7 @@ def item_at(layout: Layout | None, index: int) -> int | None:
     if here is None:
         return None
     for piece in reversed([p for p in layout.pieces if p.index <= index][-LOOKBACK:]):
-        if piece.section != here.section and piece.section[:len(here.section)] != here.section \
-                and here.section[:len(piece.section)] != piece.section:
+        if not _related_sections(piece.section, here.section):
             return None
         if piece.kind in ("table", "image") or piece.note:
             continue
@@ -542,8 +559,7 @@ def item_of_text(layout: Layout | None, text: str) -> int | None:
     if layout is None or not text.strip():
         return None
     flat = _SPACE.sub(" ", _clean(text)).strip()
-    first = layout.first if layout.first is not None else 0
-    for piece in sorted(layout.pieces, key=lambda p: (p.index < first, -p.index if p.index < first else p.index)):
+    for piece in _own_first(layout):
         if flat and flat in _SPACE.sub(" ", _clean(piece.text)):
             return item_at(layout, piece.index)
     return None
@@ -554,8 +570,7 @@ def item_of_referent(layout: Layout | None, referent: Mapping[str, frozenset[str
     first, whose opener shares an identifier of a kind the referent names. None when no opener does."""
     if layout is None or not referent:
         return None
-    first = layout.first if layout.first is not None else 0
-    for piece in sorted(layout.pieces, key=lambda p: (p.index < first, -p.index if p.index < first else p.index)):
+    for piece in _own_first(layout):
         if piece.kind in ("table", "image") or piece.note:
             continue
         for line in piece.text.splitlines():
@@ -584,10 +599,16 @@ def notes(layout: Layout | None) -> list[NoteInfo]:
     """The footnote blocks inside a source (from its first block on) with the scope of the block each belongs to (``bind_geometry``)."""
     if layout is None or layout.first is None:
         return []
+    return list(_notes(layout))
+
+
+@lru_cache(maxsize=256)
+def _notes(layout: Layout) -> tuple[NoteInfo, ...]:
+    """``notes`` of a layout, kept per layout: every claim and item of a turn reads the notes of the same few sources."""
     bound = bind_geometry(layout)
-    return [NoteInfo(p.index, p.note, bound.get(p.index), scope_through(layout, bound[p.index]) if p.index in bound else None, p.text,
-                     item_at(layout, bound[p.index]) if p.index in bound else None)
-            for p in layout.pieces if p.note and p.index >= layout.first]
+    return tuple(NoteInfo(p.index, p.note, bound.get(p.index), scope_through(layout, bound[p.index]) if p.index in bound else None, p.text,
+                          item_at(layout, bound[p.index]) if p.index in bound else None)
+                 for p in layout.pieces if p.note and p.index >= (layout.first or 0))
 
 
 def note_conflicts(note: NoteInfo, scope: Mapping[str, frozenset[str]], item: int | None = None) -> bool:
@@ -646,13 +667,42 @@ def _hear(heard: dict[str, frozenset[str]], ids: Mapping[str, frozenset[str]]) -
     return heard
 
 
+class _Spot(NamedTuple):
+    """A place of a source where a datum may stand, before a claim asks for it: the ``text`` a claim's datum is looked for in (a cell, a
+    sentence), the ``scope`` in force there, the ``line`` it is in, and ``base`` and ``heard`` as ``Located`` holds them."""
+
+    text: str
+    scope: Mapping[str, frozenset[str]]
+    line: str
+    base: frozenset[str]
+    heard: Mapping[str, frozenset[str]]
+
+
 def occurrences(parts: Sequence[tuple[str, str]], body: Sequence[str], layout: Layout | None,
                 holds: Callable[[str], bool]) -> list[Located]:
     """Every occurrence of the claim's datum in a cited source, each with the scope it is written under. ``parts``: the context parts above
     the source's rows or text, ``(place, text)`` in reading order (``heading``, ``caption``, ``before``); ``body``: its lines (the rows of a
     table, the lines of a passage); ``layout``: the blocks above it, when the fetcher preloaded them; ``holds``: whether a line or a cell states
     the datum. A table row is read cell by cell: the header of the cell's column and the label of its row set the scope of that cell,
-    over what the openers above it set; a line of a passage is under the last opener before it."""
+    over what the openers above it set; a line of a passage is under the last opener before it. The places of a source are read once
+    (``_spots``) whatever the number of claims that look for a datum in it."""
+    return [_located(s) for s in _spots(tuple((place, text) for place, text in parts), tuple(body), layout) if holds(s.text)]
+
+
+def first_occurrence(parts: Sequence[tuple[str, str]], body: Sequence[str], layout: Layout | None,
+                     holds: Callable[[str], bool]) -> Located | None:
+    """The first of ``occurrences``, read without the others; None when there is none."""
+    spot = next((s for s in _spots(tuple((place, text) for place, text in parts), tuple(body), layout) if holds(s.text)), None)
+    return _located(spot) if spot is not None else None
+
+
+def _located(spot: _Spot) -> Located:
+    return Located(spot.scope, spot.line, spot.base, spot.heard, line_ids(spot.text))
+
+
+@lru_cache(maxsize=256)
+def _spots(parts: tuple[tuple[str, str], ...], body: tuple[str, ...], layout: Layout | None) -> tuple[_Spot, ...]:
+    """The places of a source where a datum may stand, each with the scope it is written under (``occurrences``), in reading order."""
     scope = inherited(layout)
     own: set[str] = set()  # the kinds the source's own text names
     heard: dict[str, frozenset[str]] = {}
@@ -664,29 +714,24 @@ def occurrences(parts: Sequence[tuple[str, str]], body: Sequence[str], layout: L
                 scope, own = merge(scope, found), own | set(found)
     header = header_of(body)
     column_scope = [by_kind(cell_scope(c)) for c in header]
-    out: list[Located] = []
+    out: list[_Spot] = []
     for line in body:
-        named = line_ids(line)
-        heard = _hear(heard, named)
+        heard = _hear(heard, line_ids(line))
         if "|" in line:
             cells = row_cells(line)
             if cells == header:
                 continue
             label = by_kind(cell_scope(keyed_label(header[0], cells[0]) if header else cells[0])) if cells else {}
             for i, cell in enumerate(cells):
-                if not holds(cell):
-                    continue
                 column = column_scope[i] if i < len(column_scope) else {}
                 here = merge(merge(scope, label), column)
-                out.append(Located(here, line, frozenset(k for k in here if k not in own and k not in label and k not in column), heard,
-                                   line_ids(cell)))
+                out.append(_Spot(cell, here, line, frozenset(k for k in here if k not in own and k not in label and k not in column), heard))
             continue
         for sentence in sentences(line):
             found = by_kind(opener(sentence))
             scope, own = merge(scope, found), own | set(found)
-            if holds(sentence):
-                out.append(Located(scope, sentence, frozenset(k for k in scope if k not in own), heard, line_ids(sentence)))
-    return out
+            out.append(_Spot(sentence, scope, sentence, frozenset(k for k in scope if k not in own), heard))
+    return tuple(out)
 
 
 @dataclass

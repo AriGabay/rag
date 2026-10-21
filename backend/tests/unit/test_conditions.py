@@ -162,10 +162,11 @@ def test_the_clause_another_items_span_holds_and_the_sentence_states_is_the_quot
     other = _state(id="I2", condition_spans=[{"place": "note", "text": "חל עד שנה מהמסירה"}])
     unit = verify.Unit(0, "השכירות לדירה גדולה היא 5,000 עד שנה מהמסירה [S2].", "השכירות לדירה גדולה היא 5,000 עד שנה מהמסירה", ["S2"])
     mine = _state(quote="דירה גדולה | 5,000", condition_foreign=["I2"])
-    assert verify._foreign_quote(mine, [mine, other], unit) == "חל עד שנה מהמסירה"
-    assert verify._foreign_quote(_state(quote="דירה גדולה | 5,000"), [mine, other], unit) == ""  # the ledger named no other item
+    by_id = {st["id"]: st for st in (mine, other)}
+    assert verify._foreign_quote(mine, by_id, unit) == "חל עד שנה מהמסירה"
+    assert verify._foreign_quote(_state(quote="דירה גדולה | 5,000"), by_id, unit) == ""  # the ledger named no other item
     quiet = verify.Unit(0, "השכירות לדירה גדולה היא 5,000 [S2].", "השכירות לדירה גדולה היא 5,000", ["S2"])
-    assert verify._foreign_quote(mine, [mine, other], quiet) == ""  # a sentence that does not state the clause holds nothing of it
+    assert verify._foreign_quote(mine, by_id, quiet) == ""  # a sentence that does not state the clause holds nothing of it
 
 
 def test_another_sentence_states_the_condition_only_when_it_cites_the_items_source_and_keeps_every_span():

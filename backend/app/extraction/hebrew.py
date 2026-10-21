@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Iterable
 
 QUALITY_THRESHOLD = 0.8
 
@@ -42,6 +43,15 @@ _PAIRS = (("(", ")"), ("[", "]"), ("{", "}"))
 
 def has_hebrew(text: str) -> bool:
     return bool(_HEB_LETTER.search(text))
+
+
+def has_latin(text: str) -> bool:
+    return bool(_LATIN.search(text))
+
+
+def page_has_hebrew(lines: Iterable[str]) -> bool:
+    """Whether any line of a page holds a Hebrew letter: the page has a right-to-left paragraph at all."""
+    return any(has_hebrew(line) for line in lines)
 
 
 def strip_bidi_controls(text: str) -> str:
@@ -154,7 +164,7 @@ def fix_text_lines(lines: list[str], default_visual: bool | None = None) -> list
     page = page_is_visual(lines) if default_visual is None else default_visual
     # A page with no Hebrew letter has no right-to-left paragraph for a digits-only line to follow, whatever the
     # document's default orientation is: the line keeps the order its words are stored in (round 20, KTD4).
-    page_hebrew = any(has_hebrew(line) for line in lines)
+    page_hebrew = page_has_hebrew(lines)
     out = []
     for line in lines:
         if not has_hebrew(line):

@@ -102,7 +102,7 @@ from typing import NamedTuple
 from app.answering.numread import number_forms, number_spans
 from app.answering.verify import _QUANTITY_AFTER, not_an_amount, numbers_in
 from app.chat import conditions, scopes
-from app.chat.evidence import claim_terms
+from app.chat.evidence import OTHER_ITEM, claim_terms
 from app.chat.meaning import _row_cells
 from app.chat.verify import (
     ITEM_COVERED,
@@ -126,6 +126,7 @@ from app.chat.verify import (
     evidence_key,
     is_server_item,
     request_word_forms,
+    shared_request_words,
     shares_request_word,
     unit_referent,
 )
@@ -457,10 +458,17 @@ def _note_of_row(note: str, body: Sequence[str], row: str | None) -> bool:
     mark = scopes.note_mark(note)
     if not mark or row is None or "|" not in row:
         return True
-    header = scopes.header_of(body)
-    rows = [ln for ln in body if "|" in ln and scopes.row_cells(ln) != header]
-    held = scopes.note_rows(mark, header, rows)
+    rows, held = _rows_marked(tuple(body), mark)
     return held is None or row in {rows[i] for i in held}
+
+
+@functools.lru_cache(maxsize=256)
+def _rows_marked(body: tuple[str, ...], mark: str) -> tuple[tuple[str, ...], frozenset[int] | None]:
+    """The body rows of a table text (all but its header) and the indexes of those a note with ``mark`` belongs to (``scopes.note_rows``),
+    kept per text and mark: every note, row and item of a turn asks the same few tables."""
+    header = scopes.header_of(body)
+    rows = tuple(ln for ln in body if "|" in ln and scopes.row_cells(ln) != header)
+    return rows, scopes.note_rows(mark, header, rows)
 
 
 def _own_context(src, quote: str) -> str:
@@ -485,9 +493,9 @@ def _scope_of_quote(ws, sid: str, src, quote: str) -> dict:
     the source has no scope or the quote is not found."""
     parts, body = context_of_source(src)
     flat = SupportScope.flat(quote)
-    found = scopes.occurrences([(p.place, p.text) for p in parts], body, (getattr(ws, "layouts", None) or {}).get(sid),
-                               lambda line: flat in _flat_span(line) or _flat_span(line) in flat)
-    return dict(found[0].scope) if found else {}
+    found = scopes.first_occurrence([(p.place, p.text) for p in parts], body, ws.layouts.get(sid),
+                                    lambda line: flat in _flat_span(line) or _flat_span(line) in flat)
+    return dict(found.scope) if found is not None else {}
 
 
 def _note_of_another_scope(ws, sid: str, src, text: str, quote: str, *, condition: bool = False,
@@ -497,15 +505,19 @@ def _note_of_another_scope(ws, sid: str, src, text: str, quote: str, *, conditio
     other identifiers (another contract, lot group or plan) than the quote stands under; otherwise ``text`` is a sentence of the source,
     and the note it belongs to is bound to another scope than ``against`` (what the answer sentence that cites it is about). A note whose
     mark could not be bound conflicts with nothing: it keeps its own server item and is never another item's condition."""
-    layout = (getattr(ws, "layouts", None) or {}).get(sid)
+    layout = ws.layouts.get(sid)
     found = scopes.notes(layout)
     if not found:
         return False
     flat = SupportScope.flat(text)
-    mine = item = None
+    mine = item = own = None
     for note in found:
         if condition:
-            if not conditions.stated_in(text, note.text) or conditions.stated_in(text, _own_context(src, quote)):
+            if not conditions.stated_in(text, note.text):
+                continue
+            if own is None:
+                own = _own_context(src, quote)  # the item's own context, read once for all the notes
+            if conditions.stated_in(text, own):
                 continue
         elif flat not in _flat_span(note.text):
             continue
@@ -626,7 +638,9 @@ def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledge
         wanted = numbers_in(_outside_dates(unit.text))
         if not wanted:
             continue
-        for sid, src in _cited_sources(unit, ws):
+        sources = _cited_sources(unit, ws)
+        referent = unit_referent(unit) if sources else {}  # what the unit is about, read once for all the spans it is compared with
+        for sid, src in sources:
             made = 0
             if sid not in indexes:
                 indexes[sid] = _span_index(src)
@@ -636,11 +650,10 @@ def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledge
                 # a fill of ANOTHER component on the span holds nothing for this one: the span serves each component (round 19 U3)
                 # (a footnote of another contract, lot group or plan, or one whose mark is not found, is nobody's condition here: round 20 U3)
                 if (made >= ROWS_PER_UNIT or scope.source_problem(sid, flat) or scope.place_problem(src)
-                        or any(_holds(i, sid, ws, flat, component) for i in [*held, *built])
-                        or _note_of_another_scope(ws, sid, src, quote, quote, against=unit_referent(unit))):
+                        or any(_holds(i, sid, ws, flat, component) for i in [*held, *built])):
                     continue
                 spans = condition_spans(src, quote)
-                if not spans:
+                if not spans or _note_of_another_scope(ws, sid, src, quote, quote, against=referent):
                     continue
                 made += 1
                 document_id, unit_id = _site_of(src)
@@ -728,7 +741,7 @@ def _row_value(cells: Sequence[str], header: Sequence[str], known: Collection[st
     aligned = len(header) == len(cells)
     values = [(i, c) for i, c in enumerate(cells) if i and re.search(r"\d", c)]
     if aligned and known:
-        shared = [(_shared_words(header[i], known), c) for i, c in values if not _IDENTIFIER_HEADER.search(header[i]) and _first_value(c)]
+        shared = [(shared_request_words(header[i], known), c) for i, c in values if not _IDENTIFIER_HEADER.search(header[i]) and _first_value(c)]
         best = max((n for n, _ in shared), default=0)
         if best and sum(1 for n, _ in shared if n == best) == 1:  # one column names the request most; a tie decides nothing
             return next(c for n, c in shared if n == best)
@@ -736,13 +749,6 @@ def _row_value(cells: Sequence[str], header: Sequence[str], known: Collection[st
         if not (aligned and _IDENTIFIER_HEADER.search(header[i])) and _first_value(cell):
             return cell
     return values[0][1] if values else ""
-
-
-def _shared_words(text: str, known: Collection[str]) -> int:
-    """How many distinct content words of ``text`` have a comparable form among the request words ``known``."""
-    from app.chat.verify import _loose_forms, _missing_words
-
-    return len({w for w in _missing_words(text) if not w[0].isdigit() and not _loose_forms(w).isdisjoint(known)})
 
 
 def _level_cells(line: str, header: Sequence[str]) -> list[str]:
@@ -1810,7 +1816,7 @@ def _condition_check(item: Item, got: Coverage | None, spans: dict, gave: dict, 
         hints = ["contradicted"] if conditions.HINT in results else []
         foreign = _foreign_items(item, unit, spans, gave, owns, others)
         if foreign:
-            hints.append("other_item")
+            hints.append(OTHER_ITEM)
         check = (conditions.HINT if hints else "" if not mine else
                  conditions.UNDECIDED if conditions.UNDECIDED in results else
                  conditions.MISSING if conditions.MISSING in results else conditions.KEPT)

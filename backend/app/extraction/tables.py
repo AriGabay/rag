@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass
 
 from app.extraction.base import TableResult, TableRow
-from app.extraction.hebrew import fix_line, has_hebrew
+from app.extraction.hebrew import fix_line, has_hebrew, has_latin
 
 HEADER_VOCAB = (
     "כתובת", "גוש", "חלקה", "תאריך", "שטח", "מחיר", "סוג", "חדרים", "קומה", "רחוב", "עסקה", "שווי", "יחידה",
@@ -32,7 +32,6 @@ _LETTERS = re.compile(r"[^\u05D0-\u05EA₪]")
 _UNIT = re.compile(r"\(([^()]+)\)")
 _SPACE = re.compile(r"\s+")
 _DIGIT = re.compile(r"\d")
-_LATIN = re.compile(r"[A-Za-z]")
 # A header cell that is only a year or a quarter ("2022", "Q3 2022", "3Q22"): its period, as (year, quarter).
 _YEAR_CELL = re.compile(r"((?:19|20)\d{2})")
 _QUARTER_CELL = re.compile(r"(?:Q([1-4])[ /\-]*((?:19|20)?\d{2})|((?:19|20)?\d{2})[ /\-]*Q([1-4])|([1-4])Q[ /\-]*((?:19|20)?\d{2}))", re.I)
@@ -96,7 +95,7 @@ def reads_left_to_right(grid: list[list[str | None]], page_has_hebrew: bool) -> 
     if page_has_hebrew or any(has_hebrew(c or "") for row in grid for c in row):
         return False
     first = next((row for row in grid if any(clean_cell(c) for c in row)), [])
-    if any(_LATIN.search(c or "") for c in first):
+    if any(has_latin(c or "") for c in first):
         return True
     for row in grid:
         periods = [p for p in map(_period, row) if p is not None]

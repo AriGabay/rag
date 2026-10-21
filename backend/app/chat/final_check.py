@@ -63,6 +63,7 @@ from app.chat.verify import (
     FAILING_VERDICTS,
     GONE_ACTIONS,
     NOT_CLASSIFIED,
+    STANDING_VERDICTS,
     CutGroup,
     JudgeRequirement,
     JudgeVerdict,
@@ -71,6 +72,8 @@ from app.chat.verify import (
     Unit,
     VerificationUnavailable,
     VerifyReport,
+    _apply_cut,
+    _claim_cells,
     _Coverage,
     _cut_groups,
     _Evidence,
@@ -223,6 +226,7 @@ class _Final:
         self.drafts = {d.index: d for d in report.units}
         self.draft_starts = [d.start for d in report.units]
         self._evidence: _Evidence | None = None
+        self._voters: set[int] | None = None  # ``voters`` of the check in progress: the votes do not change until it rescores
 
     # --- composing and splitting ------------------------------------------------------------------------------------
 
@@ -312,17 +316,21 @@ class _Final:
         """The model's units of ``comp`` against what is known: a unit whose key has a verdict passes; the rest are judged
         in one call (``may_judge``), or, without it, fail as not checked (the withholding of the last step)."""
         res = Checked()
+        self._voters = None
         units = [f for f in self.split(comp) if f.model]
         self.stats["units"] = len(units)
         stale = self.stale_units() if may_judge else set()  # without a call, the draft's verdicts stand
         todo = [f for f in units if not f.protected and not f.exempt and (f.key not in self.passed
                                                                            or set(f.drafts) & stale)]
         self.stats["reused"] += len(units) - len(todo)
-        for f in [f for f in todo if f.key not in self.passed and self.cell_cut_stands(f, may_judge)]:
+        stands = [f for f in todo if f.key not in self.passed and self.cell_cut_stands(f, may_judge)]
+        for f in stands:
             # a row this check cut cell by cell, as it was judged without the cells that failed: nothing new to judge (R8)
             self.passed.add(f.key)
             self.stats["unjudged_kept"] += 1
-            todo.remove(f)
+        if stands:
+            gone = {id(f) for f in stands}
+            todo = [f for f in todo if id(f) not in gone]
         if not todo:
             return res
         if not may_judge:
@@ -462,8 +470,11 @@ class _Final:
         return todo + more
 
     def voters(self) -> set[int]:
-        return {i for votes in self.report.requirement_votes.values() for v in votes
-                if v.status in ("full", "partial") for i in v.units}
+        """The draft units that voted for a component (a full or partial vote), as of the check in progress."""
+        if self._voters is None:
+            self._voters = {i for votes in self.report.requirement_votes.values() for v in votes
+                            if v.status in ("full", "partial") for i in v.units}
+        return self._voters
 
     def batch(self, todo: list[FinalUnit]) -> tuple[list[Unit], dict[int, FinalUnit], _Coverage | None]:
         """The units of one judge call, each under the index of the draft unit it comes from (a requirement vote names
@@ -506,6 +517,7 @@ class _Final:
                 votes[rid] = [v for v in old if not (set(v.units) | set(v.absent)) & judged] + [
                     v for v in mapped if v.id == rid]
         self.report.settle_parameters(self.ws)
+        self._voters = None
         return before != {rid: [v.model_dump_json() for v in new] for rid, new in votes.items()}
 
     def decide(self, f: FinalUnit, v: JudgeVerdict, res: Checked) -> None:
@@ -527,7 +539,7 @@ class _Final:
             return
         claims = unit_claims(u, v, self.ws)
         failing = [c for c in claims if not c.whole_unit and c.verdict in ("unsupported", "contradicts", "partial")]
-        if v.defect == "scope" and v.verdict in ("supported", "partial") and not failing and self.scope(f, v, res):
+        if v.defect == "scope" and v.verdict in STANDING_VERDICTS and not failing and self.scope(f, v, res):
             return
         if v.verdict == "partial" and (failing or v.defect != "none") and not self.attribute_only(f, v, failing) or (
                 v.verdict == "supported" and any(c.verdict in ("unsupported", "contradicts") for c in claims)):
@@ -585,15 +597,15 @@ class _Final:
         bounds = cell_bounds(d.raw)
         for r in recs:
             r.post_check, r.citation = r.verdict, "cited" if d.ids else "not_needed"
-            r.action = "cut" if r in failing else "qualified" if r in partial else "kept"
+            r.action = "qualified" if r in partial else "kept"  # the failing claims' action is the cut's (``_apply_cut``)
         old = {r.id for r in report.claims.get(d.index, [])}
         report.claims[d.index] = recs
-        primary = next((r.id for r in recs if r.verdict in FAILING_VERDICTS), recs[0].id)
+        primary = _primary_claim_id(report, d.index)
         for p in report.problems:  # a problem of the draft names a record of it that the cells replace
             if p.unit.index == d.index and p.claim_id in old:
                 p.claim_id = primary
         if groups:
-            report.cuts[d.index] = groups
+            _apply_cut(report, d.index, groups, failing)
             for r in failing:
                 report.problems.append(Problem(d, FINAL_UNSUPPORTED.format(reason=v.reason), "partial", failure_kind=r.failure_kind(),
                                                check="final", claim_id=r.id, resolution="cut"))
@@ -601,7 +613,7 @@ class _Final:
             self.stats["cell_cuts"] += len(failing)
         if partial:
             r = partial[0]
-            cell = next(i for i, (a, b) in enumerate(bounds) if a < r.end - d.start and r.start - d.start < b)
+            cell = min(_claim_cells(d, r, bounds))
             end = d.start + bounds[cell][0] + len(d.raw[bounds[cell][0]:bounds[cell][1]].rstrip())
             self.stats["cell_marks"] += self.mark(Problem(d, FINAL_PARTIAL, "partial", defect="none", check="final",
                                                           claim_id=r.id, cell_end=end), keep_claim=True)

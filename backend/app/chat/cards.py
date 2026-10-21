@@ -334,7 +334,7 @@ def opening_rows(conn: Connection, version_id: UUID | str, unit: unit_store.Unit
         " AND status NOT IN :skip AND btrim(text) <> '' ORDER BY block_index LIMIT :n").bindparams(
             bindparam("skip", expanding=True)),
         {"v": UUID(str(version_id)), "a": unit.block_first, "b": unit.block_last, "n": READ_ROWS,
-         "skip": list(contexts._SKIP_STATUS)}).all()
+         "skip": list(contexts.SKIP_STATUS)}).all()
 
 
 def opening_of(conn: Connection, version_id: UUID | str, unit: unit_store.Unit) -> list:
