@@ -611,8 +611,7 @@ class _Final:
                                                check="final", claim_id=r.id, resolution="cut"))
             self.cell_cuts[d.index] = CellCut(f.unit.heading, key_context(f.unit), tuple(groups))
             self.stats["cell_cuts"] += len(failing)
-        if partial:
-            r = partial[0]
+        for r in partial:  # every partly supported cell has its own mark, at the end of its own content
             cell = min(_claim_cells(d, r, bounds))
             end = d.start + bounds[cell][0] + len(d.raw[bounds[cell][0]:bounds[cell][1]].rstrip())
             self.stats["cell_marks"] += self.mark(Problem(d, FINAL_PARTIAL, "partial", defect="none", check="final",
@@ -673,10 +672,11 @@ class _Final:
 
     def mark(self, problem: Problem, keep_claim: bool = False) -> bool:
         """Add a problem the composer turns into a server span (a partial mark, an attached citation), once. ``keep_claim``: the problem
-        already names the claim it is about (a cell of a row, round 20 U2)."""
+        already names the claim it is about (a cell of a row, round 20 U2): a unit has one such problem for each claim and cell."""
         problems = self.report.problems
         if any(p.unit is problem.unit and p.check == "final" and p.kind == problem.kind and p.cite == problem.cite
-               and p.severity == problem.severity and p.resolution == problem.resolution for p in problems):
+               and p.severity == problem.severity and p.resolution == problem.resolution and p.cell_end == problem.cell_end
+               and (problem.cell_end is None or p.claim_id == problem.claim_id) for p in problems):
             return False
         if not keep_claim:
             problem.claim_id = _primary_claim_id(self.report, problem.unit.index)

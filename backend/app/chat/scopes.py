@@ -690,9 +690,11 @@ def occurrences(parts: Sequence[tuple[str, str]], body: Sequence[str], layout: L
 
 
 def first_occurrence(parts: Sequence[tuple[str, str]], body: Sequence[str], layout: Layout | None,
-                     holds: Callable[[str], bool]) -> Located | None:
-    """The first of ``occurrences``, read without the others; None when there is none."""
-    spot = next((s for s in _spots(tuple((place, text) for place, text in parts), tuple(body), layout) if holds(s.text)), None)
+                     holds: Callable[[str], bool], line: str | None = None) -> Located | None:
+    """The first of ``occurrences``, read without the others; None when there is none. ``line``: only the places of that line of the body
+    count (the row a quote stands in), not those of the lines before it."""
+    spot = next((s for s in _spots(tuple((place, text) for place, text in parts), tuple(body), layout)
+                 if (line is None or s.line == line) and holds(s.text)), None)
     return _located(spot) if spot is not None else None
 
 

@@ -338,6 +338,23 @@ def test_a_partial_mark_span_carries_its_ordinal_and_the_failing_claim_ids_in_th
     assert [s["ordinal"] for s in saved if s["kind"] == "partial_mark"] == [1, 2]
 
 
+def test_a_table_row_has_one_mark_at_each_cell_end_whatever_the_number_of_problems_that_name_the_cell(monkeypatch):
+    _no_ledger(monkeypatch)
+    md = "| נתון | ערך | הערה | פירוט |\n|---|---|---|---|\n| השווי למ\"ר | 9,500 ₪ [S1] | הערה א | פירוט ב |"
+    a = _answer(md)
+    r = verify_answer(_judge(lambda t: {"verdict": "supported", "supported_by": ["S1"]}), a, _ws(), "?", [])
+    row = next(u for u in r.units if "9,500" in u.text)
+    note, more = (row.start + row.raw.index(x) + len(x) for x in ("הערה א", "פירוט ב"))
+    for claim, end in (("C1", note), ("C2", note), ("C3", more), ("C3", more)):  # two claims in one cell, one claim named twice
+        r.problems.append(verify.Problem(row, "חלקי", "partial", defect="none", check="final", claim_id=claim, cell_end=end))
+    edited = r.edit(a)
+    marks = [s for s in edited.doc.spans() if s.kind == "partial_mark"]
+    assert [m.claim_ids for m in marks] == [("C1", "C2"), ("C3",)]
+    line = next(ln for ln in edited.doc.text.splitlines() if "9,500" in ln)
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    assert len(cells) == 4 and cells[2].count("אומת חלקית") == cells[3].count("אומת חלקית") == 1 and "אומת חלקית" not in cells[1]
+
+
 def test_a_unit_with_two_partly_supported_claims_has_one_mark_carrying_both_claim_ids():
     a, r = _partial_report(two_claims=True)
     edited = r.edit(a)

@@ -115,6 +115,7 @@ from app.chat.verify import (
     ORIGIN_JUDGE_SUPPORT,
     ORIGIN_SOURCE,
     SUPPORT_QUOTE_MAX,
+    SUPPORT_QUOTE_MIN,
     SupportScope,
     Unit,
     _cited_sources,
@@ -490,11 +491,25 @@ def _other_context(src, quote: str) -> str:
 
 def _scope_of_quote(ws, sid: str, src, quote: str) -> dict:
     """The scope the item's quote is written under in its source (``scopes.occurrences``: the openers above it, its column and row), {} when
-    the source has no scope or the quote is not found."""
+    the source has no scope or the quote is not found. A quote in a table row is looked for in the cells of that row only (a cell of an
+    earlier row that is empty or short is no place of the quote); a place states the quote when it holds it, or is a sentence of at least
+    ``SUPPORT_QUOTE_MIN`` characters inside a longer quote, and an empty place never does."""
     parts, body = context_of_source(src)
     flat = SupportScope.flat(quote)
-    found = scopes.first_occurrence([(p.place, p.text) for p in parts], body, ws.layouts.get(sid),
-                                    lambda line: flat in _flat_span(line) or _flat_span(line) in flat)
+    if not flat:
+        return {}
+    row = _row_of(body, flat)
+    row = row if row is not None and "|" in row else None
+
+    def holds(text: str) -> bool:
+        span = _flat_span(text)
+        return bool(span) and (flat in span or (len(span) >= SUPPORT_QUOTE_MIN and span in flat))
+
+    layout = ws.layouts.get(sid)
+    place = [(p.place, p.text) for p in parts]
+    found = scopes.first_occurrence(place, body, layout, holds, row)
+    if found is None and row is not None:
+        found = scopes.first_occurrence(place, body, layout, lambda text: True, row)  # a row of short cells: the scope the row sets
     return dict(found.scope) if found is not None else {}
 
 

@@ -2213,10 +2213,13 @@ class VerifyReport:
                 if cid in by_id:
                     by_id[cid].marker = n
 
-    def partial_claim_ids(self, index: int) -> tuple[str, ...]:
+    def partial_claim_ids(self, index: int, cell_end: int | None = None) -> tuple[str, ...]:
         """The claims a unit's partial mark covers (round 14 U7, KTD9), once each: those its partial problems name (a claim
         that failed, or the unit's first), then the claims the judge found only partly supported, else the claims the log
-        records as qualified (a unit marked by a check that names no claim, such as the recency check)."""
+        records as qualified (a unit marked by a check that names no claim, such as the recency check). ``cell_end``: the mark of
+        that cell of a table row (round 20 U2), which covers the claims its own problems name."""
+        if cell_end is not None:
+            return tuple(dict.fromkeys(p.claim_id for p in self.partial_problems(index) if p.claim_id and p.cell_end == cell_end))
         recs = self.claims.get(index, [])
         ids = [p.claim_id for p in self.partial_problems(index) if p.claim_id]
         ids += [r.id for r in recs if r.action == "qualified" and r.verdict == "partial"]
@@ -2789,10 +2792,12 @@ class VerifyReport:
         blocked = cuts + spans  # a qualifier or a citation never lands inside a removed or replaced span
         edits: list[tuple[int, int, str, str | None, tuple]] = [(a, b, "", None, ()) for a, b in cuts]
         # a mark carries the claim ids of its unit (round 14 U7, KTD9)
-        marks = {u.index: next((p.cell_end for p in self.partial_problems(u.index) if p.cell_end is not None),
-                               _mark_point(markdown, u)) for u in self.units if u.index in partial}
-        edits += [(marks[u.index], marks[u.index], PARTIAL_MARK, "partial_mark", self.partial_claim_ids(u.index))
-                  for u in self.units if u.index in partial and not any(a <= u.start < b for a, b in cuts)]
+        # a table row has a mark in each partly supported cell (round 20 U2): one for each end of a cell, however many problems name it
+        marks = {u.index: list(dict.fromkeys(p.cell_end for p in self.partial_problems(u.index) if p.cell_end is not None))
+                 or [_mark_point(markdown, u)] for u in self.units if u.index in partial}
+        edits += [(at, at, PARTIAL_MARK, "partial_mark",
+                   self.partial_claim_ids(u.index, at if len(marks[u.index]) > 1 else None))
+                  for u in self.units if u.index in partial and not any(a <= u.start < b for a, b in cuts) for at in marks[u.index]]
         edits += [(g.start, g.end, MARKER.format(n=0), "marker", g.claims) for groups in planned.values()
                   for g in groups if not any(a <= g.start < b for a, b in cuts)]
         edits += totals

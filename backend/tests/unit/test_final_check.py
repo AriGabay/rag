@@ -1760,6 +1760,43 @@ def test_a_partly_supported_independent_cell_keeps_the_mark_inside_that_cell_and
     assert _kinds(out).count("partial_mark") == 1 and out.final_check["cell_marks"] == 1 and out.final_digest == text_digest(md)
 
 
+def test_a_row_with_two_partly_supported_independent_cells_marks_each_cell_and_adds_no_cell(offline):
+    """Review: every partly supported cell has its own mark, at the end of its own content; the columns stay aligned."""
+    row = f"| השווי למ\"ר | 9,500 ₪ [S1] | {CELL_NOTE} | {CELL_MORE} |"
+    reply = _claims(("9,500 ₪", "supported"), (CELL_NOTE, "partial"), (CELL_MORE, "partial"))
+    reply["defect"] = "none"
+    out, judge = _cell_turn(offline, _after_lead_rule(CELL_NOTE, reply), f"{PLAN_LEAD}\n{WIDE_HEAD}{row}\n{RENT_ROW}")
+    md = out.answer.answer_markdown
+    cells = _cells(_row(md, "9,500"))
+    assert len(cells) == 4 and cells[1] == "9,500 ₪ [S1]", md
+    assert cells[2].startswith(CELL_NOTE) and cells[2].count("אומת חלקית") == 1, md
+    assert cells[3].startswith(CELL_MORE) and cells[3].count("אומת חלקית") == 1, md
+    assert "אומת חלקית" not in _row(md, "55 ₪")
+    assert _kinds(out).count("partial_mark") == 2 and out.final_check["cell_marks"] == 2 and out.final_digest == text_digest(md)
+    marks = [s for s in out.server_spans if s.kind == "partial_mark"]
+    assert len({c for s in marks for c in s.claim_ids}) == 2 and all(len(s.claim_ids) == 1 for s in marks)
+
+
+def test_a_cell_mark_is_not_written_twice_for_the_same_cell_and_claim(offline):
+    """Review: a second final-check pass over a row that already carries its marks adds none."""
+    row = f"| השווי למ\"ר | 9,500 ₪ [S1] | {CELL_NOTE} | {CELL_MORE} |"
+    reply = _claims(("9,500 ₪", "supported"), (CELL_NOTE, "partial"), (CELL_MORE, "partial"))
+    reply["defect"] = "none"
+    out, _ = _cell_turn(offline, _after_lead_rule(CELL_NOTE, reply), f"{PLAN_LEAD}\n{WIDE_HEAD}{row}\n{RENT_ROW}")
+    report = out.report
+    before = list(report.partial_problems())
+    assert len(before) == 2 and len({p.cell_end for p in before}) == 2
+    final = final_check._Final.__new__(final_check._Final)
+    final.report = report
+    for p in before:  # the pass finds the same cells partly supported again
+        again = dataclasses.replace(p)
+        assert final.mark(again, keep_claim=True) is False
+    assert report.partial_problems() == before
+    # a different claim in a cell that already has a mark is a mark of its own problem; the cell still has one mark in the text
+    extra = dataclasses.replace(before[0], claim_id="C-other")
+    assert final.mark(extra, keep_claim=True) is True and len(report.partial_problems()) == 3
+
+
 def test_two_failing_independent_cells_are_both_cut_and_the_row_stays_with_its_columns(offline):
     row = f"| השווי למ\"ר | 9,500 ₪ [S1] | {CELL_NOTE} | {CELL_MORE} |"
     reply = _claims(("9,500 ₪", "supported"), (CELL_NOTE, "unsupported", ABSENT), (CELL_MORE, "unsupported", ABSENT))

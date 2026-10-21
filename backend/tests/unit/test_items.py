@@ -1872,3 +1872,23 @@ def test_a_candidate_row_under_a_two_level_header_is_valued_by_the_column_the_re
     ws2 = _ws(ids)
     got = _offer(ws2, "התכסית במגרש 501 היא 60% [S1].", [{"id": "N1", "text": "התכסית המותרת"}])
     assert [(c.label, c.value) for c in got.candidates] == [("502", "55%")]
+
+
+# --- review: the scope of a quote is read from the quote's own row, never from an empty or short cell of an earlier row ----------------
+
+PLAN_ROWS = "\n".join(["הטבלה: 3 שורות", "תכנית | הערה | שטח (מ״ר)", "תכנית 1 |  | 1,500", "תכנית 2 | מאושרת | 2,100"])
+
+
+def test_the_scope_of_a_quote_is_that_of_its_own_row_not_of_an_empty_cell_of_an_earlier_row():
+    ws = _ws(PLAN_ROWS)
+    src = ws.sources["S1"]
+    row_two = "תכנית 2 | מאושרת | 2,100"
+    assert items._scope_of_quote(ws, "S1", src, row_two) == {"plan": frozenset({"2"})}
+    # a single cell of the second row keeps its row's scope too (the empty cell of row 1 is contained in every quote)
+    assert items._scope_of_quote(ws, "S1", src, "מאושרת") == {"plan": frozenset({"2"})}
+    assert items._scope_of_quote(ws, "S1", src, "2,100") == {"plan": frozenset({"2"})}
+    # protection: the first row, empty cell and all, is still plan 1's
+    assert items._scope_of_quote(ws, "S1", src, "תכנית 1 |  | 1,500") == {"plan": frozenset({"1"})}
+    assert items._scope_of_quote(ws, "S1", src, "1,500") == {"plan": frozenset({"1"})}
+    # a quote the source does not hold has no scope
+    assert items._scope_of_quote(ws, "S1", src, "תכנית 3 | 9,999") == {}

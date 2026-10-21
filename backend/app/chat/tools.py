@@ -621,7 +621,7 @@ class Workspace:
     # (the unit's normalised text, its cited ids) -> the line; written by the context check (``verify._context_check``), read by the
     # judge's input and the unit's reuse key
     ownership_facts: dict = field(default_factory=dict)
-    # the blocks above a cited source with their word geometry, preloaded for the scope reader (round 20 U3, KTD3; ``rereader.ContextReader.layout``,
+    # the blocks above a cited source with their word geometry, preloaded for the scope reader (round 20 U3, KTD3; ``rereader.ContextReader.preload``,
     # ``scopes.Layout``): S# -> its layout, or None when the fetcher could not read one. And the table cells a scope check found under another
     # plan, parcel, contract or alternative than their column names: (the unit's normalised text, its cited ids) -> {cell index: reason}
     layouts: dict = field(default_factory=dict)
