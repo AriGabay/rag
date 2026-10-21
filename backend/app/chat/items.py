@@ -634,6 +634,7 @@ class _SpanSentence(NamedTuple):
 
     text: str
     written: tuple[tuple[str, frozenset[str], str], ...]
+    names: tuple[tuple[str, frozenset[str], str], ...] = ()  # the numbers it writes as names (``_not_headline``: a plot, a block, a permit), same shape
 
 
 _PERCENT_WORD = re.compile(r"\s?(?:%|אחוז(?:ים)?(?![א-ת]))")
@@ -691,26 +692,36 @@ def _span_index(src) -> list[_SpanRow | list[_SpanSentence]]:
         sentences = []
         for sentence in _SENTENCE_END.split(line):
             blank = _outside_dates(sentence)
-            sentences.append(_SpanSentence(sentence, tuple(
-                (m.group(0), frozenset(numbers_in(m.group(0))), _number_class(blank, m.start(), m.end())) for m in _NUMBER.finditer(blank))))
+            # a number the sentence writes as a name (a plot, a plan, a permit, a footnote mark: ``_not_headline``) is kept apart: a figure matches a
+            # unit by itself, a name only when the unit states every name of the sentence (``_cited_spans``; round 21 third pass, H3)
+            figures, names = [], []
+            for m in _NUMBER.finditer(blank):
+                (names if _not_headline(blank, m.start(), m.end()) else figures).append(
+                    (m.group(0), frozenset(numbers_in(m.group(0))), _number_class(blank, m.start(), m.end())))
+            sentences.append(_SpanSentence(sentence, tuple(figures), tuple(names)))
         out.append(sentences)
     return out
 
 
-def _cited_spans(index: Sequence[_SpanRow | list[_SpanSentence]], wanted: Mapping[str, set[str]]) -> Iterable[tuple[str, str, str]]:
-    """(quote, label, value) of each table row of the source (parsed by ``_span_index``) whose value cells state a number of ``wanted``,
+def _cited_spans(index: Sequence[_SpanRow | list[_SpanSentence]], wanted: Mapping[str, set[str]]) -> Iterable[tuple[str, str, str, tuple[str, ...]]]:
+    """(quote, label, value, hits) of each table row of the source (parsed by ``_span_index``) whose value cells state a number of ``wanted``,
     or each sentence of a passage that does: the spans an answer sentence stating those numbers draws on. ``wanted`` maps each form of the
-    unit's numbers to their classes: a percent never states a count, nor a count a percent (round 21 packet A, Q4)."""
+    unit's numbers to their classes: a percent never states a count, nor a count a percent (round 21 packet A, Q4). ``hits``: every number of a
+    sentence that the unit states, in the sentence's order (``value`` is the first); empty for a row."""
     for entry in index:
         if isinstance(entry, _SpanRow):
             covered = {f for forms, _ in entry.classes for f in forms}
             if _states([*entry.classes, *((frozenset({f}), "") for f in entry.numbers - covered)], wanted):
-                yield _clip_row(entry.line), entry.label, entry.value
+                yield _clip_row(entry.line), entry.label, entry.value, ()
             continue
         for sentence in entry:
             hits = [written for written, forms, cls in sentence.written if _states([(forms, cls)], wanted)]
+            if not hits and sentence.names and all(forms & wanted.keys() for _, forms, _ in sentence.names):
+                # matched by a name alone ("block 181"): the sentence is about the unit's thing only when the unit states every name the
+                # sentence writes — "plot 200" beside "plot 301" of a neighbouring sentence is about the neighbour (round 21 third pass, H3)
+                hits = [written for written, forms, cls in sentence.names if _states([(forms, cls)], wanted)]
             if hits:
-                yield sentence.text.strip(), _first_words(sentence.text, trim=False), hits[0]
+                yield sentence.text.strip(), _first_words(sentence.text, trim=False), hits[0], tuple(hits)
 
 
 def _component_of(asked: Sequence[Mapping], text: str) -> str:
@@ -782,7 +793,7 @@ def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledge
             made = 0
             if sid not in indexes:
                 indexes[sid] = _span_index(src)
-            for quote, label, value in _cited_spans(indexes[sid], wanted):
+            for quote, label, value, hits in _cited_spans(indexes[sid], wanted):
                 flat = SupportScope.flat(quote)
                 component = _component_of(asked, f"{unit.text} {label}")
                 # a fill of ANOTHER component on the span holds nothing for this one: the span serves each component (round 19 U3)
@@ -791,6 +802,17 @@ def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledge
                         or any(_holds(i, sid, ws, flat, component) for i in [*held, *built])):
                     continue
                 spans = condition_spans(src, quote, [i.quote for i in held])
+                own = [sp for sp in spans if sp.place in ("quote", "row")] if hits else []
+                if own:
+                    # a clause of the item's own sentence limits the figures it holds: the clause of another figure of the sentence (the exclusion
+                    # of the commerce area, beside the lot's area) is that figure's. The item's value is the first figure the unit states that
+                    # such a clause holds; when none, the clause is not the item's and only its other spans are (round 21 third pass, H3)
+                    inside = frozenset().union(*(numbers_in(sp.text) for sp in own))
+                    figures = [h for h in hits if numbers_in(h) & inside]
+                    if figures:
+                        value = figures[0]
+                    else:
+                        spans = [sp for sp in spans if sp not in own]
                 if not spans or _note_of_another_scope(ws, sid, src, quote, quote, against=referent):
                     continue
                 if _only_itself(spans, flat) and not _related(quote, unit.text):
@@ -1145,12 +1167,28 @@ def _outside_dates(text: str) -> str:
     return text
 
 
+_ASIDE = re.compile(r"\([^()]*\)")
+_DATING_ASIDE = re.compile(r"\(\s*(?:נכון|כמצב|לתאריך|ליום|בתאריך|ביום|מיום)")  # a parenthesis that opens with a word of dating: "(נכון ליום …)"
+
+
+def _dating_dates(quote: str):
+    """The dates of a quote that date what it says: those outside a parenthetical aside made of words and dates alone ("(אשר נפתח … 2021)" tells
+    when a building opened, not when the figure beside it holds), unless the aside opens with a word of dating or holds a number of its own (round
+    21 third pass, H3: a source sentence wrapped over two lines is one sentence now, and its aside is in the quote)."""
+    asides = [(m.start(), m.end()) for m in _ASIDE.finditer(quote) if not _DATING_ASIDE.match(m.group())
+              and not numbers_in(_outside_dates(m.group()))]
+    return [p for p in shared_dates.find_all(quote) if not any(a <= p.span[0] and p.span[1] <= b for a, b in asides)]
+
+
 def _item_dates(item: Item) -> list[str]:
     """The dates (ISO) the item has: those in its own words (label, value, condition); when none, the one date of its quote."""
-    own = shared_dates.find_all(f"{item.label} ; {item.value} ; {item.condition}")
+    if item.origin == ORIGIN_SOURCE:  # the server's label and condition are clips of the quote: they carry its asides too
+        own = [p for text in (item.label, item.value, item.condition) for p in _dating_dates(text)]
+    else:
+        own = shared_dates.find_all(f"{item.label} ; {item.value} ; {item.condition}")
     if own:
         return list(dict.fromkeys(p.iso for p in own))
-    quoted = shared_dates.find_all(item.quote)
+    quoted = _dating_dates(item.quote)
     return [quoted[0].iso] if len(quoted) == 1 else []
 
 

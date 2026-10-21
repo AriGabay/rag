@@ -2817,3 +2817,15 @@ def test_u4_a_problem_of_the_scope_check_words_its_removal_with_the_scope_senten
     assert verify.removal_lines([scoped]) == ["> " + verify.SCOPE_REMOVAL_SENTENCE]
     assert verify.removal_lines([plain]) == ["> " + verify.REMOVAL_SENTENCES["wrong_subject"]]
     assert len(verify.removal_lines([scoped, plain])) == 2  # two causes, two lines
+
+
+def test_round21_pass3_a_figure_that_is_one_member_of_a_list_of_bare_numbers_anchors_nothing_and_the_whole_list_anchors_after_its_last_member():
+    md = "הבתים ברחובות 20, 22, 24, 26 ו־28 נמסרו."
+    assert _anchor(md, "22")[0] is None  # one house number among five
+    got, unit = _anchor(md, "20, 22, 24, 26, 28")
+    assert got == ("28", unit.text.index("28"))  # the datum is the list: after its last member
+    assert _anchor("הממוצע חושב לשנים 2018, 2019 ו־2021.", "2019")[0] is None
+    # amounts, units, a range and a lone number are no list: the anchor is the figure's own place
+    assert _anchor("השטח 20 מ״ר, 22 מ״ר ו־24 מ״ר.", "22 מ״ר")[0] is not None
+    assert _anchor("השטח הוא 22 מ״ר ובקומה 3, 4.", "22 מ״ר")[0] is not None
+    assert _anchor("הסעיפים 10-12 והשטח 22 מ״ר.", "22 מ״ר")[0] is not None

@@ -3432,7 +3432,7 @@ def _after_number(unit: Unit, written: str, at: int | None = None) -> int | None
 
 
 # the one word that closes a phrase: a blank, a word and then a mark that ends a phrase (a comma, a stop, a bracket, a bold or cell edge) or the line's end
-_PHRASE_TAIL = re.compile(r"[ \t]+[^\W\d_][^\s,;.:!?()\[\]*|]*(?=[ \t]*(?:[,;.:!?)\]*|]|\[|$))", re.M)
+_PHRASE_TAIL = re.compile(r"[ \t]+[^\W\d_][^\s,;.:!?()\[\]*|]*(?=[ \t]*(?:[,;.:!?)\]*|]|\[|[—–][ \t]|$))", re.M)  # a spaced dash ends a phrase too (round 21 third pass)
 
 
 def _phrase_close(markdown: str, at: int) -> int:
@@ -4888,6 +4888,45 @@ def _value_sources(u: Unit, ws: Workspace) -> list[tuple[str, Source]]:
     return [(k, s) for k, s in cited if wanted & _body_numbers(s)] or cited
 
 
+# a bare number (no percent, currency, fraction or decimal part) and what separates two members of an enumeration of them ("20, 22, 24 ו־26"):
+# the figures of such a list are names (house numbers, lots, years), and the list is one thing — never one of its members (round 21 third pass, H1)
+_BARE_NUMBER = re.compile(r"(?<![\d.,/:%])\d{1,4}(?![\d%₪$€/:]|[.,]\d)")
+_LIST_GAP = re.compile(r"\s*[,،]\s*(?:ו[־\-]?\s*)?|\s+ו[־\-]?\s*|\s+(?:או|and)\s+")
+
+
+def _enumerations(text: str) -> list[list[tuple[int, int]]]:
+    """The enumerations of bare numbers ``text`` writes, each as the (start, end) offsets of its members, two members or more: "20, 22, 24 ו־26"
+    is one; "20 מ״ר, 22 מ״ר", a range, a date, a decimal and an amount are not (round 21 third pass, H1)."""
+    runs: list[list[tuple[int, int]]] = []
+    cur: list[tuple[int, int]] = []
+    for m in _BARE_NUMBER.finditer(text):
+        if cur and _LIST_GAP.fullmatch(text[cur[-1][1]:m.start()]):
+            cur.append((m.start(), m.end()))
+            continue
+        if len(cur) > 1:
+            runs.append(cur)
+        cur = [(m.start(), m.end())]
+    if len(cur) > 1:
+        runs.append(cur)
+    return runs
+
+
+def _list_members_only(text: str, places: Sequence[Sequence[tuple[int, int]]]) -> bool:
+    """Whether every place a datum's tokens have in ``text`` (``items.token_places``) is a member of an enumeration of bare numbers that also
+    holds a number which is no token of the datum: the sentence writes the figure only as one of a list of names (a house number among
+    house numbers, one year of several), so it does not state the datum and no note belongs after it. A datum that is the whole list
+    (every member one of its tokens) is not such: the note follows the list (round 21 third pass, H1)."""
+    flat = [p for group in places for p in group]
+    if not flat:
+        return False
+    runs = _enumerations(text)
+
+    def partial(a: int, b: int) -> bool:
+        return any(any(x[0] <= a and b <= x[1] for x in run) and any(x not in flat for x in run) for run in runs)
+
+    return all(partial(a, b) for a, b in flat)
+
+
 def datum_anchor(unit: Unit, groups: Sequence[frozenset[str]], fractions: Sequence[str] = ()) -> tuple[str, int] | None:
     """Where a note about a datum is anchored in a unit (round 21 U2, KTD1; R1, R2, R6): the ONE place in the unit's text where the
     datum's own value tokens stand — its headline forms (``items.value_tokens``), its share fractions n/m, as ``(written, at)`` with ``at``
@@ -4898,7 +4937,7 @@ def datum_anchor(unit: Unit, groups: Sequence[frozenset[str]], fractions: Sequen
     from app.chat.items import token_places
 
     places = token_places(unit.text, groups, fractions)
-    if not places or any(len(p) != 1 for p in places):
+    if not places or any(len(p) != 1 for p in places) or _list_members_only(unit.text, places):
         return None
     a, b = max((p[0] for p in places), key=lambda x: x[1])
     return unit.text[a:b], a
@@ -4912,7 +4951,7 @@ def _claim_anchor(u: Unit, ws: Workspace, claims: Sequence, report: VerifyReport
     from app.chat.items import token_places, value_tokens
 
     def unique(places: list[list[tuple[int, int]]]) -> tuple[str, int] | None:
-        if not places or any(len(p) != 1 for p in places):
+        if not places or any(len(p) != 1 for p in places) or _list_members_only(u.text, places):
             return None
         a, b = max((p[0] for p in places), key=lambda x: x[1])
         return u.text[a:b], a
@@ -5101,6 +5140,7 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
     if report.item_ledger is None:
         return
     from app.chat import conditions  # conditions reads this module
+    from app.chat.items import value_tokens
 
     said = _condition_verdicts(votes)
     units = {u.index: u for u in report.units}
@@ -5131,6 +5171,8 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
         if (verdict is None or verdict.outcome == KEPT or st["state"] != ITEM_COVERED or unit is None
                 or unit.index in removed):
             continue
+        if _incidental_figure(unit, st):
+            continue  # the sentence writes the item's figure only as one name of a list (a house number, a year): it states no datum of the item
         name = _plain_label(st)
         source = ws.sources.get(st["source"])
         if verdict.outcome == "contradicted":
@@ -5157,6 +5199,9 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
                 continue
             phrase = _condition_span([x["text"] for x in st["condition_spans"]], verdict.quote) if source is not None else ""
             anchor = _item_anchor(unit, st, states, phrase or verdict.quote, source) if source is not None else None
+            if anchor is None and source is not None and not conditions.limits_figure(
+                    phrase or verdict.quote, frozenset().union(*value_tokens(st.get("value") or "", st.get("quote") or "")[0])):
+                continue  # no place for the datum, and the words that limit stand far from its figure: they limit another noun (round 21 third pass, H2)
             if phrase and anchor is not None:
                 # the note says what the datum's own clause leaves out and never repeats the words it states (a sentence item's condition
                 # span opens with the item's own words); nothing left: the clause states it all (round 21 second pass, harm 4)
@@ -5194,6 +5239,16 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
             report.problems.append(Problem(unit, MSG_CONDITION_UNVERIFIED.format(sid=sid), kind="missing_qualifier",
                                            annotation=MSG_CONDITION_LIMIT.format(where=_read_in(cited)), check=CONDITION_LIMIT_CHECK,
                                            **common))
+
+
+def _incidental_figure(unit: Unit, st: dict) -> bool:
+    """Whether the sentence ``unit`` writes the figure of the item ``st`` only as a member of an enumeration of other bare numbers (round 21
+    third pass, H1, H2): "22" among the house numbers "20, 22, 24, 26 ו־28" is the item "22 apartments" by coincidence. Nothing is written for such an
+    item — no note after the member, no line that cannot be placed — and nothing is removed for it."""
+    from app.chat.items import token_places, value_tokens
+
+    groups, fractions = value_tokens(st.get("value") or "", st.get("quote") or "")
+    return _list_members_only(unit.text, token_places(unit.text, groups, fractions)) if groups or fractions else False
 
 
 def _item_label(st: dict) -> str:
@@ -8419,10 +8474,12 @@ def _shown_support(verdicts: dict[int, JudgeVerdict], batch: _Batch, ws: Workspa
         mine = set(_candidate_ids(batch, ws).get(i, []))
         # a source the turn read and returned with text also stands (round 21 R4): a unit with no number (the connector sentence of a list)
         # has no candidate to be shown, and the one the judge named is a source of this turn; it must hold the unit's numbers when it has
-        # any. Only a source the turn never saw is refused; the server's checks of the named support still run (``_named_support``)
+        # any, and the unit must cite a source itself. Only a source the turn never saw is refused; the server's checks of the named support still run (``_named_support``)
         read = returned_text_sources(ws)
         numbers = numbers_in(_stated_text(units[i]))
-        turn_read = {s for s in named if s in read and _EVIDENCE_ID.fullmatch(s)
+        # only a unit that cites a source of its own: an uncited claim keeps the old rule (no shown source holds it, so it stays unsupported)
+        cites = any(x in ws.sources for x in units[i].ids)
+        turn_read = {s for s in named if cites and s in read and _EVIDENCE_ID.fullmatch(s)
                      and (not numbers or numbers & _source_terms(ws, s, (_source_parts(ws, s) or ("", "", ""))[1])[0])}
         wrong = [s for s in named if not (s in shown or s in mine or s in turn_read) or not _EVIDENCE_ID.fullmatch(s)]
         if wrong:

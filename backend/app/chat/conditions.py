@@ -48,7 +48,8 @@ _THRESHOLD = {"מעל": "מעל", "יותר": "מעל", "מתחת": "מתחת", 
 # a heading or a note that names a method or a component of the valuation limits the values under it
 _METHOD_HEADS = frozenset("גישת שיטת רכיב מרכיב".split())
 _JOINERS = ("ו", "ש", "וש")  # a conjunction or relative prefix an operator takes ("ושלא", "וכולל")
-_CLAUSE_END = re.compile(r"[;|\n]|(?<!\d)[.:!?](?!\d)|\s[—–]\s")
+# a dash after a one-letter preposition ("לא יפחתו מ – 31%") joins it to its number: it is no clause end (round 21 third pass, H4)
+_CLAUSE_END = re.compile(r"[;|\n]|(?<!\d)[.:!?](?!\d)|(?<!\s[מלבכ])\s[—–]\s")
 
 
 class Op(NamedTuple):
@@ -359,3 +360,27 @@ def _material_clauses(text: str) -> tuple[str, ...]:
 def material_clauses(text: str) -> list[str]:
     """The clauses of a text that hold a closed-class operator that limits (the source side), in order."""
     return list(_material_clauses(text))
+
+
+NEAR_TOKENS = 12  # a limiting operator this many words from the figure, at most, limits that figure
+
+
+def limits_figure(text: str, forms: frozenset[str] = frozenset()) -> bool:
+    """Whether the closed-class limit that ``text`` holds can be about the figure ``forms`` (round 21 third pass, H2): True when some limiting
+    operator stands within ``NEAR_TOKENS`` words of one of the figure's numbers (any number of its clause when the figure is not written there), or
+    when the text holds no such operator at all (a footnote or a heading: a limit by its place, not by a word). False when every limiting
+    operator is farther from the figure — "if there is such a part" at the end of a long description of a list limits that part, not the "22" at its
+    start, and the server does not hand it over as the figure's missing condition."""
+    held = False
+    for clause in _clauses(text):
+        tokens = _tokens(clause)
+        marks = [op for op in _ops(tokens) if op.material]
+        if not marks:
+            continue
+        held = True
+        digits = [i for i, t in enumerate(tokens) if t[:1].isdigit()]
+        mine = [i for i in digits if not forms or numbers_in(tokens[i]) & forms] or digits
+        if not mine or any(abs(op.at - i) <= NEAR_TOKENS for op in marks for i in mine):
+            return True
+    return not held
+

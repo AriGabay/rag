@@ -4159,3 +4159,158 @@ def test_round21_pass2_the_words_of_a_note_that_the_datums_clause_states_are_dro
     assert conditions.without_echo("3 קומות משרדים (לא כולל קומת קרקע)", clause) == "3 קומות משרדים (לא כולל קומת קרקע)"
     assert conditions.without_echo("כ-1,500 מ״ר", "סכום של 1,500 מ״ר, בלי תנאי") == ""  # a number the clause writes is stated
     assert conditions.clause_at("א ב; ג ד. ה ו", 6) == "ג ד"
+
+
+# --- round 21 third pass: the late packets' harms found by the private replay (synthetic shapes only) ---------------------------------------
+
+def _text_check(markdown: str, lines, *, ask: str = "הנתון בנכס", raw=(), decide=None):
+    """Like ``_plan_check`` with the source a passage (its lines are sentences, a wrapped sentence runs over two of them), not a table."""
+    from app.chat import items as ledger_items
+
+    ws = _file(SOURCE, "\n".join(lines), units=(1, 1), declared=(1,))
+    turn = _turn({"id": "1", "text": ask})
+    answer = _answer(markdown).model_copy(update={"items": list(raw)})
+    report = verify_answer(_condition_judge(decide), answer, ws, "?", [], requirements=turn, ledger=ledger_items.Ledger())
+    return report, ws, answer
+
+
+def _server_text(report, answer) -> tuple[str, list]:
+    return report.edit(answer).doc.text, [p for p in report.problems if p.check in verify.CONDITION_CHECKS or p.check == verify.SCOPE_CHECK]
+
+
+HOUSES_SOURCE = ["בהסכם המכר לדירות ברחובות הדגמה 20, 22, 24, 26 ו־28 נקבע כי החזקה תימסר בתוך 36 חודשים מהמועד הקובע.",
+                 "רשימת הדירות כוללת 22 דירות בנות 4 חדרים, לרבות חלקים ברכוש המשותף אם יש כאלה על פי התכנית."]
+HOUSES_MD = "בהסכם נמכרו הדירות ברחובות הדגמה 20, 22, 24, 26 ו־28 והחזקה תימסר בתוך 36 חודשים מהמועד הקובע [S2]."
+
+
+def test_round21_pass3_h1_h2_a_figure_the_sentence_writes_only_as_one_member_of_a_list_is_no_datum_of_a_note_or_an_uncertainty_line():
+    """A house number among five house numbers equals a source item's figure by coincidence: no note lands on it and no line is written."""
+    r, _, answer = _text_check(HOUSES_MD, HOUSES_SOURCE)
+    text, notes = _server_text(r, answer)
+    assert text == HOUSES_MD, text
+    assert notes == [] and r.unbound == [], ([(p.number, p.check) for p in notes], r.unbound)
+
+
+YEARS_SOURCE = ["ממוצע הרווחים לשנים 2018, 2019 ו־2021 הינו 641,380 ₪ לשנה (לא נלקחה בחשבון שנת 2020 עקב ירידה בפעילות)."]
+YEARS_MD = "הממוצע חושב על פני השנים 2018, 2019 ו־2021 [S2]. שנת 2020 לא הובאה בחשבון בשל ירידה בפעילות [S2]."
+
+
+def test_round21_pass3_h1_an_average_note_is_not_written_after_one_year_of_a_list_of_years():
+    r, _, answer = _text_check(YEARS_MD, YEARS_SOURCE)
+    text, notes = _server_text(r, answer)
+    assert text == YEARS_MD and notes == [] and r.unbound == [], (text, r.unbound)
+
+
+def test_round21_pass3_h1_a_datum_that_is_the_whole_list_has_its_note_after_the_list():
+    source = ["החזקה בבתים 20, 22 ו־24 תימסר רק לאחר קבלת טופס אכלוס."]
+    md = "החזקה בבתים 20, 22 ו־24 תימסר באביב [S2]."
+    r, _, answer = _text_check(md, source, raw=[_adj_item("הבתים", source[0], "20, 22, 24")])
+    text, notes = _server_text(r, answer)
+    assert len(notes) == 1 and notes[0].number == "24", [(p.number, p.check) for p in notes]
+    assert text.index("(התנאי") > text.index("24") and text.index("20, 22 ו־24") < text.index("(התנאי"), text
+
+
+WRAPPED_SOURCE = ["בנוסף, עולה כי דמי השכירות השנתיים בגין המבנה הנוסף (אשר נפתח לקהל בחודש יולי 2021),",
+                  "הינם בסך כולל של 3,105,720 ₪ לשנה, לא כולל מע״מ."]
+WRAPPED_MD = "ההכנסה השנתית שנרשמה היא 3,105,720 ₪ לשנה [S2]."
+
+
+def test_round21_pass3_h3_a_date_in_an_aside_of_a_joined_sentence_does_not_date_the_figure_so_its_vat_caveat_is_still_written():
+    """A wrapped source sentence is one sentence now; the opening date in its parenthesis dates the building, not the rent."""
+    r, _, answer = _text_check(WRAPPED_MD, WRAPPED_SOURCE)
+    text, notes = _server_text(r, answer)
+    assert len(notes) == 1 and notes[0].number == "3,105,720", [(p.number, p.check) for p in notes]
+    assert "לא כולל מע״מ" in text and text.index("3,105,720") < text.index("לא כולל מע״מ"), text
+
+
+def test_round21_pass3_h3_a_date_in_a_parenthesis_that_dates_the_figure_still_must_be_stated():
+    source = ["הערך בנכס הוא 5,000 ₪ (נכון ליום 31.12.2022), לא כולל מע״מ."]
+    r, _, answer = _text_check("הערך בנכס הוא 5,000 ₪ [S2].", source)
+    states = r.item_states()
+    assert [x["state"] for x in states] == [] or all(x["state"] != "covered" for x in states), states  # the date is the item's own: not stated
+
+
+PLOT_SOURCE = ["בצמוד למגרש מספר 200 שבנדון, ממוקם מגרש מספר 301 הדגמה אשר אינו מהווה חלק מחוות דעת זו.",
+               "בתא שטח מספר 200 מאושרים 41,300 מ״ר עיקרי למסחר (לא כולל משרדים) לפי התכנית."]
+PLOT_MD = "לתא שטח 200 זכויות בנייה של כ־41,300 מ״ר עיקרי למסחר [S2]."
+
+
+def test_round21_pass3_h3_a_plot_number_a_neighbouring_sentence_writes_makes_no_item_so_the_exclusion_of_the_plot_is_still_written():
+    """«מספר 200» is a name: a neighbour sentence that names the plot is not a twin of the sentence that states the plot's area."""
+    r, _, answer = _text_check(PLOT_MD, PLOT_SOURCE)
+    text, notes = _server_text(r, answer)
+    assert len(notes) == 1 and "לא כולל משרדים" in notes[0].annotation, [(p.number, p.annotation) for p in notes]
+    assert text.index("41,300") < text.index("לא כולל משרדים"), text
+    assert [x["value"] for x in r.item_states()] == ["41,300"], r.item_states()
+
+
+DASH_SOURCE = ["החוכר רשאי להעביר זכויות בתאגיד, ובלבד שזכויותיו לאחר ההעברה לא יפחתו מ – 27% בהון המניות."]
+DASH_MD = "החוכר רשאי להעביר זכויות בתאגיד בהיקף של 27% [S2]."
+
+
+def test_round21_pass3_h4_a_dash_between_a_preposition_and_its_number_does_not_end_the_clause_so_a_note_is_never_cut_before_its_number():
+    from app.chat import conditions
+
+    assert conditions.clauses("זכויותיו לאחר ההעברה לא יפחתו מ – 27% בהון המניות") == ["זכויותיו לאחר ההעברה לא יפחתו מ – 27% בהון המניות"]
+    assert conditions.clauses("שלב א׳ – 3 קומות משרדים") == ["שלב א׳", "3 קומות משרדים"]  # a dash between phrases still ends a clause
+    r, _, answer = _text_check(DASH_MD, DASH_SOURCE)
+    _, notes = _server_text(r, answer)
+    assert all("27%" in (p.annotation or "") for p in notes), [(p.number, p.annotation) for p in notes]
+
+
+FAR_SOURCE = ["הדירות ברחובות הדגמה 20, 22, 24, 26 ו־28 נמכרו בהסכם אחד.",
+              "רשימת הדירות כוללת 22 דירות בנות 4 חדרים כמפורט בסעיף 2.4 לעיל, לרבות החלקים ברכוש המשותף אשר יוצמדו אליהן לפי "
+              "ההסכם, וכן אותו חלק שיוצא מהרכוש המשותף ויצמד אליהן, אם יש כזה על פי הדין."]
+FAR_MD = "בהסכם נמכרו 22 דירות ברחובות הדגמה 20, 22, 24, 26 ו־28 [S2]."
+NEAR_SOURCE = [FAR_SOURCE[0], "רשימת הדירות כוללת 22 דירות בנות 4 חדרים, אם יש היתר בנייה בתוקף."]
+
+
+def test_round21_pass3_h2_a_limiting_word_far_from_the_figure_limits_something_else_so_no_line_and_no_repair_request_is_made_for_it():
+    """The datum is written twice in the sentence (a count and a house number), so it has no place; the source clause's «אם» belongs to another noun."""
+    r, _, answer = _text_check(FAR_MD, FAR_SOURCE)
+    text, notes = _server_text(r, answer)
+    assert r.unbound == [] and notes == [] and text == FAR_MD, (r.unbound, text)
+    assert [p for p in r.problems if p.check == verify.CONDITION_FOUND_CHECK] == []
+
+
+def test_round21_pass3_h2_a_limiting_word_beside_the_figure_of_a_datum_with_no_place_is_still_one_uncertainty_line():
+    r, _, answer = _text_check(FAR_MD, NEAR_SOURCE)
+    assert [x.label for x in r.unbound] != [] and "אם יש היתר בנייה" in r.unbound[0].detail, r.unbound
+
+
+TWO_FIGURES = ["שטח המגרש 47.2 דונם, שטח עיקרי למסחר – 41,300 מ״ר עיקרי למסחר (לא כולל משרדים) לפי התכנית."]
+
+
+def test_round21_pass3_h3_a_limit_in_the_clause_of_another_figure_of_the_same_sentence_is_not_the_limit_of_the_figure_the_answer_gives():
+    r, _, answer = _text_check("שטח המגרש הוא 47.2 דונם [S2].", TWO_FIGURES)
+    text, notes = _server_text(r, answer)
+    assert notes == [] and text == "שטח המגרש הוא 47.2 דונם [S2].", text  # the exclusion is the commerce area's, not the lot's
+    r, _, answer = _text_check("הזכויות הן 41,300 מ״ר עיקרי למסחר [S2].", TWO_FIGURES)
+    text, notes = _server_text(r, answer)
+    assert len(notes) == 1 and notes[0].number == "41,300" and "לא כולל משרדים" in text, text
+
+
+NAME_SOURCE = ["חלקה מספר 13 בגוש מספר 181 רשומה בתשריט החלוקה, ברם אינה רשומה בחוזה החכירה.", "בגוש מספר 181 מספר 301 הדגמה אינו חלק מהשומה."]
+
+
+def test_round21_pass3_h3_a_sentence_matched_by_names_alone_is_kept_only_when_the_answer_states_every_name_it_writes():
+    """Parcel and block numbers are the datum of a land-registry sentence; «מספר 200» beside the neighbour's «מספר 301» is not."""
+    r, _, answer = _text_check("חלקה 13 בגוש 181 רשומה בתשריט החלוקה [S2].", NAME_SOURCE[:1])
+    assert [x["state"] for x in r.item_states()] == ["covered"], r.item_states()
+    r, _, answer = _text_check("חלקה 13 בגוש 181 היא חלק מהשומה [S2].", [NAME_SOURCE[1]])
+    assert r.item_states() == [], r.item_states()  # block 181 is stated, plot 301 is not: the sentence is about another thing
+
+
+def test_round21_pass3_h3_the_value_of_a_source_item_is_the_figure_its_limiting_clause_holds_not_the_first_number_the_answer_shares():
+    source = ["תכנית מספר בניין עיר מספר 604-0112233 מגדירה שטח עיקרי למסחר – 41,300 מ״ר עיקרי למסחר (לא כולל משרדים)."]
+    r, _, answer = _text_check("בתכנית 604-0112233 נקבעו זכויות של 41,300 מ״ר עיקרי למסחר [S2].", source)
+    text, notes = _server_text(r, answer)
+    assert len(notes) == 1 and notes[0].number == "41,300" and text.index("41,300") < text.index("לא כולל משרדים"), text
+    assert [x["value"] for x in r.item_states()] == ["41,300"], r.item_states()
+
+
+def test_round21_pass3_h3_a_note_after_a_number_and_its_unit_stands_after_the_word_before_a_dash_that_ends_the_phrase():
+    source = ["שטח עיקרי למסחר – 41,300 מ״ר עיקרי למסחר (לא כולל משרדים)."]
+    r, _, answer = _text_check("הזכויות הן 41,300 מ״ר עיקרי — והיתר בהמשך [S2].", source)
+    text, notes = _server_text(r, answer)
+    assert len(notes) == 1 and "41,300 מ״ר עיקרי (התנאי" in text and text.index("(התנאי") < text.index("— והיתר"), text
