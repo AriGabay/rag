@@ -1,6 +1,7 @@
 ---
 title: "Attribution needs positive evidence and three states, evidence is not the requirement it fills, and coverage is one decision over the final text"
 date: 2026-10-20
+last_updated: 2026-10-21
 category: logic-errors
 module: backend chat verification, item ledger and number reading (app/chat/contexts.py, verify.py, tools.py, items.py, coverage.py, meaning.py, anchors.py; app/answering/numread.py, verify.py, compose.py; app/measurements/values.py)
 problem_type: logic_error
@@ -51,7 +52,7 @@ After round 18 (PR AriGabay/rag#2), the round-18 held-out set gave a full answer
 - **Evidence identity is not requirement fulfilment.**
   - **Identity without the handle:** evidence is (document, appraisal unit, flat quote), without the turn's S# handle.
   - **One fill per component:** each request component gets its own fill, with state, reason, origin and version.
-  - **Replacing:** an agent fill replaces only a fill of its own component.
+  - **Replacing:** an agent fill replaces only a fill of its own component. *Refined in round 20:* even within one component, quotes that overlap or nest do not make two fills one; only the same datum (values, dates, conditions) does. See `overlap-is-not-identity-keep-the-supported-cell-and-attribute-below-the-property.md`.
   - **Closed decisions stay closed:** a repeated "included" does not reopen a decision such as "not applicable" with a reason.
 - **One coverage decision over the final text.**
   - **What it is:** a pure function over the model-written blocks of the answer as edited: a list item with all its sentences, a paragraph, a table row with its heading. Server lines cover nothing.
