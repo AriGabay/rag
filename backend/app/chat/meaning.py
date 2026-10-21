@@ -131,6 +131,10 @@ _AMOUNT_AFTER = re.compile(r"\s*(?:₪|ש\"ח|מ\"ר|דונם|%|אלף|מילי�
 _APPROX_WORDS = re.compile(r"(?<![א-ת])(?:מקורב|בקירוב|בערך|בסביבות)(?![א-ת])")
 # a clause ends at a full stop, a semicolon or a line end, but not inside the dotted VAT abbreviation "מ.ע.מ." (round 13)
 _CLAUSE_END = re.compile(r"(?<!מ\.ע)[.;\n](?!\d)(?!ע\.?מ(?![א-ת]))")
+# where a qualifier stops belonging to the words before it (round 21 packet A, R1): a clause end, and also a table cell separator and the end of a
+# bold lead-in label ("**שטח בנוי, זכויות:**", "**שטח בנוי**:"). A basis or a period at the end of one cell or label is not the next cell's or the first
+# amount after the label's; ``_CLAUSE_END`` itself (read by the VAT and condition checks, whose clauses run across cells) is unchanged
+_QUALIFIER_END = re.compile(_CLAUSE_END.pattern + r"|\||:\*\*|\*\*\s?:")
 _ROW = " | "
 # a clause saying the source does not state / does not show something ("לא צוין אם הסכום כולל מע״מ", "אינו מופיע"): it
 # claims no basis, period or VAT for the numbers it names, so no number-meaning check applies to it (round 9 U12)
@@ -495,6 +499,23 @@ def _noun_period(clause: str, owner: tuple, after: int) -> bool:
     return any(w != "של" for w in re.findall(r"[א-ת]{2,}", clause[after:a]))
 
 
+def _row_line(text: str, at: int) -> tuple[int, int] | None:
+    """The (start, end) of the line of ``text`` that holds ``at`` when it is a table row (it holds a cell separator), else None."""
+    lo = text.rfind("\n", 0, at) + 1
+    hi = text.find("\n", at)
+    hi = len(text) if hi < 0 else hi
+    return (lo, hi) if "|" in text[lo:hi] else None
+
+
+def _row_amounts(text: str, row: tuple[int, int] | None) -> list[int]:
+    """The positions (in ``text``) of the amounts of a table row: its numbers that are no year, identifier, count or duration."""
+    if row is None:
+        return []
+    lo, hi = row
+    line = text[lo:hi]
+    return [lo + a for a, b, _ in _numbers(line) if not not_an_amount(line, a, b, years=True) and not after_kind(line, b)]
+
+
 def attached(text: str, noun_period: bool = True) -> tuple[list[tuple[frozenset[str], int, Qualifiers]], Qualifiers]:
     """For each number in the text, its forms, position and the qualifiers attached to it; and the qualifiers of
     clauses with no number (what the text states beyond its own numbers). A rate's period word ("בריבית שנתית")
@@ -504,8 +525,9 @@ def attached(text: str, noun_period: bool = True) -> tuple[list[tuple[frozenset[
     text = _read(text)
     out: list[tuple[frozenset[str], int, Qualifiers]] = []
     general = Qualifiers()
+    pending: list[tuple[str, str, str, int]] = []
     start = 0
-    for end_m in [*_CLAUSE_END.finditer(text), None]:
+    for end_m in [*_QUALIFIER_END.finditer(text), None]:
         end = end_m.end() if end_m else len(text)
         clause = text[start:end]
         nums = _numbers(clause)
@@ -523,6 +545,9 @@ def attached(text: str, noun_period: bool = True) -> tuple[list[tuple[frozenset[
             if noun_period and kind == "period" and nums and (of_owner := _of_owner(clause, nums, pos + len(written))) is not None:
                 owner = of_owner  # the answer's side only: a source is read as it was written (round 20 U9, F4)
             if owner is None or (noun_period and kind == "period" and _noun_period(clause, nums[owner], pos + len(written))):
+                if not nums and _row_line(text, start) is not None:
+                    pending.append((kind, key, written, start))  # a cell of only a qualifier: the row's one amount, if it has one
+                    continue
                 general.add(kind, key, written)
                 continue
             quals[owner].add(kind, key, written)
@@ -531,6 +556,16 @@ def attached(text: str, noun_period: bool = True) -> tuple[list[tuple[frozenset[
                 quals[i].add("approx", "approx", "מקורב")
             out.append((forms, start + a, quals[i]))
         start = end
+    for kind, key, written, at in pending:
+        # a table cell that holds only a qualifier applies to the row's ONE amount when the row has exactly one; with several amounts it stays
+        # general, and a qualifier in a cell with a number of its own stays with that number (round 21 packet A, R1; R3: no protection is lost)
+        row = _row_line(text, at)
+        only = _row_amounts(text, row)
+        target = next((n for n, (_, p, _) in enumerate(out) if len(only) == 1 and p == only[0]), None)
+        if target is None:
+            general.add(kind, key, written)
+        else:
+            out[target][2].add(kind, key, written)
     return out, general
 
 
@@ -550,7 +585,7 @@ def _only(q: Qualifiers, kind: str, keep: bool = True) -> Qualifiers:
 def absence_spans(text: str) -> list[tuple[int, int]]:
     """The spans of the clauses of ``text`` (split as ``attached`` splits them) that state something is not stated."""
     out, start = [], 0
-    for end_m in [*_CLAUSE_END.finditer(text), None]:
+    for end_m in [*_QUALIFIER_END.finditer(text), None]:
         end = end_m.end() if end_m else len(text)
         if ABSENCE_SENTENCE.search(text[start:end]):
             out.append((start, end))
@@ -588,12 +623,40 @@ _AREA_AFTER = re.compile(r"\s*(?:מ\"ר|מטר|דונם)(?![א-ת])")
 _AREA_WORD = re.compile(r"(?<![א-ת])[לב]?(?:מ\"ר|מטר|דונם)(?![א-ת])")
 
 
-def _area_amount(text: str, pos: int, written: str, closest: list[Occurrence]) -> bool:
+def _own_part_is_area(context: str, forms: frozenset[str]) -> bool | None:
+    """Whether the number of ``forms`` is an area amount by the words of its OWN part of a quote (round 21 packet A, Q3): its unit right after
+    it ("4,350 מ״ר"), or "למ״ר" in the stretch of its comma part between the numbers beside it. None when the quote does not hold the number
+    (the caller then reads the whole quote, as before). A quote that names an area beside a rate or a cost ("... 6% על 4,350 מ״ר ברוטו") does not
+    make that rate or cost an area amount."""
+    c = _norm(context)
+    nums = _numbers(c)
+    own = [i for i, (_, _, f) in enumerate(nums) if f & forms]
+    if not own:
+        return None
+    for i in own:
+        a, b, _ = nums[i]
+        if _AREA_AFTER.match(c, b):
+            return True
+        starts = [m.end() for m in _SEGMENT_END.finditer(c, 0, a)]
+        end = _SEGMENT_END.search(c, b)
+        lo = max(starts[-1] if starts else 0, nums[i - 1][1] if i else 0)
+        hi = min(end.start() if end else len(c), nums[i + 1][0] if i + 1 < len(nums) else len(c))
+        if _PER_AREA.search(c[lo:hi]):
+            return True
+    return False
+
+
+def _area_amount(text: str, pos: int, written: str, closest: list[Occurrence], forms: frozenset[str] | None = None) -> bool:
     """Whether the number at ``pos`` is an area or a per-area amount, the only numbers an area basis qualifies:
     the answer presents it so ("145 מ״ר", or its clause says "למ״ר"), or its own line in the source does ("שווי
     למ״ר בנוי | 8,700"). A total in ₪ or a factor in the rows of a calculation table whose area column is "מ״ר
-    אקוו׳" is neither, though the column's header binds the basis to it."""
-    if _AREA_AFTER.match(text, pos + len(written)):
+    אקוו׳" is neither, though the column's header binds the basis to it. A percent is never one, and the area
+    words of an occurrence count only in the number's own row, column or part of a quote, never in the whole quote
+    (``_own_part_is_area``; round 21 packet A, Q3)."""
+    after = pos + len(written)
+    if _PERCENT_AFTER.match(text, after) or text[max(0, pos - 1):pos] == "%":
+        return False
+    if _AREA_AFTER.match(text, after):
         return True
     # its own part of the sentence: a list of figures ("2,870 ₪ למ״ר, שווי כזמין של 41,260,500 ₪, מקדם 0.8712")
     # gives "למ״ר" to the figure it follows, not to the others
@@ -601,7 +664,15 @@ def _area_amount(text: str, pos: int, written: str, closest: list[Occurrence]) -
     end = _SEGMENT_END.search(text, pos)
     if _PER_AREA.search(text[starts[-1] if starts else 0:end.start() if end else len(text)]):
         return True
-    return any(o.area or _AREA_WORD.search(o.context) for o in closest)
+    for o in closest:
+        if o.area:
+            return True
+        if _ROW in o.context or o.context.lstrip().startswith("|"):
+            continue  # a table row's cells name their own area (``area``); the row's other cells are not this number's
+        own = _own_part_is_area(o.context, forms) if forms else None
+        if own is True or (own is None and _AREA_WORD.search(o.context)):
+            return True
+    return False
 
 
 COLUMN_ROW_NUMBERS = 3  # a page-text line of this many numbers is a row of a column layout (``_period_lines``)
@@ -771,20 +842,48 @@ def context_kind(context: str) -> str:
     return "other" if nonmonetary(c) else "rate"
 
 
-# a row that names a capitalised amount ("שווי מהוון", "סה״כ מהוון", "Capitalised value") or a plain value or price is a one-time amount
+# a row that names a capitalised amount ("שווי מהוון", "סה״כ מהוון", "Capitalised value") or a plain value or price is a one-time amount. The
+# capitalisation as a NOUN is a capitalised amount's word too ("היוון ההכנסות", "בהיוון", "capitalisation"; round 21 packet A, Q1), unless a rate
+# noun stands right before it ("שיעור היוון", "מקדם ההיוון": the rate of capitalisation is a percent, not an amount, and keeps its own period)
 _CAPITALISED = re.compile(r"(?<![א-ת])[והב]?מהוו?ן(?![א-ת])|(?<![A-Za-z])(?i:capitali[sz]ed|present\s+value)(?![A-Za-z])")
+_CAPITALISATION_NOUN = re.compile(r"(?<![א-ת])[ובלכשמ]?ה?היוו?ן(?![א-ת])|(?<![A-Za-z])(?i:capitali[sz]ation|capitali[sz]ing)(?![A-Za-z])")
+_RATE_BEFORE = re.compile(r"(?<![א-ת])(?:שיעור(?:י)?|מקדם|מקדמי|ריבית|תשואת|תשואה|קצב|אחוז|rate|factor|yield)\s+(?:ה|ל|ב)?$", re.IGNORECASE)
 _RECURRING_KINDS = ("rent", "management_fee", "income")
 _ONE_TIME_KINDS = ("value", "price")
 _RECURRING_WORDS = re.compile(r"(?<![A-Za-z])(?i:rent|rental|income|revenue|fee|fees|payment|payments|charge|charges)(?![A-Za-z])")
 _ONE_TIME_WORDS = re.compile(r"(?<![A-Za-z])(?i:value|price|valuation)(?![A-Za-z])")
+# a valuation word: the value of something ("שווי ההכנסות", "Valuation of the rent") is one amount; but the "שווי שכירות" family is a rent's own
+# value, a recurring amount (round 21 packet A, Q1)
+_VALUATION = re.compile(r"(?<![א-ת])[והבלמש]?שווי(?![א-ת])(?!\s+(?:ה)?(?:דמי\s+)?(?:שכירות|שכ\"ד|שכר\s+דירה)(?![א-ת]))"
+                        r"|(?<![A-Za-z])(?i:value|valuation)(?![A-Za-z])")
+
+
+def capitalised_label(label: str) -> bool:
+    """Whether a row label names a capitalised amount: the participle, the noun "היוון" (not the rate of capitalisation: a rate noun before
+    it makes it a percent's label) or the English words (round 21 packet A, Q1, Q2)."""
+    c = _norm(label)
+    if _CAPITALISED.search(c):
+        return True
+    return any(not _RATE_BEFORE.search(c[:m.start()]) for m in _CAPITALISATION_NOUN.finditer(c))
+
+
+def _valuation_label(label: str) -> bool:
+    """Whether the label is the value of something ("שווי ההכנסות"): a valuation word with no recurring word before it. A recurring word
+    before it ("דמי שכירות - שווי") names a recurring amount's own value."""
+    for m in _VALUATION.finditer(label):
+        before = label[:m.start()]
+        if not (_RECURRING_WORDS.search(before) or any(kind_attested(k, before) for k in _RECURRING_KINDS)):
+            return True
+    return False
 
 
 def _recurring_row(label: str) -> bool:
-    """Whether a table row can carry its column header's period (round 21 U3, KTD3): a capitalised amount cannot, whatever kind it names; a
-    row of a recurring kind (rent, a management fee, income) can; a row of a value or a price that names no recurring kind cannot ("שווי"
-    under "סכום חודשי"); a row that names none of them can, as before."""
+    """Whether a table row can carry its column header's period (round 21 U3, KTD3): a capitalised amount cannot, whatever kind it names (and
+    in either word of capitalisation, round 21 packet A, Q1); the value of something ("שווי ההכנסות") cannot; a row of a recurring kind
+    (rent, a management fee, income) can; a row of a value or a price that names no recurring kind cannot ("שווי" under "סכום חודשי"); a
+    row that names none of them can, as before."""
     c = _norm(label)
-    if _CAPITALISED.search(c):
+    if capitalised_label(c) or _valuation_label(c):
         return False
     if _RECURRING_WORDS.search(c) or any(kind_attested(k, c) for k in _RECURRING_KINDS):
         return True
@@ -950,7 +1049,12 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                     kind = after_kind(cell, at + len(written_at(cell, at))) or context_kind(row_meaning)
                     q = _tagged(q, "cell")
                     if i > 0:
-                        q.merge(_gated(_all(cells[0]), kind, True), "row")  # the row's label
+                        label_q = _gated(_all(cells[0]), kind, True)  # the row's label
+                        if capitalised_label(cells[0]):
+                            # "capitalisation of the MONTHLY rents": the word modifies the rents, the cell is a one-time total. A rate
+                            # row ("שיעור היוון שנתי") is no capitalised label (``capitalised_label``) and keeps its period (round 21 packet A, Q2)
+                            label_q = _only(label_q, "period", keep=False)
+                        q.merge(label_q, "row")
                     # a column header's period is the period of a recurring row (rent, income, a payment); a capitalised total or a value row is
                     # not a recurring amount, and a period the cell or its row states itself beats the header's (round 21 U3, KTD3, R5)
                     header_period = not q.keys("period") and (i == 0 or _recurring_row(cells[0]))
@@ -1235,8 +1339,16 @@ def value_qualifiers(v, forms: frozenset[str]) -> Qualifiers:
                                 v.period if provenance.get("period") == "source" else None, bool(v.approx))
     q = Qualifiers()
     for kind, field_ in (("basis", "area_basis"), ("period", "period")):
+        if kind == "basis" and _rate_value(v):
+            q.merge(_only(own, kind))  # an area basis stored beside a rate is the area figure's, not the rate's (round 21 packet A, Q3)
+            continue
         q.merge(_only(stored if provenance.get(field_) == "source" else own, kind))
     return q.merge(_only(stored, "approx"))
+
+
+def _rate_value(v) -> bool:
+    """Whether a registered value is a percent or a rate: no area basis of its record is its own (round 21 packet A, Q3)."""
+    return getattr(v, "unit", "") in ("percent", "ratio") or getattr(v, "kind", "") == "rate"
 
 
 @dataclass
@@ -1604,7 +1716,7 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
         closest = _closest(occurrences, words)
         expanded: list | None = None  # read only for a qualifier the cited passages do not attach
         for kind in ("basis", "period", "approx"):
-            if kind == "basis" and not _area_amount(text, pos, written, closest):
+            if kind == "basis" and not _area_amount(text, pos, written, closest, forms):
                 continue  # an area basis qualifies an area or a per-area amount only
             if kind == "period" and shape:
                 continue  # a duration or a count never receives a period

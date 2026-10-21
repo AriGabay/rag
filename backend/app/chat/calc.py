@@ -666,8 +666,8 @@ class _Eval:
 
     def additive(self, op: str, a: Operand, b: Operand) -> Operand:
         self._additive_checks([a, b], op)
-        if a.subject and b.subject and not same_subject(a.subject, b.subject) and not (
-                op == "+" and a.role == "component" and b.role == "component"):
+        if a.subject and b.subject and not (
+                op == "+" and a.role == "component" and b.role == "component") and _subjects_differ(a, b):
             self.need(f"נושא: «{a.subject}» מול «{b.subject}»")
         (va, vb), scale = self.same_scale([a, b])
         value = va + vb if op == "+" else va - vb
@@ -874,6 +874,21 @@ def _subject_words(subject: str) -> set[str]:
     from app.chat.meaning import _norm, metric_word
 
     return {_SUBJECT_PREFIX.sub("", w) for w in re.findall(r"[\w\"']+", _norm(subject)) if not metric_word(w)}
+
+
+def _subjects_differ(a: Operand, b: Operand) -> bool:
+    """Whether two operands that are added or subtracted name different scopes, decided by evidence first (round 21 packet A, Q5): when every
+    input of both lies in an appraisal context the sources locate (``Leaf.context``), the same context is no mismatch whatever strings the
+    model wrote for the two subjects, and disjoint contexts are one as before; when either is unknown the model's own strings decide, as before
+    (``same_subject``)."""
+    ca = {lf.context[0] for lf in a.leaves if lf.context is not None}
+    cb = {lf.context[0] for lf in b.leaves if lf.context is not None}
+    if ca and cb and all(lf.context is not None for lf in (*a.leaves, *b.leaves)):
+        if ca == cb:
+            return False
+        if ca.isdisjoint(cb):
+            return True
+    return not same_subject(a.subject, b.subject)
 
 
 def same_subject(a: str, b: str) -> bool:

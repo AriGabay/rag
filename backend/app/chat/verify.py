@@ -4378,7 +4378,30 @@ def _computation_vat(unit: Unit, ws: Workspace, c) -> set[tuple[str, str]]:
         # a value's VAT backs a claim only when its source gave it, as in ``_vat_problems`` (round 12 U10, R6, R8)
         if v is not None and v.vat in ("included", "excluded") and v.provenance.get("vat") == "source":
             out |= {(f, v.vat) for f in numbers_in(v.written)}
+    if not c.vat:
+        # a result whose money inputs are stored measurements: the VAT their own words state backs it when they all agree — in the quote, the
+        # table caption or the column header of the cell (round 21 packet A, R5); a status no words state, or an input with none, backs nothing
+        statuses = {_stated_vat(ws, lf) for lf in c.outcome.leaves if lf.vat is not None}
+        if len(statuses) == 1 and statuses <= {"included", "excluded"}:
+            status = next(iter(statuses))
+            for n in _shown(unit.text):
+                if _shows(c, n.written, n.percent, n.scale, steps=False):
+                    out |= {(f, status) for f in numbers_in(n.written)}
     return out
+
+
+def _stated_vat(ws: Workspace, leaf) -> str | None:
+    """The VAT status a money input of a calculation has, as words state it: the recorded status when it is "included" or "excluded" (as
+    ``Computation.vat`` reads it), else, for a stored measurement, the one status its quote, caption and column header write together."""
+    if leaf.vat in ("included", "excluded"):
+        return leaf.vat
+    m = ws.measurements.get(leaf.id)
+    if m is None:
+        return None
+    text = " ".join(str(x) for x in (getattr(m.row, a, None) for a in ("quote", "caption", "header")) if x)
+    pairs, general = vat_attachments(text)
+    found = {polarity for _, polarity in pairs} | general
+    return next(iter(found)) if len(found) == 1 else None
 
 
 def _vat_backing(unit: Unit, ws: Workspace) -> set[tuple[str, str]]:
@@ -5383,7 +5406,7 @@ def _qualifier_span(text: str, pos: int, number: str, kind: str, written: str) -
     the number's clause that belong to that number (``meaning._owner``), the nearest to it; an area basis without the
     unit or the word for area it was read with ("מ״ר ברוטו" -> "ברוטו": the unit stays). None when no such words are found."""
     start = 0
-    for end_m in [*meaning._CLAUSE_END.finditer(text), None]:
+    for end_m in [*meaning._QUALIFIER_END.finditer(text), None]:
         end = end_m.end() if end_m else len(text)
         if start <= pos < end:
             break
@@ -5398,6 +5421,16 @@ def _qualifier_span(text: str, pos: int, number: str, kind: str, written: str) -
     owned = [m for m in re.finditer(r"(?<![א-ת])" + re.escape(core) + r"(?![א-ת])", clause)
              if meaning._owner(nums, amounts, m.start(), clause) == mine]
     if not owned:
+        # a cell that holds only the qualifier, in a row with this one amount (``meaning.attached``; round 21 packet A, R1)
+        row = meaning._row_line(text, pos)
+        if row is None or meaning._row_amounts(text, row) != [pos]:
+            return None
+        line = text[row[0]:row[1]]
+        for m in re.finditer(r"(?<![א-ת])" + re.escape(core) + r"(?![א-ת])", line):
+            lo = line.rfind("|", 0, m.start()) + 1
+            hi = line.find("|", m.end())
+            if not meaning._numbers(line[lo:len(line) if hi < 0 else hi]):  # the word stands in a cell with no number of its own
+                return row[0] + m.start(), row[0] + m.end()
         return None
     here = pos - start
 
@@ -8387,13 +8420,18 @@ def _shown_support(verdicts: dict[int, JudgeVerdict], batch: _Batch, ws: Workspa
     return out
 
 
-def _named_support(unit: Unit, named: list[str], ws: Workspace, question: str) -> Problem | None:
+def _named_support(unit: Unit, named: list[str], ws: Workspace, question: str, fetcher: meaning.Fetcher | None = None,
+                   found: list[str] | None = None) -> Problem | None:
     """The deterministic checks of a unit that cites ``named`` too (numbers, VAT, the meaning of each number,
     against their full text): the judge's naming of a support is accepted only if the unit, cited so, passes them.
-    None when it does; otherwise the problem, on the unit itself."""
+    None when it does; otherwise the problem, on the unit itself. ``fetcher``: the turn's (round 21 packet A, R2): a period or a basis that
+    the same calculation's table states is found there and is no blocking problem; the evidence it found is added to ``found``, to be cited
+    with the unit (a check without a fetcher called a period the table states "unstated" and removed a sentence the judge had supported)."""
     cited = dataclasses.replace(unit, ids=[*unit.ids, *named])
-    failed = [p for p in deterministic([cited], ws, question, {unit.index: check_meaning(cited, ws)})
+    failed = [p for p in deterministic([cited], ws, question, {unit.index: check_meaning(cited, ws, fetcher)})
               if p.check != RECENCY_CHECK]
+    if found is not None:
+        found += [i for i in cited.ids if i not in unit.ids and i not in named and i not in found]
     if not failed:
         return None
     return Problem(unit, f"לא נתמך במקורות: הטענה אינה מצטטת מקור, ולפי {', '.join(named)}: {failed[0].reason}",
@@ -8620,7 +8658,8 @@ def _expand_unstated(report: VerifyReport, units: list[Unit], meanings: dict, ws
 
 
 def _named_support_expanded(u: Unit, named: list[str], problem: Problem, ws: Workspace, question: str,
-                            deadline: float | None, fetcher: ContextFetcher) -> tuple[Problem | None, list[str]]:
+                            deadline: float | None, fetcher: ContextFetcher, meaning_fetcher: meaning.Fetcher | None = None
+                            ) -> tuple[Problem | None, list[str]]:
     """A unit the judge found supported by shown sources it does not cite (``named``) whose only failure is a number their
     passages do not state (round 13): the bounded number re-read (``_expand_numbers``, as for a unit that cites) runs on the
     unit cited with ``named`` — the number may be stated in the part of the section the passage leaves out, most often
@@ -8634,9 +8673,10 @@ def _named_support_expanded(u: Unit, named: list[str], problem: Problem, ws: Wor
         return problem, []
     new_sid = _expand_numbers(cited, sid, ws, numbers_in(question), _TurnNumbers(ws), deadline, fetcher)
     if new_sid is not None:
-        again = _named_support(u, [*named, new_sid], ws, question)
+        again_found: list[str] = []
+        again = _named_support(u, [*named, new_sid], ws, question, meaning_fetcher, again_found)
         if again is None:
-            return None, [*named, new_sid]
+            return None, [*named, new_sid, *again_found]
         return again, []
     last = (ws.reread_log.get("unit:" + u.id) or [{}])[-1].get("outcome")
     if last in CONTEXT_UNREAD and last != "not_found":
@@ -9139,12 +9179,13 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                                                    claim_id=r.id if r is not None else recs[0].id))
             elif named := [s for s in dict.fromkeys(v.supported_by) if s not in u.ids]:
                 # supported by a shown source the unit does not cite: kept, and cited, only if the numbers agree
-                problem = _named_support(u, named, ws, question)
-                cite_ids = named
+                found_for_named: list[str] = []
+                problem = _named_support(u, named, ws, question, fetcher, found_for_named)
+                cite_ids = [*named, *found_for_named]
                 if problem is not None and problem.check == "unstated_number" and reread is not None:
                     # a number only the part of the section the passage leaves out states (round 13): read it before the unit
                     # is removed, as for a unit that cites
-                    problem, cite_ids = _named_support_expanded(u, named, problem, ws, question, deadline, reread)
+                    problem, cite_ids = _named_support_expanded(u, named, problem, ws, question, deadline, reread, fetcher)
                 if problem is not None:
                     report.problems.append(problem)
                 else:

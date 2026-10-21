@@ -2235,3 +2235,59 @@ def test_u7_pass2_a_valueless_item_stated_in_paraphrase_is_covered_by_its_label_
     single = _item(label="פינוי", quote="פינוי המגרש לפני המסירה", value="")
     assert not _covered(_ws("תנאי | פירוט\nפינוי | פינוי המגרש לפני המסירה"), "אישור הפינוי נדרש [S1].", single).ok
     assert not _covered(ws, "הבניין נמצא בעיר [S1].", item).ok
+
+
+# --- round 21 packet A, Q4: a server item is built from the span that states the unit's datum, not from a coinciding figure ----------------
+
+def _built(passage: str, markdown: str, *, kind: str = "section"):
+    return items.source_items(_units(markdown), _ws(passage, kind=kind), COMPONENTS, items.Ledger())
+
+
+def test_a21_q4_a_percent_the_answer_states_does_not_draw_on_a_sentence_that_counts_floors():
+    passage = "מבנה המשרדים כולל 9 קומות מעל קומת הכניסה, בכפוף להיתר."
+    assert _built(passage, "התשלום הראשון הוא 9% מהתמורה [S1].") == []
+    # the count the answer states is the sentence's own, and still draws on it
+    (item,) = _built("מבנה המשרדים כולל 9 קומות, בכפוף להיתר.", "המבנה כולל 9 קומות [S1].")
+    assert item.value == "9"
+
+
+def test_a21_q4_a_count_the_answer_states_does_not_draw_on_a_sentence_that_gives_a_percent():
+    passage = "הגבייה היא 9% מהתמורה, בכפוף להיתר."
+    assert _built(passage, "המבנה כולל 9 קומות [S1].") == []
+    (item,) = _built(passage, "התשלום הוא 9% מהתמורה [S1].")
+    assert item.value == "9%"
+
+
+def test_a21_q4_a_spatial_above_before_a_floor_is_no_threshold_operator():
+    from app.chat import conditions
+
+    for text in ("מבנה בן 9 קומות מעל קומת הכניסה", "המרתף מתחת לקרקע", "גובה 40 מטר מעל פני הים", "שטח הגג מעל לקומה האחרונה"):
+        assert conditions.operators(text) == [], text
+    assert [o.cls for o in conditions.operators("באגף שמעל החניון")] == [conditions.THRESHOLD]  # a named place still limits the datum
+    (above,) = conditions.operators("שטח מעל 30 מ״ר")  # a threshold of a number stays an operator
+    assert above.cls == conditions.THRESHOLD
+    assert [o.cls for o in conditions.operators("מתחת לגיל 30 שנה")] == [conditions.THRESHOLD]
+
+
+WRAPPED = ("דמי השכירות כפי שנקבעו בהסכם בין הצדדים לתקופת האופציה הראשונה\n"
+           "הם 41,000 ₪ לחודש בהצמדה למדד, לא כולל מע״מ.\n"
+           "הרכיב השני נקבע בנפרד.")
+
+
+def test_a21_q4_a_wrapped_sentence_is_one_span_with_its_head():
+    (item,) = _built(WRAPPED, "דמי השכירות לתקופת האופציה הם 41,000 ₪ לחודש [S1].")
+    flat = " ".join(item.quote.split())
+    assert flat.startswith("דמי השכירות כפי שנקבעו בהסכם") and flat.endswith("לא כולל מע״מ.")
+    assert item.value == "41,000"
+
+
+def test_a21_q4_a_heading_line_and_a_list_member_are_not_joined_to_the_line_after_them():
+    passage = "תנאי התשלום\nהתשלום הוא 5,000 ₪, בכפוף להיתר.\n- סכום נוסף של 6,000 ₪, בכפוף לאישור."
+    got = _built(passage, "התשלום הוא 5,000 ₪ [S1].")
+    assert [" ".join(i.quote.split()) for i in got] == ["התשלום הוא 5,000 ₪, בכפוף להיתר."]
+
+
+def test_a21_q4_a_sentence_that_shares_no_word_with_the_unit_is_not_its_own_condition():
+    # the figure coincides, the sentence is about something else, and the only condition it holds is itself
+    passage = "בכל מקרה לא יגבו עמלה נוספת של 12 אחוז על קנסות ופיצויים."
+    assert _built(passage, "שכר הטרחה הוא עלויות ישירות בתוספת 12% [S1].") == []

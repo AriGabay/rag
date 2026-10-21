@@ -103,7 +103,7 @@ from app.answering.numread import number_forms, number_spans
 from app.answering.verify import _QUANTITY_AFTER, not_an_amount, numbers_in
 from app.chat import conditions, scopes
 from app.chat.evidence import OTHER_ITEM, claim_terms
-from app.chat.meaning import _row_cells
+from app.chat.meaning import _row_cells, after_kind
 from app.chat.verify import (
     ITEM_COVERED,
     ITEM_INCLUDED,
@@ -618,47 +618,97 @@ def _clip_row(line: str) -> str:
 
 
 class _SpanRow(NamedTuple):
-    """A table row of a source for ``_cited_spans``: the line, its first cell, its first value cell and the numbers its value cells state."""
+    """A table row of a source for ``_cited_spans``: the line, its first cell, its first value cell, the numbers its value cells state and the
+    class of each (``_number_class``)."""
 
     line: str
     label: str
     value: str
     numbers: frozenset[str]
+    classes: tuple[tuple[frozenset[str], str], ...] = ()
 
 
 class _SpanSentence(NamedTuple):
-    """A sentence of a passage line for ``_cited_spans``: its text and, for each number it writes outside its dates, (as written, its numbers)."""
+    """A sentence of a passage line for ``_cited_spans``: its text and, for each number it writes outside its dates, (as written, its numbers,
+    its class)."""
 
     text: str
-    written: tuple[tuple[str, frozenset[str]], ...]
+    written: tuple[tuple[str, frozenset[str], str], ...]
+
+
+_PERCENT_WORD = re.compile(r"\s?(?:%|אחוז(?:ים)?(?![א-ת]))")
+WRAP_MIN = 45  # a line at least this long, with no sentence end, goes on in the line after it (``_unwrapped``)
+_SENTENCE_CLOSE = re.compile(r"[.!?;:]['\")\]״׳]*\s*$")
+
+
+def _number_class(text: str, start: int, end: int) -> str:
+    """What the number at ``text[start:end]`` counts: "percent", "count" (a noun of things follows: "9 קומות"), "duration" (a time word follows)
+    or "" (a plain number or an amount). A percent is no count and no duration, and neither is the other (round 21 packet A, Q4)."""
+    if text[start:end].endswith("%") or _PERCENT_WORD.match(text, end):
+        return "percent"
+    return after_kind(text, end)
+
+
+def _compatible(a: str, b: str) -> bool:
+    """Whether two number classes can be one datum: the same, or either plain."""
+    return a == b or not a or not b
+
+
+def _states(pairs: Iterable[tuple[frozenset[str], str]], wanted: Mapping[str, set[str]]) -> bool:
+    """Whether a span's numbers (forms, class) state a number of the unit (form -> classes) in a compatible class."""
+    return any(_compatible(cls, w) for forms, cls in pairs for f in forms if f in wanted for w in wanted[f])
+
+
+def _unwrapped(lines: Sequence[str]) -> list[str]:
+    """The lines of a passage with each wrapped sentence on one line (round 21 packet A, Q4): a line of at least ``WRAP_MIN`` characters that
+    does not end a sentence and is no table row, heading or list member goes on in the next line when that is no list member, heading, table
+    row or note (a footnote mark opens it) either. A sentence cut per source line leaves a headless fragment that no item may be built from."""
+    out: list[str] = []
+    for line in lines:
+        prev = out[-1] if out else ""
+        if (prev and len(prev) >= WRAP_MIN and "|" not in prev and "|" not in line and not _SENTENCE_CLOSE.search(prev)
+                and not _HEADING_LINE.match(prev) and not _HEADING_LINE.match(line) and not _MEMBER_LINE.match(line)
+                and line.strip() and not scopes.note_mark(line)):
+            out[-1] = prev.rstrip() + " " + line.strip()
+        else:
+            out.append(line)
+    return out
 
 
 def _span_index(src) -> list[_SpanRow | list[_SpanSentence]]:
-    """The body of a source parsed once for ``_cited_spans``, line by line: a table row (two cells or more) with a value cell that holds a
-    digit, else the sentences of a passage line. A row without a digit in its value cells has no entry."""
+    """The body of a source parsed once for ``_cited_spans``, line by line (a wrapped sentence is one line, ``_unwrapped``): a table row (two
+    cells or more) with a value cell that holds a digit, else the sentences of a passage line. A row without a digit in its value cells has no entry."""
     out: list[_SpanRow | list[_SpanSentence]] = []
-    for line in context_of_source(src)[1]:
+    for line in _unwrapped(context_of_source(src)[1]):
         cells = _row_cells(line) if "|" in line else []
         if len(cells) >= 2:
             values = [c for c in cells[1:] if re.search(r"\d", c)]
             if values:
-                out.append(_SpanRow(line, cells[0], values[0], frozenset(numbers_in(_outside_dates(" ".join(values))))))
+                blank = _outside_dates(" ".join(values))
+                classes = tuple((frozenset(numbers_in(m.group(0))), _number_class(blank, m.start(), m.end())) for m in _NUMBER.finditer(blank))
+                out.append(_SpanRow(line, cells[0], values[0], frozenset(numbers_in(blank)), classes))
             continue
-        out.append([_SpanSentence(s, tuple((m.group(0), frozenset(numbers_in(m.group(0))))
-                                           for m in _NUMBER.finditer(_outside_dates(s)))) for s in _SENTENCE_END.split(line)])
+        sentences = []
+        for sentence in _SENTENCE_END.split(line):
+            blank = _outside_dates(sentence)
+            sentences.append(_SpanSentence(sentence, tuple(
+                (m.group(0), frozenset(numbers_in(m.group(0))), _number_class(blank, m.start(), m.end())) for m in _NUMBER.finditer(blank))))
+        out.append(sentences)
     return out
 
 
-def _cited_spans(index: Sequence[_SpanRow | list[_SpanSentence]], wanted: set[str]) -> Iterable[tuple[str, str, str]]:
+def _cited_spans(index: Sequence[_SpanRow | list[_SpanSentence]], wanted: Mapping[str, set[str]]) -> Iterable[tuple[str, str, str]]:
     """(quote, label, value) of each table row of the source (parsed by ``_span_index``) whose value cells state a number of ``wanted``,
-    or each sentence of a passage that does: the spans an answer sentence stating those numbers draws on."""
+    or each sentence of a passage that does: the spans an answer sentence stating those numbers draws on. ``wanted`` maps each form of the
+    unit's numbers to their classes: a percent never states a count, nor a count a percent (round 21 packet A, Q4)."""
     for entry in index:
         if isinstance(entry, _SpanRow):
-            if wanted & entry.numbers:
+            covered = {f for forms, _ in entry.classes for f in forms}
+            if _states([*entry.classes, *((frozenset({f}), "") for f in entry.numbers - covered)], wanted):
                 yield _clip_row(entry.line), entry.label, entry.value
             continue
         for sentence in entry:
-            hits = [written for written, numbers in sentence.written if numbers & wanted]
+            hits = [written for written, forms, cls in sentence.written if _states([(forms, cls)], wanted)]
             if hits:
                 yield sentence.text.strip(), _first_words(sentence.text, trim=False), hits[0]
 
@@ -691,6 +741,22 @@ def _holds(item: Item, sid: str, ws, flat: str, component: str | None = None) ->
     return place == (item.document_id, item.unit_id) if place is not None and item.document_id else _same_source(ws, item.source, sid)
 
 
+def _related(sentence: str, text: str) -> bool:
+    """Whether a source sentence and an answer sentence share a content word (one word's stem opening the other, three letters at least)."""
+    final = str.maketrans("םןץףך", "מנצפכ")  # a stem keeps its letters when a suffix follows ("דגם" / "דגמים")
+    mine, theirs = {w.translate(final) for w in claim_terms(sentence)[1]}, {w.translate(final) for w in claim_terms(text)[1]}
+    return any(a.startswith(b) or b.startswith(a) for a in mine for b in theirs if min(len(a), len(b)) >= 3)
+
+
+def _only_itself(spans: Sequence[Span], flat: str) -> bool:
+    """Whether every condition span of an item is the item's own quote: the sentence limits itself and nothing else limits it."""
+    def bare(text: str) -> str:
+        return SupportScope.flat(text).strip(" .,;:")
+
+    mine = bare(flat)
+    return all(sp.place in ("quote", "row") and mine in bare(sp.text) for sp in spans)
+
+
 def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledger: Ledger) -> list[Item]:
     """The origin ``source`` items for the spans the answer cites (round 18 U5, KTD1): for each surviving unit and each source it
     cites, each table row or sentence stating a number of the unit whose own context carries a condition (``condition_spans``) and
@@ -703,7 +769,11 @@ def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledge
     built: list[Item] = []
     indexes: dict[str, list] = {}  # each cited source parsed once, whatever the number of units that cite it
     for unit in units:
-        wanted = numbers_in(_outside_dates(unit.text))
+        blank = _outside_dates(unit.text)
+        wanted: dict[str, set[str]] = {}
+        for m in _NUMBER.finditer(blank):
+            for form in numbers_in(m.group(0)):
+                wanted.setdefault(form, set()).add(_number_class(blank, m.start(), m.end()))
         if not wanted:
             continue
         sources = _cited_sources(unit, ws)
@@ -723,6 +793,8 @@ def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledge
                 spans = condition_spans(src, quote, [i.quote for i in held])
                 if not spans or _note_of_another_scope(ws, sid, src, quote, quote, against=referent):
                     continue
+                if _only_itself(spans, flat) and not _related(quote, unit.text):
+                    continue  # the figure coincides: the sentence is about another thing and its only condition is itself (round 21 packet A, Q4)
                 made += 1
                 document_id, unit_id = _site_of(src)
                 item = Item(component, label, sid, quote, value,

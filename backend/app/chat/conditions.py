@@ -40,6 +40,9 @@ _EXCLUSIVE = frozenset("רק בלבד אלא".split())
 _EXCEPT_OUT = frozenset("למעט מלבד פרט להוציא בהוצאת".split())
 _EXCEPT_IN = frozenset("כולל כוללת כוללים כוללות לרבות".split())
 _SUBJECT = frozenset("בכפוף כפוף כפופה כפופים כפופות בתנאי מותנה מותנית מותנים מותנות אם".split())
+# "above"/"below" before a floor or ground-level word is a position, not a threshold: "קומות מעל קומת הקרקע", "מתחת לקרקע", "מעל פני הים"
+# (round 21 packet A, Q4). A named place ("שמעל החניון") stays an operator: the wing above the lot is a limit of the datum
+_SPATIAL_NEXT = frozenset("קומה קומת קומות קרקע פני גג מפלס כביש ים".split())
 _THRESHOLD = {"מעל": "מעל", "יותר": "מעל", "מתחת": "מתחת", "פחות": "מתחת", "עד": "עד", "היותר": "עד", "מקסימום": "עד",
               "לפחות": "לפחות", "מינימום": "לפחות"}
 # a heading or a note that names a method or a component of the valuation limits the values under it
@@ -116,6 +119,13 @@ def _tokens(clause: str) -> tuple[str, ...]:
     return tuple(_MISSING_TOKEN.findall(clause))
 
 
+def _spatial(tokens: Sequence[str], at: int) -> bool:
+    """Whether the "above"/"below" at ``tokens[at]`` says where something is (a place word follows it, with or without a "the" or "to" prefix),
+    not how much (round 21 packet A, Q4)."""
+    nxt = _bare(tokens[at + 1]) if at + 1 < len(tokens) else ""
+    return nxt in _SPATIAL_NEXT or re.sub(r"^[הלבו]+", "", nxt) in _SPATIAL_NEXT
+
+
 def _ops(tokens: Sequence[str]) -> list[Op]:
     """The operators of a clause's tokens. A negation right before an including word or a threshold folds into it ("לא כולל" is
     an exclusion, "לא יותר" the negative side of a threshold) and is not an operator of its own."""
@@ -127,6 +137,9 @@ def _ops(tokens: Sequence[str]) -> list[Op]:
             at += 1
             continue
         cls, key, negative = found
+        if cls == THRESHOLD and key in ("מעל", "מתחת") and _spatial(tokens, at):
+            at += 1
+            continue
         follows = _word_op(tokens[at + 1]) if at + 1 < len(tokens) else None
         if cls == NEGATION and follows is not None and follows[0] in (EXCEPTION, THRESHOLD):
             cls, key, negative = follows[0], follows[1], not follows[2]

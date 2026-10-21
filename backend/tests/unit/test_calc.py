@@ -880,3 +880,59 @@ def test_u3_c1_a_value_with_a_clear_reading_whose_attributes_the_source_states_i
     v = calc.Value("V1", Decimal(3100000), "3,100,000", "S1", None, None, None, "t", "l", "שווי", "value", "ILS", "none", "unknown", "",
                    "הנכס", "other", prov, {"quote": "3,100,000 ₪"}, "3,100,000 ₪")
     assert v.certainty == "verified"
+
+
+# --- round 21 packet A, Q5: a subject mismatch is decided by the evidence's appraisal context before the model's strings ------------
+
+def _valuation(vid: str, value: str, subject: str, **kw) -> calc.Operand:
+    return operand(vid, value, "ILS", kind="value", subject=subject, vat="excluded", **kw)
+
+
+A_CONTEXT, B_CONTEXT = ("v1:1", "שומה א"), ("v1:2", "שומה ב")
+
+
+def test_a21_q5_two_values_of_one_appraisal_context_are_no_mix_of_subjects_whatever_the_model_wrote():
+    now = _valuation("V1", "9000000", "שווי הזכויות כיום", context=A_CONTEXT)
+    before = _valuation("V2", "7000000", "שווי הזכויות בשומה הקודמת", context=A_CONTEXT)
+    out = run("V1 - V2", ops(now, before))
+    assert out.value == Decimal("2000000") and not out.conditional
+
+
+def test_a21_q5_values_of_different_contexts_are_a_mix_even_when_the_model_wrote_alike():
+    a = _valuation("V1", "9000000", "פרויקט הדגמה", context=A_CONTEXT)
+    b = _valuation("V2", "7000000", "פרויקט הדגמה", context=B_CONTEXT)
+    with pytest.raises(CalcError):
+        run("V1 - V2", ops(a, b))
+    out = run("V1 - V2", ops(a, b), "הפרש בין שתי שומות לצורך השוואה")
+    assert out.conditional and any("נושא" in c for c in out.conditional)
+
+
+def test_a21_q5_when_either_value_has_no_known_context_the_model_strings_decide_as_before():
+    a = _valuation("V1", "9000000", "פרויקט הדגמה")
+    b = _valuation("V2", "7000000", "פרויקט אחר")
+    with pytest.raises(CalcError):
+        run("V1 - V2", ops(a, b))  # neither is located
+    with pytest.raises(CalcError):
+        run("V1 - V2", ops(_valuation("V1", "9000000", "פרויקט הדגמה", context=A_CONTEXT), b))  # one is located
+    similar = _valuation("V3", "7000000", "הפרויקט במתחם הדגמה")
+    same = _valuation("V4", "9000000", "מתחם הדגמה", context=A_CONTEXT)
+    assert run("V3 - V4", ops(similar, same)).value == Decimal("-2000000")
+
+
+def test_a21_q5_a_result_built_over_two_contexts_is_not_located_in_one():
+    a = _valuation("V1", "9000000", "הנכס", context=A_CONTEXT)
+    b = _valuation("V2", "1000000", "הנכס", context=B_CONTEXT)
+    total = calc.result_operand("C1", run("V1 + V2", ops(a, b), "איחוד שתי שומות"))
+    c = _valuation("V3", "500000", "הנכס אחר", context=A_CONTEXT)
+    with pytest.raises(CalcError):
+        run("C1 - V3", ops(total, c))  # {A, B} against {A}: partly overlapping evidence is not decided by context, the strings are
+
+
+def test_a21_q5_a_registered_values_context_reaches_its_operand():
+    from app.chat.calc import Value
+
+    value = Value("V1", Decimal("9"), "9", "S1", None, None, None, "שומה", "סעיף", "שווי", "value", "ILS", "none", "excluded", "",
+                  "הנכס", "other", {"vat": "source", "unit": "source"}, {"quote": "שווי 9"}, "שווי 9",
+                  context={"key": "v1:1", "label": "שומה א", "described": "שומה א", "subject": True})
+    (leaf,) = value.operand().leaves
+    assert leaf.context == ("v1:1", "שומה א")

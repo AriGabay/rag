@@ -1505,3 +1505,169 @@ def test_pass2_a_column_layout_that_goes_on_after_a_page_break_keeps_its_header_
     ws = _ws(text)
     assert _problems("The annual yield of the last row is 6.9100% [S1].", ws) == []
     assert _row_period(text, "6.9100%") == set()
+
+
+# --- round 21 packet A, Q1/Q2: a capitalised or valuation row takes no period from the column header or from its own label ------------
+
+CAPITALISED_TABLE = "\n".join([
+    "תמהיל הכנסות", MONTHLY_HEADER, "דמי שכירות חודשיים | 2,500",
+    "שווי לפי גישת היוון ההכנסות | 3,300,000", "היוון דמי השכירות החודשיים | 18,000", "שיעור היוון שנתי | 6.4%"])
+
+
+def test_a21_q1_the_noun_capitalisation_in_a_label_gives_no_header_period_even_with_an_income_word():
+    assert _cell_period(CAPITALISED_TABLE, "3,300,000") == set()
+    assert _cell_period(CAPITALISED_TABLE, "2,500") == {"month"}
+
+
+@pytest.mark.parametrize("label", ["שווי ההכנסות בהיוון", "היוון ההכנסות", "שווי ההכנסות", "Total value by the capitalisation approach",
+                                   "Present value of the rents", "Valuation of the rent"])
+def test_a21_q1_a_capitalised_or_valuation_row_never_takes_the_header_period(label):
+    header = "Item | Monthly (₪)" if label.isascii() else MONTHLY_HEADER
+    table = "\n".join(["Income", header, "דמי שכירות | 55,000" if not label.isascii() else "Base rent | 55,000", f"{label} | 6,600,000"])
+    assert _cell_period(table, "6,600,000") == set()
+
+
+def test_a21_q1_a_rental_value_row_is_still_a_recurring_amount():
+    table = "\n".join(["תמהיל הכנסות", MONTHLY_HEADER, "שווי שכירות | 55,000"])
+    assert _cell_period(table, "55,000") == {"month"}
+
+
+def test_a21_q2_the_period_inside_a_capitalised_rows_label_is_not_the_amounts_period():
+    # "capitalisation of the MONTHLY rents": the word modifies the rents, the cell is a one-time total
+    assert _cell_period(CAPITALISED_TABLE, "18,000") == set()
+    other = "\n".join(["Income", "Item | Total (₪)", "Total value by capitalising the monthly base rent | 9,000,000"])
+    assert _cell_period(other, "9,000,000") == set()
+
+
+def test_a21_q2_a_rate_row_keeps_the_period_of_its_own_label():
+    assert _cell_period(CAPITALISED_TABLE, "6.4") == {"year"}
+
+
+def test_a21_q2_the_answer_is_not_told_to_add_a_month_to_a_capitalised_total():
+    ws = _ws(CAPITALISED_TABLE)
+    assert _problems("השווי לפי גישת היוון ההכנסות הוא 3,300,000 ₪ [S1].", ws) == []
+    assert _problems("היוון דמי השכירות החודשיים הוא 18,000 ₪ [S1].", ws) == []
+    (p,) = _problems("דמי השכירות הם 2,500 ₪ [S1].", ws)
+    assert p.kind == "period" and not p.blocking
+
+
+# --- round 21 packet A, Q3: an area basis stored beside a rate is not the rate's ------------------------------------------------
+
+AREA_QUOTE = "עלות 2,950 ₪ למ\"ר, בשיעור היוון 6% על 4,350 מ\"ר ברוטו"
+
+
+def test_a21_q3_a_stored_area_basis_on_a_percent_value_is_no_evidence_and_is_not_demanded():
+    ws = _registered("6", AREA_QUOTE, unit="percent", area_basis="ברוטו", kind="rate")
+    assert meaning.value_qualifiers(ws.values["V1"], frozenset({"6"})).keys("basis") == set()
+    assert _problems("שיעור ההיוון הוא 6% [V1].", ws) == []
+
+
+def test_a21_q3_the_area_figure_of_the_same_quote_keeps_its_basis():
+    ws = _registered("4,350", AREA_QUOTE, unit="sqm", area_basis="ברוטו", kind="area")
+    (p,) = _problems("השטח הוא 4,350 מ״ר [V1].", ws)
+    assert p.kind == "basis" and not p.blocking and p.annotation == "ברוטו"
+
+
+def test_a21_q3_a_percent_the_answer_states_is_never_an_area_amount_even_when_the_quote_names_an_area():
+    occ = meaning.Occurrence(meaning.Qualifiers(), AREA_QUOTE, measurement=True)
+    text = "שיעור ההיוון הוא 6%"
+    assert not meaning._area_amount(text, text.index("6"), "6", [occ], frozenset({"6"}))
+
+
+def test_a21_q3_the_area_word_of_another_part_of_the_quote_does_not_make_a_number_an_area_amount():
+    quote = 'שטח ברוטו 4,350 מ"ר, עלות הבנייה 2,950 ₪'
+    ws = _registered("2,950", quote, unit="ILS", area_basis="ברוטו", kind="cost")
+    assert _problems("עלות הבנייה היא 2,950 ₪ [V1].", ws) == []
+    occ = meaning.Occurrence(meaning.Qualifiers(), quote, measurement=True)
+    text = "עלות הבנייה היא 2,950 ₪"
+    assert not meaning._area_amount(text, text.index("2,950"), "2,950", [occ], frozenset({"2950"}))
+    area = "השטח הוא 4,350"
+    assert meaning._area_amount(area, area.index("4,350"), "4,350", [occ], frozenset({"4350"}))  # its own unit follows it in the quote
+
+
+# --- round 21 packet A, R1: a table cell and a bold lead-in label end a clause for the qualifiers ------------------------------
+
+def _basis_of(text: str, number: str) -> set[str]:
+    (q,) = [q for forms, _, q in meaning.attached(text)[0] if number in forms]
+    return q.keys("basis")
+
+
+def test_a21_r1_a_basis_at_the_end_of_one_table_cell_is_not_passed_to_the_amount_of_the_next_cell():
+    row = '| 2015 | 3-6 | כ-3,640 מ"ר, שטח רשום | 8,260 מ"ר |'
+    assert _basis_of(row, "3640") == {"רשום"}
+    assert _basis_of(row, "8260") == set()
+
+
+def test_a21_r1_a_cell_of_only_a_period_applies_to_the_rows_one_amount_and_to_nothing_when_the_row_has_several():
+    single = "| דמי שכירות | 5,000 ₪ | שנתי |"
+    assert [q.keys("period") for _, _, q in meaning.attached(single)[0]] == [{"year"}]
+    plain = "| דמי שכירות | 5,000 | שנתי |"
+    assert [q.keys("period") for _, _, q in meaning.attached(plain)[0]] == [{"year"}]
+    several = "| שכירות | 5,000 ₪ | 6,000 ₪ | שנתי |"
+    assert [q.keys("period") for _, _, q in meaning.attached(several)[0]] == [set(), set()]
+    own = "| שכירות | 5,000 ₪ לחודש | 6,000 ₪ | שנתי |"  # a qualifier in a cell with its own number stays with that number
+    assert [q.keys("period") for _, _, q in meaning.attached(own)[0]] == [{"month"}, set()]
+
+
+def test_a21_r1_a_single_amount_row_with_an_annual_cell_is_still_checked_against_a_monthly_source():
+    ws = _ws("סוג | סכום\nדמי שכירות חודשיים | 5,000 ₪")
+    (p,) = _problems("| דמי שכירות | 5,000 ₪ | שנתי | [S1]", ws)
+    assert p.kind == "period" and p.blocking
+    assert _problems("| דמי שכירות | 5,000 ₪ | חודשי | [S1]", ws) == []
+    # with several amounts in the row the cell is general and claims no period of one of them
+    assert not [x for x in _problems("| דמי שכירות | 5,000 ₪ | 6,000 ₪ | שנתי | [S1]", ws) if x.blocking]
+
+
+def test_a21_r1_the_cell_of_a_qualifier_the_source_lacks_is_found_for_the_edit():
+    from app.chat import verify
+
+    row = '| שטח | 120 מ"ר | ברוטו |'
+    pos = row.index("120")
+    start, end = verify._qualifier_span(row, pos, "120", "basis", "ברוטו")
+    assert row[start:end] == "ברוטו"
+    assert verify._qualifier_span('| שטח | 120 מ"ר | 90 מ"ר | ברוטו |', pos, "120", "basis", "ברוטו") is None
+
+
+def test_a21_r1_the_words_of_a_bold_lead_in_label_do_not_pass_to_the_first_amount_after_it():
+    text = '**שטח בנוי, סטטוס וחתימות:** זכויות של 21,800 מ"ר שטח עיקרי'
+    assert _basis_of(text, "21800") == {"עיקרי"}
+    assert "בנוי" not in meaning.attached(text)[0][0][2].keys("basis")
+    after_colon = '**שטח בנוי**: זכויות של 21,800 מ"ר'
+    assert _basis_of(after_colon, "21800") == set()
+
+
+def test_a21_r1_the_answer_row_with_a_registered_area_cell_has_no_blocking_basis_on_the_capacity_cell():
+    ws = _ws('שנה | שטח | קיבולת\n2015 | כ-3,640 מ"ר, שטח רשום | 8,260 יחידות')
+    problems = _problems('| 2015 | כ-3,640 מ"ר, שטח רשום | 8,260 יחידות | [S1]', ws)
+    assert not [p for p in problems if p.blocking]
+
+
+def test_a21_r1_a_sentence_and_a_comma_part_keep_the_rule_they_had():
+    text = 'בשטח 120 מ"ר, דמי השכירות לחודש 7,560 ₪'
+    assert [q.keys("period") for _, _, q in meaning.attached(text)[0]] == [set(), {"month"}]
+
+
+# --- round 21 packet A, R2: the judge's named support is checked with the turn's fetcher ----------------------------------------
+
+def _names_support(source: str) -> ScriptedProvider:
+    p = ScriptedProvider()
+    p.on(Purpose.VERIFY, lambda i, input: {"verdicts": [
+        {"index": int(m.group(1)), "verdict": "supported", "reason": "בדיקה", "supported_by": [] if m.group(2) else [source]}
+        for m in re.finditer(r'<unit index="(\d+)" cites="([^"]*)">', input)]}, repeat=True)
+    return p
+
+
+def test_a21_r2_a_period_the_same_calculations_table_states_does_not_block_a_sentence_the_judge_names_support_for():
+    ws = _appraisal_ws(PARAGRAPH, ROW, contexts=(1, 1))
+    a = _answer("תוספת שנתית של 846,215 ₪.")
+    r = verify_answer(_names_support("S1"), a, ws, "?", [])
+    assert not r.removed_units(), [p.reason for p in r.problems]
+    out = r.apply(a).answer_markdown
+    assert "846,215" in out and "S1" in out and "S2" in out  # the table that states the period is cited with the sentence
+
+
+def test_a21_r2_a_period_no_source_of_the_calculation_states_still_removes_the_sentence():
+    ws = _appraisal_ws(PARAGRAPH, "תוספת | 846,215", contexts=(1, 1))
+    a = _answer("תוספת שנתית של 846,215 ₪.")
+    r = verify_answer(_names_support("S1"), a, ws, "?", [])
+    assert r.removed_units()

@@ -1230,3 +1230,50 @@ def test_u3_a_value_the_agent_set_is_the_only_cause_named_in_the_calculations_ow
     assert tools.value_uncertain(ws, "V1") and not tools.reading_unclear(ws, "V1")
     assert tools.uncertain_reason(ws, "V1") == "תכונות שנקבעו על ידי הסוכן ולא נמצאו במקור: היחידה"
     assert tools.uncertain_reason(ws, "V2") == ""
+
+
+# --- round 21 packet A, R5: the VAT a calculation's measurements carry --------------------------------------------------------------
+
+def _measured_sum(header: str, *, vat: str = "unknown", quotes: tuple[str, ...] = ("חלק א | 6,000,000", "חלק ב | 5,000,000", "חלק ג | 6,000,000")
+                  ) -> Workspace:
+    """M1..M3 stored cells of one invented table (the VAT, if any, stated only by the column header) and C1 their sum."""
+    from types import SimpleNamespace
+
+    from app.chat import tools
+    from app.chat.tools import Measurement
+
+    ws = Workspace(ctx=None)
+    ws.user_messages = [{"turn": 1, "text": "מה סך השווי?", "current": True}]
+    version, document = uuid.uuid4(), uuid.uuid4()
+    for n, quote in enumerate(quotes, 1):
+        written = re.search(r"\d[\d,]*\d", quote).group(0)
+        row = SimpleNamespace(metric=f"חלק {n}", metric_kind="value", value_text=written, value=Decimal(written.replace(",", "")),
+                              unit="ILS", period="none", vat=vat, area_basis=None, subject="פרויקט הדגמה", value_role="appraiser_determination",
+                              value_form="exact", table_index=0, quote=quote, header=header, caption="")
+        ws.measurements[f"M{n}"] = Measurement(f"M{n}", uuid.uuid4(), document, version, "שומת הדגמה", row)
+    node = calc.parse("M1+M2+M3")
+    out = calc.evaluate(node, {i: tools._operand(ws, i) for i in ("M1", "M2", "M3")}, None)
+    ws.computations["C1"] = calc.Computation(
+        "C1", "סך השווי", "M1+M2+M3", "M1+M2+M3", out,
+        [{"id": i, "label": i, "kind": "measurement", "value": str(ws.measurements[i].row.value), "display": ""} for i in ("M1", "M2", "M3")],
+        ["M1", "M2", "M3"], 1, "computed", None, "", None, [lf.id for lf in out.leaves])
+    return ws
+
+
+@pytest.mark.parametrize("phrase, ok", [("17,000,000 ₪ כולל מע״מ", True), ("17,000,000 ₪ ללא מע״מ", False)])
+def test_a21_r5_a_sum_of_cells_under_a_column_header_that_states_vat_is_backed_by_that_vat(phrase, ok):
+    ws = _measured_sum("שווי כולל מע״מ")
+    problems = _numbers_only(ws, f"סך השווי הוא {phrase} [C1].")
+    assert (problems == []) is ok, problems
+
+
+def test_a21_r5_a_sum_whose_cells_state_different_vat_or_none_is_not_backed():
+    ws = _measured_sum("שווי (₪)")
+    assert _numbers_only(ws, "סך השווי הוא 17,000,000 ₪ כולל מע״מ [C1].")
+    mixed = _measured_sum("שווי", quotes=("חלק א | 6,000,000 כולל מע״מ", "חלק ב | 5,000,000 ללא מע״מ", "חלק ג | 6,000,000 כולל מע״מ"))
+    assert _numbers_only(mixed, "סך השווי הוא 17,000,000 ₪ כולל מע״מ [C1].")
+
+
+def test_a21_r5_the_vat_a_measurement_states_in_its_own_quote_backs_the_sum():
+    ws = _measured_sum("שווי", quotes=("חלק א | 6,000,000 ללא מע״מ", "חלק ב | 5,000,000 ללא מע״מ", "חלק ג | 6,000,000 ללא מע״מ"))
+    assert _numbers_only(ws, "סך השווי הוא 17,000,000 ₪ ללא מע״מ [C1].") == []
