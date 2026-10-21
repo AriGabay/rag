@@ -584,6 +584,10 @@ REQ_DATA_FOUND = ("חלק של הבקשה שהתשובה לא נתנה במלו�
 # that passage, with its citation, and does not search again. ``{where}``: each validated support, "S# «quote»"
 REQ_TEXT_FOUND = ("חלק של הבקשה שהתשובה לא נתנה במלואו: «{text}». הוא כבר נקרא בתור הזה, ונכתב במקור: {where}. הוסף אותו "
                   "לתשובה מאותו מקור, עם מראה המקום שלו; אין צורך בחיפוש חדש")
+# the same, when the passage the judge quoted holds no value of the asked kind (no number): the repair round keeps its tools, so it may read
+# the passage's table or section or search for the value (round 21 U9, KTD5)
+REQ_TEXT_QUOTED = ("חלק של הבקשה שהתשובה לא נתנה במלואו: «{text}». נקרא בתור הזה קטע שקשור אליו: {where}. הקטע אינו מכיל את הערך עצמו: "
+                   "קרא את המשך המקור או חפש אותו, והוסף אותו לתשובה עם מראה המקום שלו")
 REQ_TEXT_FOUND_MORE = " ועוד {n} פריטים שנקראו באותו מקור"  # after the first ``ITEMS_PER_COMPONENT`` parts one problem lists
 TEXT_FOUND_CHECK = "text_found"  # the ``Problem.check`` of a REQ_TEXT_FOUND problem (the repair step turns its tools off for it)
 # the requirements trace (diagnostics only): what a requirements call returned for a component and what the server did with its
@@ -701,6 +705,13 @@ SCOPE_REMOVAL_SENTENCE = "הוסרה טענה שהנתון שלה כתוב במ�
 DEFECT_FAILURES = {"input": "wrong_calculation", "scenario": "wrong_calculation", "formula": "wrong_calculation",
                    "framing": "wrong_calculation", "units": "wrong_unit", "part": "absent_from_source",
                    "scope": "context_not_read"}
+# the judge's defect of a partly supported datum whose number the sources back (round 21 U9, KTD5, R10): one value is shown among several
+# the source gives (``multiple_values``). The sentence is marked as partly verified and no repair round is spent on it: a rewrite asked to
+# fix it omitted the number, which the sources back. Any other defect stays a repair request: ``units`` (the unit, period or VAT is stated
+# wrongly: a mark would show wrong meaning, R2/R3 — the repair restates it as the source writes it, and the number it may drop is protected
+# by ``VerifyReport._partial_number_claim``, restored with the source's own wording), and a defect that may be about the number itself
+# (``part``, a calculation's ``input``, ``formula``, ``scenario``, ``framing``)
+KEPT_NUMBER_DEFECTS = ("multiple_values",)
 # problem kinds that are not failure kinds, as the failure kind a removal of theirs has (KTD5): a calculation from the
 # wrong input or on an assumption the user did not give is a wrong calculation (round 7 U7 adds these kinds); an
 # unmet instruction is a gap, never a removal
@@ -1082,6 +1093,19 @@ def _supported_claim(r: ClaimRecord) -> str:
     return claim if claim.strip() else ""
 
 
+# the words that state the VAT basis of a number ("ללא מע״מ", "כולל מע״מ"): a partly verified number a repair round keeps must keep them, or
+# it changes its basis without saying so (round 21 U9, R10: a number whose VAT basis differs is kept only with its basis stated)
+VAT_BASIS_WORDS = frozenset("מעמ כולל כוללת כוללים כוללות ללא לא אינו אינה אינם אינן בלי".split())
+
+
+def _vat_basis(claim: str) -> str:
+    """The words of ``claim`` that state its VAT basis (``VAT_BASIS_WORDS``) when it states one; "" when it does not mention VAT."""
+    words = qualifier_words(claim)
+    if not any(_missing_forms(w) & {"מעמ"} for w in words):
+        return ""
+    return " ".join(w for w in words if _missing_forms(w) & VAT_BASIS_WORDS)
+
+
 def _covers_any(covers: list[set[str]], claim: str, heading: str, numeric: bool) -> bool:
     """Whether a unit of a repair's answer still says a supported claim (``lost_supported``; ``covers``: the comparable
     forms of each unit's words and of its heading chain's): all the claim's qualifier words, and, for a claim with no
@@ -1102,6 +1126,36 @@ def _covers_any(covers: list[set[str]], claim: str, heading: str, numeric: bool)
         return not words or sum(bool(w & unit_forms) for w in words) >= LOST_WORD_SHARE * len(words)
 
     return any(covers_it(c) for c in covers)
+
+
+_VAT_PHRASE = re.compile(r"(?<![א-ת])(?:ללא|בלי|לא\s+כולל|אינו\s+כולל|כולל|לפני|אחרי|בתוספת)\s+מע[\"״”]?מ(?![א-ת])")
+
+
+def _vat_phrase(source: str) -> str:
+    """The words of ``source`` that state a VAT basis ("ללא מע״מ", "כולל מע״מ"), as written; "" when it states none."""
+    m = _VAT_PHRASE.search(source or "")
+    return m.group(0) if m else ""
+
+
+def _basis_insertion(units: list[Unit], numbers: set[str], source: str) -> tuple[int, str] | None:
+    """Where the VAT basis of ``source`` is written back at a number a repair's answer still shows without it (round 21 U9, R10): after the
+    one number — the datum's own tokens (``datum_anchor``) in the one unit of the answer that holds any of ``numbers`` — as (position in the
+    answer, " <basis>"). None when the source states no basis, or no unique place exists (the number stands twice, or in several units):
+    the sentence is then restored as its own."""
+    phrase = _vat_phrase(source)
+    holders = [u for u in units if numbers & numbers_in(u.text)]
+    if not phrase or len(holders) != 1:
+        return None
+    anchor = datum_anchor(holders[0], [frozenset({n}) for n in sorted(numbers)])
+    at = _after_number(holders[0], anchor[0], anchor[1]) if anchor is not None else None
+    return None if at is None else (at, " " + phrase)
+
+
+def _keeps_basis(covers: list[set[str]], claim: str) -> bool:
+    """Whether a unit of a repair's answer (``covers``) holds the VAT basis words of ``claim`` (``_vat_basis``); true for a claim that
+    states no VAT basis."""
+    basis = _vat_basis(claim)
+    return not basis or _covers_any(covers, basis, "", True)
 
 
 def _word_forms(text: str) -> set[str]:
@@ -1157,6 +1211,9 @@ def _restored_sentence(u: Unit, r: ClaimRecord) -> str:
             span = " · ".join(c for c in cells if c)
         elif cells and cells[0] and cells[0] not in span:
             span = f"{cells[0]}: {span}"
+    if r.source_sentence:  # the number in the source's own unit, period and VAT, never the claim's doubted wording (round 21 U9)
+        span = r.source_sentence.rstrip(" .")
+        cites = " ".join(dict.fromkeys(m.group(0) for m in _IDS.finditer(raw)))
     span = _LIST_MARK.sub("", span)
     sentence = " ".join(f"{span.strip()} {cites}".split())
     return sentence if sentence.endswith((".", "!", "?", ":")) else sentence + "."
@@ -1693,6 +1750,8 @@ PARTIAL_SENTENCES = {
 # the lead of a partial problem's reason (review, round 14): the judge's reason follows it. ``decisions`` takes it off again to
 # state what was not verified, so the two read one spelling
 PARTIAL_REASON_PREFIX = "נתמך חלקית: "
+# the end of a repair-prompt line about a sentence the server marks as partly verified (round 21 U9, KTD5): the number stays as written
+MARK_ONLY_NOTE = " (השרת מסמן אותה כמאומתת חלקית; השאר את המספר כלשונו)"
 
 
 def partial_reason_class(failure_kind: str | None, check: str | None = None) -> str:
@@ -1778,6 +1837,9 @@ class Problem:
     # for a note of a datum that states no figure of its own (round 21 U2): its clause is the unit, so the note joins the unit where a
     # citation would; a note without it is written only at the datum's own number
     clause_anchor: bool = False
+    # for a request to complete a part from data the turn found (``REQ_DATA_FOUND``) whose component is not a calculation: a round with no
+    # tools can add it from those data (``completable_offline``, round 21 U9)
+    data_found: bool = False
 
     def __post_init__(self) -> None:
         if self.checked_ids is None:
@@ -1810,6 +1872,19 @@ class Problem:
         if self.kind in ("needs_citation", "absence") or self.annotatable or self.resolution == "cut":
             return False
         return not (self.severity == "partial" and self.defect == "none")
+
+    @property
+    def mark_only(self) -> bool:
+        """A partial mark the server writes and no repair fixes (round 21 U9): the judge named no defect a repair could remove, or the
+        number it doubts only in its unit or scope (``KEPT_NUMBER_DEFECTS``) is one the sources back. The sentence stays, marked."""
+        return self.severity == "partial" and self.defect == "none" and self.kind == "claim" and self.check == "judge"
+
+    @property
+    def completable_offline(self) -> bool:
+        """A request for a part of the answer that a round with no tools can add from what the turn already holds (round 21 U9, KTD5): a
+        completion from a passage the turn read, a condition whose source quote is in the request, or data the turn found (not a
+        calculation). A request that needs a search or a calculation is not."""
+        return self.kind == "requirement" and (self.check in (TEXT_FOUND_CHECK, CONDITION_FOUND_CHECK) or self.data_found)
 
     @property
     def partial_open(self) -> bool:
@@ -1850,7 +1925,7 @@ class Problem:
     def repair_note(self) -> str:
         """What the repair prompt says of the problem beside its reason (KTD10): its kind, the ids checked and how
         a repair of that kind goes."""
-        if not self.failure_kind:
+        if not self.failure_kind or self.mark_only:
             return ""
         parts = [f"סוג: {FAILURE_LABELS[self.failure_kind]}"]
         if self.checked_ids:
@@ -2056,6 +2131,33 @@ class VerifyReport:
             if p.unit.index >= 0:
                 p.repair_attempted = repair_key(p.unit) in attempted
 
+    def _partial_number_claim(self, r: ClaimRecord) -> str:
+        """The words of a claim the judge called partly supported whose number the verification supported (round 21 U9, KTD5, R10): a datum
+        (not a calculation or an inference) that stands in the answer with a number, whose partial problem names no defect a repair
+        could remove (the mark is the server's: ``defect`` "none", or the context that defines it was not read) or names its unit, period or
+        VAT while the source's own wording of it is known (``ClaimRecord.source_sentence``: a repair restates it, and may drop it), and that no
+        check failed (a contradicted number, a number decided as
+        another property's or a removing problem are not kept by this rule); "" for any other claim."""
+        if r.verdict != "partial" or r.kind != "datum" or r.action not in ("kept", "qualified", "cited") or not numbers_in(r.text):
+            return ""
+        mine = [p for p in self.problems if p.claim_id == r.id]
+        if any(p.severity == "error" or p.failure_kind in ("wrong_subject", "contradicts_source") for p in mine):
+            return ""
+        # the judge's own partial: a claim it failed and a source cited beside the sentence rescued (``rescue_judged``) was judged
+        # contradicting or unsupported, and is not kept by this rule
+        if r.rescue or not any(p.severity == "partial" and p.check == "judge" and (
+                p.defect == "none" or p.failure_kind == CONTEXT_NOT_READ or (p.defect == "units" and r.source_sentence)) for p in mine):
+            return ""
+        claim = _without_absence(r.text)
+        return claim if claim.strip() else ""
+
+    def _protected(self, r: ClaimRecord) -> tuple[str, bool]:
+        """What a repair round must keep of claim ``r``, and whether only its numbers are protected: a supported claim (all of it) or a
+        partly supported number (``_partial_number_claim``: its numbers and the VAT basis it was written with); ("", False) for any other."""
+        if claim := _supported_claim(r):
+            return claim, False
+        return self._partial_number_claim(r), True
+
     def lost_supported(self, text: str) -> list[tuple[Unit, ClaimRecord]]:
         """The claims this report judged supported (kept, qualified or cited), in units that stay, that ``text`` — a
         repair round's answer — no longer holds (round 9 R20, KTD10): supported information the new answer lost. A claim
@@ -2065,7 +2167,10 @@ class VerifyReport:
         a negation, condition, status, date or caveat) and, for a claim with no number, ``LOST_WORD_SHARE`` of its other
         content words (stemmed, ``_missing_forms``; stop words ignored) and those of the heading chain it sat under. A
         rephrasing that keeps its salient words is not a loss. A claim of kind ``absence``, and a clause saying a datum is
-        not stated, found, computed or determined, is not protected (``_without_absence``): the repair fills it."""
+        not stated, found, computed or determined, is not protected (``_without_absence``): the repair fills it. A number the judge
+        called partly supported and the verification supported (``_partial_number_claim``) is protected by its numbers and its VAT
+        basis alone (round 21 U9, KTD5): the part the judge doubted is what a repair may fix, and the number is never the repair's to
+        drop."""
         shown = numbers_in(text)
         _, _, covers = _cover_forms(text)
         cited = set(ids_in(text))
@@ -2077,10 +2182,14 @@ class VerifyReport:
                 continue
             sources = {i for i in u.ids if i.startswith("S")}
             for r in recs:
-                claim = _supported_claim(r)
+                claim, number_only = self._protected(r)
                 if not claim:
                     continue  # a statement of an absence is not protected
                 needed = numbers_in(claim)
+                if number_only:
+                    if not needed <= shown or not _keeps_basis(covers, r.source_sentence or claim):
+                        lost.append((u, r))
+                    continue
                 if (needed and not needed <= shown) or (sources and not sources & cited) or not _covers_any(
                         covers, claim, u.heading, bool(needed)):
                     lost.append((u, r))
@@ -2093,7 +2202,7 @@ class VerifyReport:
         absence and a unit that cites nothing add nothing grounded; a failing claim rewritten into a new statement does."""
         units = {u.index: u for u in self.units}
         supported = [(units[idx], claim) for idx, recs in self.claims.items() if idx in units
-                     for r in recs if (claim := _supported_claim(r))]
+                     for r in recs if (claim := self._protected(r)[0])]
         known = set().union(*(numbers_in(c) for _, c in supported)) if supported else set()
         forms = [_word_forms(f"{c}\n{u.heading}") for u, c in supported]
         for unit in split_units(text):
@@ -2118,11 +2227,17 @@ class VerifyReport:
         shown = numbers_in(text)
         new_units, chains, covers = _cover_forms(text)
         by_index = {u.index: u for u in self.units}
-        todo = []
+        todo, bound = [], []  # ``bound``: a number the answer still shows, whose VAT basis is written back at it (no second sentence)
         for u, r in lost:
-            claim = _supported_claim(r)
+            claim, number_only = self._protected(r)
             needed = numbers_in(claim)
-            if (not needed or needed <= shown) and _covers_any(covers, claim, u.heading, bool(needed)):
+            if number_only:
+                if needed <= shown and _keeps_basis(covers, r.source_sentence or claim):
+                    continue  # its number is there, with its basis
+                if needed <= shown and (place := _basis_insertion(new_units, needed, r.source_sentence or claim)) is not None:
+                    bound.append((u, r, place))
+                    continue
+            elif (not needed or needed <= shown) and _covers_any(covers, claim, u.heading, bool(needed)):
                 continue  # its content is there in other words
             if all(_restored_sentence(u, r) != _restored_sentence(x, y) for x, y in todo):
                 todo.append((u, r))
@@ -2134,7 +2249,7 @@ class VerifyReport:
             return _covers_any([covers[j]], claim, heading, False)
 
         def anchor(u: Unit, r: ClaimRecord) -> Unit | None:
-            claim = _supported_claim(r)
+            claim = self._protected(r)[0]
             words = _content_forms(claim, u.heading)
             best = max(range(len(new_units)), key=lambda j: _word_share(words, covers[j]), default=None)
             if best is not None and _word_share(words, covers[best]) >= ANCHOR_WORD_SHARE:
@@ -2144,7 +2259,7 @@ class VerifyReport:
                 nearby += [(by_index[u.index + d], y) for y in self.claims.get(u.index + d, [])
                            if u.index + d in by_index]
             for x, y in nearby:
-                neighbour = _supported_claim(y)
+                neighbour = self._protected(y)[0]
                 if neighbour and (j := next((j for j in range(len(new_units)) if holds(j, neighbour, x.heading)), None)) is not None:
                     return new_units[j]
             same = [x for x in new_units if u.heading and chains[x.index] == u.heading]
@@ -2167,21 +2282,28 @@ class VerifyReport:
             if at.table_span is not None:
                 table_ends[line_end] = True
         merged = text
+        inserted: list[tuple[int, str]] = []
         for pos in sorted(after, reverse=True):
             line = text[text.rfind("\n", 0, pos) + 1:pos]
             bullet = _BULLET.match(line)
             lead = f"{bullet.group(1)} " if bullet else ""
             # GFM reads a line right after a table row as one more row: a sentence behind a table follows a blank line
             gap = "\n\n" if table_ends.get(pos) else "\n"
-            merged = merged[:pos] + gap + "\n".join(f"{lead}{x}" for x in after[pos]) + merged[pos:]
+            put = gap + "\n".join(f"{lead}{x}" for x in after[pos])
+            inserted.append((pos, put))
+            merged = merged[:pos] + put + merged[pos:]
+        # the basis is written at the number (round 21 U9): a position of ``text``, moved by what went in before it
+        for _u, _r, (pos, phrase) in sorted(bound, key=lambda b: b[2][0], reverse=True):
+            shift = sum(len(gap_text) for p, gap_text in inserted if p < pos)
+            merged = merged[:pos + shift] + phrase + merged[pos + shift:]
         if end:
             merged = merged.rstrip("\n") + "\n\n" + "\n".join(end)
-        return merged, todo
+        return merged, todo + [(u, r) for u, r, _ in bound]
 
     def repair_keys(self, claims_only: bool = False) -> set[str]:
         """The units the repair prompt (``problems_text``) names: not one whose failing claim the server cuts."""
         return {repair_key(p.unit) for p in self.problems if p.unit.index >= 0 and p.resolution != "cut"
-                and not (claims_only and p.kind == "requirement")}
+                and not (claims_only and p.kind == "requirement" and not p.completable_offline)}
 
     def partial_problems(self, index: int | None = None) -> list[Problem]:
         """The partial problems whose mark the final text carries (``Problem.partial_open``), of the unit ``index`` or, without
@@ -2316,15 +2438,18 @@ class VerifyReport:
         return out
 
     def problems_text(self, claims_only: bool = False) -> str:
-        """The problems for the repair prompt; ``claims_only``: without the requirements to complete (a rewrite
-        from verified content cannot add them; it can still meet an instruction)."""
+        """The problems for the repair prompt; ``claims_only``: without the requirements a round with no tools cannot complete (a rewrite
+        from verified content cannot search or calculate; it can still meet an instruction and add a part from a passage or data the turn
+        already holds, ``Problem.completable_offline``, round 21 U9). A mark the server writes (``Problem.mark_only``) is listed as such:
+        nothing of it is the repair's to fix or to drop."""
         lines, told = [], set()
         for p in self.problems:
-            if (claims_only and p.kind == "requirement") or p.resolution == "cut":
+            if (claims_only and p.kind == "requirement" and not p.completable_offline) or p.resolution == "cut":
                 continue  # a requirement a rewrite cannot complete; a span the server cuts needs no fix
             note = "" if p.unit.index in told else self._claims_note(p.unit.index)
             told.add(p.unit.index)
-            lines.append("- " + (f"\"{p.unit.raw[:200]}\": " if p.unit.raw else "") + p.reason + p.repair_note() + note)
+            lines.append("- " + (f"\"{p.unit.raw[:200]}\": " if p.unit.raw else "") + p.reason + p.repair_note() + note
+                         + (MARK_ONLY_NOTE if p.mark_only else ""))
         return "\n".join(lines)
 
     def text_completion_only(self) -> bool:
@@ -5887,6 +6012,41 @@ def rescue_judged(report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: W
     return held
 
 
+SOURCE_SENTENCE_CHARS = 300  # the longest sentence of a source that is quoted back as a number's own wording
+_SOURCE_SENTENCES = re.compile(r"(?<=[.;!?])\s+|\n+")
+
+
+def _source_sentence(u: Unit, numbers: set[str], ws: Workspace) -> str:
+    """The one sentence (or table row) of the unit's cited sources that holds all of ``numbers`` (round 21 U9, R10): the number in the
+    source's own unit, period and VAT basis. "" when no cited source has one, or the sources have several different ones — the server
+    then restores nothing in the source's name."""
+    if not numbers:
+        return ""
+    found: dict[str, str] = {}
+    for sid in dict.fromkeys(i for i in u.ids if i.startswith("S")):
+        src = ws.sources.get(sid)
+        for part in _SOURCE_SENTENCES.split(src.text if src is not None else ""):
+            part = " ".join(part.split())
+            head, colon, rest = part.partition(": ")  # a section label the text opens with ("סיכום: …") is no part of the sentence
+            if colon and len(head.split()) <= 3 and not any(c.isdigit() for c in head) and numbers <= numbers_in(rest):
+                part = rest
+            if part and len(part) <= SOURCE_SENTENCE_CHARS and numbers <= numbers_in(part):
+                found.setdefault(_norm(part), part)
+    return next(iter(found.values())) if len(found) == 1 else ""
+
+
+def _number_stands(u: Unit, r: ClaimRecord | None, recs: list[ClaimRecord], defect: str, ws: Workspace) -> bool:
+    """Whether the number of a partly supported claim (``r``; the unit's claims ``recs`` when the judge split none) is one the verification
+    supported and the judge doubts only in its scope among several values (round 21 U9, KTD5, R10): the judge's defect is one of
+    ``KEPT_NUMBER_DEFECTS``, the unit cites no calculation, the claim is a datum with a number, and it is not a claim the judge failed.
+    The deterministic number check has already passed for any unit that reaches the judge's verdict (a number no cited source states is a
+    problem of its own, ``_fail_unstated``); a number judged contradicting is a failing claim, never this."""
+    if defect not in KEPT_NUMBER_DEFECTS or any(i in ws.computations for i in u.ids):
+        return False
+    mine = [r] if r is not None else recs
+    return bool(mine) and all(x.verdict == "partial" and x.kind == "datum" and numbers_in(x.text) for x in mine)
+
+
 def _fail_unstated(report: VerifyReport, p: Problem, v: JudgeVerdict, reasons: dict[str, str]) -> bool:
     """The judge's claims of a unit the deterministic check found numbers in that no cited source states (rule 21):
     every claim whose span holds such a number fails — unsupported, absent from the source, whatever the judge said of
@@ -8896,6 +9056,11 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 # by id (R5); the unit stays, marked, until the edit ladder cuts the claim (U4)
                 held = rescues.get(u.index, {})
                 for r in failing or [None]:
+                    keeps = _number_stands(u, r, recs, v.defect, ws)
+                    if v.defect == "units":  # the source's own wording of the number, for a repair that drops it (``_source_sentence``)
+                        for x in ([r] if r is not None else recs):
+                            if x.verdict == "partial" and x.kind == "datum" and not any(i in ws.computations for i in u.ids):
+                                x.source_sentence = _source_sentence(u, numbers_in(x.text), ws)
                     why = (reasons.get(r.id) if r is not None else None) or v.reason + (
                         f" («{r.text}»)" if r is not None else "")
                     why += _read_in_part([r] if r is not None else [])
@@ -8908,7 +9073,9 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                                                        claim_id=r.id if r is not None else recs[0].id,
                                                        cell_end=_cell_mark_end(u, r) if r is not None else None))
                         continue
-                    report.problems.append(Problem(u, PARTIAL_REASON_PREFIX + why, "partial", defect=v.defect,
+                    # a supported number the judge doubts only in its unit or scope: the mark states what was not verified (the failure
+                    # kind), and the sentence is not a repair request (round 21 U9, KTD5)
+                    report.problems.append(Problem(u, PARTIAL_REASON_PREFIX + why, "partial", defect="none" if keeps else v.defect,
                                                    failure_kind=kind, check="judge",
                                                    claim_id=r.id if r is not None else recs[0].id))
             elif named := [s for s in dict.fromkeys(v.supported_by) if s not in u.ids]:
@@ -9334,6 +9501,9 @@ class ClaimRecord:
     context_key: str = ""  # the unit's heading and table context, for matching a repaired claim to its parent
     exact: bool = False  # ``start``/``end`` are the span's own place in the answer (not the whole unit's)
     marker: int = 0  # for a cut claim: the ordinal of the marker that replaced it in the final text
+    # for a partly supported datum the judge doubts in its unit, period or VAT (defect ``units``): the one sentence of its cited sources that
+    # holds its numbers, the number in the source's own wording; what a repair round that drops the number is restored with (round 21 U9)
+    source_sentence: str = ""
     rescue: str = ""  # for a claim the judge failed that another cited source holds: that source (``rescue_judged``, round 20 U9, F5)
     # the bounded re-reads of the claim (U5, R13-R15): {"source", "scope", "outcome" (``REREAD_OUTCOMES``), and for
     # the outcomes that have them "reason", "expanded_source"}, for the log
@@ -9915,6 +10085,21 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
     return out
 
 
+# the words of a quote beyond those of the request it was quoted for, from which it holds something the answer can state (``_holds_value``)
+QUOTE_NEW_WORDS = 3
+
+
+def _holds_value(quote: str, asked: str) -> bool:
+    """Whether a passage quoted for a part of the request holds a value of the asked kind (round 21 U9, KTD5): a number, or at least
+    ``QUOTE_NEW_WORDS`` content words the request's own words (``asked``: the component and the part the answer omits) do not hold — a
+    reason, a condition, a clause. A heading or a label that only repeats the asked part is not one: the repair round that is asked to add
+    it from there keeps its tools, to read on or search for the value."""
+    if numbers_in(quote):
+        return True
+    known = {f for w in _missing_words(asked) for f in _missing_forms(w)}
+    return sum(1 for w in _missing_words(quote) if not _missing_forms(w) & known) >= QUOTE_NEW_WORDS
+
+
 def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequirements) -> None:
     """The components against what the turn found and the answer shows (R4, R20, R21; round 7 KTD2), before the
     repair decision. A unit that says a component was not found, when the turn holds its values, measurements or
@@ -9975,7 +10160,11 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
             continue  # partial only because an item's coverage check could not be completed: the model has nothing to repair (round 20 U5, R18)
         ev = related_evidence(ws, o, turn)
         check = None
-        found = REQ_TEXT_FOUND.format(text=o.get("missing_part") or o["text"], where="; ".join(
+        # the repair round runs with tools off only when a quoted passage holds a value of the asked kind (``_holds_value``): a quote that is a
+        # heading or a label of the asked part leaves the round its tools, and its request does not say a search is needless (round 21 U9, KTD5)
+        asked = f"{o['text']} {o.get('missing_part') or ''}"
+        valued = any(_holds_value(x["quote"], asked) for x in ev["text"])
+        found = (REQ_TEXT_FOUND if valued else REQ_TEXT_QUOTED).format(text=o.get("missing_part") or o["text"], where="; ".join(
             f"{x['id']} «{prompt_text(x['quote'])}»" for x in ev["text"][:ITEMS_PER_COMPONENT])
             + (REQ_TEXT_FOUND_MORE.format(n=len(ev["text"]) - ITEMS_PER_COMPONENT)
                if len(ev["text"]) > ITEMS_PER_COMPONENT else "")) if ev["text"] else ""
@@ -9985,9 +10174,10 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
                 reason += ". " + found
         elif found:
             reason = found
-            check = TEXT_FOUND_CHECK
+            check = TEXT_FOUND_CHECK if valued else None
         elif o["status"] == "not_answered" and not ev["checks"] and not ev["failures"]:
             reason = REQ_NOT_SEARCHED.format(text=o["text"])
         else:
             continue
-        report.problems.append(Problem(Unit(-1, "", "", []), reason, kind="requirement", component=o["id"], check=check))
+        report.problems.append(Problem(Unit(-1, "", "", []), reason, kind="requirement", component=o["id"], check=check,
+                                       data_found=bool(ev["data"]) and o["kind"] != "calculation"))

@@ -94,7 +94,8 @@ steps before the step bound, an appended item tells the model to register what i
 
 A repair round whose only problems are completions from text the turn already read (``verify.REQ_TEXT_FOUND``: a part a
 passage states and the answer omits, round 16 U2, KTD3) runs with the same tools and ``tool_choice`` "none", like the last
-step: it adds the part from the passage it names and searches nothing. So does a round whose only problems are a condition of an item
+step: it adds the part from the passage it names and searches nothing — when a passage it names holds a value of the asked kind (a
+number); a quote with none (``verify.REQ_TEXT_QUOTED``) leaves the round its tools (round 21 U9, KTD5). So does a round whose only problems are a condition of an item
 the answer gives without it, or with another item's (``verify.CONDITION_FOUND_CHECK``, round 18 U5): the problem carries the source
 quote of the condition, and the round adds it to the sentence that gives the value; the value is never the repair's to drop. Any other
 problem in the round keeps its tools.
@@ -328,7 +329,8 @@ REPAIR = """בדיקת האימות של התשובה מצאה בעיות (לי�
 את הטענות לתיקון — אל תנסח מחדש את הטענה שנתמכה. אפשר להשתמש בכלים לבדיקה נוספת
 (למשל לפתוח את הקטע שבו הנתון כתוב). שמור את המידע וההבחנות שכבר נתמכו במקורות. כשמשפט משווה שני נתונים ורק
 מראה המקום של אחד מהם חסר או שגוי, תקן את ההפניה לאותו נתון מתוך המקורות שקראת (או פתח את המקור שלו), בלי להשמיט
-את ההבחנה שהמשתמש ביקש. השמט תוכן רק אם אין לו תמיכה גם לאחר הבדיקה. חלק של הבקשה שהתשובה לא נתנה — השלם אותו: מהנתונים שכבר נמצאו (וחשב ב-calculate
+את ההבחנה שהמשתמש ביקש. השמט תוכן רק אם אין לו תמיכה גם לאחר הבדיקה; מספר שאומת (כתוב במקור שצוטט) נשאר: כשחלק אחר
+בטענה לא אומת, השאר את המספר וציין מה לא אומת. חלק של הבקשה שהתשובה לא נתנה — השלם אותו: מהנתונים שכבר נמצאו (וחשב ב-calculate
 כשהוא דורש חישוב), או חפש אותו אם לא חיפשת. חישוב שתלוי בפרט שהמשתמש לא נתן ושהמסמכים אינם מציינים — אל תניח אותו:
 שאל עליו שאלה אחת ממוקדת (status=clarification) ושמור את הנתונים שנמצאו עם מראי המקום שלהם. הוראה על התשובה שלא
 קוימה — שנה את התשובה עצמה כך שתקיים אותה, בלי כלים. אם עדיין אי אפשר להשלים חלק — אל תכתוב שהוא "לא נמצא"; השרת יוסיף אחרי התשובה את הסיבה. החזר תשובה סופית
@@ -337,8 +339,10 @@ REPAIR = """בדיקת האימות של התשובה מצאה בעיות (לי�
 REWRITE = """גם התשובה המתוקנת לא אומתה במלואה. אלה המשפטים שלא נמצאה להם תמיכה:
 {problems}
 כתוב תשובה סופית קוהרנטית שמשתמשת רק בתוכן שאומת ובמראי המקום שלו. משפט שליד הבעיה שלו כתוב "לשמור כלשונם" ו"לתקן":
-השאר את הטענות לשמירה כלשונן, והשמט את הטענות לתיקון אם אי אפשר לתמוך בהן. אל תוסיף טענות חדשות. אם נקודה חשובה לשאלה לא
-אומתה, השמט אותה — השרת יציין אחרי התשובה מה לא ניתן ולמה. החזר באותו מבנה."""
+השאר את הטענות לשמירה כלשונן, והשמט את הטענות לתיקון שהמקורות אינם תומכים בהן כלל. מספר שאומת (כתוב במקור שצוטט) נשאר בתשובה גם
+כשחלק אחר בטענה לא אומת: השאר אותו וציין מה לא אומת. חלק של הבקשה שרשום בין הבעיות כבקשת השלמה (הוא נקרא או נמצא כבר בתור הזה) —
+הוסף אותו מאותו מקור, עם מראה המקום שלו. מעבר לכך אל תוסיף טענות חדשות. אם נקודה חשובה לשאלה לא אומתה במלואה, השאר את מה שאומת
+וציין מה לא אומת — השרת יציין אחרי התשובה מה לא ניתן ולמה. החזר באותו מבנה."""
 
 
 # A mixed question (a general question about a named property, round 13 U14, KTD18) has a professional part that the
@@ -987,7 +991,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                   else TIME_LIMIT if ((now >= read_until or TIME_LIMIT in limits) if attempt == 0
                                       else left < FINAL_STEP_SECONDS) else None)
         # a repair round whose every problem is a completion from text the turn already read (``REQ_TEXT_FOUND``) needs no tool:
-        # it runs with tools off, as the last step does, and adds the part from the named passage (round 16 U2, KTD3)
+        # it runs with tools off, as the last step does, and adds the part from the named passage (round 16 U2, KTD3). Only a passage
+        # that holds a value of the asked kind makes such a problem (``verify._holds_value``); any other keeps the tools (round 21 U9)
         text_only = attempt == 1 and checked is not None and checked[1].text_completion_only()
         last = reason is not None or attempt == 2 or text_only
         compute_ok = (reason == T.TOOL_BUDGET and attempt == 0 and steps < bound and now < read_until

@@ -873,6 +873,251 @@ def test_a_qualified_or_cited_supported_claim_is_protected_like_a_kept_one():
     assert not report.lost_supported("הנכס מושכר [S1].")
 
 
+# --- round 21 U9 (R10, R3, KTD5): a repair round keeps the numbers verification supported ------------------------------------------
+
+PARTIAL_THREE = ("השווי למ\"ר הוא 9,500 ₪ [S1].\n"
+                 "דמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\n"
+                 "הנכס מושכר [S1].")  # the number is partly supported (its unit doubted), a status is unsupported
+PARTIAL_LOST = ("דמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\n"
+                "הנכס פנוי [S1].")  # the repair drops the partly supported number and adds a grounded part
+
+
+def _partial_judge(defect: str, verdict: str = "partial", number: str = "9,500", once: bool = False):
+    """A judge that calls the sentence of ``number`` ``verdict`` with ``defect`` and the one about the status unsupported; ``once``: only in
+    its first call (the sentence as repaired or restored is then supported)."""
+    calls: list = []
+
+    def respond(input: str) -> dict:
+        calls.append(input)
+        out = []
+        for i, t in _units(input).items():
+            if number in t and not (once and len(calls) > 1):
+                out.append({"index": i, "verdict": verdict, "reason": "חלקי", "defect": defect})
+            else:
+                out.append({"index": i, "verdict": _wrong_management(t), "reason": "בדיקה"})
+        return {"verdicts": out}
+    return respond
+
+
+def test_a_partial_verdict_on_one_value_among_several_is_a_mark_and_no_repair_request():
+    """AE5 (R10): the number is in the source and the judge doubts only that it is one value among several the source gives: the sentence
+    stays, marked as partly verified, and no repair round is spent on it."""
+    report = verify_answer(_fixed(_partial_judge("multiple_values")), _answer("השווי למ\"ר הוא 9,500 ₪ [S1]."), _ws(), "?", [])
+    (p,) = report.problems
+    assert p.severity == "partial" and p.defect == "none" and not p.repairable and report.ok
+    assert "אומת חלקית" in report.edit(_answer("השווי למ\"ר הוא 9,500 ₪ [S1].")).doc.text
+    assert "השרת מסמן" in report.problems_text()  # the repair prompt does not ask to fix it
+
+
+@pytest.mark.parametrize("defect", ["units", "part", "formula", "input"])
+def test_a_partial_verdict_with_another_defect_is_still_a_repair_request(defect):
+    """``units`` too (R2, R3): a unit, period or VAT stated wrongly is not shown under a mark; the repair restates it as the source writes it."""
+    report = verify_answer(_fixed(_partial_judge(defect)), _answer("השווי למ\"ר הוא 9,500 ₪ [S1]."), _ws(), "?", [])
+    (p,) = report.problems
+    assert p.severity == "partial" and p.defect == defect and p.repairable and not report.ok
+
+
+def test_a_partial_verdict_on_a_claim_that_is_a_calculation_is_still_a_repair_request():
+    """The number of a calculation is not one a source supports: only a datum keeps its number on a partial."""
+    def respond(input: str) -> dict:
+        return {"verdicts": [{"index": i, "verdict": "partial", "reason": "חלקי", "defect": "units", "claims": [
+            {"span": "9,500 ₪", "kind": "computed", "verdict": "partial"}]} for i in _units(input)]}
+
+    report = verify_answer(_fixed(respond), _answer("השווי למ\"ר הוא 9,500 ₪ [S1]."), _ws(), "?", [])
+    (p,) = report.problems
+    assert p.severity == "partial" and p.defect == "units" and p.repairable
+
+
+def test_a_unit_partial_for_units_whose_number_no_source_states_is_not_kept_as_a_mark():
+    report = verify_answer(_fixed(_partial_judge("units", number="7,777")), _answer("השווי למ\"ר הוא 7,777 ₪ [S1]."), _ws(), "?", [])
+    assert report.removed_units() == {0} and not report.ok  # the deterministic number check fails it, as before
+
+
+def _protected(first: str, judge, repaired: str):
+    report = verify_answer(_fixed(judge), _answer(first), _ws(), "?", [])
+    return report, report.lost_supported(repaired)
+
+
+def test_a_partly_verified_number_dropped_by_a_repair_is_lost_and_restored_with_its_sentence():
+    first = "השווי למ\"ר הוא 9,500 ₪ [S1].\nדמי השכירות הם 55 ₪ למ\"ר לחודש [S1]."
+    report, lost = _protected(first, _partial_judge("units"), "דמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\nהנכס פנוי [S1].")
+    assert [r.text.rstrip(" .") for _, r in lost] == ["השווי למ\"ר הוא 9,500 ₪"]
+    merged, back = report.restore_lost("דמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\nהנכס פנוי [S1].", lost)
+    assert len(back) == 1 and "השווי למ\"ר הוא 9,500 ₪ [S1]." in merged
+    assert not report.lost_supported(first)  # kept as it was: nothing lost
+    assert not report.lost_supported("הערך למ\"ר הוא 9500 ₪ [S1].\nדמי השכירות הם 55 ₪ למ\"ר לחודש [S1].")  # the number, rephrased
+
+
+def test_a_partly_verified_number_the_repair_rewrote_without_the_part_the_judge_doubted_is_not_lost():
+    """Only the number (and a VAT basis it was written with) is protected: the doubted part may be what the repair fixes."""
+    first = "השווי למ\"ר הוא 9,500 ₪ לחודש [S1]."
+    _, lost = _protected(first, _partial_judge("units"), "השווי למ\"ר הוא 9,500 ₪ [S1].")
+    assert lost == []
+
+
+def test_a_partly_verified_number_keeps_the_vat_basis_the_source_gives_it():
+    ws_text = "דוח: המחיר הוא 55 ₪ ללא מע״מ. הנכס פנוי."
+    first = "המחיר הוא 55 ₪ [S1]."  # the judge doubts the unit; the source's own sentence states the basis
+    report = verify_answer(_fixed(_partial_judge("units", number="55")), _answer(first), _ws(ws_text), "?", [])
+    repaired = "המחיר הוא 55 ₪ [S1].\nהנכס פנוי [S1]."
+    (lost,) = report.lost_supported(repaired)  # the number with no basis is a loss
+    assert lost[1].source_sentence == "המחיר הוא 55 ₪ ללא מע״מ."
+    merged, back = report.restore_lost(repaired, [lost])
+    # the number is shown once: the basis is written at it, not a second sentence (R10)
+    assert len(back) == 1 and merged == "המחיר הוא 55 ₪ ללא מע״מ [S1].\nהנכס פנוי [S1]." and merged.count("55") == 1
+    assert not report.lost_supported("המחיר הוא 55 ₪ ללא מע״מ [S1].")
+
+
+def test_a_number_dropped_by_the_repair_is_restored_with_the_sources_own_wording_not_the_doubted_one():
+    ws_text = "דוח: המחיר הוא 55 ₪ לפני הנחות. הנכס פנוי."
+    first = "המחיר הוא 55 ₪ בלבד [S1]."  # the judge doubts the sentence's wording of the price
+    report = verify_answer(_fixed(_partial_judge("units", number="55")), _answer(first), _ws(ws_text), "?", [])
+    merged, back = report.restore_lost("הנכס פנוי [S1].", report.lost_supported("הנכס פנוי [S1]."))
+    assert len(back) == 1 and "המחיר הוא 55 ₪ לפני הנחות [S1]." in merged and "בלבד" not in merged
+
+
+def test_a_number_the_source_states_twice_differently_is_not_protected_in_the_sources_name():
+    ws_text = "דוח: המחיר הוא 55 ₪ לשנה. הוצע מחיר של 55 ₪ ללא מע״מ."
+    report = verify_answer(_fixed(_partial_judge("units", number="55")), _answer("המחיר הוא 55 ₪ לחודש [S1]."), _ws(ws_text), "?", [])
+    assert report.lost_supported("הנכס פנוי [S1].") == []
+
+
+def test_a_basis_is_restored_as_its_own_sentence_when_the_number_has_no_unique_place():
+    ws_text = "דוח: המחיר הוא 55 ₪ ללא מע״מ. הנכס פנוי."
+    report = verify_answer(_fixed(_partial_judge("units", number="55")), _answer("המחיר הוא 55 ₪ [S1]."), _ws(ws_text), "?", [])
+    repaired = "המחיר הוא 55 ₪ [S1].\nהמחיר בנכס אחר הוא 55 ₪ [S1]."  # the number stands in two units
+    merged, back = report.restore_lost(repaired, report.lost_supported(repaired))
+    assert len(back) == 1 and merged.count("ללא מע״מ") == 1 and all(ln in merged for ln in repaired.split("\n"))
+
+
+@pytest.mark.parametrize("defect", ["part", "formula"])
+def test_a_partial_with_another_defect_is_not_protected_because_its_number_may_be_the_doubted_part(defect):
+    _, lost = _protected("השווי למ\"ר הוא 9,500 ₪ [S1].", _partial_judge(defect), "הנכס פנוי [S1].")
+    assert lost == []
+
+
+def test_a_contradicted_number_and_a_number_of_another_property_are_not_protected():
+    first = "השווי למ\"ר הוא 9,500 ₪ [S1].\nדמי השכירות הם 55 ₪ למ\"ר לחודש [S1]."
+    _, lost = _protected(first, _partial_judge("units", verdict="contradicts"), "הנכס פנוי [S1].")
+    assert [r.text.rstrip(" .") for _, r in lost] == ["דמי השכירות הם 55 ₪ למ\"ר לחודש"]  # only the supported one
+    report = verify_answer(_fixed(_partial_judge("units")), _answer(first), _ws(), "?", [])
+    for recs in report.claims.values():  # the attribution check decided the number belongs to another property
+        for r in recs:
+            if "9,500" in r.text:
+                report.problems.append(verify.Problem(report.units[r.unit], "נתון של נכס אחר", failure_kind="wrong_subject",
+                                                      check="judge", claim_id=r.id))
+    assert [r.text.rstrip(" .") for _, r in report.lost_supported("הנכס פנוי [S1].")] == ["דמי השכירות הם 55 ₪ למ\"ר לחודש"]
+
+
+def test_a_repair_that_drops_a_partly_verified_number_and_adds_a_part_ends_with_the_number_marked(offline):
+    """The engine: the repair round (asked for by the unsupported status) omits the number the judge called partly supported."""
+    rewritten = "דמי השכירות הם 55 ₪ למ\"ר לחודש [S1].\nהשווי למ\"ר הוא 9,500 ₪ [S1].\nהנכס פנוי [S1]."
+    # the restored sentence is the one the judge doubted (its text is the source's own), so its cached verdict asks for a rewrite round
+    agent = ScriptedAgent([SEARCH, final(PARTIAL_THREE), final(PARTIAL_LOST), final(rewritten)], judge=_partial_judge("units", once=True))
+    out = _turn(agent)
+    md = out.answer.answer_markdown
+    line = next((ln for ln in md.splitlines() if "9,500" in ln), "")
+    assert line.startswith("השווי למ\"ר הוא 9,500 ₪"), md  # the number stays, in the source's own wording
+    assert md.count("9,500") == 1 and "הנכס פנוי" in md and "מושכר" not in md
+    (entry,) = _entries(out, "repair_restored_supported")
+    assert entry["claim_id"] and "9,500" in entry["text"]
+    assert [u["purpose"] for u in out.usage].count("agent") == 4  # search, answer, repair, and the rewrite the cached partial verdict asks for
+
+
+def test_a_repair_that_drops_a_partly_verified_number_and_adds_nothing_gives_way_to_the_checked_answer(offline):
+    agent = ScriptedAgent([SEARCH, final(PARTIAL_THREE), final("דמי השכירות הם 55 ₪ למ\"ר לחודש [S1].")],
+                          judge=_partial_judge("units"))
+    out = _turn(agent)
+    md = out.answer.answer_markdown
+    assert "9,500" in md and "אומת חלקית" in md and "מושכר" not in md
+    (lost,) = _entries(out, "repair_lost_supported")
+    assert "9,500" in lost["text"]
+
+
+def test_a_partial_on_a_supported_number_alone_spends_no_repair_round(offline):
+    agent = ScriptedAgent([SEARCH, final("השווי למ\"ר הוא 9,500 ₪ [S1]."), final("לא אמור לקרות.")],
+                          judge=_partial_judge("multiple_values"))
+    out = _turn(agent)
+    assert "9,500" in out.answer.answer_markdown and "אומת חלקית" in out.answer.answer_markdown
+    assert len(agent.seen) == 2 and len(_verify_inputs(agent)) == 1
+
+
+def test_the_repair_and_rewrite_prompts_keep_verified_numbers_and_state_what_was_not_verified():
+    for prompt in (engine.REPAIR, engine.REWRITE):
+        assert "מספר שאומת" in prompt and "ציין מה לא אומת" in prompt
+    assert "אם אי אפשר לתמוך בהן" not in engine.REWRITE and "השמט אותה" not in engine.REWRITE  # the old lines: omit what was not verified
+    assert "בקשת השלמה" in engine.REWRITE  # the open requests the rewrite carries
+
+
+@pytest.mark.parametrize("quote, asked, held", [
+    ("שיעור היוון למשרדים 6.5%", "שיעורי ההיוון שנקבעו", True),  # a number
+    ("הסיבה לשימוש בשיעור שוק היא שהוא משקף את התשואה של נכס חלופי", "הסיבה לשימוש בשיעור שוק", True),  # a clause beyond the asked words
+    ("שיעור זה חל רק בתנאי שהנכס מושכר במלואו ביום הקובע", "התנאי לתחולת שיעור ההיוון", True),
+    ("שיעורי ההיוון שנקבעו בשומה", "שיעורי ההיוון שנקבעו", False),  # a heading that repeats the asked part
+    ("שיעורי היוון לפי שימוש", "שיעורי ההיוון", False),  # a label
+])
+def test_a_quote_holds_a_value_of_the_asked_kind_only_beyond_a_heading_that_repeats_the_request(quote, asked, held):
+    assert verify._holds_value(quote, asked) is held
+
+
+def _repair_prompts(agent, lead: str) -> list[str]:
+    return [p for p in _user_prompts(agent) if p.startswith(lead)]
+
+
+def test_an_open_text_completion_request_reaches_the_rewrite_round(reading):
+    """Round 21 U9 (KTD5): when a claim still fails after the repair and a rewrite follows, the part the answer still omits (a passage
+    the turn read states it) is asked for in the rewrite round too: a rewrite with no tools can add it from that passage."""
+    base = _rates_judge()
+
+    def judge(input: str) -> dict:
+        out = base(input)
+        for v in out["verdicts"]:
+            if "מושכר" in _units(input)[v["index"]]:
+                v["verdict"] = "unsupported"
+        return out
+
+    bad = THREE_RATES + "\nהנכס מושכר [S1]."
+    agent = _Recording([SEARCH, final(bad), final(bad), final(ALL_RATES)], judge=judge, request=[component(RATES_ASK)])
+    out = _turn(agent, "מה שיעורי ההיוון שנקבעו?")
+    (rewrite,) = _repair_prompts(agent, "גם התשובה המתוקנת")
+    assert RATES[3] in rewrite and "S1" in rewrite  # the omitted rate, with its source
+    assert agent.choices[-1] == "none"  # the rewrite has no tools
+    assert out.answer.answer_markdown == ALL_RATES and out.report.ok
+
+
+def test_a_request_that_needs_a_search_is_not_carried_into_the_rewrite_round_that_has_no_tools():
+    r = verify.VerifyReport(units=[])
+    unit = verify.Unit(-1, "", "", [])
+    r.problems = [verify.Problem(unit, verify.REQ_NOT_SEARCHED.format(text="דמי ניהול"), kind="requirement", component="N2"),
+                  verify.Problem(unit, verify.REQ_TEXT_FOUND.format(text="שיעורי היוון", where="S1 «6.5%»"), kind="requirement",
+                                 component="N1", check=verify.TEXT_FOUND_CHECK)]
+    text = r.problems_text(claims_only=True)
+    assert "שיעורי היוון" in text and "דמי ניהול" not in text
+    assert "דמי ניהול" in r.problems_text()  # the repair round (with tools) still gets it
+
+
+def test_a_completion_whose_quoted_passage_holds_no_value_keeps_the_repair_rounds_tools(reading):
+    """Round 21 U9 (KTD5): the passage the judge quoted for the omitted part is a heading, not a value of the asked kind."""
+    heading = "שיעורי ההיוון שנקבעו בשומה"
+
+    def judge(input: str) -> dict:
+        units = _units(input)
+        ids = re.findall(r'<requirement id="(N[\d.]+)"', input)
+        given = [i for i, t in units.items() if "למחסנים" in t]
+        scored = [_req("", "full", list(units), id=ids[0]) if given else
+                  _req("", "partial", list(units), id=ids[0]) | {"missing": "שיעורי ההיוון",
+                                                                 "support": [{"id": "S1", "quote": heading}]}]
+        return {"verdicts": [{"index": i, "verdict": "supported", "reason": "בדיקה"} for i in units],
+                "requirements": scored} if ids else {
+            "verdicts": [{"index": i, "verdict": "supported", "reason": "בדיקה"} for i in units]}
+
+    agent = _Recording([SEARCH, final(THREE_RATES), final(ALL_RATES)], judge=judge, request=[component(RATES_ASK)])
+    _turn(agent, "מה שיעורי ההיוון שנקבעו?")
+    assert agent.choices[:3] == [None, None, None]  # the repair step may read and search
+    (repair,) = _repair_prompts(agent, "בדיקת האימות")
+    assert "אין צורך בחיפוש חדש" not in repair and heading in repair
+
+
 # --- reuse by stable id and context (round 8 U3, R18, KTD2, KTD7) ------------------------------------------------------
 
 def _salted(*texts: str) -> Workspace:

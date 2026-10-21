@@ -15,7 +15,7 @@ passing fails the suite, so the marker cannot be forgotten). A protection sequen
 5. AE3 (U3, fixed): a monthly column header put "monthly" on a capitalised total.
 6. AE4 (U4, fixed): a removal for another lot of the same property said "another property".
 7. Several lots (U4, fixed): the same bullet under two lot headings lost its second copy to the tidy-up.
-8. AE5 (U9): a judge "partial" on a supported number sends the repair round, which drops the number.
+8. AE5 (U9, fixed): a judge "partial" on a supported number sends the repair round, which drops the number.
 9. AE6 (U8, fixed): a table stored in reversed cell order is served unpaired and reversed to the agent and to the verifier.
 10. AE7 (U7): a numbered item stated with its label inflected gets a false "read and not used" line.
 11. AE8 (not reproduced; protection): a follow-up carries no condition of the previous answer.
@@ -265,7 +265,6 @@ VERIFIED_NUMBER = "השווי למ\"ר הוא 9,500 ₪ [S1]."
 OTHER_FACT = "דמי השכירות הם 55 ₪ למ\"ר לחודש [S1]."
 
 
-@open_case("U9", "the partial verdict sends a repair round whose rewrite omits the supported number, and nothing restores it")
 def test_ae5_a_supported_number_the_judge_calls_partial_stays_in_the_answer_when_the_repair_round_omits_it(offline):
     offline.texts = ["השווי למ\"ר הוא 9,500 ₪. דמי השכירות הם 55 ₪ למ\"ר לחודש."]
 
@@ -281,6 +280,48 @@ def test_ae5_a_supported_number_the_judge_calls_partial_stays_in_the_answer_when
     assert line, md  # the verified number stays
     assert "אומת" in line, md  # with what was not verified stated beside it
     assert "55" in md, md
+
+
+VAT_PRICE = "המחיר למ\"ר הוא 55 ₪ ללא מע\"מ [S1]."
+VAT_SOURCE = "דוח: המחיר למ\"ר הוא 55 ₪ ללא מע\"מ. הנכס פנוי. דמי הניהול הם 12 ₪ למ\"ר."
+
+
+def test_ae5_a_repair_round_that_drops_the_vat_basis_of_a_partly_verified_number_gets_the_basis_back_at_the_number(offline):
+    """R10: a number whose VAT basis the repair changes is kept only with its basis stated, at the number and not in a second sentence.
+    The judge doubts the price's unit (the first draft omits the basis), a second sentence fails and asks for the repair; the repair keeps
+    the number with no basis and adds a grounded part."""
+    offline.texts = [VAT_SOURCE]
+
+    def rule(text, input, n):
+        if "55" in text and n == 1:
+            return {"verdict": "partial", "defect": "units"}
+        return "unsupported" if "מושכר" in text else "supported"
+
+    first = "המחיר למ\"ר הוא 55 ₪ [S1]."
+    repaired = "המחיר למ\"ר הוא 55 ₪ [S1].\nדמי הניהול הם 12 ₪ למ\"ר [S1]."  # the number with no basis, one grounded part added
+    agent = ScriptedAgent([SEARCH, final(f"{first}\nהנכס מושכר [S1]."), final(repaired), final(repaired)], judge=Judge(rule))
+    out = engine_turn(agent, "מה המחיר למ\"ר ודמי הניהול?")
+    md = out.answer.answer_markdown
+    assert md.count("55") == 1, md  # the number appears once
+    line = next((ln for ln in md.splitlines() if "55" in ln), "")
+    assert 'ללא מע"מ' in line and line.index("55") < line.index('ללא מע"מ'), md  # with its basis, at the number
+    assert "12" in md and "מושכר" not in md
+    assert any(p["check"] == "repair_restored_supported" for r in out.rounds for p in r)
+
+
+def test_ae5_a_number_the_judge_contradicts_is_removed_and_a_repair_that_omits_it_is_not_restored(offline):
+    """Not kept: a number judged contradicting. The sentence goes as before; nothing puts it back."""
+    offline.texts = ["השווי למ\"ר הוא 9,500 ₪. דמי השכירות הם 55 ₪ למ\"ר לחודש."]
+    contradicted = "השווי למ\"ר הוא 8,800 ₪ [S1]."  # the source states another value
+
+    def rule(text, input, n):
+        return {"verdict": "contradicts", "defect": "none", "failure": "contradicts_source"} if "8,800" in text else "supported"
+
+    agent = ScriptedAgent([SEARCH, final(f"{contradicted}\n{OTHER_FACT}"), final(OTHER_FACT), final(OTHER_FACT)], judge=Judge(rule))
+    out = engine_turn(agent, "מה השווי למ\"ר ודמי השכירות?")
+    md = out.answer.answer_markdown
+    assert "8,800" not in md and "55" in md, md
+    assert not any(p["check"] == "repair_restored_supported" for r in out.rounds for p in r)
 
 
 # --- 9. a table stored in reversed cell order (AE6, U8) ---------------------------------------------------------------------------------------
