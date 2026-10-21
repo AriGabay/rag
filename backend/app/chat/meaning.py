@@ -567,6 +567,10 @@ class Occurrence:
     measurement: bool = False
     area: bool = False  # its row or column names it a per-area amount, or its row label or cell an area
     identifier: bool = False  # the source writes it as an identifier (a plot, a unit, a section): it carries no qualifiers
+    # the period word of the header line of a column layout in page text above it ("Annual Quarterly" over rows of numbers): it labels a column,
+    # and which number of the row it labels is unknown, so it is attached to none (``qualifiers``) and only keeps a period the answer
+    # writes for the row from being called unstated (round 21 second pass, harm 3)
+    column_period: Qualifiers = field(default_factory=Qualifiers)
 
     @cached_property
     def context_words(self) -> set[str]:
@@ -600,6 +604,7 @@ def _area_amount(text: str, pos: int, written: str, closest: list[Occurrence]) -
     return any(o.area or _AREA_WORD.search(o.context) for o in closest)
 
 
+COLUMN_ROW_NUMBERS = 3  # a page-text line of this many numbers is a row of a column layout (``_period_lines``)
 TABLE_AROUND = 4  # lines around a table that are its own (caption, title, size, notes); more are a passage's
 
 
@@ -660,6 +665,14 @@ def _period_lines(lines: list[str], is_row: list[bool]):
             q.add("period", found[0][2], found[0][3])
         return q
 
+    def row_numbers(j: int) -> bool:  # a page-text line of a column layout's rows: three numbers or more, no table row
+        return 0 <= j < len(lines) and not is_row[j] and len(_numbers(_ENUMERATION.sub("", lines[j]))) >= COLUMN_ROW_NUMBERS
+
+    def heads_columns(k: int) -> bool:
+        """Whether line ``k`` is the header line of a column layout of page text: a line with no number that does not end a sentence, over two
+        lines or more of rows of numbers. Its words name columns; they are no sentence about the numbers below it (round 21 second pass)."""
+        return not is_row[k] and not has_num[k] and not _SENTENCE_END.search(lines[k]) and row_numbers(k + 1) and row_numbers(k + 2)
+
     def above(i: int) -> list[tuple[str, Qualifiers]]:
         for k in range(i - 1, max(-1, i - 1 - NOTE_LINES), -1):
             if is_row[k] or _ENUMERATION.match(lines[k]):
@@ -667,8 +680,22 @@ def _period_lines(lines: list[str], is_row: list[bool]):
             if has_num[k] or opening(k).found:
                 continue
             if stated[k].found:
-                return [(lines[k], stated[k])]
+                return [] if heads_columns(k) else [(lines[k], stated[k])]
         return []
+
+    def column_period(i: int) -> Qualifiers:
+        """The period words of the header line of the column layout that the rows-of-numbers line ``i`` belongs to (any distance above it,
+        through the lines between): kept apart from the number's own qualifiers, as it is not known which column a number is under."""
+        if not row_numbers(i):
+            return Qualifiers()
+        for k in range(i - 1, -1, -1):
+            if is_row[k] or _ENUMERATION.match(lines[k]):
+                break
+            # the lines between (rows, and the page chrome of a table that goes on over a page break) are passed over: the layout's header
+            # is the nearest header line above that states a period
+            if not has_num[k] and stated[k].found and heads_columns(k):
+                return _tagged(stated[k], "column")
+        return Qualifiers()
 
     around = [i for i, row in enumerate(is_row) if not row]
     few = len(around) <= TABLE_AROUND
@@ -717,7 +744,7 @@ def _period_lines(lines: list[str], is_row: list[bool]):
             notes.append((lines[j], _tagged(stated[j], "note")))
         return scoped(notes, context)
 
-    return period
+    return period, column_period
 
 
 _SEPARATOR_ROW = re.compile(r"[\s|:\-]+")
@@ -898,7 +925,7 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
     first_head = tables[0].head_rows[0] if tables and tables[0].head_rows else ()
     table = _table_definitions(lines, is_row, list(first_head)) if tables else Qualifiers()
     captions = _caption_lines(lines, is_row, tables)
-    period = _period_lines(lines, is_row)
+    period, column_period = _period_lines(lines, is_row)
     occurrences: list[tuple[frozenset[str], Occurrence]] = []
     general = Qualifiers()
     for n, (line, row) in enumerate(zip(lines, is_row, strict=True)):
@@ -970,7 +997,7 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                 for pos, kind, key, written in _scan(lines[n - 1]):
                     if kind == "period" and _of_rate(lines[n - 1], pos):
                         q.add(kind, key, written, "sentence")
-            occurrences.append((f, Occurrence(q, line)))
+            occurrences.append((f, Occurrence(q, line, column_period=column_period(n))))
     return tuple(occurrences), general
 
 
@@ -1547,7 +1574,7 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
         # qualifier phrased before the amount ("השטח 120 מ"ר, דמי השכירות לחודש 7,560 ₪") is never "added"
         attested = Qualifiers().merge(general)
         for o in occurrences:
-            attested.merge(o.qualifiers).merge(_all(o.context, rates=False))
+            attested.merge(o.qualifiers).merge(_all(o.context, rates=False)).merge(o.column_period)
         # unsupported: a basis or period given to the number that its evidence does not give it
         for kind in ("basis", "period"):
             if kind == "period" and shape:

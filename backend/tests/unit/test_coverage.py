@@ -4022,3 +4022,76 @@ def test_u7_the_row_named_with_one_of_its_figures_is_still_given_in_part_and_its
     final, _ = _finish(ws, answer, r, turn)
     line = next(ln for ln in _item_lines(final) if ln.startswith("«שטח מרתף"))
     assert "בחלקו" in line and "340" in line and "ולא נעשה בו שימוש" not in line, line
+
+
+# --- round 21 second pass (harm 2): a footnote-marked note binds to the datum that carries the mark ----------------------------------------
+
+FOOT_NOTE = "(*) שיעור הגידול נמוך משום שהנכס חל רק על חוזה לתקופה קצובה"
+FOOT_ASK = "ההערכה ושיעור הגידול"
+FOOT_MD = "ההערכה היא 4,250,000 ש״ח, ושיעור הגידול הוא 1.15% [S2]."
+
+
+def _foot_check(rate_cell: str, md: str = FOOT_MD, *, extra_rate_column: bool = False):
+    """A row (an amount and a rate) with a footnote line; the item is the row, its value the amount. The judge finds the footnote missing."""
+    head = "הערכה | סכום | שיעור גידול"
+    rows = ("הטבלה: 2 שורות", head, f"הערכה א׳ | 4,250,000 | {rate_cell}", "הערכה ב׳ | 4,180,000 | 3.40%", FOOT_NOTE)
+    raw = [_adj_item("הערכה א׳", f"הערכה א׳ | 4,250,000 | {rate_cell}", "4,250,000")]
+    return _plan_check(md, lambda iid, attrs, block: ("missing", FOOT_NOTE), rows=rows, raw=raw, ask=FOOT_ASK)
+
+
+def _condition_at(report, answer):
+    text = report.edit(answer).doc.text
+    return text, [p for p in report.problems if p.check in verify.CONDITION_CHECKS]
+
+
+def test_round21_pass2_a_footnote_marked_on_the_rate_cell_is_written_after_the_rate_and_not_after_the_amount():
+    r, _, answer, _ = _foot_check("1.15%(*)")
+    text, notes = _condition_at(r, answer)
+    assert len(notes) == 1 and notes[0].number == "1.15", [(p.number, p.at) for p in notes]
+    assert text.index("1.15%") < text.index("חוזה לתקופה") and text.index("4,250,000") < text.index("1.15%")
+    assert text.index("חוזה לתקופה") > text.index("1.15%") > text.index("ש״ח,")
+
+
+def test_round21_pass2_a_footnote_whose_mark_no_cell_carries_is_tied_to_the_one_column_its_words_name_or_to_no_datum():
+    # the mark is on no cell (the source text lost it): the note names «שיעור הגידול», the header of the rate column, so the rate is its datum
+    r, _, answer, _ = _foot_check("1.15%")
+    _, notes = _condition_at(r, answer)
+    assert len(notes) == 1 and notes[0].number == "1.15" and r.unbound == [], [(p.number, p.at) for p in notes]
+    # the answer does not state the rate cell's figure: the datum cannot be located, so nothing is written inline and one uncertainty line is
+    r, _, answer, _ = _foot_check("1.15%", "ההערכה היא 4,250,000 ש״ח [S2].")
+    text, notes = _condition_at(r, answer)
+    assert notes == [] and [x.label for x in r.unbound] == ["הערכה א׳"], (notes, r.unbound)
+    assert "(*)" not in text.split("\n")[0]
+
+
+# --- round 21 second pass (harm 4): a condition note never echoes the datum's own clause and never stands inside a phrase ----------------
+
+ECHO_SOURCE = "שלב א׳ – 3 קומות משרדים בשטח של כ-1,500 מ״ר ברוטו, באגף המזרחי שמעל החניון."
+ECHO_MD = "1. **שלב א׳ —** 3 קומות משרדים, כ־1,500 מ״ר ברוטו; הבנייה הסתיימה [S2]."
+
+
+def _echo_check(md: str = ECHO_MD):
+    raw = [_adj_item("שלב א", ECHO_SOURCE, "3")]
+    return _plan_check(md, rows=(ECHO_SOURCE, "שורה נוספת | 5"), raw=raw, ask="שלבי הפרויקט")
+
+
+def test_round21_pass2_a_condition_note_holds_only_what_the_datums_clause_does_not_state_and_stands_after_the_whole_phrase():
+    r, _, answer, _ = _echo_check()
+    text = r.edit(answer).doc.text
+    (note,) = re.findall(r"\(התנאי לפי המקור: ([^)]*)\)", text)
+    assert note == "באגף המזרחי שמעל החניון", note  # the words the clause already writes are not written again
+    assert text.count("3 קומות משרדים") == 1 and "3 קומות משרדים (התנאי" in text, text  # after the complete phrase, not inside «3 קומות … משרדים»
+    assert text.index("(התנאי") < text.index("כ־1,500"), text
+
+
+def test_round21_pass2_the_words_of_a_note_that_the_datums_clause_states_are_dropped_and_a_note_wholly_stated_is_no_note():
+    from app.chat import conditions
+
+    clause = "3 קומות משרדים, כ־1,500 מ״ר ברוטו"
+    assert conditions.without_echo(ECHO_SOURCE[ECHO_SOURCE.index("3 קומות"):-1], clause) == "באגף המזרחי שמעל החניון"
+    assert conditions.without_echo("3 קומות משרדים, כ־1,500 מ״ר ברוטו", clause) == ""
+    assert conditions.without_echo("רק לאחר פרסום ההיתר", clause) == "רק לאחר פרסום ההיתר"
+    # a segment whose words the clause writes but whose operator it does not is no echo: the exclusion is the caveat
+    assert conditions.without_echo("3 קומות משרדים (לא כולל קומת קרקע)", clause) == "3 קומות משרדים (לא כולל קומת קרקע)"
+    assert conditions.without_echo("כ-1,500 מ״ר", "סכום של 1,500 מ״ר, בלי תנאי") == ""  # a number the clause writes is stated
+    assert conditions.clause_at("א ב; ג ד. ה ו", 6) == "ג ד"

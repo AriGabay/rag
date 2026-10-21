@@ -149,6 +149,30 @@ def clauses(text: str) -> list[str]:
     return list(_clauses(text))
 
 
+def clause_at(text: str, at: int) -> str:
+    """The clause of ``text`` that holds the offset ``at`` (a clause ends as ``clauses`` reads it: a sentence end, a semicolon, a cell edge or a
+    line, never a comma; round 21 second pass). The whole text when no boundary lies before the offset and after it."""
+    start = 0
+    for m in _CLAUSE_END.finditer(text or ""):
+        if m.end() <= at:
+            start = m.end()
+        else:
+            return text[start:m.start()].strip()
+    return (text or "")[start:].strip()
+
+
+_SEGMENT_END = re.compile(r",\s+")  # a comma between words, not the one inside a number ("1,500")
+
+
+def without_echo(phrase: str, clause: str) -> str:
+    """``phrase`` (the words of a source condition a note would carry) without the comma-separated segments the ``clause`` of the datum already
+    keeps (``outcome`` is ``KEPT``: its words are written there and so is every operator that limits, so «לא כולל חניון» is no echo of
+    a clause that writes the area but not the exclusion): a note says what the sentence leaves out, it does not repeat the datum's own words
+    (round 21 second pass, harm 4). "" when the clause states all of it — then there is no note to write."""
+    kept = [seg for seg in _SEGMENT_END.split(phrase or "") if seg and outcome(seg, clause) != KEPT]
+    return ", ".join(kept)
+
+
 @lru_cache(maxsize=4096)
 def _operators(text: str) -> tuple[Op, ...]:
     return tuple(op for c in _clauses(text) for op in _ops(_tokens(c)))

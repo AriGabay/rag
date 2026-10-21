@@ -1565,7 +1565,14 @@ def _value_check(item: Item, text: str, words: frozenset[str]) -> _Check:
     # as "המגרש יפונה …"; round 21 U7, KTD7, R8)
     order = (item.label, item.quote, item.value) if re.search(r"\d", item.value) else (item.value, item.quote, item.label)
     wanted = next((t for t in order if _word_groups(t)), "")
-    return _Check("" if _enough(wanted, words) else "value_not_stated")
+    if _enough(wanted, words):
+        return _Check("")
+    # an item with NO value is asked by the quote's words first, and then by its label's: the label is the agent's own description of the claim,
+    # and the answer states the claim in its own words as often as in the source's (the label's words for a quote that names the same thing otherwise). A label of one content word is no evidence (it stands in unrelated blocks), so only a label of two or more counts (round 21
+    # second pass, harm 1; the pre-U7 order asked the label for an empty value)
+    if not item.value.strip() and wanted != item.label and len(_word_groups(item.label)) >= 2 and _enough(item.label, words):
+        return _Check("")
+    return _Check("value_not_stated")
 
 
 def _states_date(item: Item, text: str, lead: str = "") -> bool:

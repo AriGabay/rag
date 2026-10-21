@@ -1457,3 +1457,51 @@ def test_u3_a_period_the_answer_adds_is_not_called_unstated_when_the_source_arou
     silent = _ws("תחשיב\nרכיב | סכום\nדמי שכירות | 55")
     (readable,) = meaning.check(unit, silent, meaning.Fetcher(silent))
     assert readable.blocking  # a source that was read and is silent is still called silent
+
+
+# --- round 21 second pass (harm 3): a period word of a column-header line labels a column, never the numbers of the rows below -----------
+
+PAGE_COLUMNS = "\n".join([
+    "Return schedule", "Date Gross Rent Revenue Cost Net Rent Annual Quarterly",
+    *(f"{6 - k % 3}.{k}100% {5 - k % 3}.{k}200% {3 + k},210,400 0 {20 + k},500- {3 + k},230,900 1{k}/03/2031" for k in range(1, 10)),
+])
+
+
+def _row_period(text: str, number: str) -> set[str]:
+    (occ,), _ = meaning.source_occurrences(text, set(meaning.numbers_in(number)))
+    return occ.qualifiers.keys("period")
+
+
+def test_pass2_a_period_word_of_a_column_header_line_of_page_text_is_attached_to_no_row_number():
+    # before: the first rows within the note window took "Annual" (the quarterly number of the row too), the rest took nothing
+    for row in (1, 4, 9):
+        assert _row_period(PAGE_COLUMNS, f"{6 - row % 3}.{row}100%") == set(), row
+    assert _row_period(PAGE_COLUMNS, "4.1200%") == set()  # the quarterly number of the first row
+
+
+@pytest.mark.parametrize("row", [1, 3, 9])
+def test_pass2_an_annual_the_answer_writes_for_a_row_of_a_page_text_column_layout_is_unknown_and_never_edited_out(row):
+    ws = _ws(PAGE_COLUMNS)
+    assert _problems(f"The annual yield of the row is {6 - row % 3}.{row}100% [S1].", ws) == []
+
+
+def test_pass2_a_sentence_period_and_a_stored_table_header_period_keep_their_numbers():
+    assert [q.keys("period") for _, _, q in meaning.attached("rent 500 per month")[0]] == [{"month"}]
+    assert [q.keys("period") for _, _, q in meaning.attached("monthly rent 500")[0]] == [{"month"}]
+    table = "\n".join(["Income", "Item | Monthly (₪)", "Base rent | 55,000"])
+    assert _cell_period(table, "55,000") == {"month"}
+    # a period line above one number of a paragraph still governs it (a line with one number is no column layout)
+    note = "The incomes below are annual\nRent 120,000"
+    assert _row_period(note, "120,000") == {"year"}
+    # a period the answer writes that no line of the source states is still called unstated
+    silent = _ws("Return schedule\nRent 120,000 for the lot")
+    (blocking,) = _problems("The annual rent is 120,000 [S1].", silent)
+    assert blocking.kind == "period" and blocking.blocking
+
+
+def test_pass2_a_column_layout_that_goes_on_after_a_page_break_keeps_its_header_for_the_rows_below_the_break():
+    rows = PAGE_COLUMNS.split("\n")
+    text = "\n".join([*rows[:6], "Printed on: 02/04/2031 09:30:00 Page 1 of 4", "Schedule continued (Amounts in EUR)", *rows[6:]])
+    ws = _ws(text)
+    assert _problems("The annual yield of the last row is 6.9100% [S1].", ws) == []
+    assert _row_period(text, "6.9100%") == set()

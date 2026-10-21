@@ -3109,6 +3109,8 @@ class VerifyReport:
                 at = _phrase_end(markdown, p.unit)  # after the sentence, never inside its phrase (round 18 U7)
             else:
                 at = _after_number(p.unit, p.number or "", p.at) if p.number else None
+                if at is not None and p.check in (CONDITION_CHECK, CONDITION_LIMIT_CHECK):
+                    at = _phrase_close(markdown, at)  # a condition note is never written inside a phrase (round 21 second pass, harm 4)
             if at is None and (p.conditional or (p.check in NOTE_CHECKS and p.clause_anchor)):
                 at = _citation_point(markdown, p.unit)
             if at is not None and not any(a <= at < b for a, b in blocked):
@@ -3422,6 +3424,18 @@ def _after_number(unit: Unit, written: str, at: int | None = None) -> int | None
     # a count or a duration: its noun is part of the quantity ("59 דירות"), and a note belongs after it (round 20 U2, KTD2)
     noun_end = meaning.after_noun_end(unit.raw, end)
     return unit.start + (at if noun_end is None else max(at, noun_end))
+
+
+# the one word that closes a phrase: a blank, a word and then a mark that ends a phrase (a comma, a stop, a bracket, a bold or cell edge) or the line's end
+_PHRASE_TAIL = re.compile(r"[ \t]+[^\W\d_][^\s,;.:!?()\[\]*|]*(?=[ \t]*(?:[,;.:!?)\]*|]|\[|$))", re.M)
+
+
+def _phrase_close(markdown: str, at: int) -> int:
+    """``at`` moved past the one word that completes the phrase of a number and its unit ("3 קומות משרדים," not "3 קומות [note] משרדים,"):
+    the word between the anchor and the mark that ends the phrase. A word followed by another word (a clause that goes on: "מ״ר והשטח …") is
+    no phrase end, and the anchor stays (round 21 second pass, harm 4)."""
+    m = _PHRASE_TAIL.match(markdown, at)
+    return m.end() if m else at
 
 
 def _shown_result(unit: Unit, written: str | None) -> str | None:
@@ -5058,6 +5072,8 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
     - ``contradicted`` (a quote in this item's span): the existing contradicted-claim path (``contradicts_source``)."""
     if report.item_ledger is None:
         return
+    from app.chat import conditions  # conditions reads this module
+
     said = _condition_verdicts(votes)
     units = {u.index: u for u in report.units}
     removed = report.removed_units()
@@ -5111,14 +5127,21 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
             several = _speaks_of_several(unit, ws)
             if several and _sibling_states(st, unit, report.units, removed, ws):
                 continue
+            phrase = _condition_span([x["text"] for x in st["condition_spans"]], verdict.quote) if source is not None else ""
+            anchor = _item_anchor(unit, st, states, phrase or verdict.quote, source) if source is not None else None
+            if phrase and anchor is not None:
+                # the note says what the datum's own clause leaves out and never repeats the words it states (a sentence item's condition
+                # span opens with the item's own words); nothing left: the clause states it all (round 21 second pass, harm 4)
+                at = anchor[1]
+                phrase = conditions.without_echo(phrase, conditions.clause_at(unit.text, at) if anchor[0] else unit.text)
+                if not phrase:
+                    continue
             report.problems.append(Problem(Unit(-1, "", "", []), REQ_CONDITION_FOUND.format(
                 name=name, where=f"{st['source']} «{prompt_text(verdict.quote)}»"), kind="requirement",
                 component=st["component"], check=CONDITION_FOUND_CHECK))
             if source is None:
                 continue
-            phrase = _condition_span([x["text"] for x in st["condition_spans"]], verdict.quote)
             cited = [(st["source"], source)]
-            anchor = _item_anchor(unit, st, states)
             if anchor is None:
                 # no unique place of the item's own tokens in the sentence that gives it: nothing is written inline, the item stays as it is
                 # and one uncertainty line names it (round 21 U2, KTD2, R2); it counts as a missing caveat, never as coverage
@@ -5152,12 +5175,47 @@ def _item_label(st: dict) -> str:
     return text if len(text) <= UNBOUND_LABEL_CHARS else text[:UNBOUND_LABEL_CHARS].rsplit(" ", 1)[0] + "…"
 
 
-def _item_anchor(unit: Unit, st: dict, states: Sequence[dict]) -> tuple[str, int] | None:
+def _noted_cell(st: dict, source: Source | None, note: str) -> str | None:
+    """The cell of the item's table row that a footnote-marked ``note`` is about (round 21 second pass, harm 2): the row of an item holds
+    several figures (an amount and a rate), and the note belongs to the datum that carries its mark, not to the item's value. The cell that
+    carries the mark; when no cell of the row does (the source text lost it), the one figure cell whose column header shares a content word
+    with the note. "" — the note is about a figure of the row but no one of them can be told (the mark stands on several cells, or on none
+    and no header names it): the datum is not located. None — the note is the item's own: it has no mark, the row holds one figure, or the
+    mark stands on a label cell or a header cell (the whole row, or every row)."""
+    from app.chat.items import _words, value_tokens
+
+    mark, quote = scopes.note_mark(note), st.get("quote") or ""
+    if not mark or "|" not in quote:
+        return None
+    cells = scopes.row_cells(quote)
+    figured = [c for c in cells if any(value_tokens(c, c))]
+    if len(figured) < 2:
+        return None
+    marked = [c for c in figured if mark in scopes.cell_marks(c)]
+    if marked:
+        return marked[0] if len(marked) == 1 else ""
+    if any(mark in scopes.cell_marks(c) for c in cells):
+        return None
+    head = scopes.header_of(context_of_source(source)[1]) if source is not None else []
+    if any(mark in scopes.cell_marks(h) for h in head):
+        return None
+    if len(head) == len(cells):
+        named = [c for c, h in zip(cells, head, strict=True) if c in figured and _words(note) & _words(h)]
+        if len(named) == 1:
+            return named[0]
+    return ""
+
+
+def _item_anchor(unit: Unit, st: dict, states: Sequence[dict], note: str = "", source: Source | None = None) -> tuple[str, int] | None:
     """Where a note about the item ``st`` is anchored in the sentence ``unit`` that gives it (round 21 U2, KTD1; R1, R6): the one place of
     the item's own value tokens (``datum_anchor``; ``("", 0)`` is no place). An item with no figure of its own (asked by its words) has the
-    sentence for its clause, and only when no other covered item of another evidence is given by the same sentence. None: no unique place."""
+    sentence for its clause, and only when no other covered item of another evidence is given by the same sentence. A footnote-marked ``note``
+    is anchored at the figure of the row that carries its mark (``_noted_cell``), not at the item's value; none located: None.
+    None: no unique place."""
     from app.chat.items import value_tokens
 
+    if note and (cell := _noted_cell(st, source, note)) is not None:
+        return datum_anchor(unit, *value_tokens(cell, cell)) if cell else None
     groups, fractions = value_tokens(st.get("value") or "", st.get("quote") or "")
     if groups or fractions:
         return datum_anchor(unit, groups, fractions)

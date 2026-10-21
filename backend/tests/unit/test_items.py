@@ -2220,3 +2220,18 @@ def test_u7_r7_an_instruction_to_attach_a_source_is_no_component_to_cover_and_no
     assert [i.component for i in _validate(ws, markdown, _raw(), components=components).kept] == ["N1"]
     offer = _offer(ws, markdown, [components[1]], request="צרף מקור לכל נתון")
     assert offer.candidates == []  # a request that asks only for citations asks for no row of a table
+
+
+# --- round 21 second pass: an item with no value is shown by its quote's words or by its multi-word label ----------------------------------
+
+def test_u7_pass2_a_valueless_item_stated_in_paraphrase_is_covered_by_its_label_when_the_quote_words_are_not_written():
+    """The agent's label describes the claim; the answer states it in its own words, not the source's. U7 asked only the quote's words for an
+    item with an empty value, so a paraphrase (the label's words, none of the quote's) made a false "read and not used" line."""
+    ws = _ws("סעיף | פירוט\nתחזוקה | התחזוקה מכוסה מקרן הבית הקיימת")
+    item = _item(label="הערכת הוצאות התחזוקה השנתית של הבניין", quote="התחזוקה מכוסה מקרן הבית הקיימת", value="")
+    assert _covered(ws, "הוצאות התחזוקה של הבניין נקבעו מראש [S1].", item).ok
+    # the quote's own words still show it, a label with one word is no evidence, and an unrelated sentence shows nothing
+    assert _covered(ws, "התחזוקה מכוסה מקרן הבית [S1].", item).ok
+    single = _item(label="פינוי", quote="פינוי המגרש לפני המסירה", value="")
+    assert not _covered(_ws("תנאי | פירוט\nפינוי | פינוי המגרש לפני המסירה"), "אישור הפינוי נדרש [S1].", single).ok
+    assert not _covered(ws, "הבניין נמצא בעיר [S1].", item).ok
