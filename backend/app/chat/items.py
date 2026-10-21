@@ -466,9 +466,15 @@ def _note_of_row(note: str, body: Sequence[str], row: str | None, quote: str = "
     if row is None or "|" not in row:
         return mark in scopes.marks_of(quote) or not elsewhere_holds
     rows, held = _rows_marked(tuple(body), mark)
-    if held is None:
-        return mark in scopes.marks_of(quote) or not elsewhere_holds
+    if held is None:  # no cell of the table carries it: another item's note only when the table carries no mark of its own
+        return mark in scopes.marks_of(quote) or not elsewhere_holds or _marked_table(tuple(body))
     return row in {rows[i] for i in held}
+
+
+@functools.lru_cache(maxsize=256)
+def _marked_table(body: tuple[str, ...]) -> bool:
+    """Whether any cell of a table text carries a note mark."""
+    return any(scopes.cell_marks(c) for ln in body if "|" in ln for c in scopes.row_cells(ln))
 
 
 @functools.lru_cache(maxsize=256)
@@ -480,21 +486,21 @@ def _rows_marked(body: tuple[str, ...], mark: str) -> tuple[tuple[str, ...], fro
     return rows, scopes.note_rows(mark, header, rows)
 
 
-def _own_context(src, quote: str) -> str:
+def _own_context(src, quote: str, elsewhere: Sequence[str] = ()) -> str:
     """The text of the item's own context: its quote and row, the paragraphs attributed to the table and its headings."""
     parts, body = context_of_source(src)
     row = _row_of(body, SupportScope.flat(quote))
-    return "\n".join([quote, row or "", *(p.text for p in parts if not p.reason and _note_of_row(p.text, body, row))])
+    return "\n".join([quote, row or "", *(p.text for p in parts if not p.reason and _note_of_row(p.text, body, row, quote, elsewhere))])
 
 
-def _other_context(src, quote: str) -> str:
+def _other_context(src, quote: str, elsewhere: Sequence[str] = ()) -> str:
     """The text of what stands beside the item's row in a table: the other rows and the paragraphs not attributed to the table ("" for
     a source that is no table). Only ``_foreign_condition`` reads it."""
     if not _is_tabular(src):
         return ""
     parts, body = context_of_source(src)
     row = _row_of(body, SupportScope.flat(quote))
-    return "\n".join([ln for ln in body if ln != row] + [p.text for p in parts if p.reason or not _note_of_row(p.text, body, row)])
+    return "\n".join([ln for ln in body if ln != row] + [p.text for p in parts if p.reason or not _note_of_row(p.text, body, row, quote, elsewhere)])
 
 
 def _scope_of_quote(ws, sid: str, src, quote: str) -> dict:
@@ -554,10 +560,11 @@ def _note_of_another_scope(ws, sid: str, src, text: str, quote: str, *, conditio
     return False
 
 
-def _foreign_condition(condition: str, src, quote: str) -> bool:
+def _foreign_condition(condition: str, src, quote: str, elsewhere: Sequence[str] = ()) -> bool:
     """Whether an agent-written condition stands only in another item's context: most of its words are not in the item's own
     context and are in a row beside it (R3)."""
-    return not conditions.stated_in(condition, _own_context(src, quote)) and conditions.stated_in(condition, _other_context(src, quote))
+    return (not conditions.stated_in(condition, _own_context(src, quote, elsewhere))
+            and conditions.stated_in(condition, _other_context(src, quote, elsewhere)))
 
 
 def _clip_row(line: str) -> str:
@@ -1761,7 +1768,7 @@ class Ledger:
             if is_server_item(item) and (got is None or not got.ok):
                 continue  # (a candidate the call assigned to a component is an open item whatever sentence cited what: round 18 U6)
             rows.append((item, got))
-        owns = {ev: _own_text(ws, i) for ev, i in {i.evidence: i for i, _ in rows}.items()}  # each evidence's own context text (last fill's)
+        owns = {ev: _own_text(ws, i, quotes) for ev, i in {i.evidence: i for i, _ in rows}.items()}  # each evidence's own context text (last fill's)
         others = [i for i, _ in rows]
         checked: set[Evidence] = set()
         covered = [i for i, g in rows if g is not None and g.ok]
@@ -1826,9 +1833,9 @@ def _spans_of(ws, item: Item, elsewhere: Sequence[str] = ()) -> list[Span]:
     return condition_spans(src, item.quote, elsewhere) if src is not None else []
 
 
-def _own_text(ws, item: Item) -> str:
+def _own_text(ws, item: Item, elsewhere: Sequence[str] = ()) -> str:
     src = ws.sources.get(item.source)
-    return _own_context(src, item.quote) if src is not None else item.quote
+    return _own_context(src, item.quote, elsewhere) if src is not None else item.quote
 
 
 def _condition_check(item: Item, got: Coverage | None, spans: dict, gave: dict, owns: dict, by_index: dict[int, Unit],

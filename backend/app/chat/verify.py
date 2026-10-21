@@ -4667,7 +4667,7 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
     by_id: dict[str, dict] = {}
     for x in states:
         by_id.setdefault(x["id"], x)
-    annotated: set[tuple[int, str]] = set()  # (unit, flat condition quote) already written into the unit
+    annotated: set[tuple[int, str, str]] = set()  # (unit, source, flat condition quote) already written into the unit
     for st in states:
         verdict = said.get(st["id"])
         unit = units.get(st["condition_unit"])
@@ -4716,7 +4716,7 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
             cited = [(st["source"], source)]
             number = _value_number(unit, cited)
             # the same condition is written into one unit once, however many items of its table it is missing from (round 20 U9, F2)
-            once = (unit.index, _flat_quote(phrase or MSG_CONDITION_LIMIT.format(where=_read_in(cited))))
+            once = (unit.index, st["source"], _flat_quote(phrase or MSG_CONDITION_LIMIT.format(where=_read_in(cited))))
             if once in annotated:
                 continue
             annotated.add(once)
@@ -5272,9 +5272,148 @@ RESCUABLE_FAILURES = ("none", "absent_from_source", "contradicts_source")  # the
 MSG_RESCUED = "נתמך במקור {sid}, שיחידה סמוכה בתשובה מצטטת, ולא במקור שהיחידה עצמה מצטטת; הנתון נשאר מסומן כמאומת חלקית"
 MSG_RESCUED_OWN = "המספר והמילים של הטענה נמצאים בשורה של {sid}, שהיחידה מצטטת, אך הבדיקה לא אישרה את מלוא הטענה; הנתון נשאר מסומן כמאומת חלקית"
 MSG_RESCUE_CITE = "נתמך ב-{sid}, שהתשובה לא ציטטה ליד המשפט"
-_NEGATIONS = frozenset({"לא", "אין", "אינו", "אינה", "אינם", "אינן", "ללא", "בלי"})
+# the negations of a claim or a sentence, compared without their prefix letters ("ולא", "שלא", "מבלי"): a sentence that negates what the
+# claim states is no holder of it
+_NEGATIONS = frozenset({"לא", "אין", "אינו", "אינה", "אינם", "אינן", "ללא", "בלי", "בלא", "מבלי", "לבלתי", "טרם"})
 _NUMBER_RUN = re.compile(r"\d[\d.,%/:-]*")
 _RESCUE_SENTENCE = re.compile(r"(?<=[.!?;])\s+(?=\S)")  # (a colon does not end the sentence: "מתחם גבעת האלה: הכנסה נטו שנתית 610,000")
+# a number as it binds to its label: "1,200" thousands, "4.62" or "4,62" a decimal (a source reading "4,62" is no "4")
+_BIND_NUMBER = re.compile(r"(?<![\d.,])\d+(?:,\d{3})+(?:\.\d+)?|(?<![\d.,])\d+(?:[.,]\d+)?")
+_BIND_UNIT = re.compile(r"\s*(?:(?:אלף|אלפי|מיליון|מיליארד)\s*)?(?:(?P<percent>%|אחוז)|(?P<money>₪|ש[\"״]?ח|שקל|דולר|יורו)|"
+                        r"(?P<duration>שנים|שנה|חודשים|חודש|ימים)|(?P<sqm>מ[\"״]ר|מטר)|(?P<dunam>דונם))(?![א-ת])")
+_LABEL_BREAK = re.compile(r"[;.!?]\s|,\s|\|")  # where the words that name a number begin, if no other number comes first
+_LABEL_PREPOSITIONS = frozenset("ושכלמה")  # a one-letter token that is a prefix, not an identifier ("מקדם א")
+
+
+class _Bound(NamedTuple):
+    """A number of a sentence with what binds it to its words: its value (scale word applied), its sign, its unit class (a unit written after
+    it, or a currency sign before it), ``label`` — the content words (and one-letter identifiers) that name it: those between it and the
+    number or clause break before it, in a table row all those before it, and, when there are none, those after it up to the next number or
+    break — and ``near``: the words before and after it in its clause (its whole row)."""
+
+    value: Decimal
+    negative: bool
+    unit: str | None
+    label: tuple[str, ...]
+    near: tuple[str, ...]
+
+
+class _Profile(NamedTuple):
+    bound: tuple[_Bound, ...]
+    numbers: frozenset[str]  # every form the sentence states (``numbers_in`` source reading and the scaled values)
+    negations: frozenset[str]
+
+
+def _negation_set(text: str) -> frozenset[str]:
+    found = set()
+    for w in _MISSING_TOKEN.findall(text or ""):
+        for form in (w, w[1:], w[2:]):
+            if form in _NEGATIONS and all(c in "ושבמלכה" for c in w[:len(w) - len(form)]):
+                found.add(form)
+                break
+    return frozenset(found)
+
+
+def _negations(text: str) -> frozenset[str]:
+    return _negation_set(text)
+
+
+def _label_words(text: str, lo: int, hi: int, skip: Sequence[tuple[int, int]] = ()) -> list[str]:
+    words = []
+    for m in _MISSING_TOKEN.finditer(text, lo, hi):
+        w = m.group(0)
+        if w[0].isdigit() or any(a <= m.start() < b for a, b in skip):
+            continue
+        if len(w) == 1:
+            if w in _LABEL_PREPOSITIONS or text[m.end():m.end() + 1] in ("-", "־"):
+                continue
+        elif w.casefold() in _MISSING_STOP:
+            continue
+        words.append(w)
+    return words
+
+
+def _is_negative(text: str, start: int, end: int) -> bool:
+    """Whether the number at ``text[start:end]`` is written negative: a minus before it (not a hyphen after a prefix letter), a trailing
+    minus, or accounting brackets right around it."""
+    before = text[start - 1:start]
+    if before in ("-", "−", "–") and (start == 1 or not re.match(r"[\wא-ת]", text[start - 2])):
+        return True
+    if before == "(" and text[end:end + 1] == ")":
+        return True
+    return text[end:end + 1] in ("-", "−") and not re.match(r"[\wא-ת]", text[end + 1:end + 2] or " ")
+
+
+_YEAR_WORD = r"(?<![א-ת])[ובלמכשה]{0,2}(?:שנת|שנים|שנה|מועד|תאריך|יום)"
+_YEAR_INTRO = re.compile(rf"{_YEAR_WORD}\s*(?<![\d])(?:19|20)\d\d(?![\d.,%])")
+_NUMBER_PREFIX = re.compile(r"(?<![א-ת])[ובלמכשה][-־]\s*(?=[\s₪]|$)")
+_BIND_YEAR = re.compile(r"(?:19|20)\d\d")
+_BIND_LIST_MARKER = re.compile(r"\s*\d{1,3}[.)]\s")
+_BIND_CURRENCY_BEFORE = re.compile(r"(?:₪|ש[\"״]?ח)\s*$")
+
+
+@functools.lru_cache(maxsize=4096)
+def _profile(text: str) -> _Profile:
+    """What a claim or a source sentence states, per number (``_Bound``), kept per text: the numbers' forms, negations and bound words.
+    A list marker ("2." opening the text) and a bare year (no unit, no currency) are not numbers to bind: they bound no other number's words,
+    and the word that introduces a year ("בשנת") names nothing."""
+    from app.chat.calc import scale_after
+
+    dates = [m.span() for m in _DATE_AT.finditer(text)]
+    row = "|" in text
+    marker = _BIND_LIST_MARKER.match(text)
+    found, skip = [], []
+    for m in _BIND_NUMBER.finditer(text):
+        if any(a <= m.start() and m.end() <= b for a, b in dates) or (marker and m.start() < marker.end()):
+            continue
+        unit = _BIND_UNIT.match(text, m.end())
+        if _BIND_YEAR.fullmatch(m.group(0)) and unit is None and not _BIND_CURRENCY_BEFORE.search(text[max(0, m.start() - 4):m.start()]):
+            lead = re.search(rf"{_YEAR_WORD}\s*$", text[:m.start()])
+            skip.append((lead.start() if lead else m.start(), m.end()))
+            continue
+        found.append((m, unit))
+    spans = sorted([*(m.span() for m, _ in found), *dates])
+    bound = []
+    for m, unit in found:
+        raw = m.group(0)
+        thousands = re.fullmatch(r"\d+(?:,\d{3})+(?:\.\d+)?", raw) is not None
+        try:
+            value = Decimal(raw.replace(",", "") if thousands else raw.replace(",", ".")) * scale_after(text, m.start(), m.end())[0]
+        except InvalidOperation:
+            continue
+        unit_class = next((k for k, v in unit.groupdict().items() if v), None) if unit else None
+        if unit_class is None and _BIND_CURRENCY_BEFORE.search(text[max(0, m.start() - 6):m.start()]):
+            unit_class = "money"
+        after_unit = unit.end() if unit else m.end()
+        if row:
+            lo, hi = 0, len(text)
+        else:
+            lo = max([e for _, e in spans if e <= m.start()] + [0])
+            lo = max([lo, *(x.end() for x in _LABEL_BREAK.finditer(text, 0, m.start()))])
+            nxt = _LABEL_BREAK.search(text, m.end())
+            hi = min([a for a, _ in spans if a >= m.end()] + [nxt.start() if nxt else len(text)])
+        label = _label_words(text, lo, m.start(), skip)
+        if not label:
+            label = _label_words(text, after_unit, hi, skip)
+        near = tuple(_label_words(text, lo, m.start(), skip)) + tuple(_label_words(text, after_unit, hi, skip))
+        bound.append(_Bound(value, _is_negative(text, m.start(), m.end()), unit_class, tuple(label), near))
+    return _Profile(tuple(bound), frozenset(numbers_in(text, words=True) | scaled_numbers_in(text)), _negation_set(text))
+
+
+def _label_in(claim_label: tuple[str, ...], source_near: tuple[str, ...]) -> bool:
+    """Whether every word that names the claim's number also stands near the source's (a one-letter identifier as written, any other word by
+    its comparable forms): a number of another item of the sentence, with only a word of the label in common, is not the same datum. A
+    claim number with no word around it puts no constraint."""
+    singles = {w for w in source_near if len(w) == 1}
+    forms = set().union(*(_loose_forms(w) for w in source_near if len(w) > 1)) if source_near else set()
+    return all((w in singles) if len(w) == 1 else bool(_loose_forms(w) & forms) for w in claim_label)
+
+
+def _same_datum(c: _Bound, s: _Bound) -> bool:
+    """Whether the source's number is the claim's: the same value and sign, the unit it is written with (a claim that names none may meet an
+    area unit), and the words that name it."""
+    return (c.value == s.value and c.negative == s.negative and (c.unit == s.unit or (c.unit is None and s.unit in ("sqm", "dunam")))
+            and _label_in(c.label, s.near))
 
 
 @functools.lru_cache(maxsize=1024)
@@ -5293,26 +5432,31 @@ def _negations(text: str) -> frozenset[str]:
 
 
 def _holds_claim(claim: str, source_text: str) -> bool:
-    """Whether one sentence or table row of ``source_text`` holds ``claim``: every number of the claim (as ``numbers_in`` reads it, signs and
-    all), every content word of it (``words_stand_in``), and the same negations, in that one place. A claim with no number or no content word
-    besides its numbers, or one that states an absence, is held by nothing."""
+    """Whether one sentence or table row of ``source_text`` holds ``claim``: every number of the claim stands in it bound to the words that
+    name it in the claim (``_same_datum``: the value, sign and unit, and every word of the label), every content word of the claim stands
+    there too (``words_stand_in``), and it has the claim's negations — in that one place. A claim with no number or no content word besides
+    its numbers, or one that states an absence, is held by nothing."""
     claim = _IDS.sub(" ", claim)
     numbers = numbers_in(claim)
-    words = _NUMBER_RUN.sub(" ", claim)
+    # (the words a number leaves out of the claim's own words: the prefix letter of "ו-300" and the word that introduces a bare year, "בשנת 2022")
+    words = _NUMBER_RUN.sub(" ", _YEAR_INTRO.sub(" ", claim))
+    words = _NUMBER_PREFIX.sub(" ", words)
     if not numbers or not source_text or states_absence(claim) or not _missing_words(words):
         return False
-    wanted = _negations(claim)
+    wanted = _profile(claim)
     for seg in _rescue_segments(source_text):
-        if (numbers <= (numbers_in(seg, words=True) | scaled_numbers_in(seg)) and _negations(seg) == wanted
-                and words_stand_in(words, seg)):
+        have = _profile(seg)
+        if (numbers <= have.numbers and have.negations == wanted.negations
+                and all(any(_same_datum(c, s) for s in have.bound) for c in wanted.bound) and words_stand_in(words, seg)):
             return True
     return False
 
 
-def _rescue_sources(u: Unit, units: list[Unit], ws: Workspace, *, anywhere: bool = False) -> list[str]:
+def _rescue_sources(u: Unit, units: list[Unit], ws: Workspace, *, anywhere: bool = False, removed: Collection[int] = ()) -> list[str]:
     """The sources a claim of ``u`` may be rescued by: those the unit cites, then those the other units of its block (a list item or a
-    paragraph) cite; with ``anywhere``, those any unit of the answer cites."""
-    pool = units if anywhere else [x for x in units if x.block >= 0 and x.block == u.block and x is not u]
+    paragraph) cite; with ``anywhere``, those any unit of the answer cites. A unit that is removed is no one's neighbour: a source only a
+    removed unit cites is not offered."""
+    pool = [x for x in units if x.index not in removed and (anywhere or (x.block >= 0 and x.block == u.block)) and x is not u]
     out: list[str] = []
     for x in [u, *pool]:
         for i in x.ids:
@@ -5322,14 +5466,17 @@ def _rescue_sources(u: Unit, units: list[Unit], ws: Workspace, *, anywhere: bool
     return out
 
 
-def _holding_source(u: Unit, claim: str, sids: list[str], ws: Workspace, question: str) -> str | None:
-    """The first of ``sids`` that holds ``claim`` (``_holds_claim``) and is not another property's or another scope's for the unit."""
+def _holding_source(u: Unit, claim: str, sids: list[str], ws: Workspace, question: str, lead: str = "") -> str | None:
+    """The first of ``sids`` that holds ``claim`` (``_holds_claim``) and is not another property's or another scope's for the unit. The unit is
+    read as if it cited only that source (its citations replaced by ``[sid]`` so a table row's cells read it), under the lead of its block;
+    a source the unit does not cite itself must be the same property's, not an unsettled one."""
     for sid in sids:
         if not _holds_claim(claim, ws.sources[sid].text or ""):
             continue
-        probe = dataclasses.replace(u, ids=[sid])
-        scope = _scope_check(probe, ws)
-        if _context_check(probe, ws, question).reason is None and scope.reason is None and not scope.cells:
+        probe = dataclasses.replace(u, ids=[sid], raw=_IDS.sub(f"[{sid}]", u.raw))
+        scope = _scope_check(probe, ws, lead)
+        owner = _context_check(probe, ws, question)
+        if owner.reason is None and scope.reason is None and not scope.cells and (sid in u.ids or not owner.facts):
             return sid
     return None
 
@@ -5337,26 +5484,31 @@ def _holding_source(u: Unit, claim: str, sids: list[str], ws: Workspace, questio
 def rescue_unstated(report: VerifyReport, units: list[Unit], ws: Workspace, question: str, meanings: dict,
                     fetcher: meaning.Fetcher) -> dict[int, str]:
     """A unit failed only because no passage it cites states its numbers (``unstated_number``) whose numbers and words stand in one sentence
-    of a source cited anywhere in the answer: that source is cited with the unit (as ``_expand_unstated`` cites an expansion) and the checks
-    run again with it; the unit is judged with it and carries the partly verified mark. Returns the unit index -> the source."""
+    of a source cited anywhere in the answer by a unit that stays: that source is cited with the unit (as ``_expand_unstated`` cites an
+    expansion) and the checks run again with it; the unit is judged with it and carries the partly verified mark. A try that fails leaves the
+    unit's citations and meanings as they were. Returns the unit index -> the source."""
     cites: dict[int, str] = {}
+    leads = _block_leads(units)
+    removed = report.removed_units()
     for p in list(report.problems):
         u = p.unit
         if (p.check != "unstated_number" or not p.unstated or u.index < 0 or u.table_span is not None or u.table_header
                 or p.resolution == "qualifier"):
             continue
-        sid = _holding_source(u, _stated_text(u), [x for x in _rescue_sources(u, units, ws, anywhere=True) if x not in u.ids], ws, question)
+        sids = [x for x in _rescue_sources(u, units, ws, anywhere=True, removed=removed) if x not in u.ids]
+        sid = _holding_source(u, _stated_text(u), sids, ws, question, leads.get(u.index, ""))
         if sid is None:
             continue
-        before = meanings.get(u.index, [])
+        ids, before = list(u.ids), meanings.get(u.index, [])
         u.ids.append(sid)
         meanings[u.index] = check_meaning(u, ws, fetcher)
         again = deterministic([u], ws, question, meanings)
         if any(x.check != RECENCY_CHECK for x in again):
-            u.ids.remove(sid)
+            u.ids[:] = ids
             meanings[u.index] = before
             continue
-        report.problems = [x for x in report.problems if x is not p] + again
+        known = {(x.check, x.reason) for x in report.problems if x.unit.index == u.index and x is not p}
+        report.problems = [x for x in report.problems if x is not p] + [x for x in again if (x.check, x.reason) not in known]
         cites[u.index] = sid
     return cites
 
@@ -5394,6 +5546,8 @@ def rescue_judged(report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: W
     (``ClaimRecord.rescue``), the unit's verdict is partial, and the holding sources are returned (unit index -> claim id -> source) for
     their citation. ``skip``: the units already decided; ``anywhere``: the units whose candidates are any source of the answer."""
     held: dict[int, dict[str, str]] = {}
+    leads = _block_leads(report.units)
+    removed = report.removed_units()
     for u in report.units:
         v, recs = verdicts.get(u.index), report.claims.get(u.index)
         if v is None or not recs or u.index in skip or u.table_header or v.verdict in ("not_factual", "navigation"):
@@ -5404,8 +5558,12 @@ def rescue_judged(report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: W
             continue  # (a claim the judge needed more context for, or that was read again with it, is the judge's to settle)
         if u.table_span is not None and any(r.whole_unit or not r.exact or 0 in _claim_cells(u, r, cell_bounds(u.raw)) for r in failing):
             continue  # a row's key cell, or a claim of a row that is not placed in a cell
-        sources = _rescue_sources(u, report.units, ws, anywhere=u.index in anywhere)
-        found = {r.id: _holding_source(u, u.text if r.whole_unit else r.text, sources, ws, question) for r in failing}
+        sources = _rescue_sources(u, report.units, ws, anywhere=u.index in anywhere, removed=removed)
+        found: dict[str, str | None] = {}
+        for r in failing:  # the first claim with no holder ends the try: the unit is not rescued
+            found[r.id] = _holding_source(u, u.text if r.whole_unit else r.text, sources, ws, question, leads.get(u.index, ""))
+            if found[r.id] is None:
+                break
         if not sources or None in found.values():
             continue
         for r in failing:

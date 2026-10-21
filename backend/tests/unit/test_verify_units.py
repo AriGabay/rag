@@ -2594,3 +2594,117 @@ def test_u9_f5_a_holder_the_sentence_itself_cites_has_its_own_check_and_wording_
     assert p.check == verify.RESCUE_CHECK == "rescue"
     assert verify.partial_summary(None, p.check)["text"] == (
         "אומת חלקית: הנתון נמצא במקור שהתשובה מצטטת ליד המשפט, ולא במקור שהמשפט עצמו מצטט.")
+
+
+# --- round 20 U9 review: the rescue binds each number to its words, and every doubt makes it hold less ---------------------------
+
+@pytest.mark.parametrize("claim, source", [
+    ("מקדם א 0.9", "חלקה 7: מקדם א 0.8, מקדם ב 0.9."),  # the number of another item of the sentence, with a word of the label in common
+    ("שכר דירה 5,000", "שכר הדירה בהסכם הוא 4,000 ₪, והארנונה 5,000 ₪."),
+    ("שיעור היוון 8%", "שיעור היוון 7% ולא 8%"),
+    ("הנכס מושכר 100 מ״ר", "הנכס ולא מושכר 100 מ״ר"),  # a negation behind a prefix letter
+    ("הנכס מושכר 100 מ״ר", "הנכס מבלי להיות מושכר 100 מ״ר"),
+    ("מקדם 4", "מקדם 4,62"),  # a decimal comma is no 4
+    ("מקדם 5", "מקדם -5"), ("מקדם 5", "מקדם (5)"), ("מקדם 5", "מקדם 5-"),  # a negative or bracketed source number
+    ("מקדם -5", "מקדם 5"),
+    ("שיעור 8%", "שיעור 8"), ("שיעור 8 חודשים", "שיעור 8%"), ("שכר 8 ₪", "שכר 8 מ״ר"),  # the unit at the number
+])
+def test_u9_review_a_sentence_does_not_hold_a_claim_whose_number_is_another_item_sign_unit_or_negation(claim, source):
+    assert not verify._holds_claim(claim, source)
+
+
+@pytest.mark.parametrize("claim, source", [
+    ("הזכויות כוללות מרתף 340", "הזכויות כוללות מרתף 340 מ״ר."),
+    ("מקדם א 0.8", "חלקה 7: מקדם א 0.8, מקדם ב 0.9."),
+    ("מקדם ב 0.9", "חלקה 7: מקדם א 0.8, מקדם ב 0.9."),
+    ("במקדם ערך נוכחי 4.62", "מקדם ערך נוכחי סידרתי (8 שנים) | 4.62"),
+    ("הכנסה 850,000 ₪", "הכנסה 850 אלף ₪"),
+    ("מקדם 4.62", "מקדם 4,62"),
+])
+def test_u9_review_a_number_bound_to_its_own_words_in_the_sentence_is_still_held(claim, source):
+    assert verify._holds_claim(claim, source)
+
+
+def test_u9_review_the_holder_is_read_under_the_lead_of_the_block_with_the_citation_the_candidate_and_a_settled_context(monkeypatch):
+    ws = _two_sources("הערך הראשון הוא 4,100 ₪.", "הערך הראשון הוא 4,100 ₪.")
+    (unit,) = split_units("הערך הראשון הוא 4,100 ₪ [S1] [S9].")
+    seen = {}
+
+    def scope(u, w, lead=""):
+        seen.update(lead=lead, raw=u.raw, ids=list(u.ids))
+        return verify.ScopeCheck()
+
+    monkeypatch.setattr(verify, "_scope_check", scope)
+    assert verify._holding_source(unit, unit.text, ["S2"], ws, "?", "פתיח הבלוק") == "S2"
+    assert seen == {"lead": "פתיח הבלוק", "raw": "הערך הראשון הוא 4,100 ₪ [S2] [S2].", "ids": ["S2"]}
+    # an unsettled owner (a neutral fact line) is enough for a source the unit cites, not for one it does not
+    monkeypatch.setattr(verify, "_context_check", lambda u, w, q: verify.ContextCheck(facts=["אין זיהוי"]))
+    assert verify._holding_source(unit, unit.text, ["S2"], ws, "?") is None
+    (own,) = split_units("הערך הראשון הוא 4,100 ₪ [S2].")
+    assert verify._holding_source(own, own.text, ["S2"], ws, "?") == "S2"
+
+
+def test_u9_review_a_failed_rescue_leaves_the_citations_and_problems_as_they_were_and_a_removed_unit_offers_no_source(monkeypatch):
+    ws = _two_sources("נתון א הוא 4,000 ₪.", "נתון ב הוא 700 ₪. נתון א הוא 5,000 ₪ לפי הסכם.")
+    a = _answer("- נתון א הוא 5,000 ₪ [S1]. נתון ב הוא 700 ₪ [S2].")
+    real = verify.deterministic
+
+    def failing(units, w, q, meanings=None):
+        out = real(units, w, q, meanings)
+        return out + [verify.Problem(units[0], "בדיקה", check="vat")] if "S2" in units[0].ids else out
+
+    monkeypatch.setattr(verify, "deterministic", failing)
+    report = verify.VerifyReport(split_units(a.answer_markdown))
+    report.problems = real(report.units, ws, "?", {})
+    before = [list(u.ids) for u in report.units]
+    assert verify.rescue_unstated(report, report.units, ws, "?", {}, meaning.Fetcher(ws)) == {}
+    assert [list(u.ids) for u in report.units] == before
+    # the only unit that cites the holder is itself removed: nothing is offered from it
+    monkeypatch.setattr(verify, "deterministic", real)
+    ws = _two_sources("נתון א הוא 4,000 ₪.", "נתון א הוא 5,000 ₪ לפי הסכם.")
+    report = verify.VerifyReport(split_units("נתון א הוא 5,000 ₪ [S1]. נתון ב הוא 9,999 ₪ [S2]."))
+    report.problems = real(report.units, ws, "?", {})
+    assert 1 in report.removed_units() and verify.rescue_unstated(report, report.units, ws, "?", {}, meaning.Fetcher(ws)) == {}
+
+
+def test_u9_review_the_rescue_stops_at_the_first_claim_with_no_holder_and_profiles_are_cached(monkeypatch):
+    ws = _two_sources("הערך הראשון הוא 3,900 ₪ והערך השני הוא 2,000 ₪.", "הערך הראשון הוא 4,100 ₪.")
+    a = _answer("הערך הראשון הוא 4,100 ₪ והערך השני הוא 2,200 ₪ [S1]. ראה גם [S2].")
+    asked = []
+    real = verify._holding_source
+    monkeypatch.setattr(verify, "_holding_source", lambda u, claim, *rest: asked.append(claim) or real(u, claim, *rest))
+    verify_answer(_claims_judge(lambda t: [("הערך הראשון הוא 4,100 ₪", "unsupported"), ("הערך השני הוא 2,200 ₪", "unsupported")]
+                                if "הערך" in t else None), a, ws, "?", [])
+    assert len(asked) <= 2
+    verify._profile.cache_clear()
+    verify._profile("מקדם 5"), verify._profile("מקדם 5")
+    assert verify._profile.cache_info().hits == 1
+
+
+@pytest.mark.parametrize("claim, source", [
+    ("2. שכר דירה 45,000 ₪", "שכר דירה | ₪ 45,000"),  # a list marker is no number to bind; a currency sign before the number is its unit
+    ("בשנת 2022 ההכנסה 1,200,000 ₪", "הכנסה 2022: 1,200,000 ₪"),  # a bare year is no number to bind, nor the word that introduces it
+    ("שטח עיקרי 1,200 מ״ר ו-300 מ״ר", "שטח עיקרי 1,200 מ״ר וגם 300 מ״ר"),  # a number with no word around it puts no label constraint
+    ("₪ 45,223,750 שכר", "שכר 45,223,750 ₪"),
+    ("נתון א 4,000 ₪", "4,000 ₪ נתון א"),  # the words may stand after the number in the source
+])
+def test_u9_review_the_binding_reads_words_on_both_sides_and_ignores_list_markers_and_bare_years(claim, source):
+    assert verify._holds_claim(claim, source)
+
+
+def test_u9_review_the_binding_keeps_its_negatives_after_the_relaxation():
+    for claim, source in [("מקדם א 0.9", "מקדם א 0.8, מקדם ב 0.9"), ("שכר דירה 5,000", "ארנונה 5,000"), ("8%", "7% ולא 8%"),
+                          ("בשנת 2022 ההכנסה 1,300,000 ₪", "הכנסה 2022: 1,200,000 ₪"), ("2. שכר דירה 45,000 ₪", "ארנונה | ₪ 45,000")]:
+        assert not verify._holds_claim(claim, source), (claim, source)
+
+
+def test_u9_review_a_mixed_absence_and_qualifier_cell_and_a_label_with_a_figure_keep_the_u9_behaviour():
+    head = "| רכיב | הערה | משך |\n|---|---|---|\n"
+    pure = _answer(f"{head}| רכיב א | {ABSENCE_CELL} | 100 ₪ [S1] |")
+    r = verify_answer(_claims_judge(lambda t: [(ABSENCE_CELL, "unsupported"), ("100 ₪", "supported")] if "רכיב א" in t else None),
+                      pure, _ws(PART_SOURCE), "?", [])
+    assert r.removed_units() == set()
+    p = _judge(lambda t: "unsupported" if "מושכר" in t else "supported")
+    a = _answer("- **שטח 40 מ״ר:** הנכס מושכר לטווח ארוך [S1]. הנכס פנוי [S1].")
+    out = verify_answer(p, a, _ws(SOURCE), "?", []).apply(a).answer_markdown
+    assert "**שטח 40 מ״ר:**" in out and "מושכר" not in out

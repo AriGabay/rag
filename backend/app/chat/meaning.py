@@ -804,6 +804,10 @@ def _caption_lines(lines: list[str], is_row: list[bool], tables: list[_Table]) -
 
 
 _NOTE_WORD = re.compile(r"\s+([א-ת][א-ת\"״׳']*)")
+# a quantity, currency or period word right after the opening number makes it a quantity, not a footnote mark ("10 אחוזים", "5 אלפי ₪")
+_NOTE_QUANTITY = re.compile(
+    r"(?:אחוז(?:ים)?|אל(?:ף|פי)|מיליון|מיליארד|דונ(?:ם|מים)|ש[\"״]?ח|שקל(?:ים)?|דולר(?:ים)?|יורו|נקוד(?:ות|ה)|ליחידה|שנים|שנה|חודשים|חודש|"
+    r"יחידות|יחידה|מ[\"״]ר)")
 
 
 def note_mark_at(text: str, at: int, end: int) -> bool:
@@ -815,7 +819,7 @@ def note_mark_at(text: str, at: int, end: int) -> bool:
         return False
     if not text[:at].strip():
         word = _NOTE_WORD.match(text, end)
-        return (bool(word) and not after_kind(text, end) and not _QUANTITY_AT.match(text, end) and word.group(1) != "אחוז"
+        return (bool(word) and not after_kind(text, end) and not _QUANTITY_AT.match(text, end) and not _NOTE_QUANTITY.fullmatch(word.group(1))
                 and not units_attested(word.group(1)) and not _all(word.group(1)).keys("period"))
     return text.startswith(" :", end) and bool(re.search(r"[א-ת]\s+$", text[:at]))
 

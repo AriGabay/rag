@@ -378,16 +378,24 @@ def _mark_key(mark: str) -> str:
     return bare if bare and set(bare) == {"*"} else "#" + re.sub(r"\D", "", mark)
 
 
+_BOLD = re.compile(r"\*\*([^*\n]+)\*\*")
+
+
+def _unbold(text: str) -> str:
+    """``text`` cleaned, with its bold marks (``**name**``) taken out: a bold word is no star mark of a note."""
+    return _BOLD.sub(r"\1", _clean(text))
+
+
 def note_mark(line: str) -> str:
     """The mark a note line opens with («*», «**», «(1)», «1)», a superscript digit), as ``_mark_key`` compares it; "" for a line that is
     no note by its text."""
-    m = _NOTE_START.match(_clean(line))
+    m = _NOTE_START.match(_unbold(line))
     return _mark_key(m.group("m")) if m else ""
 
 
 def cell_marks(cell: str) -> frozenset[str]:
     """The note marks a table cell carries at its end or its start («חוזה חכירה ראשון*», «מעל מפלס הכניסה**», «(1) שטח»)."""
-    flat = _clean(cell)
+    flat = _unbold(cell)
     return frozenset(_mark_key(m.group("m")) for p in (_CELL_MARK_END, _CELL_MARK_START) if (m := p.search(flat)))
 
 

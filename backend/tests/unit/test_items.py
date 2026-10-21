@@ -1949,3 +1949,26 @@ def test_the_scope_of_a_quote_is_that_of_its_own_row_not_of_an_empty_cell_of_an_
     assert items._scope_of_quote(ws, "S1", src, "1,500") == {"plan": frozenset({"1"})}
     # a quote the source does not hold has no scope
     assert items._scope_of_quote(ws, "S1", src, "תכנית 3 | 9,999") == {}
+
+
+def test_u9_review_a_bold_word_is_no_star_mark_and_a_note_opening_in_bold_has_no_mark():
+    assert scopes.cell_marks("**שם**") == frozenset() and scopes.cell_marks("**שם** (***)") == frozenset({"***"})
+    assert scopes.cell_marks("מעל מפלס הכניסה**") == frozenset({"**"})
+    assert scopes.note_mark("**הערה:** אחזקה לא תפחת מ-31%") == "" and scopes.note_mark("** אחזקה") == "**"
+
+
+def test_u9_review_another_items_mark_drops_a_note_only_from_a_table_that_carries_no_mark_of_its_own():
+    marked = "\n".join(["הטבלה: 3 שורות", "נתון | ערך", "נתון א׳ (*) | 1,000", "נתון ב׳ | 2,000", "נתון ג׳ | 3,000", STAR_NOTE])
+    ws = _ws(STAR_ROW, marked)
+    # the table has a mark of its own (another one): the note stays the table's, as before
+    assert [(s.place, s.text) for s in items.condition_spans(ws.sources["S2"], "נתון ב׳ | 2,000", [STAR_ROW])] == [("paragraph", STAR_NOTE)]
+    plain = _ws(STAR_ROW, PLAIN_TABLE)
+    assert items.condition_spans(plain.sources["S2"], PLAIN_ROWS[0], [STAR_ROW]) == []
+
+
+def test_u9_review_the_own_and_other_context_of_an_item_read_a_note_as_its_condition_spans_do():
+    ws = _ws(STAR_ROW, PLAIN_TABLE)
+    src = ws.sources["S2"]
+    assert STAR_NOTE in items._own_context(src, PLAIN_ROWS[0])
+    assert STAR_NOTE not in items._own_context(src, PLAIN_ROWS[0], [STAR_ROW])
+    assert STAR_NOTE in items._other_context(src, PLAIN_ROWS[0], [STAR_ROW])

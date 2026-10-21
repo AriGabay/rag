@@ -3808,3 +3808,16 @@ def test_the_lines_after_the_eighth_count_the_unchecked_ones_apart_from_the_item
     assert coverage.item_gap_lines(ws, _R(), [{"id": "N1", "status": "partial"}], omitted)[-1]["text"] == "ועוד 3 פריטים נוספים שנקראו ולא נכללו בתשובה."
     mixed = omitted[:9] + st[9:]
     assert "ולא נכללו בתשובה, ועוד 2 שנקראו" in coverage.item_gap_lines(ws, _R(), [{"id": "N1", "status": "partial"}], mixed)[-1]["text"]
+
+
+def test_u9_review_the_same_note_from_two_appraisals_keeps_one_annotation_for_each_appraisal():
+    """The dedupe is per unit, condition quote and source: a note two appraisals write alike is a condition of each."""
+    rows = ["סוג שטח | שטח (מ״ר)", "שטח כולל לבנייה | 1,200", PLAN_NOTE]
+    ws = _file(SOURCE, "\n".join(rows), "\n".join(rows).replace("1,200", "1,500"), units=(1, 1, 1), declared=(1,))
+    ws.sources["S2"].kind = ws.sources["S3"].kind = "table"
+    raw = [_adj_item("שטח כולל", "שטח כולל לבנייה | 1,200", "1,200"),
+           _adj_item("שטח כולל", "שטח כולל לבנייה | 1,500", "1,500", source="S3")]
+    md = "השטח הכולל לבנייה הוא 1,200 מ״ר [S2] ו-1,500 מ״ר [S3]."
+    r, _, _, _ = _ledger_check(ws, md, raw)
+    notes = [p for p in r.problems if p.check == verify.CONDITION_CHECK]
+    assert sorted(p.cite for p in notes) == ["S2", "S3"], [(p.cite, p.annotation) for p in notes]

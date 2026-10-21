@@ -1314,3 +1314,13 @@ def test_u9_f4_a_noun_period_word_of_a_source_line_is_not_spread_to_the_other_nu
     for source in ("הרווח השנתי הממוצע בשיעור 7.15% ומקדם 0.9", "הרווח השנתי הממוצע בשיעור 7.15%. משך ההסכם 36 חודשים. מקדם 0.9"):
         (coef,), _ = meaning.source_occurrences(source, {"0.9"})
         assert coef.qualifiers.keys("period") == set(), source
+
+
+# --- round 20 U9 review: tighter attestation across tables, and a quantity word is no footnote ---------------------------------------
+
+@pytest.mark.parametrize("line", ["10 אחוזים", "3 אחוזים לשנה", "5 אלפי ₪", "3 מיליארד ₪", "9 דונמים", "15 דולר", "10 שח", "3 ליחידה",
+                                  "7 נקודות", "4 אלף", "8 מיליון", "6 ש\"ח", "2 יורו", "5 שנים", "7 חודשים", "3 יחידות", "20 מ\"ר", "10 דונם"])
+def test_u9_review_a_line_that_opens_with_a_number_and_a_quantity_or_currency_word_is_no_footnote_mark(line):
+    (occ,), _ = meaning.source_occurrences(line, set(meaning.numbers_in(line.split()[0])))
+    assert not occ.identifier, line
+    assert not meaning.note_mark_at(line, 0, len(line.split()[0]))
