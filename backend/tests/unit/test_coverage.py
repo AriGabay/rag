@@ -3912,3 +3912,73 @@ def test_round21_an_item_with_no_figure_has_its_sentence_for_a_clause_only_when_
     both, _, answer, _ = _plan_check("התנאים: נדרש אישור ועדת התכנון והלוואה בנקאית [S2].", rows=WORD_ROWS, raw=raw, ask="תנאי העסקה")
     assert [p for p in both.problems if p.check in verify.CONDITION_CHECKS] == []  # one sentence gives both: it is the clause of neither
     assert {x.label for x in both.unbound} == {"אישור הוועדה", "מימון"} and both.edit(answer).doc.text == answer.answer_markdown
+
+
+# --- round 21 U4 (KTD4, R4, R8): tidying never deletes a supported repeated line; the coverage note says what happened -------------------
+
+LOT_BULLETS = "**מגרש 101**\n- השטח הוא 800 מ״ר [S1].\n\n**מגרש 102**\n- השטח הוא 800 מ״ר [S1]."
+
+
+def test_u4_the_same_bullet_under_two_headings_survives_the_tidy_up():
+    assert coverage.tidy(LOT_BULLETS) == LOT_BULLETS
+
+
+def test_u4_the_same_line_under_two_list_leads_survives_the_tidy_up():
+    md = "הנתונים לפי הראשונה:\n- הנכס פנוי [S1].\n\nהנתונים לפי השנייה:\n- הנכס פנוי [S1]."
+    assert coverage.tidy(md) == md
+
+
+def test_u4_a_heading_that_comes_again_is_never_dropped_for_being_a_repeat():
+    md = "**מגרש 101**\n- שטח 800 מ״ר [S1].\n\n**מגרש 102**\n- שטח 700 מ״ר [S1].\n\n**מגרש 101**\n- מצב משפטי: רשום [S2]."
+    assert coverage.tidy(md) == md
+
+
+def test_u4_a_line_repeated_under_the_same_heading_is_still_one_line():
+    md = "**מגרש 101**\n- הנכס פנוי [S1].\n- שטח 800 מ״ר [S1].\n- הנכס פנוי [S1]."
+    assert coverage.tidy(md) == "**מגרש 101**\n- הנכס פנוי [S1].\n- שטח 800 מ״ר [S1]."
+
+
+def test_u4_an_adjacent_duplicate_a_cut_leaves_is_dropped():
+    md = "הנכס פנוי [S1].\nהנכס פנוי [S1].\nשטח 800 מ״ר [S1]."
+    assert coverage.tidy(md) == "הנכס פנוי [S1].\nשטח 800 מ״ר [S1]."
+
+
+def _set_answer(markdown: str) -> FinalAnswer:
+    a = _answer(markdown)
+    return a.model_copy(update={"scope_kind": "set", "scope_query": "שומות באזור הדגמה"})
+
+
+def test_u4_an_empty_lookup_of_the_set_writes_no_not_found_note_when_the_answer_cites_a_document():
+    ws = _ws()
+    ws.scope = {"query": "שומות באזור הדגמה", "matching": [], "pages": 1, "pages_read": set()}
+    ledger, built = coverage.build(ws, _set_answer("הנכס פנוי [S1]."), "?")
+    assert "note" not in ledger and "לא נמצאו מסמכים" not in built.answer_markdown, built.answer_markdown
+    assert ledger["cited"], "the cited set is not empty: the lookup is the one that found nothing"
+
+
+def test_u4_a_set_with_no_match_and_no_citation_still_says_nothing_matched():
+    ws = _ws()
+    ws.scope = {"query": "שומות באזור הדגמה", "matching": [], "pages": 1, "pages_read": set()}
+    ledger, built = coverage.build(ws, _set_answer("לא נמצאה תשובה."), "?")
+    assert "לא נמצאו מסמכים" in ledger["note"]
+
+
+def test_u4_a_note_that_every_matching_document_gave_data_does_not_say_the_answer_rests_on_only_some_of_them():
+    ws = _ws()
+    doc = str(ws.sources["S1"].document_id)
+    ws.touch(doc, "דוח בדיקה", "read", partial=True)  # read in part: the set is not covered, though its one document gave a datum
+    ws.scope = {"query": "שומות באזור הדגמה", "matching": [{"document_id": doc, "title": "דוח בדיקה"}], "pages": 1, "pages_read": set()}
+    ledger, built = coverage.build(ws, _set_answer("הנכס פנוי [S1]."), "?")
+    note = ledger["note"]
+    assert "ולכן אינה מכסה" not in note and "מבוססת על 1 מהם" not in note, note
+    assert "נקרא" in note and "בחלקו" in note, note  # the document was read in part: that is what limits the answer
+    assert built.status == "partial"
+
+
+def test_u4_a_note_that_some_documents_gave_no_datum_keeps_the_old_wording():
+    ws = _ws("דוח אחד.", "דוח שני.")
+    d1, d2 = (str(s.document_id) for s in ws.sources.values())
+    ws.scope = {"query": "שומות באזור הדגמה", "matching": [{"document_id": d1, "title": "א"}, {"document_id": d2, "title": "ב"}],
+                "pages": 1, "pages_read": set()}
+    ledger, _ = coverage.build(ws, _set_answer("הנכס פנוי [S1]."), "?")
+    assert "התשובה מבוססת על 1 מהם, ולכן אינה מכסה את כל התחום" in ledger["note"]

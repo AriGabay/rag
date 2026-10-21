@@ -923,6 +923,26 @@ def family(kind: str) -> str:
     return _FAMILY.get(base, base)
 
 
+# the basis a per-unit amount is written for: a dwelling ("ליח״ד", "ליחידת דיור", "לדירה"), which is not an area; an area word anywhere in the
+# basis ("מ״ר", "שטח", "ברוטו", "אקוו׳") makes it an area basis
+_DWELLING_BASIS = re.compile(r"(?<![א-ת])[הלב]?(?:יח\"ד|יחידת\s+דיור|יחידה|יחידות|דירה|דירות)(?![א-ת])")
+_AREA_BASIS = re.compile(r"מ\"ר|מטר|דונם|שטח|ברוטו|נטו|אקו|עיקרי|בנוי|רשום|פלדלת")
+
+
+def per_dwelling(req: Request) -> bool:
+    """Whether the request's basis is a dwelling or a unit and no area: "value per area" is not what was asked (round 21 U4, R4). The vocabulary
+    has no per-dwelling kind, so such a request can carry a ``*_per_area`` kind; the note names the basis the request gave."""
+    basis = _norm(req.area_basis)
+    return bool(basis) and bool(_DWELLING_BASIS.search(basis)) and not _AREA_BASIS.search(basis)
+
+
+def _asked(req: Request) -> str:
+    """The requested datum as the request note words it: the kind's label, and — for a per-dwelling request — the base kind and its basis."""
+    if req.metric_kind.endswith("_per_area") and per_dwelling(req):
+        return f"{REQUEST_KINDS.get(_base(req.metric_kind), _base(req.metric_kind))} {req.area_basis.strip()}"
+    return REQUEST_KINDS.get(req.metric_kind, req.metric_kind)
+
+
 def mismatch(req: Request | None, answer_focus) -> str | None:
     """Why the answer's datum is not the requested one, or None. The answer is held only to the dimensions the user
     set (``approved``): the metric, when its change was accepted on the user's words — compared by family, so a
@@ -934,8 +954,9 @@ def mismatch(req: Request | None, answer_focus) -> str | None:
     if got in _UNSPECIFIC:
         return None
     wrong_metric = "metric" in req.approved and family(got) != family(req.metric_kind)
-    wrong_scale = "scale" in req.approved and got.endswith("_per_area") != req.per_area
+    asks_per_area = req.per_area and not per_dwelling(req)  # a per-dwelling basis is no per-area scale (round 21 U4)
+    wrong_scale = "scale" in req.approved and got.endswith("_per_area") != asks_per_area
     if wrong_metric or wrong_scale:
-        return (f"התבקש {REQUEST_KINDS.get(req.metric_kind, req.metric_kind)}, והתשובה מציגה "
+        return (f"התבקש {_asked(req)}, והתשובה מציגה "
                 f"{REQUEST_KINDS.get(got, got)}")
     return None

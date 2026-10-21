@@ -2784,3 +2784,36 @@ def test_round21_several_tokens_each_stand_once_and_the_note_follows_the_last_of
     got, unit = _anchor("השטח הוא 100 מ״ר ושווי השטח הוא 5,000 ₪.", "100 מ״ר; 5,000 ₪", "שטח | 100 | שווי | 5,000")
     assert got == ("5,000", unit.text.index("5,000"))
     assert _anchor("השטח הוא 100 מ״ר ושווי השטח הוא 5,000 ₪ ושוב 100.", "100 מ״ר; 5,000 ₪", "שטח | 100 | שווי | 5,000")[0] is None
+
+
+# --- round 21 U4 (R4): a removal by the scope check names the scope, and only the attribution check says "another property" ----------------
+
+def test_u4_a_removal_by_the_scope_check_has_a_sentence_of_its_own_that_names_the_lot_scope():
+    scoped = verify.removal_summary("wrong_subject", "", None, verify.SUBREFERENT_CHECK)
+    assert scoped["text"] == verify.SCOPE_REMOVAL_SENTENCE and scoped["check"] == verify.SUBREFERENT_CHECK
+    assert "מגרש" in scoped["text"] and "נכס" not in scoped["text"]
+    assert scoped["failure_kind"] == "wrong_subject"
+    # the attribution check (any other) keeps its sentence, and a check with no sentence of its own adds nothing to the row
+    for check in (None, "judge", "dependency"):
+        plain = verify.removal_summary("wrong_subject", "", None, check)
+        assert plain["text"] == verify.REMOVAL_SENTENCES["wrong_subject"] and "check" not in plain
+    assert verify.removal_summary("wrong_unit", "", None, verify.SUBREFERENT_CHECK)["text"] == verify.REMOVAL_SENTENCES["wrong_unit"]
+
+
+def test_u4_the_scope_sentence_survives_the_public_view_of_a_stored_removal_and_only_for_that_check():
+    from app.chat import api
+
+    row = {"failure_kind": "wrong_subject", "component": None, "check": verify.SUBREFERENT_CHECK, "text": "must not leak"}
+    (shown,) = api.public_removals([row])
+    assert shown["text"] == verify.SCOPE_REMOVAL_SENTENCE and shown["check"] == verify.SUBREFERENT_CHECK
+    (other,) = api.public_removals([row | {"check": "something else"}])
+    assert other["text"] == verify.REMOVAL_SENTENCES["wrong_subject"] and "check" not in other
+
+
+def test_u4_a_problem_of_the_scope_check_words_its_removal_with_the_scope_sentence():
+    unit = split_units("שווי הקרקע במגרש 101 הוא 4,200,000 ₪ [S1].")[0]
+    scoped = verify.Problem(unit, "r", failure_kind="wrong_subject", check=verify.SUBREFERENT_CHECK)
+    plain = verify.Problem(unit, "r", failure_kind="wrong_subject", check="judge")
+    assert verify.removal_lines([scoped]) == ["> " + verify.SCOPE_REMOVAL_SENTENCE]
+    assert verify.removal_lines([plain]) == ["> " + verify.REMOVAL_SENTENCES["wrong_subject"]]
+    assert len(verify.removal_lines([scoped, plain])) == 2  # two causes, two lines

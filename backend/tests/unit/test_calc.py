@@ -830,3 +830,53 @@ def test_a_duration_under_a_heading_in_thousands_takes_neither_its_currency_nor_
     taken = tools._take_quote(src, amount, {"quote": amount, "number": "13,250"}, [(2, amount, 1)],
                               lambda _: tools._ScaleNote(NOTE, 1, "read"))
     assert taken["units"] == {"ILS"} and taken["scale"] == 1000
+
+
+# --- round 21 U3 (KTD3, R3, R5): an attribute is "set by the agent" only when the source does not state it -------------------------------
+
+CLAUSE_SOURCE = "שווי הקרקע במגרש 101 הוא 3,100,000 ₪ לפי התחשיב. דמי השכירות הם 55 ₪ לחודש, והמסים 7 ₪."
+
+
+def _settled(quote: str, number: str, kind: str, unit: str, text: str = CLAUSE_SOURCE):
+    from types import SimpleNamespace
+
+    from app.chat import tools
+
+    src = SimpleNamespace(sid="S1", version_id="v1")
+    taken = tools._take_quote(src, text, {"quote": quote, "number": number}, [(0, text, 1)])
+    given = {"kind": kind, "unit": unit, "period": "unknown", "vat": "unknown", "area_basis": "", "subject": "הנכס", "role": "other",
+             "stance": "unknown", "stated_by": "", "scenario": ""}
+    return tools._settle_meaning(taken, given)[1]
+
+
+def test_u3_c1_a_kind_the_quotes_own_sentence_states_is_the_sources_though_the_quote_is_a_fragment():
+    prov = _settled("3,100,000 ₪", "3,100,000", "value", "ILS")
+    assert prov["kind"] == "source" and prov["unit"] == "source"
+
+
+def test_u3_c1_a_unit_the_sentence_states_is_the_sources_though_the_quote_is_only_the_number():
+    text = "שווי הקרקע המוערך הוא 3,100,000 בלבד, והנתון נקוב בשקלים חדשים (₪) לפי התחשיב."
+    prov = _settled("הוא 3,100,000", "3,100,000", "value", "ILS", text)
+    assert prov["unit"] == "source" and prov["kind"] == "source"
+    assert _settled("הוא 3,100,000", "3,100,000", "value", "sqm", text)["unit"] == "model_asserted"  # the sentence states another unit
+
+
+def test_u3_c1_a_kind_the_sentence_does_not_state_stays_the_agents():
+    prov = _settled("3,100,000 ₪", "3,100,000", "rent", "ILS")
+    assert prov["kind"] == "model_asserted" and prov["unit"] == "source"
+
+
+def test_u3_c1_a_sentence_with_two_amounts_confirms_nothing_for_either():
+    # "דמי השכירות הם 55 ₪ לחודש, והמסים 7 ₪": two amounts, so the sentence names no one kind for either of them
+    assert _settled("דמי השכירות הם 55 ₪", "55", "rent", "ILS")["kind"] == "source"  # the quote's own words state it
+    assert _settled("55 ₪", "55", "rent", "ILS")["kind"] == "model_asserted"
+    assert _settled("7 ₪", "7", "rent", "ILS")["kind"] == "model_asserted"  # "דמי השכירות" belongs to the other amount of the sentence
+
+
+def test_u3_c1_a_value_with_a_clear_reading_whose_attributes_the_source_states_is_not_certain_only_because_the_quote_was_short():
+    from app.chat import calc
+
+    prov = _settled("3,100,000 ₪", "3,100,000", "value", "ILS")
+    v = calc.Value("V1", Decimal(3100000), "3,100,000", "S1", None, None, None, "t", "l", "שווי", "value", "ILS", "none", "unknown", "",
+                   "הנכס", "other", prov, {"quote": "3,100,000 ₪"}, "3,100,000 ₪")
+    assert v.certainty == "verified"

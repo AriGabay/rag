@@ -5856,6 +5856,25 @@ def value_status(ws: Workspace, i: str) -> str:
     return STATUS_UNCERTAIN if value_uncertain(ws, i) else STATUS_AUTO
 
 
+_DEFINING_NAMES = {"kind": "הסוג", "unit": "היחידה"}
+
+
+def asserted_attributes(ws: Workspace, vid: str) -> list[str]:
+    """The defining attributes (kind, unit) of a value that the agent set and the source did not state (``Value.provenance``, confirmed
+    against the source by ``meaning.confirmed_in_source`` when the value was taken), when that is the only thing making it uncertain: a value
+    whose reading is unclear is uncertain for its reading and has none (round 21 U3, KTD3, R3)."""
+    v = ws.values.get(vid)
+    if v is None or reading_unclear(ws, vid):
+        return []
+    return [k for k in calc.DEFINING_ATTRIBUTES if v.provenance.get(k) == "model_asserted"]
+
+
+def uncertain_reason(ws: Workspace, vid: str) -> str:
+    """Why an uncertain value is uncertain when the reading is clear and the agent set the attributes that define it: "" for any other."""
+    asserted = asserted_attributes(ws, vid)
+    return "תכונות שנקבעו על ידי הסוכן ולא נמצאו במקור: " + ", ".join(_DEFINING_NAMES[k] for k in asserted) if asserted else ""
+
+
 def uncertain_inputs(ws: Workspace, ids) -> list[str]:
     """The values and measurements among ``ids`` that are uncertain: a calculation resting on any of them is
     conditional, never certain (R28)."""
@@ -6561,6 +6580,7 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
             "units": units, "vat": vats,
             "vat_from": _vat_anchors(vats, [("sentence", quote), ("paragraph", line), ("note", full)], "paragraph"),
             "kind_context": quote, "kind_parts": [("sentence", quote)], "locator": {"quote": loc["quote"].strip()},
+            "source_text": full,  # the source the quote is of: a kind or a unit its fragment lacks is confirmed in the number's own clause (round 21 U3)
             "total": False, "table": None,
             "anchor": anchor, "said": said, "context": f"{line}\n{quote}",
             "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale,
@@ -6648,8 +6668,18 @@ def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict, dict]:
     else:
         prov["area_basis"] = "model_asserted" if said else "not_stated"
     prov["kind"] = "source" if meaning.kind_attested(given["kind"], taken["kind_context"]) else "model_asserted"
+    parts = taken.get("kind_parts") or [("paragraph", taken["kind_context"])]
+    if "model_asserted" in (prov["kind"], prov["unit"]) and taken.get("source_text"):
+        # the quote of a value is often a fragment of its sentence: the same meaning reader is asked about the number's own clause of the
+        # source before the value is called the agent's (round 21 U3, KTD3, C1). A kind or a unit the clause states is the source's
+        kind_stated, unit_stated, clause = meaning.confirmed_in_source(taken["source_text"], taken["forms"], taken["quote"],
+                                                                       given["kind"], out["unit"])
+        if prov["kind"] == "model_asserted" and kind_stated:
+            prov["kind"], parts = "source", [("sentence", clause)]
+        if prov["unit"] == "model_asserted" and unit_stated:
+            prov["unit"] = "source"
     if prov["kind"] == "source":
-        anchors["kind"] = _kind_anchor(given["kind"], taken.get("kind_parts") or [("paragraph", taken["kind_context"])])
+        anchors["kind"] = _kind_anchor(given["kind"], parts)
     return out, prov, anchors
 
 
@@ -7997,7 +8027,7 @@ def register_computation(ws: Workspace, node, out, leaves: list[str], *, label: 
     if uncertain:
         # why each is uncertain, when the turn knows (an unclear region, a cell OCR did not confirm in its place)
         why = [f"{i}: {r}" for i in uncertain
-               if (r := ws.uncertain_values.get(i) or (ws.values[i].reading_note if i in ws.values else ""))]
+               if (r := ws.uncertain_values.get(i) or (ws.values[i].reading_note if i in ws.values else "") or uncertain_reason(ws, i))]
         out.conditional.append(MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain))
                                + (f" ({'; '.join(why)})" if why else ""))
     conditional = ("מותנה: " + "; ".join(out.conditional)

@@ -1324,3 +1324,136 @@ def test_u9_review_a_line_that_opens_with_a_number_and_a_quantity_or_currency_wo
     (occ,), _ = meaning.source_occurrences(line, set(meaning.numbers_in(line.split()[0])))
     assert not occ.identifier, line
     assert not meaning.note_mark_at(line, 0, len(line.split()[0]))
+
+# --- round 21 U3 (KTD3, R3, R5): meaning ownership reads structure, not position ----------------------------------------------------
+
+OF_AMOUNT = "ההפרש הוא 50,000 ₪ מההכנסה השנתית של 1,200,000 ₪"
+
+
+def test_u3_an_adjective_period_before_of_and_an_amount_is_owned_by_the_amount_after_of():
+    (earlier, later) = [q for _, _, q in meaning.attached(OF_AMOUNT)[0]]
+    assert later.keys("period") == {"year"} and earlier.keys("period") == set()
+
+
+def test_u3_the_source_side_keeps_the_nearest_amount_before_the_word_even_with_of_after_it():
+    (earlier, later) = [q for _, _, q in meaning.attached(OF_AMOUNT, noun_period=False)[0]]
+    assert earlier.keys("period") == {"year"} and later.keys("period") == set()  # round 20 U9, F4: a source is read as written
+
+
+def test_u3_a_period_word_with_no_of_keeps_its_nearest_amount():
+    (earlier, later) = [q for _, _, q in meaning.attached("ההפרש הוא 50,000 ₪ מההכנסה השנתית 1,200,000 ₪")[0]]
+    assert earlier.keys("period") == {"year"} and later.keys("period") == set()
+
+
+MONTHLY_HEADER = "רכיב | סכום חודשי (₪)"
+
+
+def _cell_period(table: str, number: str) -> set[str]:
+    (occ,), _ = meaning.source_occurrences(table, set(meaning.numbers_in(number)))
+    return occ.qualifiers.keys("period")
+
+
+def test_u3_ae3_a_monthly_column_header_gives_no_period_to_a_capitalised_total_row():
+    table = "\n".join(["תמהיל הכנסות", MONTHLY_HEADER, "שכר דירה בסיסי | 55,000", "שווי מהוון | 6,600,000"])
+    assert _cell_period(table, "55,000") == {"month"}  # a recurring row keeps the header's period
+    assert _cell_period(table, "6,600,000") == set()
+
+
+def test_u3_a_row_that_names_a_capitalised_total_in_other_words_gets_no_header_period():
+    table = "\n".join(["תמהיל הכנסות", MONTHLY_HEADER, "שכר דירה בסיסי | 55,000", "סה״כ שכר דירה מהוון | 6,600,000"])
+    assert _cell_period(table, "6,600,000") == set()
+
+
+def test_u3_a_row_that_states_its_own_period_beats_the_header_period():
+    table = "\n".join(["תמהיל הכנסות", MONTHLY_HEADER, "שכר דירה בסיסי | 55,000", "הכנסה שנתית משכירות | 660,000"])
+    assert _cell_period(table, "660,000") == {"year"}
+
+
+def test_u3_a_header_period_still_reaches_a_row_with_no_kind_word_of_its_own():
+    table = "\n".join(["תמהיל הכנסות", MONTHLY_HEADER, "קומה א | 12,000", "קומה ב | 13,000"])
+    assert _cell_period(table, "12,000") == {"month"}
+
+
+@pytest.mark.parametrize("word, key", [("Monthly", "month"), ("monthly", "month"), ("per month", "month"), ("/month", "month"),
+                                       ("Annual", "year"), ("Yearly", "year"), ("per year", "year"), ("/year", "year")])
+def test_u3_english_period_words_state_a_period(word, key):
+    assert {k for _, kind, k, _ in meaning._scan(word) if kind == "period"} == {key}
+
+
+@pytest.mark.parametrize("text", ["Quarterly", "Q3 2024", "a monthlyish word", "monthlies", "permonth"])
+def test_u3_a_quarter_and_a_word_that_only_contains_one_is_no_period(text):
+    assert not [1 for _, kind, _, _ in meaning._scan(text) if kind == "period"]
+
+
+def test_u3_an_english_table_header_period_is_read_for_a_recurring_row_and_not_for_a_capitalised_total():
+    table = "\n".join(["Income", "Item | Monthly (₪)", "Base rent | 55,000", "Capital value | 6,600,000"])
+    assert _cell_period(table, "55,000") == {"month"}
+    assert _cell_period(table, "6,600,000") == set()
+
+
+def test_u3_a_small_amount_before_an_english_per_month_is_still_an_amount_per_month():
+    assert [q.keys("period") for _, _, q in meaning.attached("rent 500 per month")[0]] == [{"month"}]
+
+
+def test_u3_a_quarterly_header_does_not_make_a_monthly_or_an_annual_claim_a_mismatch():
+    ws = _ws("Item | Quarterly (₪)\nBase rent | 155,000")
+    assert _problems("Base rent is 155,000 ₪ [S1].", ws) == []
+
+
+@pytest.mark.parametrize("text", ["שטח בנוי 500 מ״ר", "שטח בנוי: 500 מ״ר", "מ״ר בנוי 500"])
+def test_u3_a_built_area_basis_is_read_in_either_order(text):
+    ((_, _, q),) = meaning.attached(text)[0]
+    assert q.keys("basis") == {"בנוי"}, text
+
+
+def test_u3_a_building_that_is_built_names_no_area_basis():
+    assert meaning.attached("הבניין בנוי 500 מ״ר")[0][0][2].keys("basis") == set()
+
+
+class _Unreadable:
+    """A workspace whose reads fail (no tenant context): the fetcher's loads raise."""
+
+    def __init__(self):
+        self.fetched: dict = {}
+        self.ctx = None
+
+
+def test_u3_a_read_that_raises_is_not_read_and_is_never_the_none_of_a_source_that_has_nothing():
+    f = meaning.Fetcher(_Unreadable())
+
+    def boom():
+        raise RuntimeError("down")
+
+    assert f._read(("a",), boom) is meaning.NOT_READ
+    assert f._read(("a",), lambda: "later") is meaning.NOT_READ  # the failed read is kept for the turn, as before
+    assert f._read(("b",), lambda: None) is None  # a read that found nothing is "not found", a different state
+    assert f._read(("c",), lambda: [1]) == [1]
+    f.reads = 0
+    assert f._read(("d",), lambda: 1) is meaning.NOT_READ  # a read the budget did not allow was not read either
+
+
+def _unreadable_ws(text: str, kind: str = "context", **source) -> Workspace:
+    """A workspace with a database context that cannot be used: every read of the fetcher fails (a workspace with no context has nothing to read)."""
+    ws = Workspace(ctx=object())
+    ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומת בדיקה", section="תחשיב", location="", kind=kind, text=text, **source)
+    return ws
+
+
+def test_u3_the_subject_rows_of_a_read_that_failed_are_an_empty_list_and_the_unit_is_marked_unread():
+    ws = _unreadable_ws("דמי השכירות הם 55 ₪.")
+    f = meaning.Fetcher(ws)
+    assert f.subject_measurements({ws.sources["S1"].document_id}) == []  # the load raises: not read
+    assert f.unread and f.unread_for(split_units("דמי השכירות הם 55 ₪ [S1].")[0])
+    assert not meaning.Fetcher(_ws("דמי השכירות הם 55 ₪.")).subject_measurements({uuid.uuid4()})  # no database: nothing to read, not unread
+
+
+def test_u3_a_period_the_answer_adds_is_not_called_unstated_when_the_source_around_the_passage_was_not_read():
+    ws = _unreadable_ws("תחשיב\nרכיב | סכום\nדמי שכירות | 55")
+    (unit,) = split_units("דמי השכירות הם 55 ₪ לחודש [S1].")
+    unread = meaning.Fetcher(ws)
+    assert meaning.check(unit, ws, unread) == [] and unread.unread  # unknown never removes: no "not stated", no qualifier edit
+    (blocking,) = meaning.check(unit, ws)  # without a fetcher nothing was looked for beyond the passage: the old verdict
+    assert blocking.kind == "period" and blocking.blocking
+    silent = _ws("תחשיב\nרכיב | סכום\nדמי שכירות | 55")
+    (readable,) = meaning.check(unit, silent, meaning.Fetcher(silent))
+    assert readable.blocking  # a source that was read and is silent is still called silent

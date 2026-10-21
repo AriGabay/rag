@@ -1269,11 +1269,18 @@ def completeness(outcomes: list[dict], unbound: Sequence = ()) -> dict | None:
 _ORPHAN_LINE = re.compile(r"(?:[-*+]|\d{1,3}[.)]|>)?\s*(?:\*\*|__)?\s*(?:\*\*|__)?")
 
 
+# a line that opens a group of lines: a markdown heading, a bold-only line ("**מגרש 101**", "**מגרש 101:**") or a list lead ending in a colon
+_GROUP_LEAD = re.compile(r"#{1,6}\s+\S.*|(?:\*\*|__)[^*_\n]+(?:\*\*|__):?|[^|]*\S:")
+
+
 def tidy_cuts(markdown: str) -> list[tuple[int, int]]:
-    """The lines ``tidy`` drops, as ranges (each with its newline): a line left with nothing but markup, and a prose
-    line repeated; tables are kept as they are."""
+    """The lines ``tidy`` drops, as ranges (each with its newline): a line left with nothing but markup, and a prose line repeated under the
+    same heading or list lead (what a cut leaves: an absence sentence said twice); tables are kept as they are. A line that stands again
+    under another heading or lead is another statement of another group ("**מגרש 102**" / "- השטח הוא 800 מ״ר" after the same bullet under
+    "**מגרש 101**"), and a heading or lead is never dropped for being a repeat (round 21 U4, KTD4)."""
     out: list[tuple[int, int]] = []
-    seen: set[str] = set()
+    seen: set[tuple[int, str]] = set()
+    group = 0  # which heading or lead the line is under: the n-th, so the same heading coming again is another group
     lines = markdown.split("\n")
     pos = 0
     for n, line in enumerate(lines):
@@ -1282,9 +1289,11 @@ def tidy_cuts(markdown: str) -> list[tuple[int, int]]:
         s = line.strip()
         if s and not s.startswith("|"):
             drop = bool(_ORPHAN_LINE.fullmatch(s))
-            if not drop and re.search(r"[א-תA-Za-z0-9]", s):
-                drop = s in seen
-                seen.add(s)
+            if not drop and _GROUP_LEAD.fullmatch(s):
+                group += 1
+            elif not drop and re.search(r"[א-תA-Za-z0-9]", s):
+                drop = (group, s) in seen
+                seen.add((group, s))
             if drop:
                 out.append(line_cut(start, end, n + 1 == len(lines)))
     return out
@@ -1429,7 +1438,17 @@ def build(ws: Workspace, answer: FinalAnswer, question: str) -> tuple[dict, Fina
         counts = (f"{len(matching)} מסמכים מתאימים · נקראו (סעיף/טבלה) {len(read)} · נשלפו קטעים בלבד מ-"
                   f"{len(retrieved_only)} · נתון מאומת מ-{len(with_data)}")
         if not matching:
-            note = f"**כיסוי:** לא נמצאו מסמכים שמכילים את כל המונחים של \"{scope['query']}\"."
+            # the lookup found nothing, yet the answer cites a document: the lookup is what missed it, and "nothing matches" would contradict the
+            # answer's own citations; no note is written for it (round 21 U4, R4, R8). An answer that cites nothing is told so as before
+            if not cited:
+                note = f"**כיסוי:** לא נמצאו מסמכים שמכילים את כל המונחים של \"{scope['query']}\"."
+        elif not complete and len(with_data) >= len(matching):
+            # every matching document gave a datum, so the answer does not rest on only some of them: what keeps the set uncovered is how far they
+            # were read (round 21 U4, R8)
+            only = len(matching) == 1
+            which = "הוא נקרא בחלקו בלבד" if only else f"{len(partially)} מהם נקראו בחלקם בלבד" if partially else "לא כולם נקראו במלואם"
+            note = ("**כיסוי:** נמצא נתון מאומת " + ("במסמך המתאים היחיד" if only else f"בכל {len(matching)} המסמכים המתאימים")
+                    + f" לתחום \"{scope['query']}\" ({counts}), אך {which}, ולכן ייתכנו " + ("בו" if only else "בהם") + " נתונים נוספים.")
         elif not complete:
             # one sentence in the answer; which documents were not checked, unused or partly read is listed in the
             # sources panel (the ledger), not in the answer text

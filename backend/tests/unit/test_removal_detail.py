@@ -135,6 +135,9 @@ _KNOWN_KIND = verify.FAILURE_KINDS[0]
     (_KNOWN_KIND, "final", _KNOWN_KIND),  # a known failure kind beats the check "final"
     (_KNOWN_KIND, "judge", _KNOWN_KIND),
     ("wrong_unit", None, "wrong_unit"),
+    ("wrong_subject", verify.SUBREFERENT_CHECK, "scope_mismatch"),  # round 21 U4: the scope check has its own sentence
+    ("wrong_subject", "judge", "wrong_subject"),
+    ("wrong_unit", verify.SUBREFERENT_CHECK, "wrong_unit"),  # only a wrong_subject mark is split
     ("not_a_failure_kind", "judge", "unspecified"),  # a kind the server does not know is no class
     ("not_a_failure_kind", "final", "final"),
     (None, "judge", "unspecified"),
@@ -157,3 +160,11 @@ def test_every_reason_class_has_a_distinct_sentence_and_the_prefix_is_one_consta
     # a whole-unit claim names no span: the judge's reason is what was not verified, without the lead the problem adds
     detail = decisions.decision(_qualified(whole_unit=True), [])
     assert detail["not_verified"] == "התקופה לא צוינה במקור" and detail["reason"].startswith(verify.PARTIAL_REASON_PREFIX)
+
+
+def test_u4_the_scope_partial_sentence_names_the_scope_and_never_another_property():
+    text = verify.PARTIAL_SENTENCES["scope_mismatch"]
+    assert "מגרש" in text and "נכס" not in text
+    assert verify.PARTIAL_SENTENCES["wrong_subject"] != text
+    (row,) = api.public_partials([{"ordinal": 1, "failure_kind": "wrong_subject", "check": verify.SUBREFERENT_CHECK}])
+    assert row["text"] == text and row["check"] == verify.SUBREFERENT_CHECK

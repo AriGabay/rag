@@ -95,7 +95,8 @@ _BASIS = [
     ("נטו", r"(?:מ\"ר\s*)?(?<![א-ת])[ו]?נטו(?![א-ת])"),
     ("עיקרי", r"(?:מ\"ר\s*|שטח\s*)?(?<![א-ת])עיקרי(?![א-ת])"),
     ("רשום", r"(?:מ\"ר\s*|שטח\s*)(?<![א-ת])רשום(?![א-ת])"),
-    ("בנוי", r"מ\"ר\s+בנוי(?![א-ת])"),
+    # "מ״ר בנוי 500" and "שטח בנוי 500 מ״ר": the basis before the number is as much the basis as the one after it (round 21 U3, KTD3)
+    ("בנוי", r"(?:מ\"ר|שטח)\s+בנוי(?![א-ת])"),
 ]
 _MONTH_NAMES = (r"(?:[בל]?(?:ינואר|פברואר|מרץ|מרס|אפריל|מאי|יוני|יולי|אוגוסט|ספטמבר|אוקטובר|נובמבר|דצמבר|תשרי|חשוון|"
                 r"חשון|כסלו|טבת|שבט|אדר|ניסן|אייר|סיוון|סיון|תמוז|אב|אלול)(?![א-ת]))")
@@ -113,10 +114,16 @@ def _period_pattern(key: str, abbreviations: str = "") -> str:
             rf"|(?<![א-ת])(?:ו?ה?{adj}(?:{endings})?{abbreviations})(?![א-ת])")
 
 
+# English period words, as a table header or a phrase writes them (round 21 U3, KTD3): the adjective ("Monthly", "Annual"), "per month" and
+# "/month". "Quarterly" is no period of this vocabulary (a month or a year only), so it states none and cannot make a mismatch with either.
+_ENGLISH_PERIOD = {
+    "month": r"(?<![A-Za-z])(?i:monthly|per\s+month|/\s?month)(?![A-Za-z])",
+    "year": r"(?<![A-Za-z])(?i:annual|annually|yearly|per\s+year|per\s+annum|/\s?year)(?![A-Za-z])",
+}
 _PERIOD = [
     # "לחודש", "חודשי"; not "לפני שנה", "12 חודשים" (a duration), "בחודש מאי" or "לשנה אחת" (a date, a duration)
-    ("month", _period_pattern("month", "|לח'|לחו'")),
-    ("year", _period_pattern("year")),
+    ("month", _period_pattern("month", "|לח'|לחו'") + "|" + _ENGLISH_PERIOD["month"]),
+    ("year", _period_pattern("year") + "|" + _ENGLISH_PERIOD["year"]),
 ]
 # "כ-" right before a number; not the כ that ends an abbreviation (סה"כ)
 _APPROX_BEFORE = re.compile(r"(?:(?<![א-ת\"'])[בו]?כ[-־–]?\s?|בערך\s|בסביבות\s|כמעט\s)$")
@@ -342,6 +349,8 @@ def _period_word_ok(text: str, m: re.Match) -> bool:
     word = m.group(0).lstrip("ו")
     if word[:1] in ("ל", "ב", "/"):  # a noun after its prefix or a slash, or an abbreviation
         return True
+    if word[:1].isascii():  # English (round 21 U3): "per month" is a noun phrase like "לחודש" ("500 per month" is an amount), the adjectives
+        return word.lower().startswith("per") or not ((written := _number_before(text, m.start())) and _can_count_time(written))
     if (written := _number_before(text, m.start())) and _can_count_time(written):
         return False
     if word[:1] != "ה" and word.endswith(("ים", "ות")):
@@ -462,6 +471,20 @@ def _owner(nums: list, amounts: list[int], pos: int, clause: str) -> int | None:
     return before[-1] if before else eligible[0]
 
 
+# "ההכנסה השנתית של 1,200,000 ₪": the word, "של" and the amount (with an approximation mark) that is the word's own
+_OF_AMOUNT = re.compile(r"\s+של\s+(?:כ[-־]?\s?)?")
+
+
+def _of_owner(clause: str, nums: list, end: int) -> int | None:
+    """The number right after "של" when the period word that ends at ``end`` is followed by it ("השנתית של 1,200,000"): an adjective and "של"
+    give the amount after "של" its period, never an earlier amount of the clause that merely stands nearer (round 21 U3, KTD3). A duration
+    or a count after "של" ("של 36 חודשים") is no amount and is not it."""
+    m = _OF_AMOUNT.match(clause, end)
+    if m is None:
+        return None
+    return next((i for i, (a, b, _) in enumerate(nums) if a == m.end() and not after_kind(clause, b)), None)
+
+
 def _noun_period(clause: str, owner: tuple, after: int) -> bool:
     """Whether a period word that ends at ``after`` is a noun's ("הרווח השנתי הממוצע"), not the percent's that the owner is (round 20 U9, F4): the
     owner is a percent that stands after the word, with a Hebrew word between them ("בשיעור 7.15%"). An adjacent rate ("שנתי 7.15%") and
@@ -497,6 +520,8 @@ def attached(text: str, noun_period: bool = True) -> tuple[list[tuple[frozenset[
                     quals[after[0] if after else percents[-1]].add(kind, key, written)
                 continue
             owner = _owner(nums, amounts, pos, clause) if nums else None
+            if noun_period and kind == "period" and nums and (of_owner := _of_owner(clause, nums, pos + len(written))) is not None:
+                owner = of_owner  # the answer's side only: a source is read as it was written (round 20 U9, F4)
             if owner is None or (noun_period and kind == "period" and _noun_period(clause, nums[owner], pos + len(written))):
                 general.add(kind, key, written)
                 continue
@@ -719,6 +744,26 @@ def context_kind(context: str) -> str:
     return "other" if nonmonetary(c) else "rate"
 
 
+# a row that names a capitalised amount ("שווי מהוון", "סה״כ מהוון", "Capitalised value") or a plain value or price is a one-time amount
+_CAPITALISED = re.compile(r"(?<![א-ת])[והב]?מהוו?ן(?![א-ת])|(?<![A-Za-z])(?i:capitali[sz]ed|present\s+value)(?![A-Za-z])")
+_RECURRING_KINDS = ("rent", "management_fee", "income")
+_ONE_TIME_KINDS = ("value", "price")
+_RECURRING_WORDS = re.compile(r"(?<![A-Za-z])(?i:rent|rental|income|revenue|fee|fees|payment|payments|charge|charges)(?![A-Za-z])")
+_ONE_TIME_WORDS = re.compile(r"(?<![A-Za-z])(?i:value|price|valuation)(?![A-Za-z])")
+
+
+def _recurring_row(label: str) -> bool:
+    """Whether a table row can carry its column header's period (round 21 U3, KTD3): a capitalised amount cannot, whatever kind it names; a
+    row of a recurring kind (rent, a management fee, income) can; a row of a value or a price that names no recurring kind cannot ("שווי"
+    under "סכום חודשי"); a row that names none of them can, as before."""
+    c = _norm(label)
+    if _CAPITALISED.search(c):
+        return False
+    if _RECURRING_WORDS.search(c) or any(kind_attested(k, c) for k in _RECURRING_KINDS):
+        return True
+    return not (_ONE_TIME_WORDS.search(c) or any(kind_attested(k, c) for k in _ONE_TIME_KINDS))
+
+
 def _gated(q: Qualifiers, kind: str, owned: bool) -> Qualifiers:
     """What a row label or a column header gives a cell of ``kind``: a period only to a cell that can be a rate, or — for the
     row's own label and the column's own header cell — to a quantity other than a duration or a count. A period stated above
@@ -879,8 +924,12 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                     q = _tagged(q, "cell")
                     if i > 0:
                         q.merge(_gated(_all(cells[0]), kind, True), "row")  # the row's label
-                    q.merge(_gated(_all(own_heads[i]), kind, True), "header")  # the column's header
-                    q.merge(_gated(_all(upper_heads[i]), kind, False), "header")  # a header above it or spanned over it
+                    # a column header's period is the period of a recurring row (rent, income, a payment); a capitalised total or a value row is
+                    # not a recurring amount, and a period the cell or its row states itself beats the header's (round 21 U3, KTD3, R5)
+                    header_period = not q.keys("period") and (i == 0 or _recurring_row(cells[0]))
+                    for heads, owned in ((own_heads[i], True), (upper_heads[i], False)):
+                        given = _gated(_all(heads), kind, owned)  # the column's own header, then a header above it or spanned over it
+                        q.merge(given if header_period else _only(given, "period", keep=False), "header")
                     if _PER_AREA.search(cells[0] + " " + head + " " + cell):
                         defined = table.found.get("basis", {})
                         if len(defined) == 1 and not q.keys("basis"):
@@ -956,6 +1005,34 @@ def number_qualifiers(text: str, forms: frozenset[str], within: str) -> Qualifie
         if line and (w in line or line in w):
             q.merge(o.qualifiers)
     return q
+
+
+def confirmed_in_source(text: str, forms: frozenset[str], within: str, kind: str, unit: str) -> tuple[bool, bool, str]:
+    """Whether the source itself states a value's kind and unit, read with the meaning reader the checks use (round 21 U3, KTD3, R5):
+    ``(kind stated, unit stated, the clause that states them)``. The quote of a value is often a fragment of its sentence ("3,100,000 ₪"
+    of "שווי הקרקע הוא 3,100,000 ₪"), so a kind or a unit the fragment lacks is looked for in the number's own clause of the source line
+    that holds the quote — and only when that clause is that number's alone: exactly one occurrence of the number holds the quote, and the
+    clause has no other amount. Anything less is not confirmed (false, false, ""), and the attribute stays the agent's."""
+    parsed, _ = parse_source(text)
+    w = _one_point(_flat(_read(within)))
+    lines = {o.context for f, o in parsed if f & forms and not o.identifier
+             and ((line := _one_point(_flat(o.context))) and (w in line or line in w))}
+    if len(lines) != 1:
+        return False, False, ""
+    (line,) = lines
+    clauses, start = [], 0
+    for end_m in [*_CLAUSE_END.finditer(line), None]:
+        end = end_m.end() if end_m else len(line)
+        if any(g & forms for _, _, g in _numbers(line[start:end])):
+            clauses.append(line[start:end])
+        start = end
+    if len(clauses) != 1:
+        return False, False, ""
+    clause = clauses[0]
+    amounts = [g for a, b, g in _numbers(clause) if not not_an_amount(clause, a, b, years=False) and not after_kind(clause, b)]
+    if len(amounts) != 1 or not amounts[0] & forms:
+        return False, False, ""
+    return kind_attested(kind, clause), unit in units_attested(clause), clause
 
 
 def basis_key(text: str | None) -> str:
@@ -1165,6 +1242,23 @@ TABLE_TEXT_COLUMNS = (
 READS = 6  # database reads per verification for evidence beyond the cited passages
 
 
+class _NotRead:
+    """The state of evidence the server could not read (the read failed, or the budget of reads was spent): neither "nothing found" (``None``)
+    nor a source. It is false, so a caller that treats it as nothing is no worse than before, but the check can tell it from a source
+    that is silent (round 21 U3, KTD3): "not read" never becomes "not stated"."""
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return "NOT_READ"
+
+
+NOT_READ = _NotRead()
+
+
 @dataclass
 class Fetcher:
     """Evidence for a number beyond the passages a unit cites, read by the server for this check only: the same
@@ -1176,20 +1270,39 @@ class Fetcher:
 
     ws: Workspace
     reads: int = READS  # per verification round; what was read is kept for the turn's later rounds
+    not_read: set = field(default_factory=set)  # the keys of the reads that came back ``NOT_READ`` in this verification
 
     @property
     def cache(self) -> dict:
         return self.ws.fetched
 
+    @property
+    def unread(self) -> bool:
+        """Whether any read of this verification came back not read."""
+        return bool(self.not_read)
+
+    def unread_for(self, unit: Unit) -> bool:
+        """Whether evidence around the unit's cited passages was not read: a table or a section of a cited source's version, or the stored
+        measurements of a cited document. What was not read is not known to be silent, so the check says nothing is "not stated" (round 21 U3)."""
+        versions = {str(self.ws.sources[i].version_id) for i in unit.ids if i in self.ws.sources}
+        documents = {str(self.ws.sources[i].document_id) for i in unit.ids if i in self.ws.sources} \
+            | {str(self.ws.measurements[i].document_id) for i in unit.ids if i in self.ws.measurements}
+        return any((k[0] == "x" and k[1] in versions) or (k[0] == "m" and bool(set(k[1]) & documents)) for k in self.not_read)
+
     def _read(self, key: tuple, load):
+        """What ``load`` read, cached for the turn: ``None`` when it found nothing, ``NOT_READ`` when the read failed (the failure is kept for the
+        turn too) or the budget of reads was spent. Every caller converts ``NOT_READ`` itself; none takes it for "not found"."""
         if key not in self.cache:
             if self.reads <= 0:
-                return None
+                self.not_read.add(key)
+                return NOT_READ
             self.reads -= 1
             try:
                 self.cache[key] = load()
-            except Exception:  # noqa: BLE001 - evidence not read is evidence not found; the check stays strict
-                self.cache[key] = None
+            except Exception:  # noqa: BLE001 - evidence not read is not evidence of silence; the check does not call a qualifier "not stated" for it
+                self.cache[key] = NOT_READ
+        if self.cache[key] is NOT_READ:
+            self.not_read.add(key)
         return self.cache[key]
 
     def expansions(self, sid: str) -> list:
@@ -1207,7 +1320,7 @@ class Fetcher:
         if src.table_index is not None and not whole_table:
             table = self._read(("x", str(src.version_id), src.table_index, src.block_start, src.block_end, "table"),
                                lambda: read_scope(self.ws, sid, "table"))
-            if table is not None:
+            if table is not None and table is not NOT_READ:
                 out.append(table)
         anchor = src if src.block_start is not None else next((x for x in out if x.block_start is not None), None)
         if anchor is not None:
@@ -1215,7 +1328,7 @@ class Fetcher:
                    "table_index": anchor.table_index, "chunk_id": None}
             section = self._read(("x", str(src.version_id), None, anchor.block_start, anchor.block_end, "section"),
                                  lambda: read_scope(self.ws, sid, "section", ref=ref))
-            if section is not None:
+            if section is not None and section is not NOT_READ:
                 out.append(section)
         return [x for x in out if len(x.text) > len(src.text)]
 
@@ -1259,6 +1372,8 @@ class Fetcher:
         return out
 
     def _subject_rows(self, document_ids: set) -> list:
+        if self.ws.ctx is None:  # a workspace with no database holds no stored measurements: there is nothing to read, so nothing is "not read"
+            return []
         from sqlalchemy import text as sql
 
         from app.db import tenant_tx
@@ -1274,7 +1389,8 @@ class Fetcher:
                     " AND m.subject_role ="
                     " 'appraised_property' AND m.value_role = ANY(:r) ORDER BY m.block_index NULLS FIRST, m.id"
                     " LIMIT 400"), {"d": sorted(document_ids), "r": list(SUBJECT_ROLES)}).all()
-        return self._read(("m", tuple(sorted(str(d) for d in document_ids))), load) or []
+        rows = self._read(("m", tuple(sorted(str(d) for d in document_ids))), load)
+        return [] if rows is None or rows is NOT_READ else rows
 
     def adopt(self, found) -> str:
         """The id of a source or measurement the check uses: registered as the turn's, once. A measurement is dated like
@@ -1447,6 +1563,10 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
                         written, kind, f"{KIND_LABELS[kind]} \"{display(claimed.found[kind][k])}\" של {written} נכתב "
                         f"ב-{where}; צטט אותו", blocking=False, cite=where, needs_citation=True, at=pos))
             extra = {k for k in extra if found_in.get(k) is None}
+            if extra and fetcher is not None and fetcher.unread_for(unit):
+                # the table, section or measurements around the cited passage were not read, so the source is not known to be silent: the period
+                # or basis is not called unstated, and no qualifier is edited out for it (round 21 U3, KTD3; unknown never removes)
+                continue
             if extra:
                 said = claimed.found[kind][sorted(extra)[0]]
                 problems.append(MeaningProblem(

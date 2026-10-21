@@ -1195,3 +1195,38 @@ def test_the_short_tag_of_a_conditional_result_in_a_table_row_stays_in_its_cell(
     markdown = "| פריט | סכום |\n| --- | --- |\n| עלות כוללת | 20,220,000 ₪ [C1] |"
     _, text, _ = _composed(ws, markdown)
     assert "| עלות כוללת | 20,220,000 ₪ (תוצאה מותנית) [C1] |" in text
+
+
+# --- round 21 U3 (KTD3, R3): the conditional note says what the agent set, and only when that is true -------------------------------
+
+def _asserted(ws: Workspace, vid: str, *attributes: str) -> None:
+    ws.values[vid].provenance.update({a: "model_asserted" for a in attributes})
+
+
+def test_u3_a_conditional_note_names_the_details_the_agent_set_and_the_source_did_not_state():
+    ws = _conditional_sum(("V1",))
+    _asserted(ws, "V1", "kind")
+    _, text, _ = _composed(ws, "סך העלות הוא 20,220,000 ₪ [C1].")
+    assert "התוצאה 20,220,000 ₪ מותנית: " in text
+    note = text.split("\n\n")[-1]
+    assert "נקבעו על ידי הסוכן ולא נמצאו במקור" in note and "«בנייה עילית»" in note, note
+    assert "אינו ודאי" not in note and "אינם ודאיים" not in note, note  # the reading is clear: it is not called uncertain
+
+
+def test_u3_a_conditional_note_keeps_the_uncertain_wording_for_a_value_whose_reading_is_unclear():
+    ws = _conditional_sum(("V1", "V2"))
+    _asserted(ws, "V1", "kind")
+    ws.uncertain_values["V2"] = "התא לא אושר"
+    note = _composed(ws, "סך העלות הוא 20,220,000 ₪ [C1].")[1].split("\n\n")[-1]
+    assert "הערך «חניון תת-קרקעי» (4,620,000) אינו ודאי" in note, note
+    assert "«בנייה עילית»" in note and "נקבעו על ידי הסוכן ולא נמצאו במקור" in note, note
+
+
+def test_u3_a_value_the_agent_set_is_the_only_cause_named_in_the_calculations_own_conditional_text():
+    from app.chat import tools
+
+    ws = _conditional_sum(())
+    _asserted(ws, "V1", "unit")
+    assert tools.value_uncertain(ws, "V1") and not tools.reading_unclear(ws, "V1")
+    assert tools.uncertain_reason(ws, "V1") == "תכונות שנקבעו על ידי הסוכן ולא נמצאו במקור: היחידה"
+    assert tools.uncertain_reason(ws, "V2") == ""

@@ -785,3 +785,25 @@ def test_the_candidates_block_lists_the_cards_in_order_with_handles_basis_and_ca
 def test_a_unit_gone_after_a_reread_is_told_to_the_model_with_its_old_name_and_no_number():
     hint = resolve.gone_unit_hint({"display": "מתחם <x>", "unit_no": 7})
     assert "מתחם ‹x›" in hint and "7" not in hint
+
+
+# --- round 21 U4 (R4): the request note names a per-area value only when the basis is an area -----------------------------------------
+
+def _scale_request(basis: str, metric_kind: str = "value_per_area") -> resolve.Request:
+    return resolve.Request(kind="follow_up", standalone_question="?", metric_kind=metric_kind, area_basis=basis, approved=["scale"])
+
+
+def test_u4_a_per_area_value_with_an_area_basis_is_per_area():
+    for basis in ("", "מ\"ר אקוו'", "שטח עיקרי", "ברוטו"):
+        req = _scale_request(basis)
+        assert req.per_area is True and not resolve.per_dwelling(req), basis
+        assert "שווי ליחידת שטח" in resolve.mismatch(req, SimpleNamespace(metric_kind="value")), basis
+
+
+def test_u4_a_value_per_dwelling_is_no_value_per_area_in_the_request_note():
+    for basis in ("ליח\"ד", "ליחידת דיור", "לדירה"):
+        req = _scale_request(basis)
+        assert resolve.per_dwelling(req), basis
+        assert resolve.mismatch(req, SimpleNamespace(metric_kind="value")) is None, basis  # no per-area scale was asked
+        note = resolve.mismatch(req, SimpleNamespace(metric_kind="value_per_area"))
+        assert note and "ליחידת שטח" not in note.split("והתשובה")[0] and basis in note, note

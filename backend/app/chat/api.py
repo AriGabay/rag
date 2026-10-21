@@ -325,7 +325,8 @@ def public_removals(items: list) -> list[dict]:
         claim_id = r.get("claim_id")
         ordinal = r.get("ordinal")
         valid = component if isinstance(component, str) and _COMPONENT_ID.fullmatch(component) else None
-        out.append(verify.removal_summary(kind, cause or "", valid)
+        scope = verify.SUBREFERENT_CHECK if r.get("check") == verify.SUBREFERENT_CHECK else None  # the one check that has a sentence of its own
+        out.append(verify.removal_summary(kind, cause or "", valid, scope)
                    | ({"claim_id": claim_id} if isinstance(claim_id, str) and _CLAIM_ID.fullmatch(claim_id) else {})
                    | ({"action": action} if action else {})
                    | ({"ordinal": ordinal} if action == "cut" and type(ordinal) is int and ordinal > 0 else {}))

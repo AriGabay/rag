@@ -692,6 +692,9 @@ REMOVAL_SENTENCES = {
     "not_checked": "הוסרה טענה שלא ניתן היה לבדוק מול המקורות; היא לא נמצאה שגויה.",
     "context_not_read": "הוסרה טענה שההקשר הדרוש לבדיקתה לא נקרא.",
 }
+# the removal of a claim whose datum the source writes under another plan, parcel, lot or contract than the claim's (``SUBREFERENT_CHECK``,
+# round 20 U3): the claim is of the same property, so its note names the scope and not "another property" (round 21 U4, R4)
+SCOPE_REMOVAL_SENTENCE = "הוסרה טענה שהנתון שלה כתוב במקור תחת מגרש, תכנית, חלקה, חוזה או חלופה אחרים מאלה שהטענה מייחסת לו."
 # a judge's concrete defect of a partly supported unit, as a failure kind (for the repair prompt)
 # ``scope`` (round 17 U5, KTD5) maps to the one kind that removes nothing: the context that defines the value was not verified. The server
 # never fails a unit for it — it writes the validated scope or a limitation next to the value (``scope_outcome``)
@@ -734,6 +737,10 @@ TOTAL_ROW_CUT = " (הסכום כולל שורה שחלק ממנה הושמט)"
 CONDITIONAL_LEAD = "תוצאה מותנית: "
 CONDITIONAL_UNCERTAIN_ONE = "הערך {ids} אינו ודאי"
 CONDITIONAL_UNCERTAIN_MANY = "הערכים {ids} אינם ודאיים"
+# a value whose kind or unit the agent set and the source did not state, its reading clear (round 21 U3, KTD3, R3): the note says that, and not
+# that the value is "not certain"
+CONDITIONAL_ASSERTED_ONE = "פרטי הערך {ids} נקבעו על ידי הסוכן ולא נמצאו במקור"
+CONDITIONAL_ASSERTED_MANY = "פרטי הערכים {ids} נקבעו על ידי הסוכן ולא נמצאו במקור"
 CONDITIONAL_MIX = "לפי הצדקה לערבוב נתונים שאינם תואמים — {needs}"
 CONDITIONAL_UNSTATED = "תוצאת החישוב {cid} מותנית ({why}): השרת כותב זאת ליד התוצאה"
 # a conditional result keeps only this short tag by its number; the reason is said once per calculation, in one server
@@ -1638,13 +1645,15 @@ def repair_key(unit: Unit) -> str:
     return _norm(unit.text)
 
 
-def removal_summary(kind: str, cause: str = "", component: str | None = None) -> dict:
+def removal_summary(kind: str, cause: str = "", component: str | None = None, check: str | None = None) -> dict:
     """A removal on the user's normal path (KTD5): its kind, its component and the server's fixed sentence — a claim
-    that could not be checked says why (R14): each cause its own sentence, none a contradiction."""
+    that could not be checked says why (R14): each cause its own sentence, none a contradiction. A claim removed by the scope check
+    (``check`` is ``SUBREFERENT_CHECK``) says that its datum is of another lot, plan or contract, and never "another property" (round 21 U4)."""
     cause = cause if kind == "not_checked" and cause in CHECK_CAUSE_SENTENCES else ""
+    scoped = kind == "wrong_subject" and check == SUBREFERENT_CHECK
     return {"failure_kind": kind, "component": component,
-            "text": CHECK_CAUSE_SENTENCES[cause] if cause else REMOVAL_SENTENCES[kind]} | (
-        {"cause": cause} if cause else {})
+            "text": CHECK_CAUSE_SENTENCES[cause] if cause else SCOPE_REMOVAL_SENTENCE if scoped else REMOVAL_SENTENCES[kind]} | (
+        {"cause": cause} if cause else {}) | ({"check": check} if scoped else {})
 
 
 def removal_lines(removals: list[Problem]) -> list[str]:
@@ -1664,6 +1673,8 @@ def removal_lines(removals: list[Problem]) -> list[str]:
 PARTIAL_SENTENCES = {
     "absent_from_source": "אומת חלקית: חלק מהטענה אינו מצוין במקורות שנבדקו.",
     "wrong_subject": "אומת חלקית: חלק מהטענה ייחס נתון לנכס או לצד אחר מזה שבמקור.",
+    # the scope check (``SUBREFERENT_CHECK``) found the datum under another lot, plan, parcel or contract than the claim's (round 21 U4, R4)
+    "scope_mismatch": "אומת חלקית: חלק מהטענה ייחס נתון למגרש, לתכנית, לחלקה, לחוזה או לחלופה אחרים מאלה שהוא כתוב להם במקור.",
     "wrong_unit": "אומת חלקית: היחידה, התקופה, בסיס השטח או המע\"מ של הנתון אינם מצוינים במקור או אינם כבמקור.",
     "uncertain_reading": "אומת חלקית: חלק מהטענה נשען על קריאה לא ודאית של המקור.",
     "contradicts_source": "אומת חלקית: חלק מהטענה סותר את המקור.",
@@ -1691,6 +1702,8 @@ def partial_reason_class(failure_kind: str | None, check: str | None = None) -> 
     kind = failure_kind if failure_kind in FAILURE_KINDS else None
     if check in (RESCUE_CHECK, RESCUE_OWN_CHECK):
         return "rescued" if check == RESCUE_CHECK else "rescued_own"
+    if check == SUBREFERENT_CHECK and kind == "wrong_subject":  # the same split as the removal sentence (``removal_summary``)
+        return "scope_mismatch"
     return "recency" if check == RECENCY_CHECK else kind or ("final" if check == "final" else "unspecified")
 
 
@@ -1832,7 +1845,7 @@ class Problem:
 
     def summary(self) -> dict:
         """The removal on the user's normal path (KTD5): its kind, its component and the server's fixed sentence."""
-        return removal_summary(self.failure_kind or "absent_from_source", self.cause, self.component)
+        return removal_summary(self.failure_kind or "absent_from_source", self.cause, self.component, self.check)
 
     def repair_note(self) -> str:
         """What the repair prompt says of the problem beside its reason (KTD10): its kind, the ids checked and how
@@ -3777,12 +3790,19 @@ def conditional_qualifier(c, stated: bool = False, ws: Workspace | None = None) 
     def words(text: str) -> str:
         return _ID_IN_TEXT.sub(lambda m: input_words(ws, m.group(0)), text) if ws is not None else text
 
+    from app.chat.tools import asserted_attributes
+
     uncertain = list(c.uncertain or [])
     said = MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain)) if uncertain else None
     why = []
-    if uncertain:
-        ids = _join_and([input_words(ws, i) for i in uncertain]) if ws is not None else ", ".join(uncertain)
-        why.append((CONDITIONAL_UNCERTAIN_ONE if len(uncertain) == 1 else CONDITIONAL_UNCERTAIN_MANY).format(ids=ids))
+    # the user's note tells a value the agent set apart from one whose reading is unclear; the judge's (no workspace) names the ids as before
+    asserted = [i for i in uncertain if ws is not None and asserted_attributes(ws, i)]
+    unclear = [i for i in uncertain if i not in asserted]
+    for ids_, one, many in ((unclear, CONDITIONAL_UNCERTAIN_ONE, CONDITIONAL_UNCERTAIN_MANY),
+                            (asserted, CONDITIONAL_ASSERTED_ONE, CONDITIONAL_ASSERTED_MANY)):
+        if ids_:
+            ids = _join_and([input_words(ws, i) for i in ids_]) if ws is not None else ", ".join(ids_)
+            why.append((one if len(ids_) == 1 else many).format(ids=ids))
     mix = [words(x) for x in c.outcome.conditional if not (said and x.startswith(said))]
     if mix:
         why.append(CONDITIONAL_MIX.format(needs="; ".join(mix)))
@@ -9377,7 +9397,8 @@ class Logged:
         """The row on the normal path: the fixed sentence of the kind, never the claim's text, and the ids that link it."""
         r = self.record
         if self.action == "cut" and r is not None:
-            row = removal_summary(r.failure_kind(), r.cause, self.problem.component if self.problem else None)
+            row = removal_summary(r.failure_kind(), r.cause, self.problem.component if self.problem else None,
+                                  self.problem.check if self.problem else None)
         elif self.problem is not None:
             row = self.problem.summary()
         else:

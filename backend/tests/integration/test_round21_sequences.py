@@ -12,9 +12,9 @@ passing fails the suite, so the marker cannot be forgotten). A protection sequen
    such line nothing is written inline and one uncertainty line names the item.
 3. Equal values in two components (U2, fixed): two equal numbers anchor nothing — no inline condition, one uncertainty line names both.
 4. A footnote-marked note (U2, fixed): the note of the first contract is written in the clause of the first group only.
-5. AE3 (U3): a monthly column header puts "monthly" on a capitalised total.
-6. AE4 (U4): a removal for another lot of the same property says "another property".
-7. Several lots (U4): the same bullet under two lot headings loses its second copy to the tidy-up.
+5. AE3 (U3, fixed): a monthly column header put "monthly" on a capitalised total.
+6. AE4 (U4, fixed): a removal for another lot of the same property said "another property".
+7. Several lots (U4, fixed): the same bullet under two lot headings lost its second copy to the tidy-up.
 8. AE5 (U9): a judge "partial" on a supported number sends the repair round, which drops the number.
 9. AE6 (U8): a table stored in reversed cell order is served unpaired and reversed to the agent and to the verifier.
 10. AE7 (U7): a numbered item stated with its label inflected gets a false "read and not used" line.
@@ -216,7 +216,6 @@ INCOME_TABLE = "\n".join(["תמהיל הכנסות", "רכיב | סכום חוד
 CAPITALISED = "השווי המהוון של הנכס הוא 6,600,000 ₪ [S2]."
 
 
-@open_case("U3", "the column header's monthly period is attached to the capitalised total: «לחודש, כפי שנכתב במקור»")
 def test_ae3_a_capitalised_total_under_a_monthly_column_header_gets_no_monthly_period():
     ws = _file("סיכום: השווי למ\"ר הוא 9,500 ₪.", INCOME_TABLE, units=(1, 1), declared=(1,))
     ws.sources["S2"].kind = "table"
@@ -234,7 +233,6 @@ LOT_QUESTION = "מה שווי הקרקע במגרשים 101 ו-102?"
 MISPLACED_LOT = "שווי הקרקע במגרש 101 הוא 4,200,000 ₪ [S1].\nשווי הקרקע במגרש 102 הוא 4,200,000 ₪ [S1]."
 
 
-@open_case("U4", "the removal note says the claim was attributed to another property or side, though the claim is of another lot of the same property")
 def test_ae4_the_note_of_a_claim_removed_for_another_lot_names_the_lot_scope_and_not_another_property(offline):
     offline.texts = [LOT_SOURCE]
     agent = ScriptedAgent([SEARCH, *[final(MISPLACED_LOT) for _ in range(3)]], judge=Judge(lambda t, i, n: "supported"))
@@ -252,7 +250,6 @@ SAME_BULLET_SOURCE = "מגרש 101 — שטח 800 מ״ר.\nמגרש 102 — שט
 SAME_BULLET = "**מגרש 101**\n- השטח הוא 800 מ״ר [S1].\n\n**מגרש 102**\n- השטח הוא 800 מ״ר [S1]."
 
 
-@open_case("U4", "the tidy-up drops the second copy of an identical bullet, so the second lot's heading is left with nothing under it")
 def test_the_same_bullet_under_two_lot_headings_survives_the_tidy_up(offline):
     offline.texts = [SAME_BULLET_SOURCE]
     agent = ScriptedAgent([SEARCH, *[final(SAME_BULLET) for _ in range(3)]], judge=Judge(lambda t, i, n: "supported"))
