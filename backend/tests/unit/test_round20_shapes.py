@@ -334,7 +334,6 @@ def test_the_same_twin_items_are_covered_when_the_answer_writes_the_compound_wit
     assert {k: o["state"] for k, o in got.items()} == {"משרדים בצפון־מזרח": "covered", "חנויות בדרום־מערב": "covered"}, got
 
 
-@strict_xfail("U5", "an item whose condition is a direction word the source writes with a maqaf stays omitted: the item's words are split at the maqaf and the answer's block words are not")
 def test_twin_items_told_apart_by_a_direction_word_the_answer_writes_as_a_maqaf_compound_are_covered():
     from tests.unit.test_items import _item, _states, _ws
 
@@ -345,7 +344,6 @@ def test_twin_items_told_apart_by_a_direction_word_the_answer_writes_as_a_maqaf_
     assert {k: o["state"] for k, o in got.items()} == {"משרדים בצפון־מזרח": "covered", "חנויות בדרום־מערב": "covered"}, got
 
 
-@strict_xfail("U5", "a count the answer writes as a word (שתי קומות) is not the digit the source writes (2): the item is partial and its line says the floors were left out")
 def test_a_count_written_as_a_word_before_the_noun_the_source_writes_after_the_digit_is_given():
     from tests.unit.test_items import BASEMENT, RIGHTS, _item, _states, _ws
 
@@ -354,7 +352,6 @@ def test_a_count_written_as_a_word_before_the_noun_the_source_writes_after_the_d
     assert got["state"] == "covered" and got["outcome"] == "covered" and got["missing"] == [], got
 
 
-@strict_xfail("U5", "the value of a candidate row under a two-level header is the first figure of the row (the monthly one), not the figure of the column the request names")
 def test_a_candidate_row_under_a_two_level_header_is_valued_by_the_column_the_request_names():
     from tests.unit.test_items import _offer, _ws
 
@@ -364,7 +361,6 @@ def test_a_candidate_row_under_a_two_level_header_is_valued_by_the_column_the_re
     assert [(c.label, c.value) for c in offer.candidates] == [("מסחר", "540,000")], [(c.label, c.value) for c in offer.candidates]
 
 
-@strict_xfail("U5", "a judge's missing text equal to the whole component is accepted, so the gap line denies the whole component although the answer gives part of it")
 def test_a_missing_text_that_equals_the_whole_component_is_rejected_and_a_part_of_it_is_kept():
     from app.chat.verify import valid_missing
 
@@ -374,7 +370,6 @@ def test_a_missing_text_that_equals_the_whole_component_is_rejected_and_a_part_o
     assert valid_missing(component, "partial", component, request) == ""
 
 
-@strict_xfail("U5", "an item whose coverage check could not be completed leaves its component full: the lenient judge's vote stands and nothing caps it")
 def test_ae10_an_unchecked_item_makes_its_component_partial_with_a_line_that_the_check_could_not_be_completed_and_no_repair_request(
         monkeypatch):
     from app.chat import items as ledger_items

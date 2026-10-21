@@ -1691,6 +1691,9 @@ def test_a_coverage_check_that_fails_technically_says_so_in_place_of_every_gap_m
     assert len(lines) == 2 and all("לא ניתן היה להשלים את הבדיקה" in ln for ln in lines), md
     assert not re.search(r"לא נעשה בו שימוש|לא נמצא|לא אותר", md) and {i["state"] for i in out.item_ledger["items"]} == {"unchecked"}
     assert out.final_digest == text_digest(md)
+    # round 20 U5 (KTD5, R18): the component is partial on a check that did not finish, so the answer is partial - and no repair was asked for it
+    assert out.answer.status == "partial" and out.report.completeness["status"] == "partial"
+    assert not [p for p in out.report.problems if p.kind == "requirement"]
 
 
 # --- round 20 U2: cell-level outcomes in the final check (KTD2; R5-R8; AE4, AE5) ----------------------------------------------------

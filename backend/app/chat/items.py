@@ -94,7 +94,7 @@ import hashlib
 import logging
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from typing import NamedTuple
@@ -719,16 +719,55 @@ def _first_value(text: str) -> str:
 _IDENTIFIER_HEADER = re.compile(r"מס(?:פר|[׳'.])|מס[\"״]ד|גוש|חלקה|מגרש|תיק|תכנית|תוכנית|היתר|מזהה|קוד|סידורי|\bID\b|\bNo\b|#")
 
 
-def _row_value(cells: Sequence[str], header: Sequence[str]) -> str:
-    """The value cell of a table row: the first cell after the label that holds a figure and is neither under an identifier header (when the
-    header lines up with the row) nor an identifier, a footnote mark or an ordinal itself (round 19 U4); the first cell with a digit when no
-    cell does."""
+def _row_value(cells: Sequence[str], header: Sequence[str], known: Collection[str] = frozenset()) -> str:
+    """The value cell of a table row: the cell after the label whose column header shares the most request words (``known``:
+    ``request_word_forms`` of the asked components and the request) when the header lines up with the row, and holds a figure (round 20
+    U5, KTD5, R17; an identifier column is never it); else the first cell after the label that holds a figure and is neither under an
+    identifier header (when the header lines up with the row) nor an identifier, a footnote mark or an ordinal itself (round 19 U4); the
+    first cell with a digit when no cell does."""
     aligned = len(header) == len(cells)
     values = [(i, c) for i, c in enumerate(cells) if i and re.search(r"\d", c)]
+    if aligned and known:
+        shared = [(_shared_words(header[i], known), c) for i, c in values if not _IDENTIFIER_HEADER.search(header[i]) and _first_value(c)]
+        best = max((n for n, _ in shared), default=0)
+        if best and sum(1 for n, _ in shared if n == best) == 1:  # one column names the request most; a tie decides nothing
+            return next(c for n, c in shared if n == best)
     for i, cell in values:
         if not (aligned and _IDENTIFIER_HEADER.search(header[i])) and _first_value(cell):
             return cell
     return values[0][1] if values else ""
+
+
+def _shared_words(text: str, known: Collection[str]) -> int:
+    """How many distinct content words of ``text`` have a comparable form among the request words ``known``."""
+    from app.chat.verify import _loose_forms, _missing_words
+
+    return len({w for w in _missing_words(text) if not w[0].isdigit() and not _loose_forms(w).isdisjoint(known)})
+
+
+def _level_cells(line: str, header: Sequence[str]) -> list[str]:
+    """The cells of a header line of a table text, lined up with the level before it (``header``) when that is possible. The text of a
+    table renders a row as its cells joined by " | ", so a line that starts or ends with a pipe has an EMPTY edge cell ("| חודשית | שנתית":
+    the first column has no second-level header) - ``_row_cells`` reads that pipe as the outer pipe of a Markdown row and drops the cell,
+    which shifts every later cell one column left. A line with a pipe at both edges is read both ways, and the reading that has as many cells
+    as the earlier level wins; with no earlier level to line up with, a pipe at both edges is Markdown's, and a pipe at one edge is an empty
+    cell (round 20 U5, KTD5, R17)."""
+    flat = line.strip()
+    full = [c.strip() for c in flat.split("|")]
+    outer = _row_cells(line)
+    if header:
+        return next((cells for cells in (full, outer) if len(cells) == len(header)), outer)
+    return outer if flat.startswith("|") and flat.endswith("|") else full
+
+
+def _merge_header(header: list[str], cells: Sequence[str]) -> list[str]:
+    """The header lines of a table as one row of column headers: a second level is merged column by column ("הכנסה" over "חודשית" is "הכנסה
+    חודשית"), each column once, when it lines up with the level before it; else the cells follow the earlier ones (round 20 U5, KTD5; R17)."""
+    if not header:
+        return list(cells)
+    if len(cells) != len(header):
+        return [*header, *cells]
+    return [" ".join(dict.fromkeys(part for part in (a, b) if part)) for a, b in zip(header, cells, strict=True)]
 
 
 def _first_words(text: str, *, trim: bool = True) -> str:
@@ -749,11 +788,12 @@ def _context_words(src, parts) -> str:
     return " ".join([*(p.text for p in parts if p.place in ("heading", "caption")), _text(src.section)])
 
 
-def _raws(src) -> tuple[list[_Raw], dict[str, list[str]]]:
+def _raws(src, known: Collection[str] = frozenset()) -> tuple[list[_Raw], dict[str, list[str]]]:
     """The spans of a source that can be an item, and the lines of each group (``_Raw.group``). A table: the data rows (a first cell,
     and a value cell with a number) and the sentences of its attributed notes that state a number and limit nothing. A passage: the
     members of each enumerated list (two lines or more in a row that open with a list mark) and the sentences with a number of the
-    other lines, a heading line ending the paragraph run."""
+    other lines, a heading line ending the paragraph run. Round 20 U5 (KTD5, R17): the header lines of a table are merged column by column,
+    and a row's value is the cell of the column whose header shares the most request words (``known``)."""
     parts, body = context_of_source(src)
     about = _context_words(src, parts)
     raws: list[_Raw] = []
@@ -767,11 +807,11 @@ def _raws(src) -> tuple[list[_Raw], dict[str, list[str]]]:
             values = [c for c in cells[1:] if re.search(r"\d", c)]
             if not values:
                 if not raws:
-                    header += cells
+                    header = _merge_header(header, _level_cells(line, header))
                 continue
             if numbers_in(_outside_dates(" ".join(values))):
                 quote = _clip_row(line)
-                raws.append(_Raw(quote, cells[0], _row_value(cells, header), "row", f"{quote} {' '.join(header)} {about}", "table"))
+                raws.append(_Raw(quote, cells[0], _row_value(cells, header, known), "row", f"{quote} {' '.join(header)} {about}", "table"))
         for part in parts:
             if part.place in ("before", "after", "note") and not part.reason:
                 for sentence in _SENTENCE_END.split(part.text):
@@ -835,7 +875,7 @@ def candidates(units: Sequence[Unit], ws, ledger: Ledger, components: Sequence[M
         src = ws.sources[sid]
         if src.is_listing or sid not in scope.readable or scope.place_problem(src):
             continue
-        raws, groups = _raws(src)
+        raws, groups = _raws(src, known)
         if not raws:
             continue
         if used >= CANDIDATE_SOURCES:
@@ -971,15 +1011,30 @@ _TOKEN = re.compile(r"[^\W\d_]+")
 _CODE = re.compile(r"[א-תA-Za-z]{1,4}\s?[/\\]\s?\d[\d/\\.\-]*|\d+(?:\s?[/\\]\s?\d+)+")
 
 
+# the maqaf (U+05BE) and the Unicode hyphens (U+2010, U+2011) that join a Hebrew compound: ``claim_terms`` reads the maqaf as a mark of
+# the text (the search normaliser drops it) and so joins the compound into one word, while ``_TOKEN`` splits at it, so the two sides of a
+# comparison read the compound differently (round 20 U5, KTD5, R17)
+_MAQAF = re.compile("[־‐‑]")
+
+
+def _unjoined(text: str) -> str:
+    """``text`` with the maqaf and the Unicode hyphens read as a space, the way the ASCII hyphen is read: a compound is its words on BOTH sides
+    of a comparison (``_word_groups`` of an item's condition, ``_words`` of a block of the answer), never one word on one side and two on the
+    other (round 20 U5, KTD5; R17)."""
+    return _MAQAF.sub(" ", text)
+
+
 @functools.lru_cache(maxsize=2048)
 def _word_groups(wanted: str) -> tuple[frozenset[str], ...]:
-    """The content words of ``wanted`` (an identifier written with a slash left out), one group of variants per word."""
-    return tuple(g for t in _TOKEN.findall(_CODE.sub(" ", wanted)) if (g := claim_terms(t)[1]))
+    """The content words of ``wanted`` (an identifier written with a slash left out), one group of variants per word. A compound joined by a
+    maqaf is its words (``_unjoined``)."""
+    return tuple(g for t in _TOKEN.findall(_CODE.sub(" ", _unjoined(wanted))) if (g := claim_terms(t)[1]))
 
 
 @functools.lru_cache(maxsize=2048)
 def _words(text: str) -> frozenset[str]:
-    return claim_terms(text)[1]
+    """The content words of ``text``, with their variants; a compound joined by a maqaf is its words (``_unjoined``)."""
+    return claim_terms(_unjoined(text))[1]
 
 
 def _enough(wanted: str, have: frozenset[str]) -> bool:
@@ -1050,6 +1105,45 @@ def _have(text: str) -> frozenset[str]:
     return frozenset().union(*_number_forms(text))
 
 
+# a count written as a word ("שתי קומות", two floors) is the digit the source writes ("2 קומות"), when it stands directly before the noun the
+# source writes after the digit (round 20 U5, KTD5; R17): "one", "two" and the like are ordinary words elsewhere
+COUNT_WORD_MAX = 10
+_ADJACENT_WORDS = re.compile(r"([^\W\d_]+)[ \t]+(?=([^\W\d_]+))")
+
+
+@functools.lru_cache(maxsize=2048)
+def _counts_before_nouns(text: str) -> tuple[tuple[str, frozenset[str]], ...]:
+    """For each count word of ``text`` that is directly followed by a word (only blanks between them), the count (as a digit) and the words
+    of the noun it stands before."""
+    out = []
+    for first, second in _ADJACENT_WORDS.findall(_unjoined(text)):
+        # the count word with up to two prefix letters ("ובשתי": ``numbers_in`` strips one)
+        for n in numbers_in(first, words=True) | (numbers_in(first[1:], words=True) if len(first) > 3 else set()):
+            if n.isdigit() and 1 <= int(n) <= COUNT_WORD_MAX:
+                out.append((n, _words(second)))
+    return tuple(out)
+
+
+@functools.lru_cache(maxsize=2048)
+def _noun_after(count: str, value: str, quote: str) -> frozenset[str]:
+    """The words of the noun the item's value (else its quote) writes right after the digit ``count`` ("2 קומות"); none when it writes none."""
+    pattern = re.compile(rf"(?<![\d.,]){count}(?![\d.,%])[ \t]+([^\W\d_]+)")
+    for text in (value, quote):
+        if m := pattern.search(_unjoined(text)):
+            return _words(m.group(1))
+    return frozenset()
+
+
+def _stated(item: Item, text: str, have: frozenset[str], group: frozenset[str]) -> bool:
+    """Whether ``text`` states the headline value ``group`` of the item: a form of it among the numbers ``text`` writes (``have``), or, for a
+    small count, the count written as a word right before the noun the item's source writes after the digit (round 20 U5, KTD5)."""
+    if group & have:
+        return True
+    counted = [d for d in group if d.isdigit() and 1 <= int(d) <= COUNT_WORD_MAX]
+    return bool(counted) and any(n == d and (nouns := _noun_after(d, item.value, item.quote)) and nouns & after
+                                 for d in counted for n, after in _counts_before_nouns(text))
+
+
 # --- the headline values of an item (round 19 U4, KTD4; R14) ------------------------------------------------------------------
 
 # a plan, a permit or a file named before a number: the number is its identifier, unless a quantity follows it
@@ -1060,6 +1154,13 @@ _CODE_AFTER = re.compile(r"\s?[/\\]\s?\d")
 _MARK_AFTER = re.compile(r"\s*[)\]]")
 _MARK_BEFORE = re.compile(r"[(\[]\s*$")
 _ORDINAL_AT_START = re.compile(r"\s*(?:[-*+•]\s+)?\d{1,3}[.)]\s")
+_LIST_NUMBER = re.compile(r"\A\s*(?:[-*+•]\s+)?\d{1,3}[.)]\s")  # the number a numbered list item opens with: its place in the list
+
+
+def _without_list_number(text: str) -> str:
+    """``text`` without the number a numbered list item opens with ("2. …"): the number is the item's place in the list, not a figure it
+    states, so an item is matched on its text and never on its list number (round 20 U5, KTD5; R17)."""
+    return _LIST_NUMBER.sub(" ", text, count=1)
 
 
 def _not_headline(text: str, start: int, end: int) -> bool:
@@ -1245,7 +1346,7 @@ def quote_in_blocks(quote: str, units: Sequence[Unit], component: str = "", *, b
     words = words - _words(component) or words
     need = (len(words) + 1) // 2
     groups = headline(quote, quote)
-    return any(all(g & _have(b.unit.text) for g in groups) and len(words & _words(b.unit.text)) >= need
+    return any(all(g & _have(_without_list_number(b.unit.text)) for g in groups) and len(words & _words(b.unit.text)) >= need
                for b in blocks)
 
 
@@ -1262,12 +1363,13 @@ class CoverageUnavailable(Exception):
 def _value_check(item: Item, text: str, words: frozenset[str]) -> _Check:
     """Whether the block's ``text`` states the item's value: a date value by its date; else every headline value (``headline``), and, for an item
     with none, half of the words of its value, its label or its quote (the first that has content words)."""
+    text = _without_list_number(text)
     if parsed := shared_dates.parse(item.value):
         return _Check("" if any(p.iso.startswith(parsed.iso) for p in shared_dates.find_all(text)) else "value_not_stated")
     groups = headline(item.value, item.quote)
     if groups:
         have = _have(text)
-        missing = tuple(g for g in groups if not g & have)
+        missing = tuple(g for g in groups if not _stated(item, text, have, g))
         if not missing:
             return _Check("")
         return _Check("partial", missing) if len(missing) < len(groups) else _Check("value_not_stated")
@@ -1334,7 +1436,7 @@ def _giving_parts(item: Item, block: Block, ws=None) -> list[Unit]:
     if parsed := shared_dates.parse(item.value):
         mine = [u for u in block.parts if any(p.iso.startswith(parsed.iso) for p in shared_dates.find_all(u.text))]
     elif groups := headline(item.value, item.quote):
-        mine = [u for u in block.parts if any(g & _have(u.text) for g in groups)]
+        mine = [u for u in block.parts if any(_stated(item, (t := _without_list_number(u.text)), _have(t), g) for g in groups)]
     else:
         mine = []
     chosen = mine or list(block.parts)

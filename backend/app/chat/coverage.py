@@ -840,7 +840,13 @@ def item_line(ws: Workspace, state: dict, request: str = "") -> dict:
     word of it stands in the item's source context or in the ``request`` (``verify.words_stand_in``), else the state's own wording
     stands without it."""
     from app.chat.items import _own_context, source_name
-    from app.chat.verify import ITEM_NOT_APPLICABLE, ITEM_NOT_VERIFIABLE, ITEM_UNCHECKED, words_stand_in
+    from app.chat.verify import (
+        CHECK_NOT_COMPLETED,
+        ITEM_NOT_APPLICABLE,
+        ITEM_NOT_VERIFIABLE,
+        ITEM_UNCHECKED,
+        words_stand_in,
+    )
 
     src = ws.sources.get(state["source"])
     title = (src.title if src is not None else "") or ""
@@ -852,8 +858,9 @@ def item_line(ws: Workspace, state: dict, request: str = "") -> dict:
     tail = f": {reason}." if reason else "."
     missing = [_plain(m, ITEM_NAME_CHARS) for m in state.get("missing") or [] if m]
     if state["state"] == ITEM_UNCHECKED:
-        # round 19 U4, R17: a check that failed technically says so; it never says the item was not used or not found
-        text = f"{name}: נקרא {place}, אך לא ניתן היה להשלים את הבדיקה אם הוא נכלל בתשובה."
+        # round 19 U4, R17: a check that failed technically says so; it never says the item was not used or not found. Round 20 U5 (KTD5,
+        # R18): the item's component is partial on it (``VerifyReport._resolve``), and this line is what states the limitation
+        text = f"{name}: נקרא {place}, אך {CHECK_NOT_COMPLETED} אם הוא נכלל בתשובה."
     elif state["state"] == ITEM_NOT_VERIFIABLE:
         text = f"{name}: נקרא {place}, אך לא ניתן לאמת אותו" + tail
     elif state["state"] == ITEM_NOT_APPLICABLE:
@@ -875,6 +882,7 @@ def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict], states: Sequ
     ``not_applicable`` with a reason that the answer does not state (``item_line``), in the ledger's order, at most ``ITEM_GAP_LINES`` (one
     more line counts the rest). An item of a component the request made not relevant is not stated."""
     from app.chat.verify import (
+        CHECK_NOT_COMPLETED,
         ITEM_NOT_APPLICABLE,
         ITEM_NOT_VERIFIABLE,
         ITEM_OMITTED,
@@ -892,9 +900,11 @@ def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict], states: Sequ
     lines: list[dict] = []
     written: set[tuple[str, str]] = set()  # one evidence can fill several components (round 19 U3): its fills that read the same make one line
     for st in report.item_states() if states is None else states:
+        # an item whose check could not be completed is stated whatever its origin (round 20 U5, KTD5, R18): its component is partial on it,
+        # and a judge's part is stated by its component's own line only when the answer omits it, which is not known for this one
         if (st["component"] in skip or is_server_item(st)
-                or not (st["state"] in (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE)
-                        or (st["state"] in (ITEM_OMITTED, ITEM_UNCHECKED) and st["origin"] != ORIGIN_JUDGE_SUPPORT
+                or not (st["state"] in (ITEM_NOT_VERIFIABLE, ITEM_NOT_APPLICABLE, ITEM_UNCHECKED)
+                        or (st["state"] == ITEM_OMITTED and st["origin"] != ORIGIN_JUDGE_SUPPORT
                             and st["why"] != "date_not_stated"))):
             continue
         line = item_line(ws, st, request)
@@ -903,9 +913,16 @@ def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict], states: Sequ
             lines.append(line)
     if len(lines) <= ITEM_GAP_LINES:
         return lines
-    rest = len(lines) - ITEM_GAP_LINES
-    return lines[:ITEM_GAP_LINES] + [{"id": "", "state": "more", "text": f"ועוד {rest} פריטים נוספים שנקראו ולא נכללו בתשובה.",
-                                      "document_id": None, "title": ""}]
+    left = lines[ITEM_GAP_LINES:]
+    unchecked = sum(1 for x in left if x["state"] == ITEM_UNCHECKED)
+    if unchecked == len(left):  # the rest are items whose check could not be completed: never counted as "not included" (round 20 U5, R18)
+        text = f"ועוד {unchecked} פריטים נוספים שנקראו, ו{CHECK_NOT_COMPLETED} אם נכללו בתשובה."
+    elif unchecked:
+        text = (f"ועוד {len(left) - unchecked} פריטים נוספים שנקראו ולא נכללו בתשובה, ועוד {unchecked} שנקראו ו{CHECK_NOT_COMPLETED} "
+                "אם נכללו בתשובה.")
+    else:
+        text = f"ועוד {len(left)} פריטים נוספים שנקראו ולא נכללו בתשובה."
+    return lines[:ITEM_GAP_LINES] + [{"id": "", "state": "more", "text": text, "document_id": None, "title": ""}]
 
 
 def _not_read_gap(ws: Workspace) -> dict:
@@ -952,6 +969,8 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
     stated (R21); a partly given leaf with none is listed in completeness only, and so is a leaf with no reason
     at all: ``limitation`` None, when the answer shows all its data and only the kind of a value was asserted). ``states``: the coverage
     decision (``VerifyReport.decision``) the caps rest on, when the caller holds it (round 19 U4)."""
+    from app.chat.verify import covers_component
+
     opened = _openings(ws)  # the turn's openings, for every claim and component
     claims, _ = _claims_by_component(ws, requested, opened)
     outcomes = report.requirement_outcomes(applied, None if states is None else list(states))
@@ -963,6 +982,12 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
               "searched": None, "claimed": (claims.get(o["id"]) or {}).get("claimed"), "detail": "", "variant": "",
               "gap": None}
         if o["children"] or o["status"] not in UNMET:
+            continue
+        if o.get("check_incomplete"):
+            # partial only because an item's coverage check could not be completed (round 20 U5, KTD5, R18): none of the turn's reasons is
+            # true of it, and the limitation is stated by the item lines (``item_gap_lines``); it is listed in completeness, with no line
+            # of the component's own and no repair request
+            o["stated"] = False
             continue
         if signal is None:
             signal = unit_signal(ws)
@@ -976,8 +1001,8 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
         # a partly given leaf is stated only for the part the judge named missing (validated against the request,
         # ``verify.valid_missing``): a conditional requirement (R21) or one that is no datum of the documents never is
         datum = not o["conditional"] and o["kind"] in ("information", "calculation")
-        if o["status"] != "partial" or not datum:
-            o["missing_part"] = ""
+        if o["status"] != "partial" or not datum or (o["missing_part"] and covers_component(o["missing_part"], o["text"])):
+            o["missing_part"] = ""  # a part that is the whole component is no part: the line would deny what the answer gives (round 20 U5, R16)
         # a part a read passage states and the answer omits is stated too (round 16 U2, R6), never a conditional component
         o["stated"] = (o["status"] != "partial" or o["kind"] == "instruction" or bool(o["missing_part"])
                        or (o["variant"] == "read_not_used" and datum))

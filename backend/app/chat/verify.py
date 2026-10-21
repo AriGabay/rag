@@ -602,6 +602,10 @@ RESCORED = "rescored"
 EVIDENCE_CHANGED = "evidence_changed"
 OVERRULED_SUPPORT = "overruled_by_validated_support"
 OVERRULED_ITEMS = "overruled_by_omitted_items"
+OVERRULED_UNCHECKED = "overruled_by_unchecked_items"
+# what the server says of an item whose coverage check could not be completed (round 20 U5, KTD5, R18): the item line (``coverage.item_line``) and
+# the cap of its component say it; it is never "not used" or "not found", and it is never a request to the model to repair
+CHECK_NOT_COMPLETED = "לא ניתן היה להשלים את הבדיקה"
 SUPPORT_QUOTE_MIN = 6  # the least a support quote may hold, in characters after normalisation
 SUPPORT_QUOTE_MAX = 300  # the most: a quote is one sentence or table row, never a passage (a longer one is dropped silently)
 REQ_NOT_SEARCHED = ("חלק של הבקשה שהתשובה לא נתנה: «{text}». לא בוצע חיפוש או קריאה שמכסים אותו: יש לחפש אותו "
@@ -1153,23 +1157,54 @@ def is_request_clause(text: str) -> bool:
     return "?" in (text or "") or bool(_QUESTION_WORD.search(text or ""))
 
 
-def valid_missing(missing: str, status: str, component: str, request: str) -> str:
+def _part_words(text: str) -> list[str]:
+    """``_missing_words`` without a prefix letter left alone by a hyphen ("ב-INDJIJA": the letter is no word of the part)."""
+    return [w for w in _missing_words(text) if not (len(w) == 1 and w in _MISSING_PREFIXES)]
+
+
+WHOLE_COMPONENT_SHARE = 0.75  # a missing part that names this share of the component's words, and no other word, is the component itself
+
+
+def covers_component(part: str, component: str) -> bool:
+    """Whether a missing ``part`` is the whole ``component`` (round 20 U5, KTD5, R16): it names no word the component does not write — a part
+    of a component is narrowed by a word of the request (a plot, a property, a period) or is a piece of the component's own words —,
+    it leaves out no number the component writes, and it holds at least ``WHOLE_COMPONENT_SHARE`` of the component's distinct content
+    words (the shortened copy of a component that drops its closing clause is the component). A requirement the answer gives in part has no
+    such missing part: the line that names it would deny what the answer gives."""
+    named = [(w, _loose_forms(w)) for w in _part_words(part)]
+    asked: list[tuple[str, frozenset[str]]] = []
+    for w in _part_words(component):
+        forms = _loose_forms(w)
+        if not any(forms & other for _, other in asked):
+            asked.append((w, forms))
+    if not named or not asked or any(not any(forms & other for _, other in asked) for _, forms in named):
+        return False
+    left_out = [w for w, forms in asked if not any(forms & other for _, other in named)]
+    if any(w[0].isdigit() for w in left_out):
+        return False
+    return 1 - len(left_out) / len(asked) >= WHOLE_COMPONENT_SHARE
+
+
+def valid_missing(missing: str, status: str, component: str, request: str, subject: str = "", question: str = "") -> str:
     """The part of a ``partial`` requirement the judge says the answer does not give (``JudgeRequirement.missing``) when
     it names nothing the request did not ask for, else "" (round 8 R20, R21): every content word of it — a Hebrew or
     latin word, or a number, prefixes and stop words ignored — is a word of the component's text or of the user's
     request, and it is a short noun phrase — not a clause of the request: no question word, no question mark (round 9
-    R24). The server never writes a part the request does not hold."""
+    R24). The server never writes a part the request does not hold. Round 20 U5 (KTD5; R16): the component's ``subject`` (the property or
+    the document it asks about, which the component's own text may not write) and the user's own ``question`` are words of the request too,
+    so the part that a half of a two-property component lacks can be named; and a part equal to the whole component is no part at all
+    (``covers_component``): the line that would name it denies what the answer gives of it."""
     part = _norm(missing or "")
     if status != "partial" or not part or len(part) > MISSING_PART_CHARS or is_request_clause(part):
         return ""
-    words = _missing_words(part)
+    words = _part_words(part)
     if not words:
         return ""
-    known = [_missing_forms(w) for w in _missing_words(f"{component}\n{request}")]
+    known = [_missing_forms(w) for w in _missing_words(f"{component}\n{request}\n{subject}\n{question}")]
     for w in words:
         if not any(_missing_forms(w) & k for k in known):
             return ""
-    return part
+    return "" if covers_component(part, component) else part
 
 
 def _common_missing(votes: list[JudgeRequirement]) -> str:
@@ -2480,6 +2515,7 @@ class VerifyReport:
         # the item ledger (round 17 U3, KTD3, R2, R6): the items no surviving unit gives, by component, and the keys of the items
         # the ledger closed (covered, or declared not verifiable / not applicable with a reason)
         omitted_by: dict[str, list[dict]] = {}
+        unchecked_by: dict[str, list[dict]] = {}
         closed: set[tuple[str, tuple[str, str, str]]] = set()
         for st in self.item_states(kept) if states is None else states:
             if is_server_item(st):
@@ -2487,7 +2523,11 @@ class VerifyReport:
                 # (a candidate a component asked for (round 18 U6) is an item of that component like an agent's: it caps it while omitted)
             if st["state"] == ITEM_OMITTED:
                 omitted_by.setdefault(st["component"], []).append(st)
-            elif st["state"] != ITEM_UNCHECKED:  # a check that could not be completed closes nothing and caps nothing (R17)
+            elif st["state"] == ITEM_UNCHECKED:
+                # a check that could not be completed closes nothing, and the component cannot be counted complete on it (round 20 U5, KTD5,
+                # R18; round 19 left it uncapped): it is not "omitted" either, and it is never a request to the model (``check_incomplete``)
+                unchecked_by.setdefault(st["component"], []).append(st)
+            else:
                 closed.add((st["component"], evidence_key(st["document_id"], st["unit_id"], st["source"], st["quote"])))
         out: dict[str, dict] = {}
         for r in self.requirements:
@@ -2520,6 +2560,9 @@ class VerifyReport:
                              if (r["id"], self._evidence_of(x["id"], x["quote"])) not in closed]}
             validated = list(o["support"]) if kind in SEARCHABLE_KINDS else []  # the judge's validated part: evidence of a gap (R2)
             omitted = omitted_by.get(r["id"], []) if kind in SEARCHABLE_KINDS else []
+            unchecked = unchecked_by.get(r["id"], []) if kind in SEARCHABLE_KINDS else []
+            if unchecked:
+                o["unchecked_items"] = [i["id"] for i in unchecked]
             if omitted:
                 # the judge's items first (the component's own gap line names the place of the first part): the part the judge
                 # named is stated by that line, the agent's items one by one (``coverage.item_gap_lines``)
@@ -2558,17 +2601,22 @@ class VerifyReport:
                     status = "needs_clarification"  # waiting for the user's detail (KTD9), not missing data
                 o |= {"status": status, "reason": (absent or votes)[0].reason if votes else ""}
                 note["voters"] = absent or votes
-            if o["status"] == "full" and (omitted or validated):
+            if o["status"] == "full" and (omitted or validated or unchecked):
                 # a required item no surviving unit gives, or a part of the asked kind a read passage states that the answer
-                # omits (validated, ``validated_support``): at most partial, whatever any score says (R2, R6)
+                # omits (validated, ``validated_support``): at most partial, whatever any score says (R2, R6). An item whose coverage check
+                # could not be completed (round 20 U5, KTD5, R18) caps it the same way: the component is not counted complete on a check that
+                # did not finish. When that is the only cap, the component says so (``check_incomplete``): its item lines state the
+                # limitation, no reason of the turn's evidence applies to it, and it is no request to repair
                 o["status"] = "partial"
-                note["caps"] = (["validated_support"] if validated else []) + (["omitted_items"] if omitted else [])
+                o["check_incomplete"] = not (omitted or validated)
+                note["caps"] = ((["validated_support"] if validated else []) + (["omitted_items"] if omitted else [])
+                                + (["unchecked_items"] if unchecked else []))
                 partial = [v for v in votes if v.status == "partial"]
                 o["missing_part"] = o["missing_part"] or (_common_missing(partial) if partial else "")
                 lower = [v for v in given if v.status == "partial"]
                 if lower:  # a score that gave less stands; the better scores are overruled by the evidence
-                    note["overruled"] = [(v, OVERRULED_SUPPORT if validated else OVERRULED_ITEMS) for v in given
-                                         if v.status == "full"]
+                    cause = OVERRULED_SUPPORT if validated else OVERRULED_ITEMS if omitted else OVERRULED_UNCHECKED
+                    note["overruled"] = [(v, cause) for v in given if v.status == "full"]
                     note["voters"] = lower
             o["pending_parameters"] = list(self.pending_parameters.get(r["id"]) or [])
             out[r["id"]] = o
@@ -2588,8 +2636,9 @@ class VerifyReport:
                 status = "needs_clarification"
             else:
                 status = "not_answered"
-            if status == "full" and o.get("omitted_items"):
+            if status == "full" and (o.get("omitted_items") or o.get("unchecked_items")):
                 status = "partial"
+                o["check_incomplete"] = not o.get("omitted_items")
             o["status"] = status
             return status
 
@@ -6874,6 +6923,7 @@ class _Coverage:
     candidates: list[dict] = field(default_factory=list)
     candidates_left: dict[str, int] = field(default_factory=dict)
     candidate_sources_left: int = 0
+    question: str = ""  # the user's own question: its words, with the request's and the component's subject, ground a missing part (round 20 U5)
 
     def component_texts(self) -> list[str]:
         """What the passages are clipped against: the asked components, else (before they are derived) the request and the
@@ -6914,13 +6964,14 @@ class _Coverage:
         if not self.turn.derived:
             scored = [r.model_copy(update={"id": item["id"]}) for r, item in self.turn.freeze(scored)]
         texts = {r["id"]: r["text"] for r in self.turn.items}
+        subjects = {r["id"]: r.get("subject") or "" for r in self.turn.items}
         self.calls += 1
         out = []
         for r in scored:
             if r.id not in texts:
                 continue
             trace = _VoteTrace(self.calls, r.status, passages)
-            missing = valid_missing(r.missing, r.status, texts[r.id], self.request)
+            missing = valid_missing(r.missing, r.status, texts[r.id], self.request, subjects.get(r.id, ""), self.question)
             v = r.model_copy(update={"units": [i for i in r.units if i in indexes],
                                      "absent": [i for i in r.absent if i in indexes],
                                      "related": [x for x in dict.fromkeys(r.related) if x in self.known],
@@ -7883,7 +7934,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
     if requirements is not None:
         listing, known = _workspace_listing(ws, requirements)
         coverage = _Coverage(requirements, [p.ask for p in getattr(answer, "parts", None) or []],
-                             request or question, listing, known, {i for u in units for i in u.ids})
+                             request or question, listing, known, {i for u in units for i in u.ids}, question=question)
     # a result of the turn's calculations that a unit shows without citing it is bound to its C#, which joins the
     # unit's citations (and the answer's, once the unit is verified)
     bound = bind_computations(units, ws, question)
@@ -9145,6 +9196,8 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
             continue
         if o["status"] not in ("not_answered", "partial") or o["kind"] not in SEARCHABLE_KINDS:
             continue  # an assumption or a clarification is never searched for (R4)
+        if o.get("check_incomplete"):
+            continue  # partial only because an item's coverage check could not be completed: the model has nothing to repair (round 20 U5, R18)
         ev = related_evidence(ws, o, turn)
         check = None
         found = REQ_TEXT_FOUND.format(text=o.get("missing_part") or o["text"], where="; ".join(

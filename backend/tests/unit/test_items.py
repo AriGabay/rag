@@ -1753,3 +1753,122 @@ def test_among_the_sentences_that_state_an_items_value_the_one_that_cites_its_so
     parts = items._giving_parts(item, block, ws)
     assert [u.ids for u in parts] == [["S1"]]  # the sentence that cites S2 only shares the figure through its block
     assert len(items._giving_parts(item, block)) == 2  # without the workspace, as before
+
+
+# --- round 20 U5: complete coverage - compounds, counts, numbered lists, two-level headers (KTD5; R16-R18) --------------------------------
+
+DIRECTIONS = "\n".join(["שיעורי היוון", "שימוש | שיעור", "משרדים בצפון־מזרח | 7%", "חנויות בדרום־מערב | 7%"])
+
+
+def _direction_twins():
+    return (_item(label="שיעור למשרדים", quote="משרדים בצפון־מזרח | 7%", value="7%", condition="משרדים בצפון־מזרח"),
+            _item(label="שיעור לחנויות", quote="חנויות בדרום־מערב | 7%", value="7%", condition="חנויות בדרום־מערב"))
+
+
+@pytest.mark.parametrize("joiner", ["־", "‐", "‑", "-", " "])
+def test_a_compound_is_the_same_words_whichever_character_joins_it_on_either_side(joiner):
+    written = f"בצפון{joiner}מערבי"
+    assert items._words(written) == items._words("בצפון מערבי")
+    assert items._word_groups(written) == items._word_groups("בצפון מערבי")
+    assert [sorted(g)[0] for g in items._word_groups(written)] and len(items._word_groups(written)) == 2
+
+
+@pytest.mark.parametrize("answer_joiner", ["־", "-", "‑"])
+def test_twin_items_whose_condition_is_a_maqaf_compound_are_covered_whichever_hyphen_the_answer_writes(answer_joiner):
+    ws = _ws(DIRECTIONS)
+    markdown = (f"- השיעור למשרדים בצפון{answer_joiner}מזרח הוא 7% [S1].\n- השיעור לחנויות בדרום{answer_joiner}מערב הוא 7% [S1].")
+    got = _states(ws, markdown, *_direction_twins())
+    assert {k: o["state"] for k, o in got.items()} == {"משרדים בצפון־מזרח": "covered", "חנויות בדרום־מערב": "covered"}, got
+
+
+def test_protection_a_twin_the_answer_does_not_state_is_still_omitted_with_the_direction_it_lacks():
+    ws = _ws(DIRECTIONS)
+    got = _states(ws, "- השיעור למשרדים בצפון־מזרח הוא 7% [S1].", *_direction_twins())
+    assert got["משרדים בצפון־מזרח"]["state"] == "covered"
+    assert got["חנויות בדרום־מערב"]["state"] == "omitted" and got["חנויות בדרום־מערב"]["outcome"] == "omitted"
+
+
+@pytest.mark.parametrize("written", ["שתי קומות", "בשתי קומות", "ובשתי קומות", "2 קומות"])
+def test_a_count_written_as_a_word_directly_before_the_noun_the_source_writes_after_the_digit_is_the_digit(written):
+    ws = _ws(RIGHTS)
+    got = _states(ws, f"- שטח המרתף בנכס הוא 340 מ״ר, {written} [S1].", _item(**BASEMENT))["שטח מרתף"]
+    assert got["state"] == "covered" and got["missing"] == [], got
+
+
+@pytest.mark.parametrize("markdown", [
+    "- שטח המרתף בנכס הוא 340 מ״ר, ושתי מרפסות [S1].",   # a count before another noun
+    "- שטח המרתף בנכס הוא 340 מ״ר, בשלוש קומות [S1].",   # another count before the noun
+    "- שטח המרתף בנכס הוא 340 מ״ר, שתי [S1].",            # a count word with no noun after it
+    "- שטח המרתף בנכס הוא 340 מ״ר, קומות שתיים [S1].",    # the count after the noun is not a count before it
+])
+def test_protection_a_count_word_that_is_not_the_count_of_the_noun_is_not_the_digit_and_the_item_stays_partial(markdown):
+    ws = _ws(RIGHTS)
+    got = _states(ws, markdown, _item(**BASEMENT))["שטח מרתף"]
+    assert got["state"] == "omitted" and got["outcome"] == "partial" and got["missing"], got
+
+
+NUMBERED = "\n".join(["1. השטח העיקרי בנכס הוא 1,200 מ״ר [S1].", "2. שטח המרתף בנכס הוא 340 מ״ר, בשתי קומות [S1].", "3. שטח הגג בנכס הוא 95 מ״ר [S1]."])
+
+
+def test_items_the_answer_states_as_a_numbered_list_are_covered_by_their_text():
+    ws = _ws(RIGHTS)
+    got = _states(ws, NUMBERED, _item(**MAIN), _item(**BASEMENT), _item(**ROOF))
+    assert {k: o["state"] for k, o in got.items()} == {"שטח עיקרי": "covered", "שטח מרתף": "covered", "שטח גג": "covered"}, got
+
+
+def test_protection_an_item_is_never_covered_by_the_number_of_its_list_member():
+    """The basement's 2 floors are not stated by the member numbered 2: the list number is the member's place, not a figure of the text."""
+    ws = _ws(RIGHTS)
+    markdown = NUMBERED.replace(", בשתי קומות", "")
+    got = _states(ws, markdown, _item(**MAIN), _item(**BASEMENT), _item(**ROOF))
+    assert got["שטח מרתף"]["state"] == "omitted" and got["שטח מרתף"]["outcome"] == "partial" and got["שטח מרתף"]["missing"], got
+    assert got["שטח עיקרי"]["state"] == got["שטח גג"]["state"] == "covered"
+    assert items._without_list_number("2. שטח 340") .strip() == "שטח 340" and items._without_list_number("שטח 3. 340") == "שטח 3. 340"
+    assert items.quote_in_blocks("שטח מרתף | 2 | ג/4521", _units("2. שטח המרתף")) is False  # the same for a quote looked for in the blocks
+
+
+TWO_LEVEL = "\n".join(["הכנסות מהנכס", "שימוש | הכנסה | הכנסה", " | חודשית | שנתית", "משרדים | 100,000 | 1,200,000", "מסחר | 45,000 | 540,000"])
+
+
+def test_the_header_lines_of_a_table_are_merged_column_by_column_keeping_the_empty_edge_cells():
+    assert items._level_cells("| חודשית | שנתית", []) == ["", "חודשית", "שנתית"]
+    assert items._level_cells("חודשית | שנתית |", []) == ["חודשית", "שנתית", ""]
+    assert items._level_cells("| חודשית | שנתית |", []) == ["חודשית", "שנתית"]  # a Markdown row: the outer pipes are no cells
+    # a pipe at both edges of a line that has to line up with the level before it: the reading with as many cells as that level wins
+    level = ["שימוש", "הכנסה", "הכנסה", "הערה"]
+    assert items._level_cells("| חודשית | שנתית |", level) == ["", "חודשית", "שנתית", ""]
+    assert items._level_cells("| חודשית | שנתית |", ["שימוש", "הכנסה", "הכנסה"]) == ["חודשית", "שנתית"]  # neither lines up: today's reading
+    assert items._level_cells("| א | ב | ג |", ["x", "y", "z"]) == ["א", "ב", "ג"]
+    merged = items._merge_header(["שימוש", "הכנסה", "הכנסה"], ["", "חודשית", "שנתית"])
+    assert merged == ["שימוש", "הכנסה חודשית", "הכנסה שנתית"]
+    assert items._merge_header([], ["א", "ב"]) == ["א", "ב"]
+    assert items._merge_header(["א", "ב", "ג"], ["ד", "ה"]) == ["א", "ב", "ג", "ד", "ה"]  # not in line with it: the cells follow, as before
+
+
+def test_a_row_value_is_the_cell_of_the_column_whose_header_shares_the_most_request_words():
+    from app.chat.verify import request_word_forms
+
+    header = ["שימוש", "הכנסה חודשית", "הכנסה שנתית"]
+    cells = ["מסחר", "45,000", "540,000"]
+    assert items._row_value(cells, header, request_word_forms("ההכנסה השנתית מכל שימוש")) == "540,000"
+    assert items._row_value(cells, header, request_word_forms("ההכנסה החודשית")) == "45,000"
+    assert items._row_value(cells, header, request_word_forms("ההכנסה")) == "45,000"  # a tie decides nothing: the first figure, as before
+    assert items._row_value(cells, header) == "45,000"
+    # an identifier column is never the value, whatever the request says
+    assert items._row_value(["חלקה א", "38081", "1,250,000"], ["חלקה", "מספר גוש", "מחיר"], request_word_forms("מספר הגוש")) == "1,250,000"
+    assert items._row_value(["מסחר", "45,000"], ["שימוש"], request_word_forms("ההכנסה")) == "45,000"  # no header in line with the row
+
+
+def test_a_candidate_row_under_a_two_level_header_is_valued_by_the_column_the_request_names_and_the_identifier_column_is_skipped():
+    ws = _ws(TWO_LEVEL)
+    offer = _offer(ws, "ההכנסה השנתית ממשרדים היא 1,200,000 ₪ [S1].", [{"id": "N1", "text": "ההכנסה השנתית מכל שימוש"}])
+    assert [(c.label, c.value) for c in offer.candidates] == [("מסחר", "540,000")]
+    assert "הכנסה שנתית" in offer.candidates[0].own and "הכנסה חודשית" in offer.candidates[0].own
+    # the monthly figure when the request asks for it
+    monthly = _offer(ws, "ההכנסה החודשית ממשרדים היא 100,000 ₪ [S1].", [{"id": "N1", "text": "ההכנסה החודשית מכל שימוש"}])
+    assert [(c.label, c.value) for c in monthly.candidates] == [("מסחר", "45,000")]
+    # with an identifier column first: the first figure of the row is no longer the plot's number
+    ids = "\n".join(["זכויות", "מגרש | גודל מגרש מינימלי | תכסית", " | (מ״ר) | (%)", "501 | 300 | 60%", "502 | 300 | 55%"])
+    ws2 = _ws(ids)
+    got = _offer(ws2, "התכסית במגרש 501 היא 60% [S1].", [{"id": "N1", "text": "התכסית המותרת"}])
+    assert [(c.label, c.value) for c in got.candidates] == [("502", "55%")]

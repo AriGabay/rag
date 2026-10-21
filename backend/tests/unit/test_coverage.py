@@ -3542,7 +3542,7 @@ def test_a_declared_not_applicable_item_the_answer_states_gets_no_line_and_one_i
     assert line.startswith("«שטח גג»") and "אינו חל על הבקשה" in line
 
 
-def test_a_coverage_check_that_fails_gets_its_own_wording_in_place_of_read_and_not_used_and_caps_nothing(monkeypatch):
+def test_a_coverage_check_that_fails_gets_its_own_wording_in_place_of_read_and_not_used_and_makes_its_component_partial(monkeypatch):
     from app.chat import items as ledger_items
 
     def broken(*args, **kwargs):
@@ -3554,7 +3554,10 @@ def test_a_coverage_check_that_fails_gets_its_own_wording_in_place_of_read_and_n
     lines = _item_lines(final)
     assert len(lines) == 3 and all("לא ניתן היה להשלים את הבדיקה" in ln for ln in lines)
     assert not re.search(r"לא נעשה בו שימוש|לא נמצא|לא אותר", final.answer_markdown)
-    assert [o["status"] for o in outcomes] == ["full"] and "I1" not in (outcomes[0].get("omitted_items") or [])  # a check that failed is no omission
+    # round 20 U5 (KTD5, R18; superseding round 19's "caps nothing"): the component is not counted complete on a check that did not finish,
+    # and a check that failed is still no omission
+    assert [o["status"] for o in outcomes] == ["partial"] and not outcomes[0].get("omitted_items")
+    assert outcomes[0]["unchecked_items"] == ["I1", "I2", "I3"] and outcomes[0]["check_incomplete"] is True and final.status == "partial"
 
 
 def test_the_gap_lines_the_caps_and_the_body_rest_on_the_one_decision_the_report_holds():
@@ -3653,3 +3656,133 @@ def test_items_that_share_a_value_whose_condition_every_twin_writes_are_not_aske
     again.merge([labelled, shops])
     two = {o["quote"].split(" | ")[0]: o["state"] for o in again.outcomes(verify.split_units("- השיעור לחנויות הוא 7% [S1]."), ws)}
     assert two == {"משרדים": "omitted", "חנויות": "covered"}  # a label word the twin lacks is still asked
+
+
+# --- round 20 U5: gap lines name a specific missing detail, and an unchecked item never leaves its component complete (KTD5; R16-R18) ----
+
+TENANT_COMPONENT = "מי השוכר שנשארה לו התקופה הארוכה ביותר בכל אחד משני הנכסים, וכמה זמן התקופה?"
+TENANT_QUESTION = "מי השוכר שנשארה לו התקופה הארוכה ביותר בכל נכס וכמה זמן?"
+TENANT_GIVEN = "השוכר עם התקופה הארוכה ביותר בנכס הראשון הוא חברת א, ונשארו לו 8 שנים [S1]."
+
+
+def _tenant_case(missing: str, *, subject: str = "", limit: str | None = "time_limit"):
+    ws = _ws("הנכס הראשון: השוכר עם התקופה הארוכה ביותר הוא חברת א, 8 שנים.")
+    ws.searches.append("שוכרים")
+    if limit:
+        _stopped_on(ws, limit)
+    turn = _turn({"id": "1", "text": TENANT_COMPONENT, "subject": subject})
+    a = _answer(TENANT_GIVEN)
+    r = verify_answer(_judge(_partial_score(missing)), a, ws, TENANT_QUESTION, [], requirements=turn)
+    final, outcomes = _finish(ws, a, r, turn)
+    return a, r, final, outcomes
+
+
+def test_a_missing_text_equal_to_the_component_but_for_its_closing_clause_is_no_part_and_no_line_denies_the_whole_phrase():
+    whole = "מי השוכר שנשארה לו התקופה הארוכה ביותר בכל אחד משני הנכסים"
+    a, r, final, (o,) = _tenant_case(whole)
+    assert o["status"] == "partial" and o["missing_part"] == "" and o["stated"] is False
+    assert _gap(final, a) == "" and r.gaps == []
+    assert "לא אותר" not in final.answer_markdown and "הנכסים" not in final.answer_markdown.replace(TENANT_GIVEN, "")
+
+
+def test_a_part_the_component_lacks_is_named_through_the_components_subject_and_the_limit_line_names_it_and_not_the_whole_component():
+    part = "השוכר עם התקופה הארוכה ביותר באינדג'יה"
+    a, r, final, (o,) = _tenant_case(part, subject="אינדג'יה")
+    assert o["missing_part"] == part and o["stated"] is True and o["limitation"] == "limit_reached"
+    assert _gap(final, a) == f"**{part}** לא אותר במסגרת מגבלת הזמן של השאלה."
+    assert "משני הנכסים" not in _gap(final, a)  # the whole phrase is not said to be unlocated
+    # without the subject the word is nobody's: the part is dropped, as before
+    _, _, final2, (o2,) = _tenant_case(part, subject="")
+    assert o2["missing_part"] == "" and o2["stated"] is False
+
+
+def test_the_users_own_question_grounds_a_missing_part_too():
+    part = "השוכר באינדג'יה"
+    ws = _ws("הנכס הראשון: חברת א, 8 שנים.")
+    ws.searches.append("שוכרים")
+    turn = _turn({"id": "1", "text": "השוכר הארוך ביותר בכל נכס"})
+    a = _answer("השוכר הארוך ביותר בנכס הראשון הוא חברת א [S1].")
+    ask = "מי השוכר הארוך ביותר בכל נכס? (אינדג'יה וקרגוייבץ)"
+    r = verify_answer(_judge(_partial_score(part)), a, ws, ask, [], requirements=turn)
+    final, (o,) = _finish(ws, a, r, turn)
+    assert o["missing_part"] == part and "**השוכר באינדג'יה**" in _gap(final, a)
+
+
+def test_a_missing_part_that_names_the_whole_component_is_never_stated_even_when_a_hand_built_vote_carries_it():
+    from app.chat.verify import JudgeRequirement
+
+    ws = _ws("הנכס הראשון: חברת א, 8 שנים.")
+    ws.searches.append("שוכרים")
+    turn = _turn({"id": "1", "text": TENANT_COMPONENT})
+    a = _answer(TENANT_GIVEN)
+    r = verify_answer(_judge(_partial_score("")), a, ws, TENANT_QUESTION, [], requirements=turn)
+    r.requirement_votes["N1"] = [JudgeRequirement(id="N1", status="partial", units=[0], missing=TENANT_COMPONENT.rstrip("?"))]
+    final, (o,) = _finish(ws, a, r, turn)
+    assert o["missing_part"] == "" and o["stated"] is False and _gap(final, a) == ""
+
+
+def test_ae10_an_unchecked_item_caps_its_component_at_partial_without_calling_it_omitted_and_without_a_repair_request(monkeypatch):
+    from app.chat import items as ledger_items
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr(ledger_items, "_check_block", broken)
+    ws, r, turn, answer, _ = _rights_check(MAIN_TWO_SENTENCES)
+    final, (o,) = _finish(ws, answer, r, turn)
+    assert o["status"] == "partial" and o["check_incomplete"] is True and o["unchecked_items"] == ["I1", "I2", "I3"]
+    assert not o.get("omitted_items") and o["stated"] is False and o["limitation"] is None and o["gap"] is None
+    assert r.decision(final) and {s["state"] for s in r.decision(final)} == {"unchecked"}
+    lines = _item_lines(final)
+    assert len(lines) == 3 and all("לא ניתן היה להשלים את הבדיקה" in ln for ln in lines)
+    assert not re.search(r"לא נעשה בו שימוש|לא נמצא|לא אותר", final.answer_markdown)
+    assert not [p for p in r.problems if p.kind == "requirement"]  # nothing is asked of the model for a check the server could not complete
+    assert final.status == "partial" and r.completeness["status"] == "partial"
+    assert [(m["id"], m["status"], m["reason"]) for m in r.completeness["missing"]] == [("N1", "partial", None)]
+    assert r.requirement_decisions["N1"]["caps"] == ["unchecked_items"]
+    assert all(row["why"] == "overruled_by_unchecked_items" for row in r.requirement_history.get("N1", []))
+
+
+def test_an_item_whose_source_is_absent_from_the_workspace_caps_its_component_and_is_not_omitted():
+    ws, r, turn, answer, _ = _rights_check(MAIN_TWO_SENTENCES)
+    del r.item_ws.sources["S2"]
+    final, (o,) = _finish(ws, answer, r, turn)
+    assert {s["state"] for s in r.decision(final)} == {"unchecked"} and not o.get("omitted_items")
+    assert o["status"] == "partial" and o["unchecked_items"] and o["check_incomplete"] is True
+    assert all("לא ניתן היה להשלים את הבדיקה" in ln for ln in _item_lines(final))
+
+
+def test_protection_a_true_omission_beside_an_unchecked_item_still_gets_its_read_and_not_used_line_and_stays_a_repair_trigger(monkeypatch):
+    from app.chat import items as ledger_items
+
+    real = ledger_items._check_block
+
+    def broken_for_main(item, *args, **kwargs):
+        if item.label == "שטח עיקרי":
+            raise RuntimeError("synthetic failure")
+        return real(item, *args, **kwargs)
+
+    monkeypatch.setattr(ledger_items, "_check_block", broken_for_main)
+    ws, r, turn, answer, _ = _rights_check(BASEMENT_FIGURE.replace("מ״ר", "מ״ר ובו 2 קומות"))
+    final, (o,) = _finish(ws, answer, r, turn)
+    assert o["status"] == "partial" and o["omitted_items"] == ["I3"] and o["unchecked_items"] == ["I1"] and o["check_incomplete"] is False
+    lines = {ln.split("»")[0] + "»": ln for ln in _item_lines(final)}
+    assert sorted(lines) == ["«שטח גג»", "«שטח עיקרי»"]
+    assert "לא נעשה בו שימוש" in lines["«שטח גג»"] and "לא ניתן היה להשלים את הבדיקה" in lines["«שטח עיקרי»"]
+    assert "לא נעשה בו שימוש" not in lines["«שטח עיקרי»"]
+
+
+def test_the_lines_after_the_eighth_count_the_unchecked_ones_apart_from_the_items_the_answer_does_not_include():
+    st = [{"id": f"I{n}", "component": "N1", "origin": "agent", "state": "unchecked", "why": "unchecked", "source": "S1",
+           "quote": f"שורה {n} | {n}", "document_id": None, "unit_id": None, "reason": "", "outcome": "unchecked", "missing": []}
+          for n in range(1, 12)]
+    ws = _ws()
+    class _R:
+        request = ""
+    lines = coverage.item_gap_lines(ws, _R(), [{"id": "N1", "status": "partial"}], st)
+    assert len(lines) == coverage.ITEM_GAP_LINES + 1 and lines[-1]["state"] == "more"
+    assert lines[-1]["text"] == "ועוד 3 פריטים נוספים שנקראו, ולא ניתן היה להשלים את הבדיקה אם נכללו בתשובה."
+    omitted = [dict(x, state="omitted", why="value_not_stated", outcome="omitted") for x in st]
+    assert coverage.item_gap_lines(ws, _R(), [{"id": "N1", "status": "partial"}], omitted)[-1]["text"] == "ועוד 3 פריטים נוספים שנקראו ולא נכללו בתשובה."
+    mixed = omitted[:9] + st[9:]
+    assert "ולא נכללו בתשובה, ועוד 2 שנקראו" in coverage.item_gap_lines(ws, _R(), [{"id": "N1", "status": "partial"}], mixed)[-1]["text"]

@@ -2355,3 +2355,39 @@ def test_the_judges_source_header_also_shows_the_names_the_document_gives_the_un
                              text="x", kind="context", date_line=None, link=None, unit=None)
     heading = verify._source_parts(SimpleNamespace(sources={"S1": source}, contexts={"v": cx}, declared_handles={}), "S1")[0]
     assert heading.index("מתחם גבעת הרימון") < heading.index("קובץ: קובץ") and cx.describe(1) in heading
+
+
+# --- round 20 U5: a missing part is a specific part, never the whole component (KTD5; R16, R18) -------------------------------------
+
+def test_a_missing_text_equal_to_the_whole_component_is_rejected_and_so_is_its_shortened_copy():
+    component = "שווי הנכס בגישת ההשוואה"
+    request = "מהו שווי הנכס בגישת ההשוואה?"
+    assert verify.valid_missing(component, "partial", component, request) == ""
+    assert verify.valid_missing("שווי הנכס גישת ההשוואה", "partial", component, request) == ""  # a stop-word-free copy
+    long = "מי השוכר שנשארה לו התקופה הארוכה ביותר בכל אחד משני הנכסים, וכמה זמן התקופה?"
+    assert verify.valid_missing("מי השוכר שנשארה לו התקופה הארוכה ביותר בכל אחד משני הנכסים", "partial", long, long) == ""  # the closing clause dropped
+
+
+def test_a_part_of_a_component_is_kept_when_it_is_a_piece_of_its_words_or_is_narrowed_by_a_word_of_the_request():
+    component = "השטח והשווי של הנכס"
+    request = "מהם השטח והשווי של הנכס בתא שטח 2?"
+    assert verify.valid_missing("השטח", "partial", component, request) == "השטח"
+    assert verify.valid_missing("השטח והשווי", "partial", component, request) == "השטח והשווי"
+    assert verify.valid_missing("השווי בתא שטח 2", "partial", component, request) == "השווי בתא שטח 2"  # narrowed by the request
+    assert verify.valid_missing("השטח והשווי של הנכס בתא שטח 2", "partial", component, request) == "השטח והשווי של הנכס בתא שטח 2"
+    # a number the component writes that the part leaves out narrows it to the piece the number names
+    plots = "שטחי השירות בתא שטח 1 ובתא שטח 2"
+    assert verify.valid_missing("שטחי השירות בתא שטח 2", "partial", plots, plots) == "שטחי השירות בתא שטח 2"
+    assert verify.covers_component("שטחי השירות בתא שטח 2", plots) is False
+    assert verify.covers_component(plots, plots) is True and verify.covers_component("", plots) is False
+    assert verify.covers_component("מרפסות", plots) is False  # a word the component never wrote is no copy of it
+
+
+def test_the_components_subject_and_the_users_question_are_words_of_the_request_for_a_missing_part():
+    component = "השוכר הארוך ביותר בכל אחד משני הנכסים"
+    request = "מי השוכר הארוך ביותר בכל נכס?"
+    part = "השוכר הארוך ביותר באינדג'יה"
+    assert verify.valid_missing(part, "partial", component, request) == ""  # a word of neither text
+    assert verify.valid_missing(part, "partial", component, request, "נכס אינדג'יה") == part
+    assert verify.valid_missing(part, "partial", component, request, "", "מי השוכר באינדג'יה ובקרגוייבץ?") == part
+    assert verify.valid_missing("השוכר באילת", "partial", component, request, "נכס אינדג'יה") == ""  # still never a word nobody wrote
