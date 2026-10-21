@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from app.extraction.tables import (
     RawTable,
     assemble_tables,
@@ -208,3 +210,129 @@ def test_a_trailing_minus_cell_keeps_its_sign_with_its_number_in_a_left_to_right
 
 def test_wrapped_lines_of_a_left_to_right_cell_are_joined_in_reading_order():
     assert logical_row(["Gross\nrent", "1,200"], left_to_right=True) == ["Gross rent", "1,200"]
+
+
+# --- round 21 U8: a stored table is served in the order it is drawn, each cell with its column label (KTD6, R11, AE6) ---------
+
+def _box(x0: float) -> list[float]:
+    return [x0, 100.0, x0 + 40.0, 112.0]
+
+
+def _stored(rows: list[list[str]], xs: list[float] | None, headers: list[str] | None = None) -> dict:
+    """A stored table structure: ``rows`` are the cells as stored, ``xs`` the x of each stored cell (None: no boxes)."""
+    return {"headers": headers or [], "units": [], "caption": None, "title": [], "notes": [],
+            "rows": [{"page": 1, "cells": r, **({"cell_boxes": [_box(x) for x in xs]} if xs else {})} for r in rows]}
+
+
+# the round-19 generation: a left-to-right table stored from its right edge to its left one, so its boxes run from right to left
+REVERSED = _stored([["Annual", "Q2 2024", "Q1 2024", "Item"], ["300", "200", "100", "Revenue"], ["15-", "20", "25", "Net"]],
+                   [300, 220, 140, 60])
+# the round-20 generation: the same table stored in the order it is drawn, boxes from left to right
+DRAWN = _stored([["Item", "Q1 2024", "Q2 2024", "Annual"], ["Revenue", "100", "200", "300"], ["Net", "-25", "20", "-15"]],
+                [60, 140, 220, 300])
+NO_BOXES = _stored([["Annual", "Q2 2024", "Q1 2024", "Item"], ["300", "200", "100", "Revenue"]], None)
+# a Hebrew table in logical (right-to-left) order: column 0 is the rightmost, so its boxes run from right to left too
+HEBREW = _stored([["שווי", "שטח", "כתובת"], ["900", "80", "הגפן 4"]], [300, 180, 60], headers=["שווי", "שטח", "כתובת"])
+NUMBERS_ONLY = _stored([["30", "20", "10"], ["3", "2", "1"]], [300, 180, 60])  # no cue: today's handling
+
+
+def test_a_reversed_stored_table_with_a_left_to_right_cue_is_served_in_drawn_order_with_each_cell_paired():
+    from app.extraction import tables
+
+    assert tables.column_order(REVERSED) == [3, 2, 1, 0]
+    served = tables.serve_structure(REVERSED)
+    assert [r["cells"] for r in served["rows"]][:2] == [["Item", "Q1 2024", "Q2 2024", "Annual"], ["Revenue", "100", "200", "300"]]
+    assert tables.render_served_row(served, 1) == "Item: Revenue | Q1 2024: 100 | Q2 2024: 200 | Annual: 300"
+    assert tables.render_served_row(served, 0) == "Item | Q1 2024 | Q2 2024 | Annual"  # the row that holds the labels
+    assert REVERSED["rows"][1]["cells"] == ["300", "200", "100", "Revenue"]  # nothing stored is changed
+
+
+def test_the_boxes_follow_the_cells_and_each_served_column_names_its_stored_column():
+    from app.extraction import tables
+
+    served = tables.serve_structure(REVERSED)
+    assert served["columns"] == [3, 2, 1, 0]
+    assert [b[0] for b in served["rows"][1]["cell_boxes"]] == [60, 140, 220, 300]
+    assert tables.stored_column(served, 1) == 2 and tables.served_position(served, 2) == 1  # Q1 2024: served 1, stored 2
+    assert tables.stored_column(DRAWN, 1) == 1 and tables.served_position(DRAWN, 1) == 1
+
+
+def test_a_negative_number_a_reversed_row_stored_with_its_minus_at_the_end_is_served_with_its_sign():
+    from app.extraction import tables
+
+    served = tables.serve_structure(REVERSED)
+    assert served["rows"][2]["cells"] == ["Net", "25", "20", "-15"]
+    assert tables.render_served_row(served, 2) == "Item: Net | Q1 2024: 25 | Q2 2024: 20 | Annual: -15"
+    assert tables.fix_sign("5%-") == "-5%" and tables.fix_sign("₪ 3-") == "-3 ₪" and tables.fix_sign("1,200") == "1,200"
+    assert tables.fix_sign("Q1-") == "Q1-" and tables.fix_sign("-") == "-"
+
+
+@pytest.mark.parametrize("st", [DRAWN, NO_BOXES, HEBREW, NUMBERS_ONLY], ids=["drawn", "no_boxes", "hebrew", "numbers_only"])
+def test_a_table_without_the_three_signs_is_served_as_stored(st):
+    from app.extraction import tables
+
+    assert tables.column_order(st) is None
+    assert tables.serve_structure(st) is st
+    block = "\n".join(" | ".join(r["cells"]) for r in st["rows"])
+    assert tables.serve_text(st, block) == block
+
+
+def test_a_drawn_stored_latin_table_with_ascending_boxes_is_not_flipped_even_though_its_cue_holds():
+    from app.extraction import tables
+
+    assert tables.reads_left_to_right([r["cells"] for r in DRAWN["rows"]], False)
+    assert tables.column_order(DRAWN) is None
+
+
+def test_a_hebrew_right_to_left_table_with_descending_boxes_is_not_flipped():
+    from app.extraction import tables
+
+    assert tables.column_order(HEBREW) is None
+    one_hebrew_cell = _stored([["Annual", "Q2 2024", "Q1 2024", "פריט"], ["300", "200", "100", "הכנסה"]], [300, 220, 140, 60])
+    assert tables.column_order(one_hebrew_cell) is None  # a Hebrew letter in any cell: the right-to-left handling stands
+
+
+def test_years_that_rise_from_left_to_right_are_the_cue_of_a_reversed_numbers_table():
+    from app.extraction import tables
+
+    rising = _stored([["2024", "2023", "2022", ""], ["30", "20", "10", ""]], [300, 220, 140, 60])  # drawn 2022 2023 2024
+    assert tables.column_order(rising) == [3, 2, 1, 0]
+    falling = _stored([["2022", "2023", "2024", ""], ["30", "20", "10", ""]], [300, 220, 140, 60])  # drawn 2024 2023 2022
+    assert tables.column_order(falling) is None
+
+
+def test_a_table_whose_boxes_disagree_row_by_row_is_not_flipped():
+    from app.extraction import tables
+
+    mixed = {**REVERSED, "rows": [REVERSED["rows"][0],
+                                 {**REVERSED["rows"][1], "cell_boxes": [_box(x) for x in (60, 140, 220, 300)]}]}
+    assert tables.column_order(mixed) is None
+
+
+def test_the_text_of_a_reversed_table_block_and_of_its_row_chunk_is_served_by_line_and_other_lines_stay():
+    from app.extraction import tables
+    from app.extraction.chunking import render_row
+
+    block = "\n".join([*(" | ".join(r["cells"]) for r in REVERSED["rows"]), "* amounts in thousands"])
+    served = tables.serve_text(REVERSED, block).split("\n")
+    assert served[0] == "Item | Q1 2024 | Q2 2024 | Annual"
+    assert served[1] == "Item: Revenue | Q1 2024: 100 | Q2 2024: 200 | Annual: 300"
+    assert served[-1] == "* amounts in thousands"
+    stored_chunk = "Quarterly revenue: " + render_row([], REVERSED["rows"][1]["cells"])
+    assert stored_chunk == "Quarterly revenue: 300 | 200 | 100 | Revenue"
+    assert tables.serve_row_text(REVERSED, 1, stored_chunk) == \
+        "Quarterly revenue: Item: Revenue | Q1 2024: 100 | Q2 2024: 200 | Annual: 300"
+    assert tables.serve_row_text(REVERSED, 1, "a chunk that is not that row") == "a chunk that is not that row"
+    assert tables.serve_row_text(DRAWN, 1, "Revenue | 100 | 200 | 300") == "Revenue | 100 | 200 | 300"
+
+
+def test_the_count_by_class_separates_reversed_drawn_boxless_and_hebrew_tables():
+    from app.extraction import tables
+
+    assert tables.classify_stored(REVERSED) == "reversed_stored"
+    assert tables.classify_stored(DRAWN) == "drawn_stored"
+    assert tables.classify_stored(NO_BOXES) == "no_boxes"
+    assert tables.classify_stored(HEBREW) == "hebrew"
+    assert tables.classify_stored(NUMBERS_ONLY) == "other"
+    counts = tables.count_stored([REVERSED, REVERSED, DRAWN, NO_BOXES, HEBREW, NUMBERS_ONLY, {}])
+    assert counts == {"reversed_stored": 2, "drawn_stored": 1, "no_boxes": 2, "hebrew": 1, "other": 1}

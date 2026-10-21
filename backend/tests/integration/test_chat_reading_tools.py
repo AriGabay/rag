@@ -1064,3 +1064,160 @@ def test_the_next_part_of_a_section_does_not_repeat_the_sibling_list(office):
     assert tag(first, "more") and "6.2 שכירויות" in first
     second = T.tool_read(ws, {"cursor": tag(first, "more")})
     assert "סעיפים אחים" not in second
+
+
+# --- round 21 U8: a stored table is served in the order it is drawn, each cell with its column label (KTD6, R11, AE6) --------------
+#
+# The left-to-right table the round-19 extraction stored reversed (and the round-20 extraction stores as drawn) is told apart at serve
+# time by what the stored data shows: descending cell boxes, no Hebrew letter, the left-to-right cue on the table read as drawn.
+
+QUARTERLY = "Quarterly revenue by property"
+LOT_TWO = ["4. שיטות", "מגרש 2"]
+
+
+def _quarterly(st: dict) -> dict:
+    return {**st, "caption": QUARTERLY, "section": PATH4[0], "block_index": 1}
+
+
+def _quarterly_doc(office, st: dict, sha: str, *, rows_text: str | None = None) -> tuple[UUID, UUID]:
+    lines = ([" | ".join(st["headers"])] if any(st["headers"]) else []) + [" | ".join(r["cells"]) for r in st["rows"]]
+    return add_laid_out(office, [("heading", PATH4, PATH4[0], None), ("table", PATH4, rows_text or "\n".join(lines), 0)],
+                        {0: _quarterly(st)}, sha=sha)
+
+
+def _line_of(text_: str, label: str) -> str:
+    (line,) = [ln for ln in text_.splitlines() if label in ln]
+    return line
+
+
+def _stored_structure(office, ver) -> dict:
+    with tenant_tx(office.system) as conn:
+        return conn.execute(text("SELECT structure FROM extracted_tables WHERE version_id = :v AND table_index = 0"),
+                            {"v": ver}).scalar_one()
+
+
+REVERSED_ROW = "Item: Revenue | Q1 2024: 100 | Q2 2024: 200 | Annual: 300"
+
+
+def test_ae6_a_table_read_of_a_reversed_stored_table_pairs_each_cell_with_its_label_in_drawn_order_for_the_agent_and_the_verifier(office):
+    from tests.unit.test_tables import REVERSED
+
+    doc, ver = _quarterly_doc(office, REVERSED, "e1" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    out = read_table(ws, doc, QUARTERLY)
+    s = the_source(ws, out)
+    assert _line_of(s.text, "Revenue") == REVERSED_ROW  # what the verifier checks a claim against
+    assert _line_of(out, "Revenue") == REVERSED_ROW  # what the agent reads
+    assert "Item | Q1 2024 | Q2 2024 | Annual" in s.text and "Annual | Q2 2024 | Q1 2024 | Item" not in out
+    assert _line_of(s.text, "Net") == "Item: Net | Q1 2024: 25 | Q2 2024: 20 | Annual: -15"  # the sign in front, as drawn
+    assert _stored_structure(office, ver)["rows"][1]["cells"] == ["300", "200", "100", "Revenue"]  # nothing stored changes
+
+
+def test_a_pages_read_and_a_section_read_serve_the_reversed_stored_table_block_the_same_way(office):
+    from tests.unit.test_tables import REVERSED
+
+    doc, _ = _quarterly_doc(office, REVERSED, "e2" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    pages = T.tool_read(ws, {"pages": {"document": str(doc), "from_page": 1, "to_page": 1}})
+    assert _line_of(pages, "Revenue") == REVERSED_ROW
+    assert _line_of(ws.sources["S1"].text, "Revenue") == REVERSED_ROW
+    ws = T.Workspace(ctx=office.ctx())  # the blocks the first read returned are not sent again in a turn
+    section = T.tool_read(ws, {"section": handle_of(T.tool_outline(ws, str(doc)), PATH4[0])})
+    assert _line_of(section, "Revenue") == REVERSED_ROW
+
+
+@pytest.mark.parametrize("which", ["DRAWN", "NO_BOXES", "HEBREW", "NUMBERS_ONLY"])
+def test_a_drawn_stored_table_a_table_without_boxes_a_hebrew_table_and_a_table_without_a_cue_are_served_as_stored(office, which):
+    import tests.unit.test_tables as fixtures
+
+    st = getattr(fixtures, which)
+    doc, ver = _quarterly_doc(office, st, f"e3{which}".ljust(64, "0"))
+    ws = T.Workspace(ctx=office.ctx())
+    s = the_source(ws, read_table(ws, doc, QUARTERLY))
+    stored_rows = [" | ".join(r["cells"]) for r in st["rows"]]
+    assert all(line in s.text.splitlines() for line in stored_rows), s.text
+    assert not re.search(r"\w+: \d", s.text.replace("הטבלה:", ""))  # no label: value pairs were added
+
+
+def test_a_search_hit_on_a_row_of_a_reversed_stored_table_has_the_pairing_of_a_table_read_and_the_stored_chunk_is_untouched(
+        office, monkeypatch):
+    from tests.unit.test_tables import REVERSED
+
+    doc, ver = _quarterly_doc(office, REVERSED, "e4" * 32)
+    stored_chunk = f"{QUARTERLY}: 300 | 200 | 100 | Revenue"  # the chunk as the round-19 ingestion wrote it
+    _searching(monkeypatch, _hit_of(office, doc, ver, kind="table_row", body=stored_chunk, first=1, last=1, table_index=0,
+                                    row_index=1))
+    ws = T.Workspace(ctx=office.ctx())
+    hit = T.tool_search(ws, "Revenue Q1 2024", [str(doc)])
+    assert f"{QUARTERLY}: {REVERSED_ROW}" in hit
+    read_line = _line_of(the_source(ws, read_table(ws, doc, QUARTERLY)).text, "Revenue")
+    assert read_line in ws.sources["S1"].text  # one pairing for a hit and for a read
+    with tenant_tx(office.system) as conn:
+        assert conn.execute(text("SELECT text FROM chunks WHERE version_id = :v"), {"v": ver}).scalar_one() == stored_chunk
+
+
+def test_a_search_hit_on_a_table_chunk_of_a_reversed_stored_table_is_served_by_line(office, monkeypatch):
+    from tests.unit.test_tables import REVERSED
+
+    doc, ver = _quarterly_doc(office, REVERSED, "e5" * 32)
+    chunk = "\n".join([QUARTERLY, *(" | ".join(r["cells"]) for r in REVERSED["rows"])])
+    _searching(monkeypatch, _hit_of(office, doc, ver, kind="table", body=chunk, first=1, last=1, table_index=0))
+    ws = T.Workspace(ctx=office.ctx())
+    T.tool_search(ws, "Revenue", [str(doc)])
+    assert _line_of(ws.sources["S1"].text, "Revenue") == REVERSED_ROW
+    assert "Annual | Q2 2024 | Q1 2024 | Item" not in ws.sources["S1"].text
+
+
+def _meaning() -> dict:
+    return {"kind": "income", "unit": "ILS", "period": "unknown", "vat": "unknown", "area_basis": "", "subject": "הנכס",
+            "role": "other", "stated_by": "", "stance": "unknown", "scenario": ""}
+
+
+def test_take_value_on_a_reversed_stored_table_returns_the_value_under_the_requested_label_and_anchors_to_its_stored_box(office):
+    from tests.unit.test_tables import REVERSED
+
+    doc, ver = _quarterly_doc(office, REVERSED, "e6" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    sid = the_source(ws, read_table(ws, doc, QUARTERLY)).sid
+    T.tool_take_value(ws, sid, {"row": "Revenue", "column": "Q2 2024"}, _meaning(), "ההכנסה")
+    value = ws.values["V1"]
+    assert value.value == 200 and value.locator["column"] == "Q2 2024" and value.locator["column_number"] == 2  # stored column
+    stub = ws.anchors["V1"]
+    assert (stub["table_index"], stub["row"], stub["column"]) == (0, 1, 1)
+    stored = _stored_structure(office, ver)
+    assert stored["rows"][1]["cells"][stub["column"]] == "200" and stored["rows"][1]["cell_boxes"][stub["column"]][0] == 220
+    T.tool_take_value(ws, sid, {"row": "Net", "column": "Annual"}, _meaning(), "הנטו")
+    assert ws.values["V2"].value == -15
+
+
+def test_a_chunk_under_a_lot_heading_carries_the_heading_in_its_envelope_and_a_chunk_with_its_own_section_does_not(office, monkeypatch):
+    body = "שטח הדירה לפי המדידה הוא 94 מ\"ר."
+    doc, ver = add_laid_out(office, [("heading", LOT_TWO, "מגרש 2", None), ("paragraph", LOT_TWO, body, None)], sha="e7" * 32)
+    own = _hit_of(office, doc, ver, kind="text", body=body, first=1, last=1)
+    lacking = {**own, "section": None}
+    _searching(monkeypatch, lacking)
+    ws = T.Workspace(ctx=office.ctx())
+    out = T.tool_search(ws, "שטח הדירה", [str(doc)])
+    assert 'heading="4. שיטות › מגרש 2"' in out
+    assert ws.sources["S1"].text == body  # the verifier's text is the passage, not the envelope
+    _searching(monkeypatch, own)
+    ws = T.Workspace(ctx=office.ctx())
+    assert "heading=" not in T.tool_search(ws, "שטח הדירה", [str(doc)])
+
+
+def test_the_rereads_neighbouring_blocks_and_table_expansion_serve_a_reversed_stored_table_as_a_read_does(office):
+    from app.chat import reader
+    from app.chat.rereader import _expand_neighbours, _expand_next_page
+    from tests.unit.test_tables import REVERSED
+
+    doc, ver = _quarterly_doc(office, REVERSED, "e8" * 32)
+    ws = T.Workspace(ctx=office.ctx())
+    s = the_source(ws, read_table(ws, doc, QUARTERLY))
+    near = ws.add_source(document_id=s.document_id, version_id=s.version_id, title=s.title, section=None, location="", kind="text",
+                         text="x", block_start=0, block_end=0, reading_id=s.reading_id)
+    with tenant_tx(office.ctx()) as conn:
+        head = reader.version(conn, ver)
+        neighbours = _expand_neighbours(ws, conn, head, near)[0]
+        whole = _expand_next_page(ws, conn, head, s)  # a table on one page has no continuation: nothing to add
+    assert _line_of(neighbours, "Revenue") == REVERSED_ROW and "Annual | Q2 2024 | Q1 2024 | Item" not in neighbours
+    assert whole is None

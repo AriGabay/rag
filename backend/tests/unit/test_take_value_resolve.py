@@ -403,3 +403,79 @@ def test_a_decimal_comma_is_a_decimal_and_a_thousands_comma_a_thousands_where_a_
     found = tools_._numbers_of("שטח 13,2 מ\"ר ושווי 3,596,696 ₪")
     assert [(w, v) for w, _, _, v in found] == [("13,2", Decimal("13.2")), ("3,596,696", Decimal("3596696"))]
     assert all("שטח 13,2 מ\"ר ושווי 3,596,696 ₪"[s:e] == w for w, s, e, _ in found)  # found again where it is written
+
+
+# --- round 21 U8: a table stored in reversed cell order is resolved in the order it is drawn, by the stored column (KTD6) -----
+
+def _reversed_store():
+    from tests.unit.test_tables import DRAWN, REVERSED
+
+    return REVERSED, DRAWN
+
+
+def test_a_cell_of_a_reversed_stored_table_is_taken_by_its_drawn_label_and_looked_up_by_its_stored_column():
+    reversed_, _ = _reversed_store()
+    taken = _row(reversed_, "Revenue", "Q1 2024")
+    assert taken["written"] == "100" and taken["value"] == Decimal("100")
+    # Q1 2024 is the second column as drawn and the third as stored: the datum and the highlighted box are the stored cell's
+    assert taken["locator"] == {"table_index": 0, "row": "Revenue", "row_number": 2,
+                                "column": "Q1 2024", "column_number": 3, "column_shown": 2}
+    assert taken["anchor"]["column"] == 2 and taken["anchor"]["row"] == 1
+    assert reversed_["rows"][1]["cell_boxes"][taken["anchor"]["column"]][0] == 140  # the box of «100»
+    assert reversed_["rows"][1]["cells"][taken["anchor"]["column"]] == "100"
+
+
+def test_the_column_number_the_agent_gives_counts_the_columns_as_drawn():
+    reversed_, _ = _reversed_store()
+    by_number = _row(reversed_, "Revenue", None, column_number=4)
+    assert by_number["written"] == "300" and by_number["locator"]["column"] == "Annual"
+    assert by_number["anchor"]["column"] == 0 and reversed_["rows"][1]["cells"][0] == "300"
+    assert _row(reversed_, "Revenue", "Annual")["locator"] == by_number["locator"]
+
+
+def test_a_negative_number_a_reversed_row_stored_with_its_minus_at_the_end_is_taken_with_its_sign():
+    reversed_, _ = _reversed_store()
+    taken = _row(reversed_, "Net", "Annual")
+    assert taken["value"] == Decimal("-15")  # «15-» as stored, «-15» as the row is drawn
+    assert reversed_["rows"][2]["cells"][taken["anchor"]["column"]] == "15-"  # as stored
+
+
+def test_a_quoted_row_of_a_reversed_stored_table_is_resolved_in_the_order_it_is_drawn():
+    reversed_, _ = _reversed_store()
+    loc = T._row_quote_locator("S1", reversed_, {"quote": "Revenue | 100 | 200 | 300", "number": "200"})
+    assert loc == {"row_number": 2, "column_number": 3, "number": "200"}  # drawn: Item, Q1, Q2, Annual
+    full = T._table_text(reversed_, reversed_["rows"])
+    src = T.Source(sid="S1", document_id=VERSION.document_id, version_id=VERSION.version_id, title="t", section=None,
+                   location="", kind="table", text=full, block_start=0, block_end=0, reading_id="r", status="complete")
+    taken = T._cell_of(src, full, loc, reversed_, 0)
+    assert taken["written"] == "200" and taken["anchor"]["column"] == 1
+
+
+def test_a_cached_value_of_a_reversed_stored_table_agrees_with_the_column_number_shown_to_the_agent():
+    reversed_, drawn = _reversed_store()
+    where = _row(reversed_, "Revenue", "Q1 2024")["locator"]
+    assert T._locator_agrees({"locator": where}, {"column_number": 2, "column": "Q1 2024"})
+    assert not T._locator_agrees({"locator": where}, {"column_number": 3})
+    plain = _row(drawn, "Revenue", None, column_number=2)["locator"]
+    assert "column_shown" not in plain and plain["column_number"] == 2
+    assert T._locator_agrees({"locator": plain}, {"column_number": 2})
+
+
+def test_the_anchor_of_a_cell_of_a_reversed_stored_table_highlights_the_stored_box_of_its_value():
+    from app.chat import anchors as A
+    from tests.unit.test_anchors import frac, page, reading, stub
+
+    reversed_, _ = _reversed_store()
+    anchor = _row(reversed_, "Revenue", "Q1 2024")["anchor"]
+    snap = A.snapshot(stub(kind="cell", block_start=1, block_end=1, **anchor),
+                      reading(tables={0: reversed_}, pages=[page(1)]), "r1")
+    assert snap["precision"] == "cell"
+    assert snap["pages"][0]["rects"] == [frac(reversed_["rows"][1]["cell_boxes"][2])]
+    assert snap["pages"][0]["rects"] == [frac([140, 100, 180, 112])]
+
+
+def test_a_table_served_as_stored_keeps_the_stored_column_and_no_shown_column():
+    _, drawn = _reversed_store()
+    taken = _row(drawn, "Revenue", None, column_number=4)
+    assert taken["anchor"]["column"] == 3 and taken["locator"]["column_number"] == 4 and "column_shown" not in taken["locator"]
+    assert taken["written"] == "300"

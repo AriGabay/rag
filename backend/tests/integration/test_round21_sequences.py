@@ -16,7 +16,7 @@ passing fails the suite, so the marker cannot be forgotten). A protection sequen
 6. AE4 (U4, fixed): a removal for another lot of the same property said "another property".
 7. Several lots (U4, fixed): the same bullet under two lot headings lost its second copy to the tidy-up.
 8. AE5 (U9): a judge "partial" on a supported number sends the repair round, which drops the number.
-9. AE6 (U8): a table stored in reversed cell order is served unpaired and reversed to the agent and to the verifier.
+9. AE6 (U8, fixed): a table stored in reversed cell order is served unpaired and reversed to the agent and to the verifier.
 10. AE7 (U7): a numbered item stated with its label inflected gets a false "read and not used" line.
 11. AE8 (not reproduced; protection): a follow-up carries no condition of the previous answer.
 12. The capture of U1: both drafts of a two-round turn and the locator of every cited source are in the diagnostics
@@ -343,7 +343,6 @@ QUARTER_PAIRS = [("Q1 2024", "100"), ("Q2 2024", "200"), ("Annual", "300")]
 
 
 @pytest.mark.db
-@open_case("U8", "the agent and the verifier are shown «Annual | Q2 2024 | Q1 2024 | Item» over «300 | 200 | 100 | Revenue»: reversed and unpaired")
 def test_ae6_a_reversed_stored_table_with_left_to_right_evidence_is_read_in_drawn_order_with_its_column_labels(client, office, monkeypatch):
     doc = ingest_pdf(office, monkeypatch, QUARTERS)
     DOCUMENT_OF[0] = doc

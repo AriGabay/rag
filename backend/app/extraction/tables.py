@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass
 
 from app.extraction.base import TableResult, TableRow
-from app.extraction.hebrew import fix_line, has_hebrew, has_latin
+from app.extraction.hebrew import fix_line, has_hebrew, has_latin, visual_to_logical
 
 HEADER_VOCAB = (
     "כתובת", "גוש", "חלקה", "תאריך", "שטח", "מחיר", "סוג", "חדרים", "קומה", "רחוב", "עסקה", "שווי", "יחידה",
@@ -215,3 +215,234 @@ def _append(table: TableResult, body: list[list[str]], boxes: list[list | None],
     table.rows.extend(TableRow(page=raw.page, cells=r, cell_boxes=b) for r, b in zip(body, boxes, strict=True))
     table.page_end = raw.page
     table.ocr = table.ocr or raw.ocr
+
+
+# --- serving a stored table (round 21 U8, KTD6; R11) -------------------------------------------------------------------------------
+#
+# Round 20 changed how a text-layer table with no Hebrew is stored (``reads_left_to_right``) without a ``READER_VERSION`` bump, so
+# the tables already stored come in two generations: a left-to-right table stored reversed (the round-19 reading: its logical row
+# runs from the right edge to the left one) and one stored in the order it is drawn. Nothing stored is rewritten (a re-read needs
+# approval); the order is recovered at serve time from what the stored data itself shows. All three must hold for a table to be
+# served reversed: its stored cell boxes run from right to left, it holds no Hebrew letter, and the left-to-right cue holds on the
+# table read in the order it is drawn. A table with no boxes, with ascending boxes, with a Hebrew letter or with no cue is served
+# as stored. A served table keeps, for each column, the stored column it came from (``columns``): the stored index is what a cell's
+# value, its box and the datum's identity are looked up by.
+
+_LETTER = re.compile(r"[^\W\d_]")
+_DIGIT_RUN = re.compile(r"\d")
+
+
+def _x0(box) -> float | None:
+    try:
+        return float(box[0])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _boxes_descend(rows_of_boxes) -> bool | None:
+    """Whether the stored cell boxes run from right to left: True when every row with two positioned cells has its first cell to the
+    right of its last, False when some row runs the other way, None when no row says (no boxes, or boxes at one x)."""
+    verdicts = []
+    for boxes in rows_of_boxes:
+        xs = [x for x in (_x0(b) for b in boxes or [] if b) if x is not None]
+        if len(xs) >= 2 and xs[0] != xs[-1]:
+            verdicts.append(xs[0] > xs[-1])
+    return None if not verdicts else all(verdicts)
+
+
+def _texts(st: dict) -> list[str]:
+    return [c or "" for c in [*(st.get("headers") or []), *(c for r in st.get("rows") or [] for c in r.get("cells") or [])]]
+
+
+def stored_reversed(st: dict | None) -> bool:
+    """Whether a stored table is a left-to-right table stored in reversed cell order (KTD6): its stored cell boxes descend, no
+    cell or header holds a Hebrew letter, and the left-to-right cue holds on the table read in the order it is drawn (the stored
+    order reversed). Read from the stored structure alone; the page's own text is not at hand, so a table of a page with Hebrew
+    and none in its cells is judged by its boxes and its cue alone."""
+    if not st or st.get("columns") is not None:  # a structure already served
+        return False
+    texts = _texts(st)
+    if any(has_hebrew(c) for c in texts):
+        return False
+    rows = st.get("rows") or []
+    if _boxes_descend([st.get("header_boxes"), *(r.get("cell_boxes") for r in rows)]) is not True:
+        return False
+    headers = st.get("headers") or []
+    grid = ([headers[::-1]] if any(headers) else []) + [list(r.get("cells") or [])[::-1] for r in rows]
+    return reads_left_to_right(grid, False)
+
+
+def _width_of(st: dict) -> int:
+    return max([len(st.get("headers") or []), *(len(r.get("cells") or []) for r in st.get("rows") or [])] or [0])
+
+
+def column_order(st: dict | None) -> list[int] | None:
+    """The stored column at each served position (right to left reversed: ``[3, 2, 1, 0]``), or None when the table is served as
+    stored."""
+    if not stored_reversed(st):
+        return None
+    return list(range(_width_of(st) - 1, -1, -1))
+
+
+def fix_sign(cell: str) -> str:
+    """A number a reversed reading stored with its minus at the end ("1,200-", "5%-", "₪ 3-") written with its sign in front, as
+    the left-to-right row it is in reads it. A cell with a letter, or with no digit, or not ending in a minus, is returned as it is."""
+    text = cell or ""
+    if _DIGIT_RUN.search(text) and not _LETTER.search(text) and text.rstrip().endswith("-"):
+        return visual_to_logical(text)
+    return text
+
+
+def serve_cells(order: list[int], cells: list[str], fixed: bool = True) -> list[str]:
+    """A stored row's cells at the served positions (``order``); a stored cell the row lacks is empty."""
+    return [fix_sign(c) if fixed else c for c in ((cells[i] if i < len(cells) else "") for i in order)]
+
+
+def serve_structure(st: dict | None) -> dict | None:
+    """A stored table structure in the order it is drawn, when the stored data show it was stored reversed (``stored_reversed``);
+    ``st`` itself otherwise. The served structure holds the headers, units, cells and cell boxes at the served positions and
+    ``columns``: the stored column index at each position (a value's box and its datum are looked up by it). Nothing stored is
+    changed: a new structure is built."""
+    order = column_order(st)
+    if order is None:
+        return st
+    headers = st.get("headers") or []
+    units = st.get("units") or []
+    out = dict(st)
+    out["columns"] = order
+    out["headers"] = serve_cells(order, headers, fixed=False) if any(headers) else []
+    out["units"] = [units[i] if i < len(units) else None for i in order] if units else []
+    if st.get("header_boxes"):
+        out["header_boxes"] = [st["header_boxes"][i] if i < len(st["header_boxes"]) else None for i in order]
+    out["rows"] = [
+        {**r, "cells": serve_cells(order, list(r.get("cells") or [])),
+         **({"cell_boxes": [r["cell_boxes"][i] if i < len(r["cell_boxes"]) else None for i in order]} if r.get("cell_boxes") else {})}
+        for r in st.get("rows") or []]
+    return out
+
+
+def stored_column(st: dict | None, position: int) -> int:
+    """The stored column of a served position (the position itself in a table served as stored)."""
+    order = (st or {}).get("columns")
+    return order[position] if order is not None and 0 <= position < len(order) else position
+
+
+def served_position(st: dict | None, column: int) -> int:
+    """The served position of a stored column (the column itself in a table served as stored)."""
+    order = (st or {}).get("columns")
+    return order.index(column) if order is not None and column in order else column
+
+
+def _periods_rise(cells: list[str]) -> bool:
+    periods = [p for p in map(_period, cells) if p is not None]
+    return len(periods) >= 2 and all(a < b for a, b in zip(periods, periods[1:], strict=False))
+
+
+def served_labels(sst: dict) -> tuple[list[str], int | None]:
+    """The column labels of a served table, and the row they come from when it has no header of its own: the headers; else its
+    first row when that row is the one that gives the left-to-right cue (a cell with Latin letters, or periods that rise) — a
+    Latin header row is not a header to the extraction, which knows Hebrew header words only. No labels: ``([], None)``."""
+    headers = sst.get("headers") or []
+    if any(headers):
+        return list(headers), None
+    rows = sst.get("rows") or []
+    first = next((i for i, r in enumerate(rows) if any(clean_cell(c) for c in r.get("cells") or [])), None)
+    if first is None:
+        return [], None
+    cells = list(rows[first].get("cells") or [])
+    if any(has_latin(c or "") for c in cells) or _periods_rise(cells):
+        return cells, first
+    return [], None
+
+
+def _render_row(headers: list[str], cells: list[str], units: list[str | None] | None = None) -> str:
+    from app.extraction.chunking import render_row
+
+    return render_row(headers, cells, units)
+
+
+def render_served_row(sst: dict, index: int) -> str:
+    """One row of a served table as a row chunk renders it (``render_row``): each cell paired with its column label, in the order
+    the table is drawn. The row that holds the labels is its cells in order; a table with no label gives its cells in order."""
+    row = sst["rows"][index]
+    cells = list(row.get("cells") or [])
+    labels, label_row = served_labels(sst)
+    if not labels or index == label_row:
+        return " | ".join(cells)
+    return _render_row(labels, cells, sst.get("units") or None if any(sst.get("headers") or []) else None)
+
+
+def render_served_cells(sst: dict, cells: list[str]) -> str:
+    """The same for a row that is not one of the structure's own (a window the caller cut): its stored cells are put in served
+    order first."""
+    order = sst.get("columns") or []
+    served = serve_cells(order, cells)
+    labels, _ = served_labels(sst)
+    if not labels or served == labels:
+        return " | ".join(served)
+    return _render_row(labels, served, sst.get("units") or None if any(sst.get("headers") or []) else None)
+
+
+def serve_text(st: dict | None, text: str) -> str:
+    """The text of a stored table block or table chunk (the header line and one ``a | b | c`` line per row, then notes) with its
+    header and row lines of a table served reversed replaced by the served ones; any other line, and the text of a table served as
+    stored, is returned as it is."""
+    sst = serve_structure(st)
+    if sst is st or not text:
+        return text
+    mapping: dict[str, str] = {}
+    headers = st.get("headers") or []
+    if any(headers):
+        mapping[" | ".join(headers)] = " | ".join(sst["headers"])
+    for i, r in enumerate(st.get("rows") or []):
+        line = " | ".join(r.get("cells") or [])
+        if line.strip(" |"):
+            mapping.setdefault(line, render_served_row(sst, i))
+    return "\n".join(mapping.get(ln, ln) for ln in text.split("\n"))
+
+
+def serve_row_text(st: dict | None, row_index: int | None, text: str) -> str:
+    """The text of a ``table_row`` chunk (its table's title, then the row as ``render_row`` wrote it) with the row paired with its
+    column labels in the order the table is drawn, when the table is served reversed; ``text`` as it is otherwise, and when the
+    chunk is not that row as stored. The stored chunk is not touched: this is what a hit shows."""
+    sst = serve_structure(st)
+    rows = (st or {}).get("rows") or []
+    if sst is st or row_index is None or not 0 <= row_index < len(rows):
+        return text
+    stored = _render_row(st.get("headers") or [], list(rows[row_index].get("cells") or []), st.get("units") or None)
+    if not stored or not text.endswith(stored):
+        return text
+    return text[:len(text) - len(stored)] + render_served_row(sst, row_index)
+
+
+# --- the read-only count of stored tables by class (KTD6, first step) -----------------------------------------------------------
+
+CLASSES = ("reversed_stored", "drawn_stored", "no_boxes", "hebrew", "other")
+
+
+def classify_stored(st: dict | None) -> str:
+    """The class of a stored table: ``reversed_stored`` (served reversed), ``drawn_stored`` (no Hebrew, boxes that ascend, the
+    left-to-right cue holds as stored), ``no_boxes`` (no Hebrew and no cell box: the order cannot be told), ``hebrew`` (a Hebrew
+    letter in a header or a cell), ``other`` (no Hebrew with boxes, but no cue, or boxes that do not settle the order)."""
+    st = st or {}
+    if any(has_hebrew(c) for c in _texts(st)):
+        return "hebrew"
+    if stored_reversed(st):
+        return "reversed_stored"
+    rows = st.get("rows") or []
+    boxes = [st.get("header_boxes"), *(r.get("cell_boxes") for r in rows)]
+    if not any(b for b in boxes):
+        return "no_boxes"
+    headers = st.get("headers") or []
+    grid = ([list(headers)] if any(headers) else []) + [list(r.get("cells") or []) for r in rows]
+    if _boxes_descend(boxes) is False and reads_left_to_right(grid, False):
+        return "drawn_stored"
+    return "other"
+
+
+def count_stored(structures) -> dict[str, int]:
+    """The number of stored tables in each class (``CLASSES``) among ``structures`` (each an ``extracted_tables.structure``)."""
+    counts = dict.fromkeys(CLASSES, 0)
+    for st in structures:
+        counts[classify_stored(st)] += 1
+    return counts

@@ -25,6 +25,7 @@ from app.chat.tools import (
     ToolError,
     Workspace,
     _clip,
+    _served_rows,
     _table_context,
     _table_context_lines,
     _table_text,
@@ -32,6 +33,7 @@ from app.chat.tools import (
 )
 from app.chat.verify import Expansion, evidence_source_id
 from app.db import tenant_tx
+from app.extraction import tables as stored_tables
 from app.providers.llm import has_time
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,7 @@ def _stored_table(conn: Connection, src: Source) -> tuple[int | None, dict | Non
 def _table_head(st: dict) -> list[str]:
     """What a table says about itself outside its rows: its caption and titles, the source of its reading, its headers,
     their units and its notes."""
+    st = stored_tables.serve_structure(st)  # the columns in the order the table is drawn, as a read of it shows them (round 21 U8)
     lines = [x for x in [st.get("caption"), *(st.get("title") or [])] if x]
     note = _TABLE_SOURCES.get(st.get("source") or "", "")
     if note:
@@ -180,8 +183,8 @@ def _expand_neighbours(ws, conn, head, src):
     if src.block_start is None:
         return None
     end = src.block_end if src.block_end is not None else src.block_start
-    rows = [r for r in reader.blocks_between(conn, src.version_id, max(0, src.block_start - NEIGHBORS), end + NEIGHBORS)
-            if r.text]
+    rows = [r for r in _served_rows(ws, conn, src.version_id, reader.blocks_between(
+        conn, src.version_id, max(0, src.block_start - NEIGHBORS), end + NEIGHBORS)) if r.text]
     if not rows:
         return None
     return ("\n".join(r.text for r in rows), "הפסקאות הסמוכות",
@@ -194,8 +197,8 @@ def _expand_continuation(ws, conn, head, src):
     end = src.block_end if src.block_end is not None else src.block_start
     cx = contexts_of(ws, conn, src.version_id, head.reading_id)
     top = _chain_of(ws, conn, head, src)[:1]
-    rows = [r for r in reader.blocks_in_section(conn, src.version_id, top, from_block=end + 1,
-                                                window=reader.section_window(cx, src.block_start, top)) if r.text]
+    rows = [r for r in _served_rows(ws, conn, src.version_id, reader.blocks_in_section(
+        conn, src.version_id, top, from_block=end + 1, window=reader.section_window(cx, src.block_start, top))) if r.text]
     if not rows:
         return None
     return ("\n".join(r.text for r in rows), "המשך הסעיף",
@@ -211,8 +214,9 @@ def _expand_preceding(ws, conn, head, src):
         return None
     cx = contexts_of(ws, conn, src.version_id, head.reading_id)
     top = _chain_of(ws, conn, head, src)[:1]
-    rows = [r for r in reader.blocks_in_section(conn, src.version_id, top, until_block=src.block_start,
-                                                window=reader.section_window(cx, src.block_start, top)) if r.text]
+    rows = [r for r in _served_rows(ws, conn, src.version_id, reader.blocks_in_section(
+        conn, src.version_id, top, until_block=src.block_start, window=reader.section_window(cx, src.block_start, top)))
+        if r.text]
     kept: list = []
     size = 0
     for r in reversed(rows):
@@ -297,7 +301,7 @@ def _expand_next_page(ws, conn, head, src):
     if not pages:
         return None
     nxt = max(pages) + 1
-    rows = [r for r in reader.blocks_on_pages(conn, src.version_id, nxt, nxt) if r.text]
+    rows = [r for r in _served_rows(ws, conn, src.version_id, reader.blocks_on_pages(conn, src.version_id, nxt, nxt)) if r.text]
     if not rows:
         return None
     return ("\n".join(r.text for r in rows), f"תחילת עמוד {nxt}",

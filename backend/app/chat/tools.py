@@ -224,6 +224,7 @@ from app.chat.timeframe import (
 from app.chat.timing import StageClock
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
+from app.extraction import tables as stored_tables
 from app.measurements.extract import (
     EXTRACTION_VERSION,
     PERIOD_LABELS,
@@ -381,6 +382,9 @@ class Source:
     # the document), shown to the judge beside the source; empty in a file of several contexts, whose sources say
     # their context instead
     subject: str = ""
+    # the nearest lot or section heading above a hit whose chunk carries none (round 21 U8, KTD6, R11): the heading path of its first
+    # block, shown in the envelope so a row or a paragraph under «מגרש 2» is read as that lot's; empty when the chunk has its own
+    heading: str = ""
     # the kind of document it is from, and — for a standard or another professional document — what identifies the
     # passage (round 10 U8, KTD13): {number, title, edition, effective, section, section_title}, each None where the
     # document states nothing; title and location render it. ``label``: how the pool labels the hit for the model (an
@@ -997,6 +1001,8 @@ def _envelope(s: Source) -> list[tuple[str, str]]:
         out.append(("context", _attr(s.context)))
     elif s.subject:  # the identity a file of one subject unit states for itself
         out.append(("subject", _attr(s.subject)))
+    if s.heading:  # the lot or section heading its chunk lacks (round 21 U8)
+        out.append(("heading", _attr(s.heading)))
     if s.unit:  # its stable unit id (version, reading, number), beside the turn's handle in the tags (round 9 U9)
         out.append(("unit_id", _attr(s.unit["id"])))
     if s.date_line:  # the valuation date of the unit holding the passage, or that it is unknown (round 11 U8, KTD6)
@@ -3267,6 +3273,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                     if passage is None:
                         continue
                 held = [n for n in held if n in kept] or held
+            passage = _served_hit_text(ws, conn, h, passage)
             paragraphs, media, blocks = _block_info(conn, h["version_id"], bs, be,
                                                     with_text=h["kind"] not in ("table", "table_row"))
             tags = {"document": ws.doc_handle(h["document_id"])}
@@ -3286,6 +3293,8 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 partial_document=gaps.get(h["version_id"], whole).cites(page_list, h["section"]), tags=tags,
                 row_index=h.get("row_index") if h["kind"] == "table_row" else None),
                 cx, held, ws)
+            if not h["section"]:
+                src.heading = _heading_of(conn, h["version_id"], bs)
             if cut:  # what the model reads says where the rest is; what a claim is checked against is the passage shown
                 src.body = f"{src.text}\n{MSG_PASSAGE_CUT.format(sid=src.sid)}"
             src.label = _label_of(src, cx, h["pool"], h["role"], ws.intent)
@@ -3306,6 +3315,32 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
     hints = [MSG_ROWS_NOT_SHOWN.format(handle=t, n=n) for t, n in capped] + ([block] if block else [])
     hints += [f"{ws.doc_handle(d)}: {note}" for d, cx in noted.items() if (note := _note_once(ws, d, cx))]
     return "\n\n".join([*notes, *_render_sources(out), *hints])
+
+
+HEADING_CHARS = 160
+
+
+def _heading_of(conn: Connection, version_id, block_index: int | None) -> str:
+    """The heading path of a block (the lot or section it is under), as one breadcrumb, for a hit whose chunk carries no section
+    (round 21 U8, KTD6): the chunk says where its text is, the document says what it is under. Empty when the block has none."""
+    if block_index is None:
+        return ""
+    path = [p for p in reader.section_path_of(conn, version_id, block_index) if p]
+    return _clip(" › ".join(path), HEADING_CHARS)
+
+
+def _served_hit_text(ws: Workspace, conn: Connection, h: dict, passage: str) -> str:
+    """The text of a search hit on a stored table (a table chunk or a row chunk) in the order the table is drawn, each cell with its
+    column label, when the table was stored in reversed cell order (round 21 U8, KTD6): re-rendered now from the stored rows through
+    the same function as a table read. The stored chunk text and its embedding are not touched; any other hit is returned as it is."""
+    if not _is_table_hit(h):
+        return passage
+    st = _table_at(ws, conn, h["version_id"], h["table_index"])[0]
+    if st is None:
+        return passage
+    if h["kind"] == "table_row":
+        return stored_tables.serve_row_text(st, h.get("row_index"), passage)
+    return stored_tables.serve_text(st, passage)
 
 
 def _register_shown(ws: Workspace, src: Source, kind: str, passage: str, shown: str, blocks) -> None:
@@ -3343,7 +3378,8 @@ def _professional_hit(ws: Workspace, conn: Connection, h: dict, bs, be, sizes: d
     kind, std = standard_for(ws, conn, vid, bs)
     secs = sections_in(ws, conn, vid)
     sec = sections.innermost(secs, bs) if bs is not None else None
-    body = _with_size(sizes.get((vid, h.get("table_index"))), _clip(h["text"], get_settings().chat_passage_chars))
+    body = _with_size(sizes.get((vid, h.get("table_index"))),
+                      _clip(_served_hit_text(ws, conn, h, h["text"]), get_settings().chat_passage_chars))
     notes = []
     if sec is not None:
         handle = _psection_handle(ws, h["document_id"], vid, ws.readings.get(str(vid)), sec.section_no)
@@ -3405,13 +3441,22 @@ def _table_text(st: dict, rows: list, marks: dict[int, str] | None = None, befor
     rows and its notes. ``marks``: a line to send before a row (by its place among ``rows``) — where the rows of
     another appraisal context start (KTD7); never part of what the verifier reads. ``before``/``after``: the lines of the
     context parts a table read adds above and below the table (``_table_context``, round 17 U4)."""
-    lines = [x for x in [st.get("caption"), *(st.get("title") or []), table_size_line(st)] if x]
-    if any(st.get("headers") or []):
-        lines.append(" | ".join(st["headers"]))
+    # a table stored in reversed cell order is read in the order it is drawn, each cell with its column label (round 21 U8, KTD6): the
+    # same text for the agent and for the verifier, which read ``Source.text``; the stored rows are not changed
+    served = stored_tables.serve_structure(st)
+    place = {id(r): i for i, r in enumerate(st.get("rows") or [])} if served is not st else {}
+    lines = [x for x in [st.get("caption"), *(st.get("title") or []), table_size_line(served)] if x]
+    if any(served.get("headers") or []):
+        lines.append(" | ".join(served["headers"]))
     for n, r in enumerate(rows):
         if marks and n in marks:
             lines.append(marks[n])
-        lines.append(" | ".join(r.get("cells") or []))
+        if served is st:
+            lines.append(" | ".join(r.get("cells") or []))
+        elif id(r) in place:
+            lines.append(stored_tables.render_served_row(served, place[id(r)]))
+        else:
+            lines.append(stored_tables.render_served_cells(served, list(r.get("cells") or [])))
     lines += st.get("notes") or []
     note = _TABLE_SOURCES.get(st.get("source") or "", "")
     return (note + "\n" if note else "") + "\n".join([*before, *lines, *after])
@@ -3694,11 +3739,13 @@ def read_scope(ws: Workspace, source_id: str, scope: str = "neighbors", ref: dic
         start, end = ref.get("block_start"), ref.get("block_end")
         table_index = ref.get("table_index")
         if start is None and ref.get("chunk_id") and not (scope == "table" and table_index is not None):
-            row = conn.execute(text("SELECT text, section, page_list, kind FROM chunks WHERE id = :c AND version_id = :v"),
-                               {"c": ref["chunk_id"], "v": vid}).first()
+            row = conn.execute(text("SELECT text, section, page_list, kind, table_index, row_index FROM chunks"
+                                    " WHERE id = :c AND version_id = :v"), {"c": ref["chunk_id"], "v": vid}).first()
             if row is None:
                 raise ToolError(MSG_UNAVAILABLE)
-            return make(section=row.section, kind=row.kind, text=_clip(row.text, CONTEXT_CHARS[scope]),
+            shown = _served_hit_text(ws, conn, {"version_id": vid, "kind": row.kind, "table_index": row.table_index,
+                                                "row_index": row.row_index}, row.text)
+            return make(section=row.section, kind=row.kind, text=_clip(shown, CONTEXT_CHARS[scope]),
                         location=_location(row.section, row.kind, row.page_list, None, None, (None, None), None),
                         page_list=row.page_list)
         if scope == "table":
@@ -3722,7 +3769,7 @@ def read_scope(ws: Workspace, source_id: str, scope: str = "neighbors", ref: dic
         else:
             rows = reader.blocks_between(conn, vid, max(0, start - NEIGHBORS),
                                          (end if end is not None else start) + NEIGHBORS)
-        rows = [r for r in rows if r.text]
+        rows = [r for r in _served_rows(ws, conn, vid, rows) if r.text]
         if not rows:
             raise ToolError("אין טקסט בהקשר הזה")
         nums = [r.paragraph_no for r in rows if r.paragraph_no]
@@ -4039,7 +4086,7 @@ def _read_window_once(ws: Workspace, conn: Connection, v: reader.Version, target
         if unread_pages:
             raise ToolError(f"{name}: לא נקראו בעיבוד המסמך (אין בהם טקסט שנקרא)")
         raise ToolError(f"אין קטעים שנשמרו ב{name}" if target[0] == "pages" else "אין קטעים בסעיף הזה")
-    part = reader.take(rows, pos, read_chars(), ws.sent.get(str(vid), {}))
+    part = reader.take(_served_rows(ws, conn, vid, rows), pos, read_chars(), ws.sent.get(str(vid), {}))
     pages = sorted({r.page for r, _, _ in part.items if r.page})
     if target[0] == "section":
         location = _location(name, "text", pages, None, None, (None, None), None)
@@ -4105,7 +4152,7 @@ def _read_professional_section(ws: Workspace, conn: Connection, v: reader.Versio
     # ``take`` starts at ``pos``: the blocks before it are not loaded (as for the appraisal windows)
     rows = reader.blocks_between(conn, vid, max(sec.block_first, pos[0]) if pos else sec.block_first, sec.block_last,
                                  limit=None)
-    part = reader.take(rows, pos, read_chars(), ws.sent.get(str(vid), {}))
+    part = reader.take(_served_rows(ws, conn, vid, rows), pos, read_chars(), ws.sent.get(str(vid), {}))
     std = standard_for(ws, conn, vid, part.items[0][0].block_index if part.items else sec.block_first, secs)
     name = called(sec)
     return _emit(ws, v, target, pos, part, name=name, scope="section", location="", section=name, lines=lines,
@@ -4214,6 +4261,32 @@ def _table_rows(ws: Workspace, conn: Connection, v: reader.Version) -> dict[int,
     return found
 
 
+class _ServedBlock:
+    """A stored block of a table served reversed, read with its text in the order the table is drawn (round 21 U8, KTD6): every other
+    attribute is the stored row's. Used by the reads that show blocks to the agent and to the verifier; a quote's word span is looked
+    up in the stored blocks (``take_value``), which this never replaces."""
+
+    __slots__ = ("_row", "text")
+
+    def __init__(self, row, text_: str) -> None:
+        self._row, self.text = row, text_
+
+    def __getattr__(self, name: str):
+        return getattr(self._row, name)
+
+
+def _served_rows(ws: Workspace, conn: Connection, version_id, rows: list) -> list:
+    """``rows`` (stored blocks) with the text of each block of a table stored in reversed cell order served in the order it is drawn,
+    each cell with its column label (``stored_tables.serve_text``); every other block, and every table served as stored, as it is."""
+    out = []
+    for r in rows:
+        st = (_table_at(ws, conn, version_id, r.table_index)[0]
+              if getattr(r, "kind", None) == "table" and getattr(r, "table_index", None) is not None else None)
+        served = stored_tables.serve_text(st, r.text or "") if st else None
+        out.append(r if served is None or served == (r.text or "") else _ServedBlock(r, served))
+    return out
+
+
 def _read_table(ws: Workspace, conn: Connection, v: reader.Version, table_index: int, row0: int = 0) -> Source:
     """``table_rows()`` rows of a table from ``row0``, each part with the table's caption, size, headers and
     notes (a continuation keeps the headers and the notes that carry the units)."""
@@ -4269,6 +4342,8 @@ def _read_table_once(ws: Workspace, conn: Connection, v: reader.Version, table_i
                       body="\n".join(head) + "\n" + sent,
                       tags={"document": ws.doc_handle(v.document_id),
                             "table": _table_handle(ws, v.document_id, vid, v.reading_id, table_index)})
+    if not st.get("section") and block is not None:
+        s.heading = _heading_of(conn, v.version_id, block.block_index)
     _mark(s, cx, numbers, ws)
     ws.once(s, ("read", target, row0))
     ws.touch(v.document_id, v.title, "read", v.partial, {"sid": s.sid, "scope": "table", "name": name,
@@ -4350,7 +4425,8 @@ def _read_source(ws: Workspace, conn: Connection, sid: str) -> Source:
         return s
     end = end if end is not None else start
     cx = contexts_of(ws, conn, v.version_id, v.reading_id)
-    rows = reader.blocks_between(conn, v.version_id, max(0, start - NEIGHBORS), end + NEIGHBORS)
+    rows = _served_rows(ws, conn, v.version_id,
+                        reader.blocks_between(conn, v.version_id, max(0, start - NEIGHBORS), end + NEIGHBORS))
     chosen, cut = _neighbors(rows, start, end, ws.sent.get(vid, {}))
     if not chosen:
         raise ToolError("למקור הזה אין קטעים בקריאה הנוכחית של המסמך")
@@ -6194,9 +6270,14 @@ def _check_quote_of_row(quote: str, rows: list[list[str]], ri: int, ci: int, whe
 def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str | _ScaleNote = "") -> dict:
     """The cell a locator names in a table structure (``extracted_tables.structure``, or a visual reading's table in
     the same shape), its number checked against the cell and the source's text, with what the table attests.
-    ``governing``: the scale note that governs the table from a block above it (``calc.governing_note``)."""
+    ``governing``: the scale note that governs the table from a block above it (``calc.governing_note``). A table stored in reversed
+    cell order is resolved in the order it is drawn (what the agent was shown): the column the locator names is a served position or
+    a served label; the value, its box and the datum's identity are looked up by the STORED column (round 21 U8, KTD6)."""
+    st = stored_tables.serve_structure(st)
     rows = [list(r.get("cells") or []) for r in st.get("rows") or []]
     headers = list(st.get("headers") or [])
+    if st.get("columns") is not None and not any(headers):
+        headers = stored_tables.served_labels(st)[0]  # a Latin header row is no header to the extraction, but it labels the columns
     if not rows:
         raise ToolError("לטבלה אין שורות")
     if _is_row_text(loc.get("row")):
@@ -6338,7 +6419,8 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
             "kind_context": " ".join([label, header, st.get("caption") or ""]),
             "kind_parts": [("row", label), ("header", header), ("caption", st.get("caption") or "")],
             "locator": {"table_index": index, "row": cells[0] if cells else "", "row_number": ri + 1,
-                        "column": header, "column_number": ci + 1},
+                        "column": header, "column_number": stored_tables.stored_column(st, ci) + 1,
+                        **({"column_shown": ci + 1} if st.get("columns") is not None else {})},
             "total": bool(calc.TOTAL_WORDS.search(meaning._norm(cells[0] if cells else ""))),
             "table": (str(src.version_id), index), "said": said, "context": " ".join([*near, *table_text]),
             "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale,
@@ -6346,7 +6428,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
             # what the facet is read from (round 13 U3, KTD2): the row label, the column header and the caption and title
             "facet_in": _cell_facet_in(label, header, st, cells),
             # the cell as stored (KTD1): its box is looked up when the answer is stored, never searched for
-            "anchor": {"table_index": index, "row": ri, "column": ci,
+            "anchor": {"table_index": index, "row": ri, "column": stored_tables.stored_column(st, ci),
                        "pages": [p] if (p := (st.get("rows") or [])[ri].get("page")) else []}}
 
 
@@ -6468,7 +6550,7 @@ def _row_quote_locator(sid: str, st: dict, loc: dict) -> dict:
     wanted = _parse_number(loc["number"])
     if wanted is None:
         raise _not_one_number(loc["number"])
-    rows = [list(r.get("cells") or []) for r in st.get("rows") or []]
+    rows = [list(r.get("cells") or []) for r in (stored_tables.serve_structure(st) or {}).get("rows") or []]  # as drawn (U8)
     quote = _row_shape(loc["quote"])
     if _quote_too_short(quote):
         raise ToolError(f"הציטוט אינו מופיע כלשונו ב-{sid}: העתק את המשפט מהמקור בדיוק (או בחר תא בטבלה)")
@@ -7400,7 +7482,8 @@ def _locator_agrees(record: dict, loc: dict) -> bool:
     for k in ("row_number", "column_number"):
         if loc.get(k) is not None:
             try:
-                if int(loc[k]) != where.get(k):
+                # a table served in the order it is drawn names its column by the position shown (``column_shown``, round 21 U8)
+                if int(loc[k]) != (where.get("column_shown", where.get(k)) if k == "column_number" else where.get(k)):
                     return False
             except (TypeError, ValueError):
                 return False
