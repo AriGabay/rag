@@ -6602,7 +6602,9 @@ def _check_evidence(u: Unit, names_from: str, ws: Workspace, question: str, head
                 state = DIFFERENT if complete else contexts.UNKNOWN
             if state == DIFFERENT and not stated:
                 if unaccused is None:  # read only where a removal is at stake
-                    unaccused = located_contexts(ws, cx) | _named_sides(ws, cx)
+                    # the located unit counts only when the request names no side: with a named side the location may be the agent's own
+                    # declaration, which never excuses its evidence against a question that names another side (round 15 held-out)
+                    unaccused = _named_sides(ws, cx) | (set() if distinctive else located_contexts(ws, cx))
                 if n in unaccused:
                     state = contexts.UNKNOWN
             states.append(state)

@@ -1402,6 +1402,18 @@ def test_evidence_in_the_located_unit_is_not_another_property_whatever_the_answe
     assert run(located).reason is None  # the turn located unit 1: its value is not another property's
 
 
+def test_a_declared_and_located_unit_never_excuses_its_evidence_against_a_question_that_names_another_side(enforced):
+    from app.chat import verify
+
+    cx = _ownership_file()
+    # the question names unit 1; the agent declared and cited unit 3, so the turn's located unit is 3
+    ws = _declared_ws(cx, {}, ASK_OWNER, declared=[3], sources={"S3": _passage(3, OTHER_SOURCE[1])})
+    ws.located_unit = {"key": cx.key(3), "anchor": {}}
+    claim = "ההכנסה נטו השנתית היא 610,000 ₪"  # names no property: the question decides the asked side
+    found = verify._context_check(verify.Unit(0, f"{claim} [S3].", claim, ["S3"]), ws, ASK_OWNER)
+    assert found.reason and cx.describe(3) in found.reason and cx.describe(1) in found.reason  # still another property's
+
+
 def test_a_contradicted_value_whose_subject_names_a_sibling_is_not_another_property_when_it_lies_in_the_located_unit(enforced):
     from app.chat import verify
 
