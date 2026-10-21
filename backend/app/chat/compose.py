@@ -49,6 +49,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from app.chat.engine import FinalAnswer
 
+# the additions inside the answer that name a datum (``ServerSpan.claim_ids``, ``datum``): the audit of ``Doc.audit`` reads these
+AUDITED_KINDS = ("qualifier", "scope_note", "citation", "partial_mark")
 SERVER_KINDS = ("marker", "partial_mark", "qualifier", "citation", "removal_note", "request_note", "gap_paragraph",
                 "limit_sentence", "coverage_note", "membership_note", "replacement", "unread_notice",
                 "conditional_note", "item_gap", "scope_note", "uncertainty_line")
@@ -135,6 +137,9 @@ class Doc:
         self._origin = list(range(len(text)))
         self._kind: dict[int, str] = {}
         self._ref: dict[int, tuple] = {}
+        # for each span, the offset in the model's draft of the model character it was written right after (-1: none before it): its anchor
+        # in model-text coordinates, which no later edit moves (round 21 U6, KTD1, KTD4)
+        self._anchor: dict[int, int] = {}
         self._count = 0
 
     def splice(self, start: int, end: int, insert: str = "", kind: str | None = None, ref: tuple = ()) -> None:
@@ -146,9 +151,18 @@ class Doc:
             self._count += 1
             tag = self._count
             self._kind[tag], self._ref[tag] = kind, ref
+            self._anchor[tag] = self._origin_before(start)
         self.text = self.text[:start] + insert + self.text[end:]
         self._tag[start:end] = [tag] * len(insert)
         self._origin[start:end] = [-1] * len(insert)
+
+    def _origin_before(self, at: int) -> int:
+        """The draft offset of the model character nearest before ``at``, the server's own characters skipped; -1 when none, and -2 when the
+        nearest is model text with no draft offset (text the model wrote that an edit replaced)."""
+        i = at - 1
+        while i >= 0 and self._tag[i]:
+            i -= 1
+        return -1 if i < 0 else (self._origin[i] if self._origin[i] >= 0 else -2)
 
     def append(self, text: str, kind: str) -> None:
         self.splice(len(self.text), len(self.text), text, kind)
@@ -182,6 +196,68 @@ class Doc:
         lead = len(self.text) - len(self.text.lstrip())
         trail = len(self.text.rstrip())
         self.delete([(0, lead), (trail, len(self.text))])
+
+    def model_line(self, at: int) -> tuple[int, str, list[int]]:
+        """The line of the text holding ``at``: where it starts, its text with the server's characters blanked, and the draft offset of each
+        of its characters (-1 for the server's)."""
+        a = self.text.rfind("\n", 0, at) + 1
+        b = self.text.find("\n", at)
+        b = len(self.text) if b < 0 else b
+        blank = "".join(" " if self._tag[i] else self.text[i] for i in range(a, b))
+        return a, blank, self._origin[a:b]
+
+    def survivors(self, ranges: list[tuple[int, int]], letters: bool = True) -> list[int]:
+        """The positions of the letters and digits (``letters``; else every character but a space) of the text that the model wrote at the draft
+        ranges ``ranges`` and that the edits left."""
+        return [i for i, o in enumerate(self._origin)
+                if o >= 0 and (self.text[i].isalnum() if letters else not self.text[i].isspace())
+                and any(a <= o < b for a, b in ranges)]
+
+    def audit(self, datum_ranges, kinds: tuple[str, ...] = AUDITED_KINDS) -> int:
+        """The audit of the server's additions inside the answer (round 21 U6, KTD4; R1): each addition of ``kinds`` that names a datum is
+        dropped when the datum's text is no longer in the answer, and follows it when the datum's place changed; the rest are left as they are.
+        ``datum_ranges(span)``: the datum's text as draft ranges (model-text coordinates), or None when the caller cannot tell (the addition
+        is then left alone: unknown never removes). The addition stays where it was written when the model character it was written after is
+        still right before it; when that character is still in the text but something else stands between, it is moved to follow it; when
+        the character went (a cut took the end of the datum's clause) it follows the last character of the datum's text before it, and when
+        nothing of the datum's text is left before it, it goes. Deterministic, no judge call; a second run changes nothing. Returns the
+        number of additions dropped or moved."""
+        changed = 0
+        for _ in range(len(self._kind) + 1):  # one change at a time on the text as it stands; each makes its span settled
+            action = self._next_audit(datum_ranges, kinds)
+            if action is None:
+                break
+            span, ref, anchor_at = action
+            text, tag = self.text[span.start:span.end], self._tag[span.start]
+            self.delete([(span.start, span.end)])
+            if anchor_at is not None:
+                at = anchor_at - (span.end - span.start) if anchor_at > span.start else anchor_at
+                self.splice(at, at, text, self._kind[tag], ref)
+            changed += 1
+        return changed
+
+    def _next_audit(self, datum_ranges, kinds):
+        pos = {o: i for i, o in enumerate(self._origin) if o >= 0}
+        for span, ref in self.refs():
+            tag = self._tag[span.start]
+            if span.kind not in kinds or not (span.claim_ids or span.datum) or self._anchor.get(tag, -1) < 0:
+                continue
+            ranges = datum_ranges(span)
+            if ranges is None:
+                continue
+            here = self._origin_before(span.start)
+            if here == -2 or here == self._anchor[tag]:
+                continue  # at its anchor (or the text before it is not the draft's: nothing to compare)
+            alive = self.survivors(ranges)
+            if not alive:
+                return span, ref, None  # the datum is no longer in the answer: its addition goes
+            if self._anchor[tag] in pos:
+                return span, ref, pos[self._anchor[tag]] + 1  # the character it followed is there: it follows it again
+            before = [i for i in self.survivors(ranges, letters=False) if self._origin[i] < self._anchor[tag]]
+            if before:
+                return span, ref, max(before, key=lambda i: self._origin[i]) + 1  # the end of the datum's clause went: it follows what is left
+            return span, ref, None
+        return None
 
     def clear(self) -> None:
         self.splice(0, len(self.text))

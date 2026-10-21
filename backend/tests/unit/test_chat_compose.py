@@ -85,6 +85,97 @@ def test_every_server_kind_is_a_fixed_word_and_a_span_of_an_unknown_kind_is_refu
     raise AssertionError("a kind outside SERVER_KINDS was accepted")
 
 
+# --- the audit of the server's additions: a note whose datum went is dropped, one whose datum moved follows it (round 21 U6, KTD4) --------
+
+def _audited(doc: Doc, ranges: dict[str, tuple[int, int] | None]) -> int:
+    """``Doc.audit`` over the claims ``ranges`` (claim id -> draft range, or None when unknown)."""
+    return doc.audit(lambda span: (lambda held: held or None)([ranges[c] for c in span.claim_ids if ranges.get(c)]))
+
+
+def test_round21_a_note_whose_datum_was_cut_is_dropped_and_a_note_whose_datum_stands_is_not():
+    model = "השכירות 5,000 וגם הניהול 7,000."
+    a1 = model.index("5,000") + len("5,000")
+    a2 = model.index("7,000") + len("7,000")
+    d = Doc(model)
+    d.edit([(a1, a1, " (תנאי א)", "qualifier", ("k1",)), (a2, a2, " (תנאי ב)", "qualifier", ("k2",)),
+            (model.index("7,000"), a2, MARKER.format(n=1), "marker", ("k2",))])  # the second datum is cut; its note stays after the marker
+    assert "(תנאי ב)" in d.text
+    ranges = {"k1": (model.index("5,000"), a1), "k2": (model.index("7,000"), a2)}
+    assert _audited(d, ranges) == 1
+    assert d.text == "השכירות 5,000 (תנאי א) וגם הניהול " + MARKER.format(n=1) + "."
+    assert [s.kind for s in d.spans()] == ["qualifier", "marker"] and d.spans()[0].claim_ids == ("k1",)
+    assert _audited(d, ranges) == 0  # a second run changes nothing
+
+
+def test_round21_server_text_between_a_note_and_the_character_it_followed_is_no_separation():
+    model = "השכירות 5,000 לחודש וגם הניהול 7,000."
+    a1 = model.index("5,000") + len("5,000")
+    d = Doc(model)
+    d.edit([(a1, a1, " (תנאי)", "qualifier", ("k1",))])
+    d.splice(a1, a1, " [S1]", "citation", ("k1",))  # a citation written between the number and its note
+    assert d.text.index("[S1]") < d.text.index("(תנאי)")
+    assert _audited(d, {"k1": (0, a1)}) == 0  # the note still follows the same model character
+    assert d.text.index("[S1]") < d.text.index("(תנאי)")
+
+
+def test_round21_a_clause_note_follows_what_is_left_of_its_clause_when_a_cut_took_the_end_it_followed():
+    model = "דמי השכירות 5,000 ₪ וגם 7,000 ₪."
+    end = model.index("₪.") + 1  # the clause note follows the last ₪, before the full stop
+    d = Doc(model)
+    d.edit([(end, end, " (התנאי לפי המקור: עד שנה)", "qualifier", ("k1",)),
+            (model.index(" וגם"), end, MARKER.format(n=1), "marker", ("k2",))])  # the tail of the clause is cut with the character the note followed
+    assert d.text.index("(התנאי") > d.text.index(MARKER.format(n=1))
+    ranges = {"k1": (0, len(model) - 1)}  # the claim is the whole clause: the first part of it stands
+    assert _audited(d, ranges) == 1
+    first = d.text.index("5,000 ₪") + len("5,000 ₪")
+    assert d.text.index("(התנאי") == first + 1 and d.text.endswith(".")  # it follows the part that is left
+    assert _audited(d, ranges) == 0
+
+
+def test_round21_a_note_with_nothing_of_its_datum_before_it_goes_and_unknown_data_and_other_kinds_are_left_alone():
+    model = "א 5,000 ב 7,000."
+    a2 = model.index("7,000") + len("7,000")
+    d = Doc(model)
+    d.edit([(a2, a2, " (תנאי)", "qualifier", ("k2",)), (model.index("7,000"), a2, MARKER.format(n=1), "marker", ("k2",))])
+    d.append("\n\n> הערה", "coverage_note")
+    assert _audited(d, {"k2": None}) == 0  # the caller cannot tell where the datum is: nothing is removed
+    assert _audited(d, {"k2": (model.index("7,000"), a2)}) == 1
+    assert "(תנאי)" not in d.text and "הערה" in d.text and MARKER.format(n=1) in d.text  # the cut marker and the coverage note are not audited
+
+
+def test_round21_the_audit_runs_inside_compose_after_the_tidy_cuts_and_the_closing_recomposition_is_a_fixed_point(monkeypatch):
+    from app.chat import final_check
+    from app.chat.compose import ref_of
+    from app.chat.verify import Edited
+
+    monkeypatch.setattr(coverage, "build", lambda ws, answer, question: ({}, answer))
+    a = _answer("השכירות 55 ₪ וגם הניהול 12 ₪ [S1].")
+
+    def respond(text: str) -> dict:
+        return {"verdict": "partial", "defect": "part", "claims": [{"span": "השכירות 55 ₪", "verdict": "supported"},
+                                                                   {"span": "הניהול 12 ₪", "verdict": "unsupported"}]}
+
+    r = verify_answer(_judge(respond), a, _ws(), "?", [])
+    first, second = r.claims[0][0], r.claims[0][1]
+    assert first.exact and second.exact and first.end <= second.start
+
+    def edited(answer):
+        d = Doc(answer.answer_markdown)
+        d.edit([(first.end, first.end, " (תנאי א)", "qualifier", ref_of([first.id])),
+                (second.end, second.end, " (תנאי ב)", "qualifier", ref_of([second.id])),
+                (second.start, second.end, MARKER.format(n=1), "marker", (second.id,))])
+        return Edited(d, "partial", answer.claims)
+
+    monkeypatch.setattr(r, "edit", edited)
+    saved = compose(_ws(), a, r, TurnRequirements(), question="?")
+    text = saved.answer.answer_markdown
+    assert "(תנאי א)" in text and "(תנאי ב)" not in text and MARKER.format(n=1) in text
+    assert [s.kind for s in saved.spans] == ["qualifier", "marker"]
+    again = compose(_ws(), a, r, TurnRequirements(), question="?")
+    final_check.assert_fixed_point(saved, again)  # the closing recomposition reproduces the text and its registry
+    assert again.answer.answer_markdown == text
+
+
 # --- the report's own edits: markers, partial marks, qualifiers, citations, notes, the replacement ------------------
 
 def _kinds_report():

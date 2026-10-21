@@ -671,6 +671,23 @@ def test_a_table_left_without_its_header_goes_with_it(offline, monkeypatch):
     assert _purposes(out).count("verify_final") == 1 and out.final_digest == text_digest(md)
 
 
+@pytest.mark.parametrize("intro, judged", [
+    ("הטבלה מציגה את הנתונים העיקריים של הנכס [S1].", False),  # round 20: an unrelated line above the table is no part of a row's verdict
+    ("הסכומים בטבלה הם לחודש, לפני מע״מ [S1].", True),  # round 21 U6, R9: a line that sets the period and the VAT is
+])
+def test_round21_a_removed_line_above_a_table_judges_its_rows_again_only_when_it_defined_what_they_say(offline, intro, judged):
+    table = "| נתון בנכס | ערך בש״ח |\n|---|---|\n| השווי למ\"ר | 9,500 ₪ [S1] |"
+    answer = f"{intro}\n{table}\n\n{VALUE}"
+
+    def rule(text, input, n):
+        return {"verdict": "unsupported", "failure": "absent_from_source"} if text.startswith(intro[:10]) else "supported"
+
+    out = _turn(ScriptedAgent([SEARCH, final(answer), final(answer), final(answer)], judge=Judge(rule)))
+    md = out.answer.answer_markdown
+    assert intro[:10] not in md and "9,500 ₪ [S1]" in md and out.final_digest == text_digest(md)
+    assert (_purposes(out).count("verify_final") == 1) is judged and out.final_check["judge_calls"] == int(judged)
+
+
 def test_a_component_given_only_by_the_part_a_cut_took_is_no_longer_given(offline):
     """KTD9: a unit that voted for a component and was cut is judged with the requirements block, and the votes are
     replaced by that call's scores — the gap paragraph then names the component the cut took away."""

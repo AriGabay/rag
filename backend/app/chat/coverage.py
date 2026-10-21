@@ -1153,8 +1153,70 @@ def compose_components(ws: Workspace, answer: FinalAnswer, report,
     if any(not o["children"] and o["status"] in UNMET for o in outcomes) and edited.status == "answered":
         edited.status = "partial"
     doc.delete(tidy_cuts(doc.text))
+    audit_server_spans(ws, report, doc)  # round 21 U6, KTD4: after the tidy cuts, before the blank lines, so every pass runs it from this state
     doc.tidy_blank_lines()
     return edited, outcomes
+
+
+def audit_server_spans(ws: Workspace, report, doc) -> int:
+    """The audit of the server's additions inside the answer (round 21 U6, KTD4; R1): an addition (a qualifier, a scope note, a citation or a
+    partial mark) whose datum is no longer in the text at its anchor is dropped, and one whose datum's place changed follows it
+    (``Doc.audit``). A step of ``compose_components``, a pure function of the report and the text as the editors left them, so the final
+    check's passes and the closing recomposition run it from the same state. The datum's text is the draft range of the claims the addition
+    is registered with (``ServerSpan.claim_ids``); an addition that names only a datum is read by that datum's value tokens (a V# by its
+    written form, a ledger item by its headline forms and fractions) and, for an item with no figure, by the claims of the sentence that
+    gives it. What cannot be read is left alone. No judge call. Returns the number of additions dropped or moved."""
+    ranges = {r.id: (r.start, r.end) for records in report.claims.values() for r in records}
+    states: dict[str, dict] = {}
+
+    def of_datum(span) -> list[tuple[int, int]] | None:
+        if not states and report.item_ledger is not None:
+            states.update({x["id"]: x for x in report.item_states()})
+        found: list[tuple[int, int]] = []
+        known = False
+        for datum in (d for d in span.datum.split(",") if d):
+            groups, fractions = _datum_tokens(ws, states, datum)
+            if groups or fractions:
+                known = True
+                found += _token_ranges(doc, span, groups, fractions)
+            elif datum in states:  # an item with no figure of its own: the sentence that gives it is its text
+                known = True
+                found += [ranges[r.id] for r in report.claims.get(states[datum].get("covered_by"), []) if r.id in ranges]
+        return found if known else None
+
+    def datum_ranges(span) -> list[tuple[int, int]] | None:
+        held = [ranges[c] for c in span.claim_ids if c in ranges]
+        if held:
+            return held
+        return of_datum(span) if span.datum else None
+
+    return doc.audit(datum_ranges)
+
+
+def _datum_tokens(ws: Workspace, states: dict, datum: str) -> tuple[tuple, tuple]:
+    """The value tokens ``(headline groups, fractions)`` of the datum a server addition is bound to (a V# by its written form, a ledger item
+    by its headline forms and fractions); empty for a datum with none or one this audit cannot read."""
+    from app.chat.items import headline, value_tokens
+
+    if datum in ws.values:
+        written = ws.values[datum].written or ""
+        return headline(written, written), ()
+    if datum in states:
+        return value_tokens(states[datum].get("value") or "", states[datum].get("quote") or "")
+    return (), ()
+
+
+def _token_ranges(doc, span, groups, fractions) -> list[tuple[int, int]]:
+    """The draft ranges of the places where the line of the addition states the datum's value tokens (``items.token_places``)."""
+    from app.chat.items import token_places
+
+    _, line, origin = doc.model_line(span.start)
+    out = []
+    for places in token_places(line, groups, fractions):
+        for a, b in places:
+            if origin[a] >= 0 <= origin[b - 1]:
+                out.append((origin[a], origin[b - 1] + 1))
+    return out
 
 
 def state_components(ws: Workspace, answer: FinalAnswer, report,

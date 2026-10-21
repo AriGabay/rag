@@ -2965,6 +2965,20 @@ def test_ae4_a_time_limit_of_the_neighbouring_row_is_a_condition_from_another_it
     assert "תקופה אחרת" not in p.reason and r.removed_units() == set()
 
 
+def test_round21_a_foreign_condition_request_is_sent_only_when_the_items_own_value_has_one_place_in_its_sentence():
+    # the item's figure stands twice in its sentence: the sentence cannot be said to give the item at one place, so a request to take "its
+    # neighbour's condition" out of it would be aimed at a clause that may be the item's own (round 21 U5, R1, R2)
+    rows = ("סוג | שכירות | הערה", "דירה קטנה | 3,000 | עד שנה מהמסירה", "דירה גדולה | 5,000 |")
+    raw = [_adj_item("שכירות דירה קטנה", "דירה קטנה | 3,000", "3,000"), _adj_item("שכירות דירה גדולה", "דירה גדולה | 5,000", "5,000")]
+    decide = lambda iid, attrs, block: ("other_item", "עד שנה מהמסירה") if iid == "I2" else None  # noqa: E731
+    once = "השכירות לדירה גדולה היא 5,000 עד שנה מהמסירה [S2]. השכירות לדירה קטנה היא 3,000 עד שנה מהמסירה [S2]."
+    r, *_ = _plan_check(once, decide, rows=rows, raw=raw, ask="שכירות הדירות")
+    assert [p.check for p in _condition_problems(r)] == [verify.CONDITION_FOUND_CHECK]  # a unique place: the request stands
+    twice = "השכירות לדירה גדולה היא 5,000, כלומר 5,000 עד שנה מהמסירה [S2]. השכירות לדירה קטנה היא 3,000 עד שנה מהמסירה [S2]."
+    r, ws, answer, _ = _plan_check(twice, decide, rows=rows, raw=raw, ask="שכירות הדירות")
+    assert _condition_problems(r) == [] and r.removed_units() == set()
+
+
 TWO_APPRAISALS = "השטח הכולל לבנייה בנכס הוא 1,200 מ״ר בשומה הראשונה ו-900 מ״ר בשומה השנייה [S2][S3]."
 SECOND_APPRAISAL = "השטח הכולל לבנייה בנכס הוא 900 מ״ר."
 

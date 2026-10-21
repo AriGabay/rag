@@ -1449,12 +1449,77 @@ def table_context(u: Unit) -> tuple[str, str]:
     return header, lead
 
 
+# the words that state the unit, the scale, the period, the VAT or the basis of what follows (round 21 U6, KTD4, R9): "in thousands of ₪", "in
+# m²", "(₪)", "per m²", "gross" are written without a figure, so no number stands near them to tie them to a datum
+_UNIT_STATED = re.compile(
+    r"(?<![א-ת])ב[-־]?(?:אלפי|מיליוני|מיליארדי|שקלים|ש[\"״]ח|₪|מ[\"״]ר|דונם|אחוזים|דולרים|יורו)(?![א-ת])"
+    r"|\(\s*(?:₪|ש[\"״]ח|מ[\"״]ר|%|אלפי\s+₪)\s*\)|(?<![א-ת])בסיס\s+(?:ה)?(?:שטח|חישוב|מדידה)|ב[-־]?(?:₪|%)")
+
+
+def defining_line(line: str) -> bool:
+    """Whether a line states the unit, scale, period, VAT, basis or scope of what follows it (round 21 U6, KTD4, R9): a scope below the
+    property (``names_scope``), a VAT phrase, a period or area-basis word (``meaning._scan``, the reading the meaning check uses) or the unit a
+    column of figures is given in. A line that says none of them is context the verdict of what follows does not depend on."""
+    text = meaning._norm(_norm(_IDS.sub("", line or "")))  # one spelling of the abbreviation marks, as the meaning check reads
+    if not text:
+        return False
+    return (names_scope(text) or bool(_VAT.search(text)) or bool(_UNIT_STATED.search(text))
+            or any(kind in ("period", "basis") for _, kind, _, _ in meaning._scan(text, rates=False)))
+
+
+def defining_leads(markdown: str, units: Sequence[Unit]) -> dict[int, str]:
+    """For each list item, the line that opens its list (round 21 U6, KTD4, R9): the nearest line above the list that is no item, no blank
+    line, no heading and no table row, when it states a unit, period, VAT, basis or scope (``defining_line``). A table row's opening line is
+    its context (``Unit.context``); the sentences of a paragraph are each their own statement, so the first of them defines nothing for the
+    next. Empty for a unit with none: an unrelated lead is no part of what a verdict depends on."""
+    lines = markdown.split("\n")
+    starts = [0]
+    for line in lines:
+        starts.append(starts[-1] + len(line) + 1)
+    out: dict[int, str] = {}
+    for u in units:
+        if u.table_span is not None or not u.list_item:
+            continue
+        n = min(max(bisect.bisect_right(starts, u.start) - 1, 0), len(lines) - 1)
+        while n > 0:
+            above = lines[n - 1]
+            if not above.strip() or _LIST_ITEM.match(above.strip()) or above[:1] in (" ", "\t"):
+                n -= 1
+                continue
+            text = above.strip()
+            if not (text.startswith("|") or _HEADING_LINE.match(text)) and defining_line(text):
+                out[u.index] = _norm(_IDS.sub("", text))
+            break
+    return out
+
+
+def table_contexts(markdown: str, units: Sequence[Unit]) -> dict[int, str]:
+    """``Unit.context`` of each table row of ``units`` as ``split_units`` writes it, read from ``markdown`` (round 21 U6): the final check
+    reads it from the text with the server's spans blanked, so a note written in the line before a table is not a new lead of its rows."""
+    lines = markdown.split("\n")
+    starts = [0]
+    for line in lines:
+        starts.append(starts[-1] + len(line) + 1)
+    out: dict[int, str] = {}
+    for u in units:
+        if u.table_span is None:
+            continue
+        n = min(max(bisect.bisect_right(starts, u.start) - 1, 0), len(lines) - 1)
+        first = min(max(bisect.bisect_right(starts, u.table_span[0]) - 1, 0), len(lines) - 1)
+        before = next((lines[i].strip() for i in range(first - 1, -1, -1) if lines[i].strip()), "")
+        out[u.index] = (lines[first].strip() if first < n else "") + "\n" + before
+    return out
+
+
 def key_context(unit: Unit) -> str:
-    """The context a table row's verdict is reused under (round 20 U2, KTD2, R7): the table's header row, and the line before the table
-    only when it names a scope (``names_scope``). A line that carries neither a header nor a scope is left out of that memory, so the
-    removal of such a line elsewhere in the answer does not by itself judge a row again. A unit that is no table row has no context."""
+    """The context a verdict is reused under (round 20 U2, KTD2, R7; round 21 U6, KTD4, R9): for a table row, the table's header row and the
+    line before the table when it defines what the row says — its scope, unit, period, VAT or basis (``defining_line``); for a list item,
+    the line that opens its list when it defines them (``Unit.lead``). A line that defines none of these is left out of that memory, so the removal
+    or the change of such a line elsewhere in the answer does not by itself judge a unit again, and a changed defining line does."""
     header, lead = table_context(unit)
-    return header + ("\n" + lead if names_scope(lead) else "")
+    if header or lead:
+        return header + ("\n" + lead if defining_line(lead) else "")
+    return unit.lead
 
 
 def unit_key(unit: Unit, ws: Workspace, request: str, heading: str, digests: dict[str, str]) -> str:
@@ -1521,6 +1586,9 @@ class Unit:
     # to the judge as ``<preceding>`` (rule 31)
     preceding: str = ""
     removed_before: list[int] = field(default_factory=list)
+    # for a list item (round 21 U6, KTD4): the line that opens its list when it defines the item's unit, period, VAT, basis or scope
+    # (``defining_leads``), set by ``split_units``; part of the reuse key (``key_context``)
+    lead: str = ""
 
 
 def _norm(text: str) -> str:
@@ -3321,8 +3389,10 @@ def split_units(markdown: str) -> list[Unit]:
             units[-1].leads_list = bool(_LIST_ITEM.match(following) or _HEADING_LINE.match(following))
     units = _attach_bare_lines(markdown, units)
     chains = _headings_above(markdown, units)
+    leads = defining_leads(markdown, units)
     for u in units:
         u.heading = chains[u.index]
+        u.lead = leads.get(u.index, "")
     return units
 
 
@@ -4882,6 +4952,10 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
                     r.verdict, r.failure = "contradicts", "none"
             removed.add(unit.index)
         elif verdict.outcome == OTHER_ITEM:
+            if _item_anchor(unit, st, states) is None:
+                # the sentence does not give this item at one place of its own tokens: a request to take "another item's condition" out of
+                # it could aim at a clause that is the item's own or a sibling datum's, so nothing is asked (round 21 U5, R1, R2; KTD1)
+                continue
             report.problems.append(Problem(Unit(-1, "", "", []), REQ_CONDITION_OTHER.format(
                 name=name, where=f"«{prompt_text(verdict.quote)}»"), kind="requirement", component=st["component"],
                 check=CONDITION_FOUND_CHECK))
@@ -6464,6 +6538,9 @@ def _check_evidence(u: Unit, names_from: str, ws: Workspace, question: str, head
         complete = True
         by_heading = set(cx.resolve(heading)) if heading else set()  # a cell is checked against the side its column names
         asked = by_heading or set(cx.named(names_from))
+        # the asked set came from the column or the claim's own words: those name the property and nothing below overrides them; any other
+        # basis (the request, the value's subject, a declaration) leaves the located unit and the request's sides unaccused (round 21 U5)
+        stated = bool(asked)
         if not asked:
             naming = " ".join(subjects)
             sides = [resolved_sides(cx, x) for x in subjects] if from_components else []
@@ -6474,8 +6551,11 @@ def _check_evidence(u: Unit, names_from: str, ws: Workspace, question: str, head
             asked, complete = resolved_sides(cx, question, explicit=True)
         # a unit named only by a name that the evidence's own unit writes in the passages read there is named by nothing
         # that separates it from that unit (round 15, held-out)
+        # — except a side the evidence itself lies in (round 21 U5, R6): the request names it and the evidence is its own, so its name standing
+        # in its own cited passage is no reason to drop it (a comparison's side would be left out of its own value's check, and the value
+        # judged another property's by the other side)
         if not by_heading:
-            asked = {n for n in asked if cx.named_by_identifier(n, naming)
+            asked = {n for n in asked if n in numbers or cx.named_by_identifier(n, naming)
                      or not any(Identity(names=(x,)).name_spans(t) for x in cx.naming_names(n, naming) for t in passages)}
         declared = declared_contexts(ws, cx)
         distinctive = bool(asked)
@@ -6491,11 +6571,20 @@ def _check_evidence(u: Unit, names_from: str, ws: Workspace, question: str, head
         # the evidence's owner against the asked property (round 19 U2): what its own text writes, the identity of its unit, a link,
         # and the continuity of the pages that only continue the asked context (round 18 U3, KTD3)
         spans, linked = _evidence_spans(i, ws)
+        # evidence in the unit the turn located, or in a side the request named whole, is never another property's unless the claim's own
+        # words (or its column) name another property distinctively: a declaration, or the model's word for a value's subject, does not
+        # outweigh where the question was read (round 21 U5, R4, R6) — the judge is told, nothing is removed
+        unaccused: set[int] | None = None
         states = []
         for n in sorted(numbers):
             state = cx.compare(n, asked, spans, linked, complete)
             if state != SAME and contradicted and not cx.is_subject(n):  # the source places this appendix value on another property
                 state = DIFFERENT if complete else contexts.UNKNOWN
+            if state == DIFFERENT and not stated:
+                if unaccused is None:  # read only where a removal is at stake
+                    unaccused = located_contexts(ws, cx) | _named_sides(ws, cx)
+                if n in unaccused:
+                    state = contexts.UNKNOWN
             states.append(state)
         where = ", ".join(cx.describe(n) for n in sorted(numbers))
         if SAME in states:
@@ -6526,6 +6615,16 @@ def _check_evidence(u: Unit, names_from: str, ws: Workspace, question: str, head
         others=", ".join(dict.fromkeys(d[2] for d in decided if d[0] != DIFFERENT)),
         elsewhere="; ".join(dict.fromkeys(d[1] for d in decided if d[0] != DIFFERENT))))
     return out
+
+
+def _named_sides(ws: Workspace, cx) -> set[int]:
+    """The contexts of ``cx`` the request names, each side of every subject resolved whole (``tools.resolved_sides``): the components'
+    subjects, else the question. Empty when a compound subject resolved only in part (round 21 U5)."""
+    from app.chat.tools import asked_subjects, resolved_sides
+
+    subjects, from_components = asked_subjects(ws)
+    found = [resolved_sides(cx, x, explicit=not from_components) for x in subjects]
+    return set().union(*(n for n, _ in found)) if found and all(c for _, c in found) else set()
 
 
 MSG_OWNER_UNKNOWN = ("{what} כתוב ב{where}; הטענה עוסקת ב{asked}{partial}. השרת לא מצא בטקסט המצוטט ובזהות היחידה ראיה שמכריעה אם "

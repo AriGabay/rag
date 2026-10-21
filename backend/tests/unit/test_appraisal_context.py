@@ -1338,6 +1338,88 @@ def test_a_claim_citing_only_a_source_of_the_asked_property_has_nothing_to_repor
     assert found.reason is None and found.facts == []
 
 
+# --- evidence in the located unit or in a side the request named is never another property's (round 21 U5, R4, R6) ----------------
+
+SIDE_A, SIDE_B = "מתחם גבעת האלה", "פרויקט נחל הלוטם"
+
+
+def _compare_ws(cx, sources: dict[str, tuple[int, str]], subject: str, question: str = "השווה"):
+    ws = _declared_ws(cx, {}, question, sources={i: _passage(n, t) for i, (n, t) in sources.items()})
+    ws.requirement_items = [{"subject": subject}]
+    return ws
+
+
+def _compare_check(cx, sources, subject, claim="ההכנסה נטו השנתית היא 610,000 ₪", **ws_fields):
+    from app.chat import verify
+
+    ws = _compare_ws(cx, sources, subject)
+    for key, value in ws_fields.items():
+        setattr(ws, key, value)
+    return verify._context_check(verify.Unit(0, f"{claim} [{', '.join(sources)}].", claim, list(sources)), ws, "השווה")
+
+
+def test_a_comparison_side_whose_name_stands_in_its_own_cited_passage_is_still_a_side_asked(enforced):
+    cx = _ownership_file()
+    # the passage of side A writes side A's name: the name filter used to drop A from the asked set, leaving only B, so A's own value was "another property's"
+    subject = f"{SIDE_A} ו{SIDE_B}"
+    own_a = (1, f"{SIDE_A} — הכנסה נטו שנתית 610,000 ₪.")
+    own_b = (3, f"{SIDE_B} — הכנסה נטו שנתית 610,000 ₪.")
+    assert _compare_check(cx, {"S1": own_a}, subject) == verify_check_empty()
+    assert _compare_check(cx, {"S3": own_b}, subject) == verify_check_empty()
+    assert _compare_check(cx, {"S1": own_a, "S3": own_b}, subject) == verify_check_empty()
+    # protection: evidence of a third property is still another property's, with the note that says so
+    third = _compare_check(cx, {"S4": (4, "פרויקט עין השקמה — הכנסה נטו שנתית 610,000 ₪.")}, subject)
+    assert third.reason and cx.describe(4) in third.reason
+
+
+def verify_check_empty():
+    from app.chat import verify
+
+    return verify.ContextCheck()
+
+
+def test_a_name_the_evidence_unit_writes_still_does_not_make_another_unit_the_asked_one_when_the_evidence_is_not_in_the_asked_unit(enforced):
+    # the round-15 filter keeps its job: the asked unit (A) is not the evidence's own unit (3), whose passages write A's name
+    cx = _ownership_file()
+    found = _compare_check(cx, {"S3": (3, f"{SIDE_A} — הכנסה נטו שנתית 610,000 ₪ ב{SIDE_B}.")}, SIDE_A)
+    assert found.reason is None
+
+
+def test_evidence_in_the_located_unit_is_not_another_property_whatever_the_answer_declared(enforced):
+    cx = _ownership_file()
+    own = (1, "הכנסה נטו שנתית 610,000 ₪.")
+    located = {"key": cx.key(1), "anchor": {}}
+    declared_sibling = [{"document_id": "d", "reading_id": cx.reading_id, "unit_no": 3, "units_tag": cx.tag, "display": cx.label(3)}]
+    from app.chat import verify
+
+    def run(located_unit):
+        ws = _declared_ws(cx, {}, "מה ההכנסה?", declared=[3], sources={"S1": _passage(1, own[1])})
+        ws.located_unit = located_unit
+        return verify._context_check(verify.Unit(0, "ההכנסה נטו השנתית היא 610,000 ₪ [S1].", "ההכנסה נטו השנתית היא 610,000 ₪", ["S1"]),
+                                     ws, "מה ההכנסה?")
+
+    assert declared_sibling and run(None).reason  # nothing located: the declared sibling is the asked set, unit 1 is another property
+    assert run(located).reason is None  # the turn located unit 1: its value is not another property's
+
+
+def test_a_contradicted_value_whose_subject_names_a_sibling_is_not_another_property_when_it_lies_in_the_located_unit(enforced):
+    from app.chat import verify
+
+    cx = _ownership_file()
+
+    def run(located_unit):
+        ws = _declared_ws(cx, {}, "מה ההכנסה?")
+        ws.values = {"V1": SimpleNamespace(context=_real_value(cx, 1, "V1", "1").context, written="610,000", version_id="v",
+                                           subject_from="contradicted", subject=SIDE_B)}
+        ws.located_unit = located_unit
+        claim = "ההכנסה נטו השנתית היא 610,000 ₪"
+        return verify._context_check(verify.Unit(0, f"{claim} [V1].", claim, ["V1"]), ws, "מה ההכנסה?")
+
+    assert run(None).reason  # the value's subject names a sibling and nothing locates unit 1
+    assert run({"key": cx.key(1), "anchor": {}}).reason is None
+    assert run({"key": cx.key(3), "anchor": {}}).reason  # a located unit that is the sibling does not excuse unit 1's value
+
+
 # --- scopes below the property: the plan, parcel, lot, contract, alternative, stage or state a datum is under (round 20 U3, KTD3) ----------
 #
 # Every identifier, plan number and name below is invented; the shapes (a lettered paragraph that opens a plan, a table whose columns are

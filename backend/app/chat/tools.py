@@ -1122,7 +1122,7 @@ def asked_subjects(ws: Workspace) -> tuple[list[str], bool]:
 def located_contexts(ws: Workspace, cx) -> set[int]:
     """The context of ``cx`` that is the unit the turn located for the question (``locate_unit``), when it is in this
     file: the asked property of a question whose words name no unit's title (a file whose units state none)."""
-    located = ws.located_unit
+    located = getattr(ws, "located_unit", None)  # a workspace without one (a bare fixture) located nothing
     return {n for n in cx.numbers if located and cx.is_subject(n) and cx.key(n) == located["key"]} if cx.multi else set()
 
 

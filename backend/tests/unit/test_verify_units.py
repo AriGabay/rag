@@ -2086,6 +2086,49 @@ def test_the_reuse_key_of_a_table_row_holds_its_header_and_the_scope_its_lead_li
     assert _row_key("הטבלה מציגה.", heading="## מצב קיים\n") != _row_key("הטבלה מציגה.", heading="## מצב מוצע\n")  # so is the heading chain
 
 
+def _item_key(lead: str, item: str = "- השווי למ\"ר 9,500 ₪ [S1]", heading: str = "") -> str:
+    md = f"{heading}{lead}\n\n{item}\n- דמי השכירות 55 ₪ [S1]"
+    row = next(u for u in split_units(md) if "9,500" in u.text)
+    return verify.unit_key(row, _ws(SOURCE), "?", row.heading, {})
+
+
+@pytest.mark.parametrize("line, defines", [
+    ("הסכומים שלהלן הם לחודש לפי עמוד 4.", True), ("כל הסכומים לשנה, לפני מע״מ.", True), ("הנתונים כוללים מע״מ.", True),
+    ("הסכומים באלפי ₪ ובמ״ר ברוטו.", True), ("השטחים בטבלה הם מ״ר ברוטו.", True), ("הנתונים לפי תכנית ב׳.", True),
+    ("הנתונים בטבלה הם במיליוני ₪.", True), ("סכומים (₪) לפי הסעיפים", True),
+    ("הטבלה מציגה את הנתונים העיקריים של הנכס [S1].", False), ("שורה אחרת לגמרי, בלי תכנית ובלי חלופה.", False),
+    ("להלן פירוט הנתונים שנמצאו בעמוד 4.", False), ("", False),
+])
+def test_round21_a_line_defines_what_follows_when_it_states_a_unit_period_vat_basis_or_scope(line, defines):
+    assert verify.defining_line(line) is defines
+
+
+def test_round21_the_key_of_a_list_item_holds_the_defining_lead_of_its_list_and_no_other_line():
+    """R9, KTD4: a verdict is reused while the item, its evidence and the lines that define its unit, period, VAT, basis and scope are the
+    same; a changed defining lead invalidates it and an unrelated line above the list does not."""
+    monthly, yearly = _item_key("הסכומים שלהלן הם לחודש, לפני מע״מ, לפי עמוד 4."), _item_key("הסכומים שלהלן הם לשנה, לפני מע״מ, לפי עמוד 4.")
+    assert monthly != yearly  # the lead that sets the period changed
+    assert monthly != _item_key("הסכומים שלהלן הם לחודש, כולל מע״מ, לפי עמוד 4.")  # so does its VAT
+    assert monthly == _item_key("הסכומים שלהלן הם לחודש, לפני מע״מ, לפי עמוד 4.")
+    plain = _item_key("להלן פירוט הנתונים שנמצאו בעמוד 4.")
+    assert plain == _item_key("") == _item_key("שורה אחרת לגמרי, בלי תכנית ובלי חלופה.")  # an unrelated line is left out
+    assert _item_key("להלן פירוט הנתונים שנמצאו בעמוד 5.") == plain
+    assert len({plain, monthly}) == 2  # a defining lead is in the key at all
+
+
+def test_round21_the_first_sentence_of_a_paragraph_defines_nothing_for_the_next_one():
+    key = lambda first: verify.unit_key(split_units(f"{first} השווי למ\"ר הוא 9,500 ₪ [S1].")[-1], _ws(SOURCE), "?", "", {})  # noqa: E731
+    assert key("הנתונים לחודש.") == key("הנתונים לשנה.")  # each sentence of a paragraph is its own statement
+
+
+def test_round21_the_defining_lead_of_a_table_is_part_of_the_key_of_its_rows():
+    """The line before a table states its unit, period or VAT: a row is judged again when it changes (round 20 kept only a scope line)."""
+    plain = _row_key("הטבלה מציגה את הנתונים העיקריים של הנכס [S1].")
+    monthly, yearly = _row_key("הסכומים בטבלה לחודש, לפני מע״מ."), _row_key("הסכומים בטבלה לשנה, לפני מע״מ.")
+    assert monthly != yearly and monthly != plain
+    assert plain == _row_key("") == _row_key("שורה אחרת לגמרי, בלי תכנית ובלי חלופה.")  # round 20: an unrelated line is left out
+
+
 def test_the_partial_mark_of_a_table_row_joins_its_last_cell_before_the_closing_bar():
     md = "| נתון | ערך | הערה |\n|---|---|---|\n| השווי למ\"ר | 9,500 ₪ [S1] | פנוי |\n| דמי השכירות | 55 ₪ למ\"ר לחודש [S1] | — |"
     a = _answer(md)

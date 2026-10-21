@@ -90,6 +90,7 @@ from app.chat.verify import (
     cell_bounds,
     claim_records,
     clarification_question,
+    defining_leads,
     exempt_without_verdict,
     has_back_reference,
     has_qualifier,
@@ -99,6 +100,7 @@ from app.chat.verify import (
     row_cut_safe,
     scope_outcome,
     split_units,
+    table_contexts,
     unit_claims,
     unit_key,
 )
@@ -251,10 +253,14 @@ class _Final:
         # the heading chain is the model's own words: a mark or a marker on a heading is not a new heading
         blank = "".join(" " if s and c != "\n" else c for c, s in zip(md, server, strict=True))
         chains = _headings_above(blank, units)
+        # likewise the line that opens a list and the one before a table: a server span written in it is not a new lead (round 21 U6)
+        leads, contexts = defining_leads(blank, units), table_contexts(blank, units)
         question = clarification_question(self.answer)
         out: list[FinalUnit] = []
         for u in units:
             u.heading = chains[u.index]
+            u.lead = leads.get(u.index, "")
+            u.context = contexts.get(u.index, u.context)
             model_at = [i for i in range(u.start, u.end) if not server[i]]
             model_raw = "".join(md[i] for i in model_at)
             # the server spans inside the unit as its text holds them (citations are not in a unit's text: the judge is
