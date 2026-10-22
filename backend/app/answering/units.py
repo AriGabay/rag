@@ -10,7 +10,7 @@ within its dimension; anything else raises ``DimensionMismatch``, so a floor num
 Text is compared after ``base_normalize`` (gershayim/geresh unified, thousands separators dropped), so
 'מ"ר', "מ״ר" and "מ'ר" are the same unit.
 
-For a count, Hebrew number words one to twenty ("שתי", "שלושה", "שתים עשרה") are numbers too, and "אין" /
+For a count, Hebrew number words ("שתי", "שלושה", "שתים עשרה", "עשרים וחמישה", read by ``numread``) are numbers too, and "אין" /
 "ללא" ("none") is zero. Two lengths written as W×H ("300 על 350 ס״מ") give an area only through
 ``area_from_dimensions``, always as an assumption (the fact goes to review).
 """
@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
+from app.answering import numread
 from app.extraction.normalize_text import base_normalize
 
 _PREFIX_LETTERS = "והבלמשכ"
@@ -101,20 +102,6 @@ for _cur in _CURRENCY_WORDS:
             _SURFACES[f"{_cur}{_sep}{_area}"] = _u("ILS/sqm", "currency_per_area", 1)
 _ORDERED = sorted(_SURFACES, key=len, reverse=True)
 
-# Hebrew number words (masculine, feminine and construct forms). Standalone "שנים" is not listed: it is also
-# the plural of "year"; it counts only inside a compound ("שנים עשר").
-_ONES: dict[int, tuple[str, ...]] = {
-    1: ("אחד", "אחת"), 2: ("שניים", "שתיים", "שני", "שתי", "שתים"), 3: ("שלוש", "שלושה", "שלושת"),
-    4: ("ארבע", "ארבעה", "ארבעת"), 5: ("חמש", "חמישה", "חמשה", "חמשת"), 6: ("שש", "שישה", "ששה", "ששת"),
-    7: ("שבע", "שבעה", "שבעת"), 8: ("שמונה", "שמונת"), 9: ("תשע", "תשעה", "תשעת"),
-    10: ("עשר", "עשרה", "עשרת"),
-}
-NUMBER_WORDS: dict[str, int] = {w: n for n, words in _ONES.items() for w in words} | {"עשרים": 20}
-for _n, _words in _ONES.items():
-    if _n < 10:
-        for _w in (*_words, *(("שנים",) if _n == 2 else ())):
-            for _ten in ("עשר", "עשרה"):
-                NUMBER_WORDS[f"{_w} {_ten}"] = 10 + _n
 ZERO_WORDS = frozenset({"אין", "ללא"})
 # Units that are counted nouns: a count of floors, rooms or dwellings is a count of that noun only, never of
 # whatever else the attribute counts ("2 X בקומה 3": the 3 counts floors, not X).
@@ -201,38 +188,20 @@ def _bare_variants(token: str) -> list[str]:
     return out
 
 
-def _word_number(words: list[str], with_zero: bool) -> tuple[int, int] | None:
-    """(value, tokens used) of the number word starting ``words``: a two-word teen first, then one word."""
-    if len(words) >= 2:
-        for first in _bare_variants(words[0]):
-            n = NUMBER_WORDS.get(f"{first} {words[1]}")
-            if n is not None and n > 10:
-                return n, 2
-    for first in _bare_variants(words[0]):
-        if first in NUMBER_WORDS:
-            return NUMBER_WORDS[first], 1
-        if with_zero and first in ZERO_WORDS:
-            return 0, 1
-    return None
-
-
 def find_word_quantities(text: str, *, with_zero: bool = True) -> list[Quantity]:
-    """Counts written as Hebrew words (one to twenty; "אין"/"ללא" as zero when ``with_zero``)."""
+    """Counts written as Hebrew words, as ``numread.number_words`` reads them (round 22 U10, KTD9: compounds, tens, hundreds, any form);
+    "אין"/"ללא" as zero when ``with_zero``."""
     norm = _norm(text)
-    tokens = list(_TOKEN.finditer(norm))
-    out, i = [], 0
-    while i < len(tokens):
-        found = _word_number([t.group(0) for t in tokens[i:i + 2]], with_zero)
-        if found is None:
-            i += 1
-            continue
-        value, used = found
-        start, end = tokens[i].start(), tokens[i + used - 1].end()
+    found: list[tuple[int, int, int, bool]] = [(w.start, w.end, w.value, False) for w in numread.number_words(norm)]
+    if with_zero:
+        for t in _TOKEN.finditer(norm):
+            if any(v in ZERO_WORDS for v in _bare_variants(t.group(0))):
+                found.append((t.start(), t.end(), 0, True))
+    out = []
+    for start, end, value, zero in sorted(found):
         after = _unit_after_span(norm, end)
         unit = after[0] if after else _unit_before(norm, start)
-        zero = value == 0 and any(v in ZERO_WORDS for v in _bare_variants(tokens[i].group(0)))
         out.append(Quantity(Decimal(value), unit, start, end, after[1] if after else None, zero))
-        i += used
     return out
 
 
@@ -240,9 +209,10 @@ def _value_of(value_text: str, dimension: str | None) -> Decimal | None:
     wanted = parse_number(value_text)
     if wanted is not None or dimension != "count":
         return wanted
-    words = [t.group(0) for t in _TOKEN.finditer(_norm(value_text))]
-    found = _word_number(words, with_zero=True) if words else None
-    return Decimal(found[0]) if found is not None and found[1] == len(words) else None
+    norm = _norm(value_text)
+    if (value := numread.whole_number_word(norm)) is not None:
+        return Decimal(value)
+    return Decimal(0) if any(v in ZERO_WORDS for v in _bare_variants(norm.strip())) else None
 
 
 def parse_mention_quantity(quote: str, value_text: str, dimension: str | None = None) -> Quantity | None:

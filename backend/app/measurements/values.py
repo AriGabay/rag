@@ -2,7 +2,7 @@
 
 ``parse_amount`` turns a written value into a Decimal and its form: "₪ 9,500" -> 9500 exact, "כ-21,000 ₪" ->
 21000 approximate, "65-85 ₪" -> range 65..85, "(₪ 1,197,500)" -> -1197500 (accounting negative), "6.70%" -> 6.70,
-"שישה" -> 6. Nothing is guessed: text without a number gives None.
+"שישה" -> 6 (a number in words is ``numread.number_word``, the project's one reader). Nothing is guessed: text without a number gives None.
 
 A written value is one table cell, so its comma is read by ``numread`` as a cell's: "13,2" is 13.2, "1,250" is 1250, "1.234,56" is
 1234.56, a chain "6,7,8" is a list. A negative is a minus (hyphen or U+2212) before the number, a trailing minus ("104,610-"), or
@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
-from app.answering.numread import CURRENCY, read_separators
+from app.answering.numread import CURRENCY, number_word, read_separators
 
 _MINUS = "[-\u2212]"
 _SIGN_NOISE = re.compile(rf"[{CURRENCY}%\s]")  # what may stand beside the brackets of an accounting negative: "(3.5)%", "(₪ 1,197,500)"
@@ -25,17 +25,6 @@ _ONE = re.compile(_NUM)
 _APPROX = re.compile(r"(?:^|[\s(])(?:כ-?|כ־|כ\s|בערך|כמעט|בסביבות|בגבולות(?:\s+של)?|כ-\s?|~)")
 _MIN = re.compile(r"(?:החל\s+מ|לפחות|מינימום|לא\s+פחות\s+מ|מעל)")
 _MAX = re.compile(r"(?:עד\s|לכל\s+היותר|מקסימום|לא\s+יותר\s+מ|פחות\s+מ)")
-
-# Hebrew number words (both genders, construct forms) used for counts and durations in appraisal prose.
-_UNITS = {
-    "אחד": 1, "אחת": 1, "שניים": 2, "שתיים": 2, "שתים": 2, "שני": 2, "שתי": 2, "שלושה": 3, "שלוש": 3, "שלושת": 3,
-    "ארבעה": 4, "ארבע": 4, "ארבעת": 4, "חמישה": 5, "חמש": 5, "חמשת": 5, "שישה": 6, "שש": 6, "ששת": 6,
-    "שבעה": 7, "שבע": 7, "שבעת": 7, "שמונה": 8, "שמונת": 8, "תשעה": 9, "תשע": 9, "תשעת": 9,
-    "עשרה": 10, "עשר": 10, "עשרת": 10,
-}
-_TENS = {"עשרים": 20, "שלושים": 30, "ארבעים": 40, "חמישים": 50, "שישים": 60, "שבעים": 70, "שמונים": 80,
-         "תשעים": 90, "מאה": 100, "מאתיים": 200, "אלף": 1000, "אלפיים": 2000}
-
 
 @dataclass(frozen=True)
 class Amount:
@@ -50,29 +39,6 @@ def _dec(text: str) -> Decimal | None:
         return Decimal(text.replace(",", ""))
     except (InvalidOperation, ValueError):
         return None
-
-
-def number_word(text: str) -> Decimal | None:
-    """The value of a Hebrew number phrase ("שישה", "עשרים וחמישה", "שתים עשרה"), or None."""
-    words = [w[1:] if w.startswith("ו") and w[1:] in {**_UNITS, **_TENS} else w
-             for w in re.findall(r"[א-ת]+", text)]
-    if not words:
-        return None
-    total = 0
-    found = False
-    for i, w in enumerate(words):
-        if w in ("עשר", "עשרה") and i > 0 and words[i - 1] in _UNITS and _UNITS[words[i - 1]] < 10:
-            continue  # the teen's second word, counted with its first ("שתים עשרה")
-        if w in _TENS:
-            total += _TENS[w]
-            found = True
-        elif w in _UNITS:
-            nxt = words[i + 1] if i + 1 < len(words) else ""
-            total += _UNITS[w] + (10 if nxt in ("עשר", "עשרה") and _UNITS[w] < 10 else 0)
-            found = True
-        elif found:
-            break
-    return Decimal(total) if found else None
 
 
 def parse_amount(text: str) -> Amount | None:

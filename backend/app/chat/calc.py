@@ -1284,6 +1284,16 @@ class Assumption:
             {"parameter": self.parameter} if self.parameter else {})
 
 
+def enumeration_count(cid: str, n: int, *, label: str, expression: str, formula: str, inputs: list[dict], sources: list[str],
+                      documents: int, note: str) -> Computation:
+    """The C# of a count of the entries of a cited enumeration that has no V# of its own — the rows of a cited table, the items of the
+    turn's ledger for a cited source (round 22 U10, KTD9, R17). Result kind ``derived``, kind ``count``, no unit; ``inputs`` are the
+    sources it counted in (the record the judge and the UI read), ``sources`` the S# behind them."""
+    out = Outcome(Decimal(n), (), None, None, "", "count", "", [], [(expression, Decimal(n))], [], [], [x["id"] for x in inputs],
+                  False, n)
+    return Computation(cid, label, expression, formula, out, inputs, sources, documents, DERIVED, None, note)
+
+
 def derived_forms(ref: str, fraction=None) -> frozenset[str]:
     """The expressions a derived reduction of the coefficient ``ref`` is registered under (round 14 U4, KTD6): ``1 − ref``, or its
     percent form ``(1 − ref) × 100``, as ``render`` writes them. ``fraction``: ``parse(f"1 - {ref}")`` when the caller holds it."""

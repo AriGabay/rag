@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from app.answering.numread import number_word
 from app.measurements.extract import (
     Annotation,
     Passage,
@@ -16,7 +17,7 @@ from app.measurements.extract import (
     looks_like_identifier,
     validate_text,
 )
-from app.measurements.values import number_word, parse_amount
+from app.measurements.values import parse_amount
 
 # --- values ------------------------------------------------------------------------------------------------
 
@@ -74,7 +75,7 @@ def test_a_date_is_not_read_as_a_range():
 def test_number_words():
     assert number_word("שישה") == Decimal(6)
     assert number_word("עשרים וחמישה") == Decimal(25)
-    assert number_word("שתים עשרה") is None or number_word("שתים עשרה") == Decimal(12)
+    assert number_word("שתים עשרה") == Decimal(12)
     assert number_word("בניין") is None
 
 

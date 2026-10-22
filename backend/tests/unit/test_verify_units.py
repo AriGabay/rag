@@ -2829,3 +2829,207 @@ def test_round21_pass3_a_figure_that_is_one_member_of_a_list_of_bare_numbers_anc
     assert _anchor("השטח 20 מ״ר, 22 מ״ר ו־24 מ״ר.", "22 מ״ר")[0] is not None
     assert _anchor("השטח הוא 22 מ״ר ובקומה 3, 4.", "22 מ״ר")[0] is not None
     assert _anchor("הסעיפים 10-12 והשטח 22 מ״ר.", "22 מ״ר")[0] is not None
+
+
+# --- round 22 U10 (KTD9, R17): a number in words, and a count the answer derives from a cited enumeration ------------------------
+
+def _count_check(ws: Workspace, markdown: str, ledger=None):
+    """The number check as a verification runs it: the server's bindings first (a derived count joins the unit's citations), then the
+    deterministic check. Returns the units and the problems."""
+    units = split_units(markdown)
+    verify.bind_computations(units, ws, "", ledger=ledger)
+    return units, verify.deterministic(units, ws, "", meanings={u.index: [] for u in units})
+
+
+def _payment_table(rows: int, header: str = "מועד | סכום", caption: str = "") -> str:
+    names = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שביעי"]
+    body = "\n".join(f"{names[i]} | {100_000 + 50_000 * i:,} ₪" for i in range(rows))
+    return (caption + "\n" if caption else "") + f"{header}\n{body}"
+
+
+def test_u10_a_claim_digit_stands_over_a_source_that_writes_the_number_as_a_compound_of_words():
+    ws = _ws("ההלוואה תוחזר בשנים עשר תשלומים חודשיים, ובריבית של שלושים אלף.")
+    assert _count_check(ws, "ההלוואה תוחזר ב-12 תשלומים [S1].")[1] == []
+    ws = _ws("בנייה של שבעה עשר קומות מעל עשרים יחידות דיור.")
+    assert _count_check(ws, "הבניין בן 17 קומות [S1], עם 20 יחידות דיור [S1].")[1] == []
+    ws = _ws("המחסן נמדד בחמישים ושלושה מטר.")
+    assert _count_check(ws, "המחסן נמדד ב-53 מטר [S1].")[1] == []
+
+
+def test_u10_a_wrong_part_of_a_compound_is_not_read_as_the_number():
+    ws = _ws("ההלוואה תוחזר בשנים עשר תשלומים.")
+    (p,) = _count_check(ws, "ההלוואה תוחזר ב-10 תשלומים [S1].")[1]
+    assert p.check == "unstated_number" and "10" in p.unstated
+
+
+def test_u10_a_count_the_claim_writes_in_words_is_confirmed_by_an_enumeration_and_never_removed_without_one():
+    # the source states it, in digits or in words: nothing to do
+    assert _count_check(_ws("הנכס משועבד בשלוש משכנתאות."), "הנכס משועבד בשלוש משכנתאות [S1].")[1] == []
+    assert _count_check(_ws("הנכס משועבד ב-3 משכנתאות."), "הנכס משועבד בשלוש משכנתאות [S1].")[1] == []
+    # no source states it and no enumeration matches: not confirmed, and not a deterministic removal either (the judge reads it)
+    ws = _ws("הנכס משועבד בשלוש משכנתאות.")
+    units, problems = _count_check(ws, "הנכס משועבד בארבע משכנתאות [S1].")
+    assert problems == [] and units[0].ids == ["S1"] and not ws.computations
+    # a table with exactly that many rows of that kind confirms it
+    ws = _ws("משכנתא | סכום\nא | 100,000 ₪\nב | 200,000 ₪\nג | 300,000 ₪\nד | 400,000 ₪", kind="table")
+    units, problems = _count_check(ws, "הנכס משועבד בארבע משכנתאות [S1].")
+    assert problems == [] and ws.computations[units[0].ids[-1]].value == 4
+    # the same count in digits keeps the digit behaviour: no enumeration, no pass
+    ws = _ws("הנכס משועבד בשלוש משכנתאות.")
+    assert [p.unstated for p in _count_check(ws, "הנכס משועבד ב-4 משכנתאות [S1].")[1]] == [["4"]]
+
+
+def test_u10_a_word_that_is_no_count_is_not_checked():
+    ws = _ws("הנכס משועבד.")
+    assert _count_check(ws, "אחד המסמכים קובע שהנכס משועבד, ושני הצדדים הסכימו [S1].")[1] == []
+
+
+def test_u10_a_count_over_the_rows_of_a_cited_table_is_a_derived_count():
+    ws = _ws(_payment_table(6), kind="table")
+    units, problems = _count_check(ws, "התשלום מתחלק ל-6 מועדי תשלום [S1].")
+    assert problems == []
+    cid = units[0].ids[-1]
+    c = ws.computations[cid]
+    assert c.result_kind == "derived" and c.value == 6 and verify.MSG_DERIVED_COUNT_NOTE in c.note
+    assert c.sources == ["S1"]
+    # the count written in words is the same count
+    units, problems = _count_check(_ws(_payment_table(6), kind="table"), "התשלום מתחלק לשישה מועדי תשלום [S1].")
+    assert problems == [] and units[0].ids[-1].startswith("C")
+
+
+def test_u10_a_derived_count_sits_beside_a_stated_amount_of_the_same_unit():
+    ws = _ws(_payment_table(6), kind="table")
+    assert _count_check(ws, "יש 6 מועדי תשלום [S1], והאחרון הוא 350,000 ₪ [S1].")[1] == []
+
+
+def test_u10_the_same_count_over_other_row_numbers_goes_on_to_the_judge():
+    ws = _ws(_payment_table(5), kind="table")
+    units, problems = _count_check(ws, "התשלום מתחלק ל-6 מועדי תשלום [S1].")
+    assert [p.unstated for p in problems] == [["6"]] and units[0].ids == ["S1"] and not ws.computations
+    ws = _ws(_payment_table(7), kind="table")
+    assert [p.unstated for p in _count_check(ws, "התשלום מתחלק ל-6 מועדי תשלום [S1].")[1]] == [["6"]]
+
+
+def test_u10_a_count_of_another_kind_than_the_rows_goes_on_to_the_judge():
+    ws = _ws(_payment_table(6), kind="table")
+    units, problems = _count_check(ws, "בטבלה 6 מגרשים [S1].")
+    assert [p.unstated for p in problems] == [["6"]] and not ws.computations
+    assert _count_check(ws, "בטבלה שישה מגרשים [S1].")[1] == [] and not ws.computations  # in words: not confirmed, not removed
+
+
+def test_u10_a_count_with_no_enumeration_is_not_accepted():
+    ws = _ws("התשלום יבוצע במועדי תשלום שווים לאורך התקופה.")
+    assert [p.unstated for p in _count_check(ws, "התשלום מתחלק ל-6 מועדי תשלום [S1].")[1]] == [["6"]]
+    ws = _ws("מועד ראשון: 100,000 ₪\nמועד שני: 150,000 ₪\nמועד שלישי: 200,000 ₪", kind="table")
+    assert [p.unstated for p in _count_check(ws, "התשלום מתחלק ל-3 מועדי תשלום [S1].")[1]] == [["3"]]  # lines, no row structure
+
+
+def test_u10_a_table_that_names_its_kind_in_its_caption_gives_the_count_its_noun():
+    ws = _ws(_payment_table(6, header="# | סכום", caption="מועדי תשלום"), kind="table")
+    assert _count_check(ws, "יש 6 מועדי תשלום [S1].")[1] == []
+    ws = _ws(_payment_table(6, header="# | סכום", caption="לוח מועדי תשלום"), kind="table")
+    assert [p.unstated for p in _count_check(ws, "יש 6 לוחות [S1].")[1]] == [["6"]]  # the generic word of a caption names no kind
+
+
+def test_u10_a_total_row_and_a_table_read_in_parts_are_no_enumeration():
+    ws = _ws("הטבלה: 7 שורות\n" + _payment_table(6) + "\nסה״כ | 975,000 ₪", kind="table")
+    assert _count_check(ws, "יש 6 מועדי תשלום [S1].")[1] == []  # six rows and a total, as the size line states
+    ws = _ws("הטבלה: 9 שורות\n" + _payment_table(6), kind="table")
+    assert [p.unstated for p in _count_check(ws, "יש 6 מועדי תשלום [S1].")[1]] == [["6"]]  # the rows shown are not the table's rows
+    ws = _ws(_payment_table(6), kind="table")
+    ws.sources["S1"].table_part = True
+    assert [p.unstated for p in _count_check(ws, "יש 6 מועדי תשלום [S1].")[1]] == [["6"]]
+
+
+def test_u10_a_count_over_the_cited_values_is_a_derived_count_of_them():
+    from tests.unit.test_verify_computed import _value
+
+    ws = _ws("טבלה")
+    ids = [_value(ws, f"{100 + i},000", f"מועד תשלום {n}", "payment", "component") for i, n in enumerate(("ראשון", "שני", "שלישי"))]
+    units, problems = _count_check(ws, f"יש 3 מועדי תשלום [{ids[0]}][{ids[1]}][{ids[2]}].")
+    assert problems == [] and units[0].ids[-1].startswith("C")
+    assert ws.computations[units[0].ids[-1]].value == 3
+    assert [p.unstated for p in _count_check(ws, f"יש 3 מגרשים [{ids[0]}][{ids[1]}][{ids[2]}].")[1]] == [["3"]]
+    assert [p.unstated for p in _count_check(ws, f"יש 4 מועדי תשלום [{ids[0]}][{ids[1]}][{ids[2]}].")[1]] == [["4"]]
+
+
+def test_u10_a_count_over_the_ledger_items_of_a_cited_source_is_a_derived_count():
+    from app.chat import items
+
+    ws = _ws("משכנתא א: 100,000 ₪\nמשכנתא ב: 200,000 ₪\nמשכנתא ג: 300,000 ₪\nמשכנתא ד: 400,000 ₪")
+    ledger = items.Ledger()
+    for n, name in enumerate(("א", "ב", "ג", "ד")):
+        it = items.Item(component="N1", label=f"משכנתא {name}", source="S1", quote=f"משכנתא {name}: {n + 1}00,000 ₪")
+        ledger.items[it.key] = it
+    units, problems = _count_check(ws, "נלקחו 4 משכנתאות [S1].", ledger=ledger)
+    assert problems == [] and ws.computations[units[0].ids[-1]].value == 4
+    assert [p.unstated for p in _count_check(_ws(ws.sources["S1"].text), "נלקחו 4 משכנתאות [S1].")[1]] == [["4"]]  # no ledger
+    assert [p.unstated for p in _count_check(ws, "נלקחו 4 הלוואות [S1].", ledger=ledger)[1]] == [["4"]]
+    assert [p.unstated for p in _count_check(ws, "נלקחו 5 משכנתאות [S1].", ledger=ledger)[1]] == [["5"]]
+
+
+def test_u10_a_derived_count_survives_the_whole_verification_and_cites_its_count_where_a_wrong_count_is_cut():
+    ws = _ws(_payment_table(6), kind="table")
+    a = _answer("התשלום מתחלק ל-6 מועדי תשלום [S1].")
+    r = verify_answer(_judge(lambda t: "supported"), a, ws, "?", [])
+    out = r.apply(a).answer_markdown
+    assert r.removed_units() == set() and "6 מועדי תשלום [S1][C1]" in out, out
+    # a count the table does not have: the unit goes on to the judge as a unit with an unstated number (a one-sentence claim: cut)
+    ws = _ws(_payment_table(5), kind="table")
+    r = verify_answer(_judge(lambda t: "supported"), a, ws, "?", [])
+    assert r.removed_units() == {0} and "6 מועדי" not in r.apply(a).answer_markdown
+
+
+_OWN_LIST_SOURCE = "הלוואה א: 100,000 ₪\nהלוואה ב: 200,000 ₪\nהלוואה ג: 300,000 ₪\nהלוואה ד: 400,000 ₪"
+
+
+def _own_list(count: str, items: int, noun: str = "הלוואות", cite: bool = True) -> str:
+    names = ("א", "ב", "ג", "ד", "ה")
+    lines = "\n".join(f"{n + 1}. הלוואה {names[n]} בסך {n + 1}00,000 ₪{' [S1]' if cite else ''}." for n in range(items))
+    return f"{noun}: הדוח מונה {count} {noun}.\n\n{lines}"
+
+
+def test_u10_a_count_in_words_before_the_answers_own_cited_list_of_that_size_is_confirmed_and_nothing_is_removed():
+    ws = _ws(_OWN_LIST_SOURCE)
+    units, problems = _count_check(ws, _own_list("ארבע", 4))
+    assert problems == []
+    c = ws.computations[units[0].ids[-1]]
+    assert c.result_kind == "derived" and c.value == 4 and c.sources == ["S1"]
+    # the count in digits is confirmed the same way, and it takes the claim's citation although the claim cites none
+    ws = _ws(_OWN_LIST_SOURCE)
+    units, problems = _count_check(ws, _own_list("4", 4))
+    assert problems == [] and units[0].ids[-1].startswith("C")
+    # the claim is kept by the whole verification
+    ws = _ws(_OWN_LIST_SOURCE)
+    a = _answer(_own_list("ארבע", 4))
+    r = verify_answer(_judge(lambda t: "supported"), a, ws, "?", [])
+    assert r.removed_units() == set() and "ארבע הלוואות" in r.apply(a).answer_markdown
+
+
+def test_u10_a_list_one_item_short_does_not_confirm_the_count_in_words_and_does_not_remove_it():
+    ws = _ws(_OWN_LIST_SOURCE)
+    units, problems = _count_check(ws, _own_list("ארבע", 3))
+    assert problems == [] and units[0].ids == [] and not ws.computations
+    a = _answer(_own_list("ארבע", 3))
+    r = verify_answer(_judge(lambda t: "supported"), a, _ws(_OWN_LIST_SOURCE), "?", [])
+    assert r.removed_units() == set() and "ארבע הלוואות" in r.apply(a).answer_markdown
+    # the digit keeps today's behaviour
+    ws = _ws(_OWN_LIST_SOURCE)
+    assert [p.unstated for p in _count_check(ws, _own_list("4", 3))[1]] == [["4"]]
+
+
+def test_u10_the_answers_own_list_confirms_a_count_only_of_the_kind_its_items_share_and_when_every_item_cites():
+    ws = _ws(_OWN_LIST_SOURCE)
+    assert [p.unstated for p in _count_check(ws, _own_list("4", 4, noun="מגרשים"))[1]] == [["4"]]  # a count of another kind
+    ws = _ws(_OWN_LIST_SOURCE)
+    assert [p.unstated for p in _count_check(ws, _own_list("4", 4, cite=False))[1]] == [["4"]]  # items that cite nothing
+    ws = _ws(_OWN_LIST_SOURCE)
+    units, problems = _count_check(ws, "הלוואות: הדוח מונה 4 הלוואות, והגדולה 400,000 ₪.\n\n" + "\n".join(
+        f"{n}. הלוואה {'אבגד'[n - 1]} בסך 100,000 ₪ [S1]." for n in range(1, 5)))
+    assert [p.unstated for p in problems] == [["4"]]  # a unit that cites nothing takes no citation when it holds other numbers too
+    assert units[0].ids == [] and not ws.computations
+
+
+def test_u10_a_sum_over_a_count_in_words_with_no_enumeration_is_not_removed():
+    ws = _ws("הסכום מחבר את שווי הדירות.")
+    assert _count_check(ws, "שני החישובים מותנים: הסכום מחבר שמונה שוויי דירות [S1].")[1] == []

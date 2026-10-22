@@ -23,6 +23,13 @@ digits and its start, and trailing blanks fill the room of its dropped thousands
 ("ב-2019" and "10-20" are no negatives); in a source also accounting brackets ("(3.5)%", "(₪ 1,197,500)") and a trailing minus
 ("3.5-"). A negative number gives both its signed and its unsigned forms: an unsigned claim still finds it, a negative claim finds
 only a negative source.
+
+**A number written in Hebrew words** (round 22 U10, KTD9, R17) is read here too, by ``number_words``: the one table of the project (the
+three that were kept in ``answering.verify``, ``measurements.values`` and ``answering.units`` are gone). A phrase is one number, whole:
+units, teens and compounds ("שנים עשר", "שתים עשרה", "שבעה עשר"), tens ("עשרים וחמישה"), hundreds ("מאה", "מאתיים", "שלוש מאות") and
+simple thousands ("אלפיים", "שלושת אלפים", "מאה וחמישים אלף"), masculine, feminine and construct forms, the prefix letters outside the
+value, "and" between the parts. A word is read whole: "עשרים" inside a longer word is nothing, "שנים" alone is the plural of year, an
+ordinal ("השני", "חמישית") and a scale word after a digit ("250 אלף") are no amount.
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ from __future__ import annotations
 import re
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
+from typing import NamedTuple
 
 # A number may follow a Hebrew prefix letter ("ב2019"), but not a Latin letter, digit or underscore. A comma is a thousands
 # separator only in groups of three ("1,250,000"): "2018,2019,2021" is a list of three years.
@@ -212,3 +220,194 @@ def numbers_written(text: str) -> list[tuple[str, int, int, str]]:
         end = _span_end(read, text, m.end())
         out.append((text[m.start():end], m.start(), end, m.group(0)))
     return out
+
+
+# --- Hebrew number words (round 22 U10, KTD9, R17) ----------------------------------------------------------------------
+
+_PREFIX_LETTERS = "ובלמכהש"
+_UNIT_WORDS = {
+    "אחד": 1, "אחת": 1, "שניים": 2, "שתיים": 2, "שני": 2, "שתי": 2, "שתים": 2, "שלוש": 3, "שלושה": 3, "שלושת": 3, "שלש": 3,
+    "שלשה": 3, "שלשת": 3, "ארבע": 4, "ארבעה": 4, "ארבעת": 4, "חמש": 5, "חמישה": 5, "חמשה": 5, "חמשת": 5, "חמישת": 5, "שש": 6,
+    "שישה": 6, "ששה": 6, "ששת": 6, "שישת": 6, "שבע": 7, "שבעה": 7, "שבעת": 7, "שמונה": 8, "שמונת": 8, "תשע": 9, "תשעה": 9, "תשעת": 9,
+}
+_TEN_WORDS = {"עשר": 10, "עשרה": 10, "עשרת": 10}
+_TENS_WORDS = {"עשרים": 20, "שלושים": 30, "שלשים": 30, "ארבעים": 40, "חמישים": 50, "חמשים": 50, "שישים": 60, "ששים": 60, "שבעים": 70,
+               "שמונים": 80, "תשעים": 90}
+_HUNDRED_WORDS = {"מאה": 100, "מאתיים": 200, "מאתים": 200}
+_THOUSAND_WORDS = {"אלף": 1000, "אלפיים": 2000, "אלפים": 1000, "אלפי": 1000}
+# the construct of a unit in the dual: "שני" and "שתי" mean two only in front of a noun, so "השני" (with the article) is "the second"
+_NO_ARTICLE = frozenset({"שני", "שתי"})
+# a plural of year, not two: it is a number only right before "עשר" ("שנים עשר")
+_SHNAYIM = "שנים"
+_WORD_TOKEN = re.compile(r"(?<![A-Za-z0-9_])[א-ת]+(?![A-Za-z0-9_])")
+_JOIN = re.compile(r"[ \t\u00a0]+|[ \t\u00a0]*[-\u05be][ \t\u00a0]*")
+_FOLLOWED_BY_WORD = re.compile(r"[ \t\u00a0]+[א-ת]")
+_DIGIT_BEFORE = re.compile(r"[\d,.][ \t\u00a0]*[-\u05be]?[ \t\u00a0]*$")
+
+
+class NumberWord(NamedTuple):
+    """One number written in words: its value, its place in the text (the prefix letters included) and whether the article stands in
+    its prefix ("השלושה")."""
+
+    value: int
+    start: int
+    end: int
+    definite: bool = False
+
+
+class _Tok(NamedTuple):
+    base: str
+    kind: str  # unit | ten | shnayim | tens | hundred | meot | thousand | thousands
+    value: int
+    start: int
+    end: int
+    prefix: str
+
+
+def _word_kind(base: str, prefix: str) -> tuple[str, int] | None:
+    if base in _UNIT_WORDS and not (prefix.endswith("ה") and base in _NO_ARTICLE):
+        return "unit", _UNIT_WORDS[base]
+    if base in _TEN_WORDS:
+        return "ten", 10
+    if base == _SHNAYIM:
+        return "shnayim", 2
+    if base in _TENS_WORDS:
+        return "tens", _TENS_WORDS[base]
+    if base in _HUNDRED_WORDS and "ה" not in prefix:  # "המאה" is the century, "האלף" the thousand
+        return "hundred", _HUNDRED_WORDS[base]
+    if base == "מאות":
+        return "meot", 100
+    if base in _THOUSAND_WORDS and "ה" not in prefix:
+        return ("thousand" if base in ("אלף", "אלפיים") else "thousands"), _THOUSAND_WORDS[base]
+    return None
+
+
+def _split(word: str) -> tuple[str, str, str, int] | None:
+    """(prefix, base, kind, value) of a word: the base is a number word, the prefix zero to two prefix letters (the shortest first)."""
+    for k in (0, 1, 2):
+        if len(word) - k < 2 or not all(ch in _PREFIX_LETTERS for ch in word[:k]):
+            continue
+        found = _word_kind(word[k:], word[:k])
+        if found is not None:
+            return word[:k], word[k:], found[0], found[1]
+    return None
+
+
+def _tokens(text: str) -> list[_Tok]:
+    """The number words of ``text`` in order, as tokens: every Hebrew word that is a number word, whole, with its prefix letters
+    apart ("ב-שנים": the hyphened prefix is the prefix of the word after it)."""
+    words = [(m.start(), m.end(), m.group(0)) for m in _WORD_TOKEN.finditer(text)]
+    out: list[_Tok] = []
+    for n, (start, end, word) in enumerate(words):
+        found = _split(word)
+        if found is None:
+            continue
+        prefix, base, kind, value = found
+        if not prefix and n and (prev := words[n - 1])[1] + 1 == start and text[prev[1]] in "-\u05be" \
+                and len(prev[2]) <= 2 and all(ch in _PREFIX_LETTERS for ch in prev[2]):
+            start, prefix = prev[0], prev[2]  # "ב-שנים עשר": the hyphened prefix letter
+            if prefix.endswith("ה") and base in _NO_ARTICLE:
+                continue
+        out.append(_Tok(base, kind, value, start, end, prefix))
+    # "שנים" alone is the plural of year: it is kept only right before "עשר"/"עשרה"
+    return [t for i, t in enumerate(out) if t.kind != "shnayim" or _joins(text, out, i + 1) and out[i + 1].kind == "ten"]
+
+
+def _joins(text: str, toks: list[_Tok], k: int) -> bool:
+    """Whether ``toks[k]`` continues the phrase of ``toks[k - 1]``: only blanks or a hyphen between them, and no prefix letter on it but
+    "ו" ("and")."""
+    return 0 < k < len(toks) and toks[k].prefix in ("", "ו") and _JOIN.fullmatch(text, toks[k - 1].end, toks[k].start) is not None
+
+
+def _group(toks: list[_Tok], text: str, i: int) -> tuple[int, int]:
+    """(value, next index) of the part below a thousand that starts at ``toks[i]``: hundreds, then tens and units or a teen. (0, i) when
+    nothing there is a number."""
+    v, j = 0, i
+    if j < len(toks) and toks[j].kind == "hundred":
+        v, j = toks[j].value, j + 1
+    elif j < len(toks) and toks[j].kind == "unit" and 2 <= toks[j].value <= 9 and _joins(text, toks, j + 1) \
+            and toks[j + 1].kind == "meot":
+        v, j = toks[j].value * 100, j + 2
+    if j < len(toks) and (j == i or _joins(text, toks, j)):
+        t = toks[j]
+        if t.kind == "tens":
+            v, j = v + t.value, j + 1
+            if _joins(text, toks, j) and toks[j].kind == "unit" and toks[j].value <= 9:
+                v, j = v + toks[j].value, j + 1
+        elif t.kind in ("unit", "shnayim") and _joins(text, toks, j + 1) and toks[j + 1].kind == "ten":
+            v, j = v + 10 + t.value, j + 2
+        elif t.kind in ("unit", "ten"):
+            v, j = v + t.value, j + 1
+    return v, j
+
+
+def _phrase(toks: list[_Tok], text: str, i: int) -> tuple[int, int]:
+    """(value, next index) of the number phrase that starts at ``toks[i]``: the part below a thousand, its thousands and the rest."""
+    v, j = _group(toks, text, i)
+    if j < len(toks) and toks[j].kind in ("thousand", "thousands") and (j == i or _joins(text, toks, j)):
+        t = toks[j]
+        total = (2000 if not v else 0) if t.value == 2000 else (v or 1) * 1000 if t.kind == "thousand" else v * 1000
+        if total:
+            rest, k = _group(toks, text, j + 1) if _joins(text, toks, j + 1) else (0, j + 1)
+            return total + rest, k
+    return v, j
+
+
+@lru_cache(maxsize=1024)
+def _read_words(text: str) -> tuple[NumberWord, ...]:
+    toks = _tokens(text)
+    out: list[NumberWord] = []
+    i = 0
+    while i < len(toks):
+        v, j = _phrase(toks, text, i)
+        if j == i:
+            i += 1
+            continue
+        first, last = toks[i], toks[j - 1]
+        # a scale word after a digit ("250 אלף", "3 מאות") belongs to that digit
+        if first.kind in ("hundred", "thousand", "thousands", "meot") and _DIGIT_BEFORE.search(text, 0, first.start):
+            i = j
+            continue
+        out.append(NumberWord(v, first.start, last.end, "ה" in first.prefix))
+        i = j
+    return tuple(out)
+
+
+def number_words(text: str, *, claim: bool = False) -> tuple[NumberWord, ...]:
+    """Every number written in Hebrew words in ``text``, in reading order (``NumberWord``). The default reads a source: every phrase.
+    ``claim``: the text is an answer's, which writes a count in words and also uses the same words as idioms, so a phrase is a number
+    only when it is a count: not "one" ("אחד המסמכים", "בפעם אחת"), not with the article in its prefix ("השלושה"), and it stands right
+    before a word (a noun) — "מצד שני" and "הוסכם על שתיים" state no count. (A claim's words only ever confirm a count, round 22 U10.)"""
+    found = _read_words(text)
+    if not claim:
+        return found
+    out = []
+    for w in found:
+        if w.value == 1 or w.definite or not _FOLLOWED_BY_WORD.match(text, w.end):
+            continue
+        out.append(w)
+    return tuple(out)
+
+
+def word_forms(text: str, *, claim: bool = False) -> set[str]:
+    """The numbers ``text`` writes in Hebrew words, in the forms ``numbers_in`` gives the same number written in digits (``add_form``: "12" for
+    "שנים עשר"; "20" and "2E+1" for "עשרים", as "20" has both)."""
+    out: set[str] = set()
+    for w in number_words(text, claim=claim):
+        add_form(out, str(w.value))
+    return out
+
+
+def number_word(text: str) -> Decimal | None:
+    """The value of the first Hebrew number phrase in ``text`` ("שישה", "עשרים וחמישה", "שתים עשרה"), or None."""
+    found = _read_words(text or "")
+    return Decimal(found[0].value) if found else None
+
+
+def whole_number_word(text: str) -> int | None:
+    """The value of ``text`` when all of it is one Hebrew number phrase ("שתים עשרה"), else None ("שתים עשרה יחידות")."""
+    found = _read_words(text or "")
+    if len(found) != 1:
+        return None
+    rest = (text[:found[0].start] + text[found[0].end:]).strip(" -\u05be\t")
+    return found[0].value if not rest else None

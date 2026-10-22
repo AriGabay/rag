@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict
 
 from app.answering.numread import NUMBER as _NUMBER
 from app.answering.numread import add_form as _add
-from app.answering.numread import decimal_convention, number_forms
+from app.answering.numread import decimal_convention, number_forms, word_forms
 from app.providers.llm import (
     CallStatus,
     LLMProvider,
@@ -48,13 +48,7 @@ _LEVEL_BEFORE = re.compile(rf"{_PREFIX}{_LEVEL_NOUNS}[׳']?\s*:?\s*$")
 _COUNTED_AFTER = re.compile(r"\s*(?:דירות|דירה|חדרים|חדר|מקומות|מקום|יחידות|יחידה|חנויות|חנות|משרדים|חניות|מחסנים|יח[\"״]ד)(?![א-ת])")
 _QUANTITY_AFTER = re.compile(r"\s*(?:₪|ש[\"״]ח|מ[\"״]ר|דונם|%|אלף|מיליון|מטר)")
 _YEAR = re.compile(r"(?:19|20)\d\d")
-# Counts written as words ("שתי קומות"); used on the evidence side only, so a claim's digit can match them.
-_NUMBER_WORDS = {
-    "אחד": 1, "אחת": 1, "שניים": 2, "שתיים": 2, "שני": 2, "שתי": 2, "שלוש": 3, "שלושה": 3, "שלושת": 3,
-    "ארבע": 4, "ארבעה": 4, "ארבעת": 4, "חמש": 5, "חמישה": 5, "חמשת": 5, "שש": 6, "שישה": 6, "ששת": 6,
-    "שבע": 7, "שבעה": 7, "שבעת": 7, "שמונה": 8, "שמונת": 8, "תשע": 9, "תשעה": 9, "תשעת": 9, "עשר": 10,
-    "עשרה": 10, "עשרת": 10,
-}
+# Counts written as words ("שתי קומות", "שנים עשר") are read by ``numread.number_words``, the one table of Hebrew number words (round 22 U10, KTD9).
 _WORD = re.compile(r"[^\W\d_][^\W_]*[״׳\"']?[^\W\d_]*")
 _PREFIX_LETTERS = "בהוכלמש"
 _FORBIDDEN = re.compile(r"(https?://|www\.|!\[|\]\(|<[a-zA-Z/])")
@@ -81,7 +75,7 @@ JUDGE_POLICY = (
 def numbers_in(text: str, *, words: bool = False, source: bool = False, decimal: bool = False) -> set[str]:
     """Normalized numbers in ``text``, ignoring [E#] citations and list ordinals: 2.80 and 2.8, 1,250 and
     1250 are the same number, and a date (14/02/2023, 14.2.2023) is its day, month and year. With ``words``,
-    counts written as Hebrew words count as well (for evidence, never for a claim).
+    counts written as Hebrew words count as well (for evidence; a claim's words are ``count_words_in``).
 
     A comma and a sign are read as ``numread`` reads them (round 19 U1, KTD3): "13,2%" is 13.2 and "1.234,56" is 1234.56, "3,596,696"
     is thousands, "6,7,8" is a list; a negative number has its signed form next to its unsigned one. ``source`` (implied by
@@ -95,11 +89,16 @@ def numbers_in(text: str, *, words: bool = False, source: bool = False, decimal:
             _add(out, part)
     out |= number_forms(_DATE.sub(" ", text), source=source or words, decimal=decimal)
     if words:
-        for w in _WORD.findall(text):
-            for form in (w, w[1:] if w[:1] in _PREFIX_LETTERS else None):
-                if form in _NUMBER_WORDS:
-                    out.add(str(_NUMBER_WORDS[form]))
+        out |= word_forms(text)
     return out
+
+
+def count_words_in(text: str) -> set[str]:
+    """The counts a claim writes in Hebrew words ("ארבע משכנתאות", "שנים עשר תשלומים"), normalized as ``numbers_in`` gives digits (round 22
+    U10, KTD9, R17): the claim side of ``numbers_in(words=True)``, which reads the same words in evidence. Only a count before a noun: not
+    "one", not a definite count ("שני הצדדים") and not a word with no noun after it (``numread.number_words``, ``claim``). Citations are
+    ignored, as in ``numbers_in``."""
+    return word_forms(CITE.sub(" ", text), claim=True)
 
 
 def claim_decimal(sources: Iterable[str]) -> bool:

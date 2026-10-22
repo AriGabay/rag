@@ -204,9 +204,10 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
+from app.answering import numread
 from app.answering.numread import NUMBER as _NUM_AT  # one reading of numbers for both checks
 from app.answering.verify import _DATE as _DATE_AT
-from app.answering.verify import not_an_amount, numbers_in
+from app.answering.verify import count_words_in, not_an_amount, numbers_in
 from app.chat import dates as chat_dates
 from app.chat import meaning, scopes
 from app.chat.compose import MARKER, PARTIAL_MARK, Doc, Edited, line_cut, ref_of
@@ -6281,7 +6282,7 @@ def _value_origin(ws: Workspace, v) -> str:
 
 def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: set[str],
               strict: bool = False, stated_by: dict[str, set[str]] | None = None, extra_text: str = "",
-              percent_of_fraction: bool = True, origins: bool = True) -> list[str]:
+              percent_of_fraction: bool = True, origins: bool = True, claim_words: bool = False) -> list[str]:
     """The numbers of a unit that nothing it cites states (for a unit that cites nothing, nothing of the turn —
     unless ``strict``, which holds it to its citations too), that the question does not give and that show no
     result of a calculation it cites (any of the turn's, for a unit citing nothing, unless ``strict``) — and the
@@ -6290,6 +6291,8 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
     ``extra_text``: more text of a cited source (the context a re-read expanded it with), whose numbers it states too.
     ``percent_of_fraction``: whether a percentage counts as stated by the fraction a source states (``_percent_of_fraction``);
     ``bind_computations`` turns it off, so the percent form of a cited value is still derived and bound as a C#.
+    ``claim_words``: whether the counts the unit writes in Hebrew words are numbers to check too (only ``bind_computations`` asks, to
+    confirm them: a count in words is never a reason to fail a unit, round 22 U10).
     ``origins``: whether a cited value also states the source line it was registered from (``_value_origin``); also off in
     ``bind_computations``, so a result the source line happens to write is still bound to the calculation that made it."""
     cited: set[str] = (set(numbers_in(extra_text, words=True)) | scaled_numbers_in(extra_text)) if extra_text else set()
@@ -6316,6 +6319,8 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
     for c in computations:
         cited.add(str(len(c.inputs)))
         cited.add(str(c.documents))
+        if c.outcome.kind == "count":  # a count the calculation made (``count(...)``, a derived count of an enumeration, round 22 U10): its number
+            cited |= numbers_in(format(c.value, "f"))
     held = bool(u.ids) or strict
     if not held:
         # a unit that cites nothing may show any calculation of the turn the model made; a derived one (round 13 U9, KTD9)
@@ -6326,7 +6331,10 @@ def _unstated(u: Unit, ws: Workspace, question_numbers: set[str], everything: se
     pool = cited if held else everything
     values = [ws.values[i] for i in u.ids if i in ws.values] if held else list(ws.values.values())
     # a numbered heading's own number ("9.1 שיטת השומה") is its place in the answer, not a fact
-    missing = [n for n in numbers_in(_stated_text(u)) - question_numbers if n not in pool and not (
+    # a count the claim writes in words ("ארבע משכנתאות") is read only when asked (``claim_words``): it can be confirmed (``derive_counts``)
+    # and never fails a unit by itself (round 22 U10, KTD9)
+    missing = [n for n in (numbers_in(_stated_text(u)) | (count_words_in(_stated_text(u)) if claim_words else set())) - question_numbers
+               if n not in pool and not (
         _small_ordinal(n, u.text) and not _document_count(n, u.text))]
     if missing and held:  # the date a cited value or measurement states for itself (round 11 U15 B)
         backed = _date_backed(_stated_text(u), ws, u.ids)
@@ -7325,7 +7333,7 @@ def _derivations(ws: Workspace, ids: list[str], shown: Shown, clause: str) -> li
     return out
 
 
-def _derived_computation(ws: Workspace, expression: str, shown: Shown, positive: bool) -> str | None:
+def _derived_computation(ws: Workspace, expression: str, shown: Shown, positive: bool, note: str | None = None) -> str | None:
     """The C# of ``expression`` when it reproduces the number as shown (``calc.evaluate`` and ``calc.display_matches``,
     the precision and scale it is written in); registered once per expression, with result kind ``derived``. None when the
     calculator refuses it (units that do not combine, a literal beside a value that is not dimensionless), it is not
@@ -7350,7 +7358,7 @@ def _derived_computation(ws: Workspace, expression: str, shown: Shown, positive:
     # registered as ``tool_calculate`` registers a result: a result resting on an uncertain input is conditional, never
     # certain (R28), and the conditional is kept in the note
     c, _ = chat_tools.register_computation(ws, node, out, [lf.id for lf in out.leaves], label_prefix="נגזר: ",
-                                           kind=calc.DERIVED, notes=[MSG_DERIVED_NOTE], conditional_in_note=True)
+                                           kind=calc.DERIVED, notes=[note or MSG_DERIVED_NOTE], conditional_in_note=True)
     return c.cid
 
 
@@ -7390,6 +7398,226 @@ def derive_numbers(u: Unit, ws: Workspace, loose: set[str]) -> list[str]:
                     found.append(cid)
                 break
     return found
+
+
+# --- a count the answer derives from a cited enumeration (round 22 U10, KTD9, R17) -----------------------------------------------
+#
+# «6 מועדי תשלום» over a cited table of six payment rows, «4 משכנתאות» over the four items the turn's ledger holds for a cited source: the
+# number is not a figure any source writes, it is how many entries the cited enumeration has. A small count is accepted as derived when a
+# cited enumeration (the data rows of a cited table source, the ledger items of a cited source, the cited V#s) has exactly that size AND
+# the noun it counts names the kind of that enumeration's entries (its row-label column header, the word its row labels share, a noun of its
+# caption, the label words its items or values share; a conservative stem match, ``_noun_stems``). It is registered as a C# of result kind
+# ``derived`` (``calc.enumeration_count``) that joins the unit's citations, the way
+# ``derive_numbers`` registers a derivation; any other count goes to the judge as before.
+
+MSG_DERIVED_COUNT_NOTE = ("נספר על ידי השרת מתוך מנייה שהיחידה מצטטת (שורות של טבלה, פריטים או ערכים מצוטטים), לפי הניסוח שלה; "
+                          "המספר אינו כתוב בשומה כפי שהוא ואינו תוצאה שהמודל חישב.")
+COUNT_MIN, COUNT_MAX = 2, 99  # the counts the channel derives: a small count of entries (one entry states no count)
+# words that name a table, a list or a column and no kind of entry: they are never what an enumeration counts
+_GENERIC_KIND_WORDS = frozenset({
+    "טבלה", "טבלת", "לוח", "סיכום", "פירוט", "נתונים", "נתון", "שורה", "שורות", "עמודה", "פריט", "פריטים", "תיאור", "הערה", "הערות", "סכום",
+    "סכומים", "מספר", "רשימה", "רשימת", "ערך", "ערכים", "שם", "סוג", "פרט", "כללי", "דוח", "סעיף", "סעיפים", "ראשון", "שני", "שלישי"})
+_TOTAL_ROW = re.compile(r"סה[\"״']?כ|סך\s*ה?כו?ל|סיכום|(?<![A-Za-z])total(?![A-Za-z])", re.I)
+_COUNT_DIGITS = re.compile(r"(?<![\d.,/%])(?<!\d-)(\d{1,2})(?![\d.,/%])[ \t]+([א-ת][א-ת\"״׳']*)")
+_HEBREW_WORD = re.compile(r"[א-ת]{2,}")
+_FIRST_HEBREW_WORD = re.compile(r"[ \t]+([א-ת][א-ת\"״׳']*)")
+
+
+class _Enumeration(NamedTuple):
+    """What a cited unit can count: ``size`` entries, of the kind the stems ``kinds`` name, over ``ids`` (S#, V#), of the sort ``what``."""
+
+    size: int
+    kinds: frozenset[str]
+    ids: tuple[str, ...]
+    what: str  # "rows" | "items" | "values" | "list" (the answer's own list)
+    tag: str = ""
+
+
+def _noun_stems(word: str) -> frozenset[str]:
+    """The forms a noun is compared by: the word, and the word without a plural, construct or feminine ending ("מועדי" and "מועדים" are
+    "מועד", "משכנתאות" is "משכנתא", "דירות" is "דירה"), each at least three letters. No prefix letter is stripped: "מועד" is not "ועד"."""
+    w = word.strip("\"'״׳.,:;()[]")
+    out = {w}
+    for ending in ("ים", "ות", "י", "ה", "ת"):
+        if w.endswith(ending) and len(w) - len(ending) >= 3:
+            base = w[:-len(ending)]
+            out |= {base, base + "ה"} if ending == "ות" else {base}
+    return frozenset(x for x in out if len(x) >= 3 and not x.isdigit())
+
+
+def _kind_stems(text: str) -> frozenset[str]:
+    """The noun stems of the words of ``text`` that can name a kind of entry (no generic table word)."""
+    return frozenset(s for w in _HEBREW_WORD.findall(text) if w not in _GENERIC_KIND_WORDS for s in _noun_stems(w))
+
+
+def _table_enumeration(src) -> _Enumeration | None:
+    """The data rows of a table source as an enumeration: one table read whole (not in parts), the rows after its header (the rows before
+    the first one that holds a digit), a total row not counted, and the stated size of the table (``הטבלה: N שורות``) the one the rows
+    show. Its kind: the header of the row-label column, the word every row label starts with, and the nouns of the lines around the table."""
+    from app.chat.tools import table_row_count
+
+    if src.kind != "table" or src.table_part or src.partial_document:
+        return None
+    text = without_part_tags(src.text)
+    rows: list[list[str]] = []
+    around: list[str] = []
+    runs = 0
+    in_run = False
+    for line in text.splitlines():
+        if meaning._ROW in line or line.strip().startswith("|"):
+            if not meaning._SEPARATOR_ROW.fullmatch(line):
+                rows.append(scopes.row_cells(line))
+            runs += not in_run
+            in_run = True
+        else:
+            in_run = False
+            if line.strip() and not line.startswith(TABLE_SIZE_PREFIX) and not line.startswith("["):
+                around.append(line)
+    first = next((i for i, r in enumerate(rows) if any(re.search(r"\d", c) for c in r)), None)
+    if runs != 1 or first is None:
+        return None
+    head, data = rows[:first], rows[first:]
+    stated = table_row_count(text)
+    if stated is not None and stated != len(data):
+        return None
+    counted = [r for r in data if not (r and _TOTAL_ROW.search(r[0]))]
+    column = next((c for c in (0, 1) if all(c < len(r) and re.search(r"[א-ת]", r[c]) for r in counted)), None)
+    kinds: set[str] = set()
+    if column is not None:
+        if head and column < len(head[-1]):
+            kinds |= _kind_stems(head[-1][column])
+        starts = {(r[column].split() or [""])[0] for r in counted}
+        if len(starts) == 1:
+            kinds |= _kind_stems(next(iter(starts)))
+    for line in around[:6]:
+        if len(line.split()) <= 8:
+            kinds |= _kind_stems(line)
+    return _Enumeration(len(counted), frozenset(kinds), (src.sid,), "rows") if len(counted) >= COUNT_MIN and kinds else None
+
+
+def _ledger_enumerations(u: Unit, ledger) -> list[_Enumeration]:
+    """Per component of the turn's item ledger, its items (one per evidence, none closed as not applicable or superseded) from the sources
+    the unit cites; their kind is what every item's label shares."""
+    cited = set(u.ids)
+    by_component: dict[str, dict] = {}
+    for item in ledger.items.values():
+        if item.source in cited and not item.superseded_by and item.state != ITEM_NOT_APPLICABLE:
+            by_component.setdefault(item.component, {}).setdefault(item.evidence, item)
+    out = []
+    for fills in by_component.values():
+        shared = frozenset.intersection(*(_kind_stems(i.label) for i in fills.values()))
+        if len(fills) >= COUNT_MIN and shared:
+            out.append(_Enumeration(len(fills), shared, tuple(dict.fromkeys(i.source for i in fills.values())), "items"))
+    return out
+
+
+def _value_enumeration(u: Unit, ws: Workspace) -> _Enumeration | None:
+    """The values (V#) the unit cites as an enumeration: their kind is what the labels of all of them share."""
+    ids = [i for i in dict.fromkeys(u.ids) if i in ws.values]
+    if len(ids) < COUNT_MIN:
+        return None
+    shared = frozenset.intersection(*(_kind_stems(ws.values[i].label) for i in ids))
+    return _Enumeration(len(ids), shared, tuple(ids), "values") if shared else None
+
+
+def _list_enumeration(u: Unit, units: Sequence[Unit], ws: Workspace) -> _Enumeration | None:
+    """The answer's own list as an enumeration (round 22 U10): the list items that directly follow the unit's block (the unit is no list
+    item itself), each citing a source. Its kind: the words every item shares (the unit's own heading words are not used: they would name
+    whatever the unit counts). The items are verified claim by claim; this only says how many there are."""
+    if u.list_item or u.block < 0:
+        return None
+    items: dict[int, list[Unit]] = {}
+    for x in units:
+        if x.index <= u.index or x.block == u.block:
+            continue
+        if not x.list_item:
+            break
+        items.setdefault(x.block, []).append(x)
+    cited = [tuple(i for x in group for i in x.ids if i in ws.sources or i in ws.values) for group in items.values()]
+    if len(items) < COUNT_MIN or not all(cited):
+        return None
+    kinds = frozenset.intersection(*(_kind_stems(" ".join(x.text for x in group)) for group in items.values()))
+    ids = tuple(dict.fromkeys(i for ids in cited for i in ids))
+    return _Enumeration(len(items), kinds, ids, "list", f"@{u.index}") if kinds else None
+
+
+def _countable(u: Unit, ws: Workspace, ledger, units: Sequence[Unit] = ()) -> list[_Enumeration]:
+    """Every enumeration the unit makes countable: its cited table sources, the ledger's items of its cited sources, its cited V#s, and the
+    list of the answer that follows it."""
+    out = [e for i in dict.fromkeys(u.ids) if i in ws.sources and (e := _table_enumeration(ws.sources[i])) is not None]
+    if ledger is not None:
+        out += _ledger_enumerations(u, ledger)
+    if (values := _value_enumeration(u, ws)) is not None:
+        out.append(values)
+    if units and (own := _list_enumeration(u, units, ws)) is not None:
+        out.append(own)
+    return out
+
+
+def _count_mentions(u: Unit) -> list[tuple[int, str]]:
+    """The small counts the unit writes right before a noun, in digits ("6 מועדי תשלום") or in words ("שישה מועדי תשלום"), as (the count,
+    the noun). A number of a date is no count."""
+    text = _stated_text(u)
+    plain = _DATE_AT.sub(" ", text)
+    found = [(int(m.group(1)), m.group(2)) for m in _COUNT_DIGITS.finditer(plain)]
+    for w in numread.number_words(text, claim=True):
+        if (m := _FIRST_HEBREW_WORD.match(text, w.end)) is not None:
+            found.append((w.value, m.group(1)))
+    return [(n, noun) for n, noun in found if COUNT_MIN <= n <= COUNT_MAX]
+
+
+def _count_computation(ws: Workspace, e: _Enumeration, n: int, noun: str) -> str | None:
+    """The C# of the count ``n`` of enumeration ``e`` (registered once per enumeration), or None when it cannot be registered. It has no
+    leaves: a later unit that only cites the same sources or values is not bound to it by the number alone (``bind_computations``)."""
+    from app.chat import calc
+
+    expression = f"count({','.join(e.ids)}:{e.what}{e.tag})"
+    existing = next((c for c in ws.computations.values() if c.result_kind == calc.DERIVED and c.expression == expression), None)
+    if existing is not None:
+        return existing.cid
+    if e.what == "values":
+        what = "הערכים המצוטטים"
+        inputs = [{"id": i, "label": ws.values[i].label, "kind": "value", "value": str(ws.values[i].value),
+                   "display": ws.values[i].written, "value_text": ws.values[i].written, "source_id": ws.values[i].source_id}
+                  for i in e.ids]
+    else:
+        what = {"rows": "שורות הטבלה", "items": "פריטי הרשימה", "list": "פריטי הרשימה שבתשובה"}[e.what]
+        inputs = [{"id": i, "label": f"{what} (ב-{i})", "kind": "enumeration", "value": str(n), "display": str(n)} for i in e.ids]
+    sources = list(dict.fromkeys(i if i in ws.sources else ws.values[i].source_id for i in e.ids))
+    documents = len({str(ws.sources[i].document_id) for i in sources if i in ws.sources})
+    cid = f"C{len(ws.computations) + 1}"
+    ws.computations[cid] = calc.enumeration_count(
+        cid, n, label=f"נגזר: מספר {noun}", expression=expression, formula=f"ספירה של {what} {', '.join(e.ids)}", inputs=inputs,
+        sources=sources, documents=documents, note=MSG_DERIVED_COUNT_NOTE)
+    return cid
+
+
+def derive_counts(u: Unit, ws: Workspace, loose: set[str], ledger=None, units: Sequence[Unit] = (), *, require_all: bool = False) -> list[str]:
+    """The C# ids that confirm the small counts of a unit that no source it cites states (``loose``, as ``numbers_in`` reads them): a count
+    before a noun, in digits or in words, that an enumeration of exactly that size has, of the kind the noun names (see above). Registers
+    what it finds; the caller cites it. A count of another size, another kind or with no enumeration is not derived — and is left to the
+    judge, never removed for it. ``units``: the answer's units, for the list that follows the unit. ``require_all``: derive only when every
+    number of ``loose`` is a count this confirms (a unit that cites nothing takes no citation for a count and keeps its other numbers
+    unchecked otherwise)."""
+    found: list[tuple[_Enumeration, int, str]] = []
+    enums: list[_Enumeration] | None = None
+    for n, noun in _count_mentions(u):
+        if not numbers_in(str(n)) & loose:
+            continue
+        if enums is None:
+            enums = _countable(u, ws, ledger, units)
+        stems = _noun_stems(noun)
+        for e in enums:
+            if e.size == n and stems & e.kinds:
+                found.append((e, n, noun))
+                break
+    if require_all and not loose <= set().union(*(numbers_in(str(n)) for _, n, _ in found)):
+        return []
+    out: list[str] = []
+    for e, n, noun in found:
+        if (cid := _count_computation(ws, e, n, noun)) is not None and cid not in out:
+            out.append(cid)
+    return out
 
 
 SPECIFIC_DIGITS = 5  # significant digits (as written) that a coincidence cannot plausibly produce (round 16 U6)
@@ -7433,7 +7661,7 @@ def _linked_conditional_results(u: Unit, conditional: Sequence[tuple[str, Comput
     return out
 
 
-def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[int, list[str]]:
+def bind_computations(units: list[Unit], ws: Workspace, question: str, ledger=None) -> dict[int, list[str]]:
     """Bind each unit that shows a result of the turn's calculations without citing it (citing only its inputs, or
     nothing) to that calculation: the C# joins the unit's citations, so the number check, the VAT check and the
     judge read the unit with it, and the server cites it in the answer. A number binds when it is the result at the
@@ -7446,6 +7674,9 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
     a C# of result kind ``derived`` and joins the unit's citations, whatever else the unit holds. A derived result binds
     only to a unit that cites an input of it.
 
+    Round 22 U10 (KTD9, R17): a small count before the noun of a cited enumeration of exactly that size (the rows of a cited table, the
+    ledger's items of a cited source, the cited V#s) is derived the same way (``derive_counts``): ``ledger`` is the turn's item ledger.
+
     Round 16 U6 (KTD7, R12): a number a cited source also writes is not ``loose``, so a result of a *conditional* calculation
     that the source happens to write too (the calculation reproduces a figure of the table its inputs were read from)
     was never bound, and its sentence went to the judge with no ``<server_qualifier>``. ``_linked_conditional_results``
@@ -7454,7 +7685,7 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
     ``SPECIFIC_DIGITS`` significant digits as written), and does not present it as written by a document."""
     from app.chat.calc import DERIVED
 
-    if not (ws.computations or ws.values or ws.measurements):
+    if not (ws.computations or ws.values or ws.measurements or ws.sources):
         return {}
     question_numbers = numbers_in(question)
     bound: dict[int, list[str]] = {}
@@ -7470,9 +7701,15 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
             known_computations = len(ws.computations)
             conditional = [(cid, c) for cid, c in ws.computations.items() if c.conditional]
         linked = _linked_conditional_results(u, conditional) if conditional else []
-        if not loose and not linked:
+        # a count written in words is no loose number (it never fails a unit); it can only be confirmed below (round 22 U10, KTD9)
+        counted = loose | (set(_unstated(u, ws, question_numbers, set(), strict=True, stated_by=stated_by, percent_of_fraction=False,
+                                         origins=False, claim_words=True)) if numread.number_words(u.text, claim=True) else set())
+        if not counted and not linked:
             continue
         derived = [cid for cid in derive_numbers(u, ws, loose) if cid not in u.ids] if u.ids and loose else []
+        # a small count next to the noun of an enumeration of exactly that size is confirmed as a derived count (round 22 U10, KTD9)
+        derived += [cid for cid in derive_counts(u, ws, counted, ledger, units, require_all=not u.ids)
+                    if cid not in u.ids and cid not in derived] if counted else []
         if derived:
             u.ids.extend(derived)
             bound[u.index] = list(derived)
@@ -7506,9 +7743,13 @@ def bind_computations(units: list[Unit], ws: Workspace, question: str) -> dict[i
 def _small_ordinal(n: str, text: str) -> bool:
     """A count of things in the answer itself ("2 מסמכים", "שלושה ערכים") is not a fact from a source."""
     try:
-        return int(n) <= 10 and bool(re.search(rf"\b{n}\s+(?:מסמכים|מסמך|ערכים|נתונים|שומות|מקורות|טבלאות)", text))
+        if int(n) > 10:
+            return False
     except ValueError:
         return False
+    nouns = r"(?:מסמכים|מסמך|ערכים|נתונים|שומות|מקורות|טבלאות)"
+    return bool(re.search(rf"\b{n}\s+{nouns}", text)) or any(
+        str(w.value) == n and re.match(rf"\s+{nouns}", text[w.end:]) for w in numread.number_words(text, claim=True))
 
 
 def _document_count(n: str, text: str) -> bool:
@@ -9041,7 +9282,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                              request or question, listing, known, {i for u in units for i in u.ids}, question=question)
     # a result of the turn's calculations that a unit shows without citing it is bound to its C#, which joins the
     # unit's citations (and the answer's, once the unit is verified)
-    bound = bind_computations(units, ws, question)
+    bound = bind_computations(units, ws, question, ledger)
     # the meaning check first: evidence it finds in the same calculation joins the unit's citations, so the number
     # check and the judge read the unit with it
     fetcher = meaning.Fetcher(ws)
