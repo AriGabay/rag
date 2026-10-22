@@ -300,6 +300,32 @@ def test_a_table_row_on_a_turned_cropped_page_lands_in_the_context_of_its_render
     assert [(g["context"], g["first"], g["last"]) for g in groups] == [(1, 1, 2), (2, 3, 4)]
 
 
+def test_a_stored_merged_table_is_split_by_the_context_of_each_rows_position():
+    """A table stored with rows of two pages (a structure stored before round 22 U3, or one the producer decided to continue)
+    is read by context row by row: the producer no longer builds such a table across two appraisals, but the split stays for
+    the tables already stored (``reader.table_contexts``, rows counted from 1; a row is placed by its page and the top of its
+    cell boxes against where the second appraisal starts: here page 2, top 60)."""
+    from app.chat import reader
+
+    cx = contexts.derive(TWO, "v")
+    assert cx.multi and cx.numbers == [1, 2] and cx.segments[1].start == (2, 60.0)
+    table = next(b for b in TWO if b.kind == "table")
+
+    def row(page: int | None, top: float, n: int) -> dict:
+        return {"page": page, "cells": [f"שורה {n}"], "cell_boxes": [[40.0, top, 90.0, top + 12]]}
+
+    # three rows on page 1, a continuation row at the top of page 2 above the second title, then three rows below it
+    st = {"rows": [row(1, 100.0, 1), row(1, 120.0, 2), row(1, 140.0, 3), row(2, 30.0, 4), row(2, 100.0, 5), row(2, 140.0, 6)]}
+    groups = reader.table_contexts(cx, st, table.block_index, table.page)
+    assert [(g["context"], g["first"], g["last"], g["pages"]) for g in groups] == [(1, 1, 4, {1, 2}), (2, 5, 6, {2})]
+    # a row with no page is in the context of the table's own block
+    st["rows"].append({"cells": ["ללא עמוד"]})
+    assert [(g["context"], g["first"], g["last"]) for g in reader.table_contexts(cx, st, table.block_index, table.page)] == [
+        (1, 1, 4), (2, 5, 6), (1, 7, 7)]
+    # a file with one context has no split at all
+    assert reader.table_contexts(contexts.derive(appraisal(0, 1, "הדמומית 12", "30871", "15", "21,400"), "v"), st, 10, 1) == []
+
+
 def test_a_page_without_usable_geometry_keeps_its_stored_block_top():
     for geometry in (None, dict(TURNED, geometry_issue="frame_mismatch"), dict(TURNED, rotation=None)):
         cx = contexts.derive(turned_two(geometry), "v")

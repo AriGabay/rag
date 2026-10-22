@@ -7,8 +7,8 @@ adopted figure, and the respondent's figure attributed to the respondent, are ke
 listed by ``find_measurements``.
 
 Within the right appraisal context (round 7 U6: KTD7; R20–R22, AE6): a file holding two appraisals (the synthetic R7b,
-and files built from blocks) is read as two contexts by outline, read, search and take_value, its merged comparables
-table split by row position; a value records its context and whether its subject names it; with enforcement on, a
+and files built from blocks) is read as two contexts by outline, read, search and take_value, its comparables
+tables kept apart, one per appraisal (a stored merged table is split by row position); a value records its context and whether its subject names it; with enforcement on, a
 claim about one property resting on the other's figure is removed as ``wrong_subject``, ``calculate`` needs a
 comparison component to combine them, an appendix's comparison figure is not the appraised property's, and a party's
 figure keeps its stance inside its context. The context count script prints ids, counts and kinds only. Synthetic
@@ -207,19 +207,28 @@ def test_r7b_each_appraisal_is_its_own_context_in_outline_read_and_table(office,
     assert f'context="הקשר 2: {label_2}' in second and 'location="עמוד 2' in second
     # the second appraisal's title block is its own, not a part of the first's last chapter
     assert SECOND_TITLE["street"] not in T.tool_read(ws, {"section": _handle(_group(outline, 1), "6. סיכום")})
-    # the merged comparables table: its rows on page 2 are the second appraisal's, said in the outline, in the second
-    # appraisal's comparables chapter and where the table is read
-    table = re.search(r"- (T\d+) «[^»]*» — [^\n]*", outline)
-    assert "שורות 4–6 (עמוד 2): הקשר 2" in table.group(0), table.group(0)
-    chapter = T.tool_read(ws, {"section": _handle(_group(outline, 2), "4. נתוני השוואה")})
-    assert f"שורות 4–6 (עמוד 2) של {table.group(1)} שייכות להקשר הזה" in chapter, chapter
-    rows = T.tool_read(ws, {"table": table.group(1)})
-    assert rows.index("[שורות 1–3 — הקשר 1") < rows.index("30871/22") < rows.index("[שורות 4–6 — הקשר 2") < rows.index(
-        "30874/12"), rows
-    # a cell of a row on page 2 is the second appraisal's
-    T.tool_take_value(ws, _sid(rows), {"row": "30874/12", "column": "מחיר למ״ר (₪)", "number": "22,500"},
+    # the comparables table is one table per appraisal (round 22 U3, KTD3): the first appraisal's rows end on page 1, and what
+    # lies between the two pieces (the rest of the first appraisal and the second one's title block) is evidence that the page-2
+    # piece is a table of its own, so the two are never merged into one table with rows of two appraisals
+    tables = re.findall(r"- (T\d+) «[^»]*» — ([^\n]*)", outline)
+    assert len(tables) == 2, outline
+    (t1, line_1), (t2, line_2) = tables
+    assert "עמוד 1, 3 שורות" in line_1 and "(הקשר 1)" in line_1 and "הקשר 2" not in line_1, line_1
+    assert "עמוד 2, 3 שורות" in line_2 and "(הקשר 2)" in line_2 and "הקשר 1" not in line_2, line_2
+    assert "שורות 4–6" not in outline  # no table is split by row context any more: each is whole in its own context
+    # each appraisal's comparables chapter is the place of its own table, and the table is read with its own context
+    rows_1, rows_2 = T.tool_read(ws, {"table": t1}), T.tool_read(ws, {"table": t2})
+    assert "30871/22" in rows_1 and "30871/31" in rows_1 and "30874/12" not in rows_1 and "30875/3" not in rows_1, rows_1
+    assert "30874/12" in rows_2 and "30875/3" in rows_2 and "30871/22" not in rows_2 and "30871/31" not in rows_2, rows_2
+    assert f'context="הקשר 1: {label_1}' in rows_1 and f'context="הקשר 2: {label_2}' in rows_2
+    assert "[שורות" not in rows_1 and "[שורות" not in rows_2  # no per-row context banner in a table of one context
+    # a cell of a row of the second table is the second appraisal's; one of the first table is the first's
+    T.tool_take_value(ws, _sid(rows_2), {"row": "30874/12", "column": "מחיר למ״ר (₪)", "number": "22,500"},
                       _sqm(kind="price_per_area"), "עסקה")
     assert list(ws.values.values())[-1].context["number"] == 2
+    T.tool_take_value(ws, _sid(rows_1), {"row": "30871/22", "column": "מחיר למ״ר (₪)", "number": "20,900"},
+                      _sqm(kind="price_per_area"), "עסקה")
+    assert list(ws.values.values())[-1].context["number"] == 1
 
 
 def test_r7b_search_hits_say_their_context(office, r7b):
