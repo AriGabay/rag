@@ -28,7 +28,16 @@ TRANSACTION_WORDS = ("עסקה", "עסקאות", "עסקת", "נמכר", "נמכ
 VALUE_WORDS = ("שווי", "שומה", "שומות", "הוערך", "הוערכו", "הערכת")
 ASKING_WORDS = ("מבוקש", "מחיר מבוקש", "מחירים מבוקשים")
 ADJUSTED_WORDS = ("מתואם", "מתואמים", "לאחר התאמות")
-CALC_WORDS = ("למ״ר", "למטר", "ממוצע", "חציון", "משוקלל", "כמה עסקאות", "מספר העסקאות", "מחיר", "שווי")
+# round 22 U1: every list below is matched as whole words (Hebrew prefix letters allowed), so an inflection is listed.
+PRICE_WORDS = ("מחיר", "מחירי", "מחירים")
+AVERAGE_WORDS = ("ממוצע", "ממוצעת", "ממוצעים")
+WEIGHTED_WORDS = ("משוקלל", "משוקללת", "משוקללים")
+MEDIAN_WORDS = ("חציון", "חציוני", "חציונית")
+VAT_INCLUDED_WORDS = ("כולל מע״מ", "כולל מעמ")
+VAT_EXCLUDED_WORDS = ("לא כולל מע״מ", "לא כולל מעמ")
+PER_SQM_WORDS = ("למ״ר",)
+CALC_WORDS = ("למ״ר", "למטר", *AVERAGE_WORDS, *MEDIAN_WORDS, *WEIGHTED_WORDS, "כמה עסקאות", "מספר העסקאות",
+              *PRICE_WORDS, "שווי")
 EXPLAIN_WORDS = ("למה", "מדוע", "שיקול", "שיקולי", "השיקולים", "הסבר", "נימוק", "נימוקי", "מה נכתב", "מה נאמר",
                  "איך השמאי", "מה השמאי", "הוזכר", "הוזכרו", "התייחס")
 LOOKUP_WORDS = ("באיזה מסמך", "באיזו שומה", "באילו שומות", "באילו מסמכים", "איפה מופיע", "מצא את", "איזה מסמך",
@@ -171,8 +180,11 @@ def _relative_year(text: str) -> int | None:
                  if any(_spans(words, p) for p in phrases)), None)
 
 
-def _has(text: str, words) -> bool:
-    return any(w in text for w in words)
+def _has_phrase(text: str, phrases) -> bool:
+    """Round 22 U1: a vocabulary word or phrase present as whole words, with Hebrew prefix letters allowed
+    ("בנטו" holds "נטו", "נטושות" does not). Replaces the bare substring test over the vocabulary lists."""
+    words = _TOKEN.findall(text)
+    return any(_spans(words, p) for p in phrases)
 
 
 def _place(tokens: list[str], gaz: Gazetteer) -> tuple[str | None, str | None]:
@@ -199,12 +211,12 @@ def _years(text: str) -> tuple[int | None, int | None]:
 
 
 def _intent(text: str) -> str:
-    calc = _has(text, CALC_WORDS)
-    explain = _has(text, EXPLAIN_WORDS)
-    lookup = _has(text, LOOKUP_WORDS)
+    calc = _has_phrase(text, CALC_WORDS)
+    explain = _has_phrase(text, EXPLAIN_WORDS)
+    lookup = _has_phrase(text, LOOKUP_WORDS)
     if lookup and not calc:
         return "document_lookup"
-    if explain and calc and ("למ״ר" in text or "ממוצע" in text or "משוקלל" in text):
+    if explain and calc and _has_phrase(text, (*PER_SQM_WORDS, *AVERAGE_WORDS, *WEIGHTED_WORDS)):
         return "combined"
     if explain:
         return "explanation"
@@ -215,22 +227,22 @@ def _intent(text: str) -> str:
 
 def _data_kind(text: str) -> str | None:
     kinds = set()
-    if _has(text, ADJUSTED_WORDS):
+    if _has_phrase(text, ADJUSTED_WORDS):
         kinds.add("adjusted_comparable")
-    elif _has(text, ASKING_WORDS):
+    elif _has_phrase(text, ASKING_WORDS):
         kinds.add("asking_price")
     else:
-        if _has(text, TRANSACTION_WORDS):
+        if _has_phrase(text, TRANSACTION_WORDS):
             kinds.add("transaction_price")
-        if _has(text, VALUE_WORDS):
+        if _has_phrase(text, VALUE_WORDS):
             kinds.add("appraised_value")
-            if "מחיר" in text and "transaction_price" not in kinds:
+            if _has_phrase(text, PRICE_WORDS) and "transaction_price" not in kinds:
                 return None  # "price" and "value" together: which one is meant is the user's call
     return kinds.pop() if len(kinds) == 1 else None
 
 
 def _date_field(text: str) -> str | None:
-    found = [f for f, words in DATE_FIELD_WORDS.items() if _has(text, words)]
+    found = [f for f, words in DATE_FIELD_WORDS.items() if _has_phrase(text, words)]
     return found[0] if len(found) == 1 else None
 
 
@@ -294,7 +306,7 @@ def parse_question(question: str, gaz: Gazetteer, previous: QueryConditions | No
             update |= {"neighborhood": hood, "city": city or previous.city}
         elif city is not None:
             update |= {"city": city, "neighborhood": None}
-        area = next((k for k, w in AREA_WORDS.items() if _has(text, w)), None)
+        area = next((k for k, w in AREA_WORDS.items() if _has_phrase(text, w)), None)
         if area:
             update["area_type"] = area
         if update:
@@ -308,7 +320,7 @@ def parse_question(question: str, gaz: Gazetteer, previous: QueryConditions | No
         year_from, year_to = _years(ctext)
         intent = "combined"
     else:
-        intent = "calculation" if is_followup and not _has(text, EXPLAIN_WORDS) else _intent(text)
+        intent = "calculation" if is_followup and not _has_phrase(text, EXPLAIN_WORDS) else _intent(text)
     conds = QueryConditions(
         intent=intent,
         data_kind=_data_kind(ctext) if scan.monetary_term else None,
@@ -317,9 +329,11 @@ def parse_question(question: str, gaz: Gazetteer, previous: QueryConditions | No
         year_to=year_to,
         city=city,
         neighborhood=hood,
-        property_type=next((code for code, words in PROPERTY_WORDS if _has(ctext, words)), None),
-        area_type=next((k for k, w in AREA_WORDS.items() if _has(ctext, w)), None),
-        vat_basis="excluded" if "לא כולל מע" in ctext else ("included" if "כולל מע" in ctext else None),
-        aggregation="weighted" if "משוקלל" in ctext else ("median" if "חציון" in ctext else "both"),
+        property_type=next((code for code, words in PROPERTY_WORDS if _has_phrase(ctext, words)), None),
+        area_type=next((k for k, w in AREA_WORDS.items() if _has_phrase(ctext, w)), None),
+        vat_basis=("excluded" if _has_phrase(ctext, VAT_EXCLUDED_WORDS)
+                   else ("included" if _has_phrase(ctext, VAT_INCLUDED_WORDS) else None)),
+        aggregation=("weighted" if _has_phrase(ctext, WEIGHTED_WORDS)
+                     else ("median" if _has_phrase(ctext, MEDIAN_WORDS) else "both")),
     )
     return ParseResult(conds, missing_conditions(conds), "rules", unknown, **report)

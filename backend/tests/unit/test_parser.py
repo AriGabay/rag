@@ -170,3 +170,62 @@ def test_parser_vocabulary_holds_no_topic_or_attribute_words():
              "זכויות", "שיפוץ", "חדרים")
     found = [w for w in words if re.search(re.escape(w), source)]
     assert found == []
+
+
+# round 22 U1: the vocabulary lists are read as whole words (with Hebrew prefix letters), never as substrings.
+def _conds(question: str):
+    return parse_question(question, GAZ).conditions
+
+
+def test_net_area_word_matches_as_a_word_and_behind_a_prefix():
+    assert _conds("מחיר עסקאות למ״ר שטח נטו ב-2024").area_type == "net"
+    assert _conds("מחיר עסקאות למ״ר בנטו ב-2024").area_type == "net"
+
+
+def test_net_area_word_does_not_match_inside_another_word():
+    assert _conds("מחיר עסקאות למ״ר בדירות נטושות ב-2024").area_type is None
+
+
+def test_area_basis_lists_have_a_positive_and_an_embedded_negative():
+    assert _conds("מחיר עסקאות לפי שטח ברוטו").area_type == "gross"
+    assert _conds("מחיר עסקאות לפי שטח רשום").area_type == "registered"
+    assert _conds("מחיר עסקאות לפי שטח רשומה").area_type == "registered"
+    assert _conds("מחיר עסקאות אקוויוולנטי").area_type == "equivalent"
+    assert _conds("מחיר עסקאות כאשר נרשום הערה").area_type is None  # «רשום» inside «נרשום»
+    assert _conds("מחיר עסקאות ללא ברוטוסיפון").area_type is None
+
+
+def test_area_basis_in_a_follow_up_is_read_as_a_word():
+    prev = QueryConditions(intent="calculation", data_kind="transaction_price", area_type="gross", year_from=2023)
+    assert parse_question("ומה לגבי נטו", GAZ, previous=prev).conditions.area_type == "net"
+    assert parse_question("ומה לגבי שנת 2024 בדירות נטושות", GAZ, previous=prev).conditions.area_type == "gross"
+
+
+def test_property_type_words_match_as_words_and_phrases():
+    assert _conds("מחיר עסקאות לדירות ב-2024").property_type == "apartment"
+    assert _conds("מחיר עסקאות לדירות גן ב-2024").property_type == "garden_apartment"
+    assert _conds("מחיר עסקאות בית פרטי ב-2024").property_type == "house"
+    assert _conds("מחיר עסקאות במגרשים ב-2024").property_type == "land"
+    assert _conds("מחיר עסקאות לפי תכנית אדירה ב-2024").property_type is None  # «דירה» inside «אדירה»
+    assert _conds("מחיר עסקאות בית פרטיות ב-2024").property_type is None  # phrase words are whole words
+
+
+def test_vat_basis_matches_as_a_phrase_and_not_inside_another_word():
+    assert _conds("מחיר עסקאות כולל מע״מ").vat_basis == "included"
+    assert _conds("מחיר עסקאות לא כולל מע״מ").vat_basis == "excluded"
+    assert _conds("מחיר עסקאות כולל מעמד חוקי").vat_basis is None
+    assert _conds("מחיר עסקאות לא כולל מעמד חוקי").vat_basis is None
+
+
+def test_intent_and_data_kind_words_are_whole_words():
+    assert _conds("מחירי עסקאות ב-2024").intent == "calculation"
+    assert _conds("מה המחירים של עסקאות").intent == "calculation"
+    assert _conds("מה מחירון הקרקע").intent == "explanation"  # «מחיר» inside «מחירון»
+    assert _conds("מחיר עסקאות חציוני").aggregation == "median"
+    assert _conds("מחיר עסקאות חציון ב-2024").aggregation == "median"
+    assert _conds("מחיר עסקאות משוקלל ב-2024").aggregation == "weighted"
+
+
+def test_date_field_words_are_whole_words():
+    assert _conds("שווי שומות למועד הקובע 2024").date_field == "valuation_date"
+    assert _conds("שווי שומות בנחתמוסיפה 2024").date_field is None
