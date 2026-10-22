@@ -24,7 +24,7 @@ from tests.conftest import login
 from tests.factories import make_group, make_office, make_user
 from tests.integration.test_chat import cloud, new_conversation, send
 from tests.integration.test_search import add_chunks
-from tests.support.scripted_agent import ScriptedAgent, call, final
+from tests.support.scripted_agent import ScriptedAgent, call, final, read
 
 pytestmark = pytest.mark.db
 
@@ -350,6 +350,54 @@ def test_the_drafts_of_a_turn_stay_behind_the_diagnostics_permission_and_the_doc
     # the owner loses the document the draft cites: the drafts are hidden with the message
     _revoke(setup, setup.secret)
     login(client, "emp@example.test")
+    assert client.get(f"/api/chat/messages/{mid}/diagnostics").status_code == 404
+
+
+def test_a_draft_that_cites_only_a_calculation_keeps_the_document_of_its_value_behind_the_diagnostics(client, setup, monkeypatch):
+    """Round 21 review: the first draft's only citation of the table is a calculation over a value taken from it ([C1] over V1), and the
+    repair round drops that sentence, so neither the final answer nor a removal names the table. A calculation's leaves are V#, M# and A#
+    ids, not S# ids: their document is behind the diagnostics all the same, so hiding it from the owner hides the diagnostics too. (The
+    answer payload also carries the documents the turn's tools touched, so this end-to-end case holds with or without the line in
+    ``_diagnostics`` that adds a draft's leaves; ``tests/unit/test_chat_diagnostics_leaves.py`` pins that line on its own.)"""
+    from tests.integration.test_chat_calculation import (
+        CAPTION,
+        INCOME,
+        _last_output,
+        add_document,
+        cell,
+        handle_of,
+        meaning,
+        take,
+    )
+
+    table, _ = add_document(setup, setup.g2, sha="3" * 64)
+    draft = final("ההכנסות החודשיות הן 1,037,500 ₪ [C1].\nהשווי למ\"ר בנוי הוא 9,500 ₪ [S2].", documents=[setup.public, table])
+    repaired = final("השווי למ\"ר בנוי הוא 9,500 ₪ [S2].", documents=[setup.public])
+
+    def judge(input: str) -> dict:
+        units = re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S)
+        return {"verdicts": [{"index": int(i), "verdict": "unsupported" if "1,037,500" in t else "supported", "reason": "בדיקה"}
+                             for i, t in units]}
+
+    agent = ScriptedAgent([[call("outline", document=table)],
+                           lambda items: [read(table=handle_of(_last_output(items), CAPTION))],
+                           [take("S1", cell("סה\"כ", INCOME), meaning("income", role="income", vat="excluded"), "סה״כ הכנסות")],
+                           [call("calculate", expression="V1 / 12", label="הכנסות חודשיות", justification=None)],
+                           [call("search", query="שווי", document_ids=[setup.public], limit=None)], draft, repaired], judge=judge)
+    cloud(monkeypatch, setup, agent)
+    login(client, "emp@example.test")
+    m = send(client, new_conversation(client), "מה ההכנסות החודשיות, ומה השווי?")
+    assert m["status"] == "done" and "1,037,500" not in json.dumps(m["answer"], ensure_ascii=False), m
+    mid = m["id"]
+    d = client.get(f"/api/chat/messages/{mid}/diagnostics")
+    assert d.status_code == 200
+    first, _ = d.json()["drafts"]
+    assert "1,037,500" in first["markdown"] and {loc["type"] for loc in first["sources"].values()} >= {"computation"}
+    assert not any(loc.get("document_id") == table for loc in first["sources"].values())  # the draft names no source of the table
+    with tenant_tx(setup.system) as conn:
+        docs = conn.execute(text("SELECT document_ids FROM message_diagnostics WHERE message_id = :m"), {"m": mid}).scalar_one()
+    assert table in {str(x) for x in docs}  # the document of the calculation's value is behind the diagnostics
+    _revoke(setup, table)
     assert client.get(f"/api/chat/messages/{mid}/diagnostics").status_code == 404
 
 

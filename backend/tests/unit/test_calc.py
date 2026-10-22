@@ -919,6 +919,37 @@ def test_a21_q5_when_either_value_has_no_known_context_the_model_strings_decide_
     assert run("V3 - V4", ops(similar, same)).value == Decimal("-2000000")
 
 
+def test_a21_q5_review_two_plots_of_one_appraisal_context_are_a_mix_of_subjects():
+    one = _valuation("V1", "9000000", "שווי מגרש 1", context=A_CONTEXT)
+    two = _valuation("V2", "7000000", "שווי מגרש 2", context=A_CONTEXT)
+    with pytest.raises(CalcError):
+        run("V1 + V2", ops(one, two))
+    out = run("V1 + V2", ops(one, two), "סכום שני המגרשים של אותה שומה")
+    assert out.conditional and any("נושא" in c for c in out.conditional)
+
+
+@pytest.mark.parametrize("left, right", [("מגרש א", "מגרש ב"), ("בניין 3", "בניין 4"), ("שווי מגרש A", "שווי מגרש B")])
+def test_a21_q5_review_lettered_and_numbered_designators_of_one_context_are_a_mix_of_subjects(left, right):
+    a = _valuation("V1", "9000000", left, context=A_CONTEXT)
+    b = _valuation("V2", "7000000", right, context=A_CONTEXT)
+    with pytest.raises(CalcError):
+        run("V1 - V2", ops(a, b))
+
+
+def test_a21_q5_review_two_wordings_of_one_plot_in_one_context_are_no_mix_of_subjects():
+    now = _valuation("V1", "9000000", "שווי מגרש 1 כיום", context=A_CONTEXT)
+    before = _valuation("V2", "7000000", "שווי מגרש 1 בשומה הקודמת", context=A_CONTEXT)
+    out = run("V1 - V2", ops(now, before))
+    assert out.value == Decimal("2000000") and not out.conditional
+    # a subject with no designator against one with a designator is no evidence of two plots either
+    bare = _valuation("V3", "5000000", "שווי הזכויות", context=A_CONTEXT)
+    assert run("V1 - V3", ops(now, bare)).value == Decimal("4000000")
+    # a year is the valuation's date, not a plot: the current and an earlier valuation of one property stay one subject (Q5)
+    dated = _valuation("V4", "9000000", "שווי הזכויות 2024", context=A_CONTEXT)
+    earlier = _valuation("V5", "7000000", "שווי הזכויות ב-2021", context=A_CONTEXT)
+    assert run("V4 - V5", ops(dated, earlier)).value == Decimal("2000000")
+
+
 def test_a21_q5_a_result_built_over_two_contexts_is_not_located_in_one():
     a = _valuation("V1", "9000000", "הנכס", context=A_CONTEXT)
     b = _valuation("V2", "1000000", "הנכס", context=B_CONTEXT)

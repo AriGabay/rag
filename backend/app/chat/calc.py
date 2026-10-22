@@ -877,18 +877,37 @@ def _subject_words(subject: str) -> set[str]:
     return {_SUBJECT_PREFIX.sub("", w) for w in re.findall(r"[\w\"']+", _norm(subject)) if not metric_word(w)}
 
 
+_YEAR_TOKEN = re.compile(r"(?<!\d)(?:19|20)\d\d(?!\d)")  # a year in a subject is its date, not a designator
+
+
+def _subject_designators(subject: str) -> frozenset[str]:
+    """What a subject says to tell one plot, lot, building or unit from another (round 21 review): a token of the normalised subject that
+    holds a digit ("1", "3א") or is exactly one letter ("א", "B"). The tokens are taken as written, without ``_subject_words``' prefix
+    strip, so a lone letter is not stripped away. A year ("2024", "ב2023") is a date, not a designator: two valuations of one property at
+    two dates stay one subject (Q5)."""
+    from app.chat.meaning import _norm
+
+    return frozenset(w for w in re.findall(r"[\w\"']+", _norm(subject)) if not _YEAR_TOKEN.search(w) and (
+        any(ch.isdigit() for ch in w) or (len(w) == 1 and w.isalpha())))
+
+
 def _subjects_differ(a: Operand, b: Operand, allowed: list[frozenset[str]] | None = None) -> bool:
     """Whether two operands that are added or subtracted name different scopes, decided by evidence first (round 21 packet A, Q5): when every
     input of both lies in an appraisal context the sources locate (``Leaf.context``), the same context is no mismatch whatever strings the
     model wrote for the two subjects, and disjoint contexts are one as before; when either is unknown the model's own strings decide, as before
     (``same_subject``). A value of an appendix or a comparables part has no subject context (``Value.operand``), so it is never located and the
-    strings decide, as before."""
+    strings decide, as before. Round 21 review: a context is an appraisal, not a plot, lot, building or unit, so inside one context two subjects
+    that each carry a designator ("מגרש 1" and "מגרש 2", "מגרש א" and "מגרש ב", ``_subject_designators``) and carry different ones are
+    still decided by the strings; two wordings of one property ("שווי מגרש 1 כיום", "שווי מגרש 1 בשומה הקודמת"), or a subject with no
+    designator, stay no mismatch."""
     ca = {lf.context[0] for lf in a.leaves if lf.context is not None}
     cb = {lf.context[0] for lf in b.leaves if lf.context is not None}
     if ca and cb and all(lf.context is not None for lf in (*a.leaves, *b.leaves)):
         if ca == cb:
-            return False
-        if ca.isdisjoint(cb):
+            da, db = _subject_designators(a.subject), _subject_designators(b.subject)
+            if not (da and db and da != db):
+                return False
+        elif ca.isdisjoint(cb):
             # two appraisals are two properties, unless the request compares exactly these (``_check_contexts`` governs the combination)
             return not (allowed and any(ca | cb <= a_ for a_ in allowed))
     return not same_subject(a.subject, b.subject)

@@ -1236,7 +1236,14 @@ def _diagnostics(outcome: engine.TurnOutcome, payload: dict, removals: _Removals
     drafted = {"drafts": outcome.drafts} if outcome.drafts else {}
     locs = [loc for d in outcome.drafts for loc in d["sources"].values()]
     checked |= {str(loc["document_id"]) for loc in locs if loc.get("document_id")}
-    checked |= documents_of(leaf for loc in locs if loc.get("type") == "computation" for leaf in loc["leaves"])
+    # a draft's calculation rests on V#, M# and A# ids, not on S# ids (``tools._leaves``): the document of each registered value or
+    # measurement it rests on is behind the message too (round 21 review: ``documents_of`` alone looks up S# ids and added nothing); an
+    # assumption has no document, and a leaf that is a source id is still looked up as one
+    ws = outcome.workspace
+    leaves = [leaf for loc in locs if loc.get("type") == "computation" for leaf in loc["leaves"]]
+    checked |= {str(holder.document_id) for leaf in leaves if (holder := ws.values.get(leaf) or ws.measurements.get(leaf)) is not None
+                and getattr(holder, "document_id", None)}
+    checked |= documents_of(leaves)
     return {"rounds": outcome.rounds, "removed": removed,
             "resolution": (resolution or {}) | {"timing": timing} | registrations | trace | item_ledger | drafted,
             "document_ids": _answer_documents(payload) | found | checked,
