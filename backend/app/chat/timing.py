@@ -7,6 +7,12 @@ choosing the next tool, the request analysis) is not any stage's: it is reported
 stage totals never exceed the turn's total. Numbers and tool names only: no content, so the summary is safe to keep in
 the diagnostics (``message_diagnostics.resolution["timing"]``; no column of its own).
 
+Round 22 U0 (R10, R18, R25) adds the measurement the gate needs, with no effect on any decision or answer text: each search
+call's lexical and fused candidate counts and seconds (on the tool's record, ``search``), the judge results that ended
+``not_checked`` by cause (``not_checked``), the state of each read target (``reads``: attempted, completed, failed with,
+skipped for the tool budget) and the number of multi-page stored tables served (``multi_page_tables``). Counts, statuses
+and handles only.
+
 A read or an inspection also records the first and last page of the sources it returned (``pages``, numbers only), which
 the evaluation's reading-completeness measure uses.
 
@@ -29,6 +35,8 @@ TOOL_STAGE = {"search": "locate", "find_documents": "locate", "list_documents": 
               "read": "read", "inspect": "read",
               "find_measurements": "compute", "take_value": "compute", "assume": "compute", "calculate": "compute"}
 TOOLS_KEPT = 200  # tool records kept for a turn's summary (a turn makes a few dozen at most)
+SEARCHES_KEPT = 12  # search records kept on one tool record (a tool call makes one to a few searches)
+READ_TARGETS_KEPT = 200  # read targets kept for a turn's summary
 
 
 @dataclass
@@ -41,6 +49,14 @@ class StageClock:
     calls: dict[str, int] = field(default_factory=lambda: dict.fromkeys(STAGES, 0))
     tools: list[dict] = field(default_factory=list)
     waits: dict[str, float] = field(default_factory=dict)  # waits that are no stage's (``wait``): the intent's
+    # round 22 U0: the searches made since the last tool record (``note_search``; the next ``tool`` takes them), the judge
+    # results that ended ``not_checked`` by cause, the state of each read target, and the multi-page stored tables served
+    pending_searches: list[dict] = field(default_factory=list)
+    searches_memoized: int = 0
+    not_checked: dict[str, int] = field(default_factory=dict)
+    reads: dict[str, dict] = field(default_factory=dict)
+    tables_served: set = field(default_factory=set)
+    multi_page: set = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.started = self.now()
@@ -57,14 +73,59 @@ class StageClock:
 
     def tool(self, name: str, seconds: float, chars: int, pages: tuple[int, int] | None = None) -> None:
         """One tool call: counted to the tool's stage, and kept as a record. ``pages``: the first and last page a read
-        or an inspection returned (R16: the eval's reading-completeness measure reads them)."""
+        or an inspection returned (R16: the eval's reading-completeness measure reads them). The searches the call made
+        (``note_search``) are on its record as ``search``."""
         stage = TOOL_STAGE.get(name, "read")
         self.add(stage, seconds)
+        searches, memoized = self.pending_searches, self.searches_memoized
+        self.pending_searches, self.searches_memoized = [], 0
         if len(self.tools) < TOOLS_KEPT:
             record = {"tool": name, "stage": stage, "seconds": round(max(0.0, seconds), 3), "chars": chars}
             if pages is not None:
                 record["pages"] = [pages[0], pages[1]]
+            if searches or memoized:
+                record["search"] = {"calls": searches[:SEARCHES_KEPT], "run": len(searches), "memoized": memoized}
             self.tools.append(record)
+
+    def note_search(self, record: dict | None) -> None:
+        """One search ``memoized_search`` answered: ``record`` (``platform.search.measure_searches``: lexical and fused
+        candidates, depth, seconds, summed over the calls it made) when it ran, None when the turn's memo answered it."""
+        if record is None:
+            self.searches_memoized += 1
+        elif len(self.pending_searches) < 4 * SEARCHES_KEPT:
+            self.pending_searches.append(record)
+
+    def note_not_checked(self, cause: str) -> None:
+        """A judge result that ended ``not_checked`` (R18): by ``cause`` — the judge call's status (``timeout``,
+        ``rate_limited``, ``invalid``, ``error``, ``unavailable``...), ``omitted``, ``not_classified`` or ``time_limit``. Never a
+        verdict about the claim."""
+        self.not_checked[cause] = self.not_checked.get(cause, 0) + 1
+
+    def note_read(self, target: str, tool: str, *, attempted: bool, completed: bool = False, failed_with: str | None = None,
+                  budget_skipped: bool = False) -> None:
+        """The state of one read target (R18): ``attempted`` — the server ran the read; ``completed`` — it returned without
+        failing; ``failed_with`` — the refusal key or exception name of a read that failed (or ``time_limit``, a read the
+        reading time stopped); ``budget_skipped`` — the tool budget stopped the call before it ran. Later calls on the same
+        target add to it: ``completed`` and ``budget_skipped`` stay once set, ``failed_with`` is cleared by a completed read."""
+        st = self.reads.get(target)
+        if st is None:
+            if len(self.reads) >= READ_TARGETS_KEPT:
+                return
+            st = self.reads[target] = {"tool": tool, "attempted": False, "completed": False, "failed_with": None,
+                                       "budget_skipped": False, "calls": 0}
+        st["calls"] += 1
+        st["attempted"] = st["attempted"] or attempted
+        st["completed"] = st["completed"] or completed
+        st["budget_skipped"] = st["budget_skipped"] or budget_skipped
+        st["failed_with"] = None if st["completed"] else failed_with or st["failed_with"]
+
+    def note_table(self, key: tuple, spans_pages: bool) -> None:
+        """A stored table served (``key``: its version and index; once per table); ``spans_pages``: its rows are on more than
+        one page. ``multi_page_tables`` in the summary counts those."""
+        if key not in self.tables_served:
+            self.tables_served.add(key)
+            if spans_pages:
+                self.multi_page.add(key)
 
     def summary(self) -> dict:
         """The turn so far: every stage with its seconds and calls, the tool records, the turn's seconds and the part
@@ -77,6 +138,10 @@ class StageClock:
                "tools": list(self.tools)}
         if self.waits:
             out["waits"] = {k: round(v, 3) for k, v in self.waits.items()}
+        out["not_checked"] = dict(self.not_checked)
+        out["reads"] = {k: dict(v) for k, v in self.reads.items()}
+        out["tables_served"] = len(self.tables_served)
+        out["multi_page_tables"] = len(self.multi_page)
         return out
 
 

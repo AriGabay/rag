@@ -735,6 +735,19 @@ CHECK_CAUSE_SENTENCES = {
     "time_limit": "הוסרה טענה שבדיקתה לא הושלמה במגבלת הזמן; היא לא נמצאה שגויה ולא נמצאה חסרה.",
 }
 NOT_CHECKED = "הטענה לא נבדקה מול המקורות"
+
+
+def note_not_checked(ws: Workspace, cause: str) -> None:
+    """Count a judge result that ended ``not_checked`` on the turn's stage clock (round 22 U0, R18), by ``cause``: the judge
+    call's status when the call failed (``timeout``, ``rate_limited``, ``invalid``, ``error``, ``unavailable``...), ``omitted``,
+    ``not_classified`` or ``time_limit``. Diagnostics only (``resolution["timing"]["not_checked"]``): no decision reads it, and a
+    measurement never fails a check."""
+    try:
+        ws.clock.note_not_checked(cause)
+    except Exception:  # noqa: BLE001 - a measurement must never fail the verification
+        logger.debug("not_checked count not recorded", exc_info=True)
+
+
 NOT_CHECKED_FAILED = "הטענה לא נבדקה מול המקורות: הבדיקה לא הושלמה ({status})"
 NOT_CLASSIFIED = "טענה סווגה כלא-עובדתית או ככותרת; לא אומתה"
 CUT_LEAVES_NOTHING = "אחרי הסרת החלק שלא נתמך (\"{text}\") לא נשארו בטענה מילים משלה"
@@ -9211,6 +9224,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 # judge's call failing (after its retry) and the judge leaving the unit out twice are two causes (R14)
                 if not exempt_without_verdict(u):
                     check_failed = u.index in unchecked
+                    note_not_checked(ws, unchecked[u.index] if check_failed else "omitted")
                     reason = NOT_CHECKED_FAILED.format(status=unchecked[u.index]) if check_failed else NOT_CHECKED
                     report.problems.append(Problem(u, reason, failure_kind="not_checked", check="judge",
                                                    cause="check_failed" if check_failed else "omitted"))
@@ -9226,6 +9240,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                     report.problems.append(problem)
             if v.verdict in ("not_factual", "navigation"):
                 if not _non_claim_accepted(u, v.verdict):
+                    note_not_checked(ws, "not_classified")
                     report.problems.append(Problem(u, NOT_CLASSIFIED, failure_kind="not_checked", check="judge",
                                                    cause="not_classified"))
             elif v.verdict in ("unsupported", "contradicts"):

@@ -244,6 +244,7 @@ from app.platform.dates import precision_of, shown_date, shown_period
 from app.platform.documents import coverage_of, display_box_of, reading_notes
 from app.platform.search import (
     SearchScope,
+    measure_searches,
     search_passages,
     topic_tokens,
     unread_documents,
@@ -1296,6 +1297,8 @@ def _table_at(ws: Workspace, conn: Connection, version_id, table_index: int) -> 
     if found is None:
         found = ws.tables[key] = (reader.table_structure(conn, version_id, table_index),
                                   reader.table_block(conn, version_id, table_index))
+        if found[0] is not None:  # round 22 U0: the multi-page stored tables the turn served (measurement only)
+            ws.clock.note_table(key, stored_tables.spans_pages(found[0]))
     return found
 
 
@@ -1975,8 +1978,17 @@ def memoized_search(ws: Workspace, conn: Connection, query: str, limit: int, sco
            _time_memo_key(ws.time), window)
     hits = ws.search_memo.get(key)
     if hits is None:
-        hits = ws.search_memo[key] = (search_passages(conn, query, limit, scope=scope, window=True) if window
-                                      else search_passages(conn, query, limit, scope=scope))
+        # round 22 U0 (R10): the search's candidate counts and seconds go to the turn's stage clock (the next tool record); the
+        # hits are the same with or without it
+        started = time.monotonic()
+        with measure_searches() as ran:
+            hits = ws.search_memo[key] = (search_passages(conn, query, limit, scope=scope, window=True) if window
+                                          else search_passages(conn, query, limit, scope=scope))
+        ws.clock.note_search({"lexical": sum(r["lexical"] for r in ran), "fused": sum(r["fused"] for r in ran),
+                              "depth": max((r["depth"] for r in ran), default=0), "evidence_calls": len(ran),
+                              "returned": len(hits), "seconds": round(time.monotonic() - started, 3)})
+    else:
+        ws.clock.note_search(None)
     return [dict(h) for h in hits]
 
 
@@ -4321,6 +4333,7 @@ def _read_table_once(ws: Workspace, conn: Connection, v: reader.Version, table_i
     st = reader.table_structure(conn, v.version_id, table_index)
     if st is None:
         raise ToolError("הטבלה לא נמצאה")
+    ws.clock.note_table((str(v.version_id), table_index), stored_tables.spans_pages(st))  # round 22 U0: measurement only
     rows = st.get("rows") or []
     size = table_rows()
     window = rows[row0:row0 + size]
@@ -8466,6 +8479,35 @@ def run_tool(ws: Workspace, name: str, arguments: str) -> str:
     return output
 
 
+READ_TARGET_TOOLS = frozenset({"read", "inspect", "outline"})  # the tools whose call opens a target of a document (R18)
+
+
+def _read_target(name: str, args: dict) -> str:
+    """The handle-level name of what a reading call opens (``read:section=§3``, ``read:pages=D1:3-5``, ``inspect:region=R2``):
+    the locator the model gave, never document text. Clipped; the states of the turn are kept by it (``StageClock.note_read``)."""
+    given = args.get("target") if name in ("read", "inspect") and isinstance(args.get("target"), dict) else args
+    parts = []
+    for k, v in sorted(given.items()):
+        if v in (None, "", [], {}):
+            continue
+        if isinstance(v, dict):
+            v = ":".join(str(x) for x in (v.get("document"), f"{v.get('from_page')}-{v.get('to_page')}"
+                                          if "from_page" in v else None) if x not in (None, ""))
+        parts.append(f"{k}={v}")
+    return _clip(f"{name}:" + ",".join(parts), 120)
+
+
+def _note_read(ws: Workspace, name: str, args: dict, **state) -> None:
+    """Record the state of a reading call's target on the stage clock (round 22 U0, R18): attempted, completed, failed with,
+    skipped for the tool budget. Diagnostics only: nothing a tool returns or decides reads it, and it never raises."""
+    if name not in READ_TARGET_TOOLS:
+        return
+    try:
+        ws.clock.note_read(_read_target(name, args), name, **state)
+    except Exception:  # noqa: BLE001 - a measurement must never fail a tool call
+        logger.debug("read state not recorded", exc_info=True)
+
+
 def _note_refusal(ws: Workspace, name: str, args: dict, key: str, message: str) -> None:
     """Record a take_value call the server refused (round 14 U1, KTD11, R15): the tool, the source id, a clipped locator, the
     reason key and message, and the time. It is stored in the message diagnostics (owner and office admin only) as
@@ -8492,22 +8534,33 @@ def _run_tool(ws: Workspace, name: str, arguments: str) -> str:
         _note_refusal(ws, name, {}, "bad_json", "")
         return "ארגומנטים לא תקינים (JSON)"
     if name in READING_TOOLS and ws.budget_spent:
+        _note_read(ws, name, args, attempted=False, budget_skipped=True)
         return _withheld(name, args)
     if name in DEADLINE_TOOLS and ws.read_until is not None and time.monotonic() >= ws.read_until:
         # the loop checks the clock only between steps: a tool that starts after the reading deadline does no work
         if TIME_LIMIT not in ws.limits_hit:
             ws.limits_hit.append(TIME_LIMIT)
+        _note_read(ws, name, args, attempted=False, failed_with=TIME_LIMIT)
         return _withheld(name, args, TIME_LIMIT)
     try:
-        return handler(ws, args)
+        out = handler(ws, args)
     except ToolError as e:
         _note_refusal(ws, name, args, e.key, str(e))
+        _note_read(ws, name, args, attempted=True, failed_with=e.key)
         return f"שגיאה: {e}"
     except (KeyError, TypeError, ValueError) as e:
         logger.warning("tool %s rejected its arguments: %s", name, type(e).__name__)
         _note_refusal(ws, name, args, "bad_arguments", type(e).__name__)
+        _note_read(ws, name, args, attempted=True, failed_with="bad_arguments")
         return "שגיאה: ארגומנטים לא תקינים לכלי"
     except Exception as e:  # noqa: BLE001 - a failing tool is reported to the model; the turn goes on
         logger.exception("tool %s failed", name)
         _note_refusal(ws, name, args, "tool_failed", type(e).__name__)
+        _note_read(ws, name, args, attempted=True, failed_with="tool_failed")
         return "שגיאה: הכלי נכשל. אפשר לנסות שוב או לנסות דרך אחרת"
+    if isinstance(out, str) and out.startswith("<not_read"):  # the tool withheld itself (``inspect``'s own time check)
+        _note_read(ws, name, args, attempted=False, failed_with=TIME_LIMIT if f'status="{TIME_LIMIT}"' in out[:160] else None,
+                   budget_skipped=f'status="{TOOL_BUDGET}"' in out[:160])
+    else:
+        _note_read(ws, name, args, attempted=True, completed=True)
+    return out

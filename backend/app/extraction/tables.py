@@ -328,6 +328,12 @@ class _ById:
         return isinstance(other, _ById) and other.st is self.st
 
 
+def spans_pages(st: dict | None) -> bool:
+    """Whether the rows of a stored table are on more than one page (a table continued across pages; round 22 U0, the
+    measurement of how many such tables are served). Reads the stored rows' ``page`` only."""
+    return len({r.get("page") for r in (st or {}).get("rows") or [] if isinstance(r, dict) and r.get("page")}) > 1
+
+
 def serve_structure(st: dict | None) -> dict | None:
     """A stored table structure in the order it is drawn, when the stored data show it was stored reversed (``stored_reversed``);
     ``st`` itself otherwise. The served structure holds the headers, units, cells and cell boxes at the served positions and

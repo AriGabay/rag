@@ -96,6 +96,7 @@ from app.chat.verify import (
     has_qualifier,
     ids_in,
     key_context,
+    note_not_checked,
     rescued_expansions,
     row_cut_safe,
     scope_outcome,
@@ -701,6 +702,7 @@ class _Final:
                 r.post_check = post
 
     def unchecked(self, f: FinalUnit, cause: str, status: str) -> Failure:
+        note_not_checked(getattr(self, "ws", None), status)  # round 22 U0: by the judge call's status, ``omitted``, ``time_limit`` or ``unavailable``
         return Failure(f.drafts, "not_checked", FINAL_UNCHECKED.format(status=status), cause, "unchecked")
 
     # --- the ladder's last step --------------------------------------------------------------------------------------

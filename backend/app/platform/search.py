@@ -33,7 +33,10 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Iterable, Sequence
+import time
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from uuid import UUID
@@ -332,9 +335,46 @@ def _small_scope_order(ranked: list, rows: dict, supported: set) -> tuple[list, 
     return first + [cid for cid in ranked if cid not in chosen], len(first)
 
 
+# round 22 U0 (R10, R25): the measurement of each ``search_evidence`` call, for a caller that asks for it (the chat's
+# ``memoized_search``): the lexical candidates the stage returned (all queries together), the candidates fused, the depth the
+# stage was asked for, and the seconds. A side record only: it changes nothing a search returns, and a search made outside
+# ``measure_searches`` records nothing
+_SEARCH_SINK: ContextVar[list[dict] | None] = ContextVar("search_sink", default=None)
+
+
+@contextmanager
+def measure_searches() -> Iterator[list[dict]]:
+    """The records of the ``search_evidence`` calls made inside the block: ``{"lexical", "fused", "depth", "queries",
+    "seconds"}`` each (counts and seconds only: no content)."""
+    sink: list[dict] = []
+    token = _SEARCH_SINK.set(sink)
+    try:
+        yield sink
+    finally:
+        _SEARCH_SINK.reset(token)
+
+
 def search_evidence(conn: Connection, queries: Sequence[str], limit: int = 8, *, scope: SearchScope | None = None,
                     filters: MetadataFilters | None = None, place_terms: Iterable[str] = (),
                     window: bool = False) -> SearchOutcome:
+    """Fused search over the queries (``_search_evidence``); inside ``measure_searches`` the call is also recorded."""
+    sink = _SEARCH_SINK.get()
+    if sink is None:
+        return _search_evidence(conn, queries, limit, scope=scope, filters=filters, place_terms=place_terms,
+                                window=window)
+    started = time.monotonic()
+    tally = {"lexical": 0, "fused": 0, "depth": 0}
+    try:
+        return _search_evidence(conn, queries, limit, scope=scope, filters=filters, place_terms=place_terms,
+                                window=window, tally=tally)
+    finally:
+        sink.append(tally | {"queries": len([q for q in queries if q and q.strip()][:MAX_QUERIES]),
+                             "seconds": round(time.monotonic() - started, 3)})
+
+
+def _search_evidence(conn: Connection, queries: Sequence[str], limit: int = 8, *, scope: SearchScope | None = None,
+                     filters: MetadataFilters | None = None, place_terms: Iterable[str] = (),
+                     window: bool = False, tally: dict | None = None) -> SearchOutcome:
     """Fused search over up to ``MAX_QUERIES`` queries (the first is the primary question). In a small
     scope the result may hold more than ``limit`` hits (at most twice), so that every page's best
     supported passage is in it; when the pages need more than that, the best ``limit`` lead. ``window`` (opt-in, round 11
@@ -352,6 +392,8 @@ def search_evidence(conn: Connection, queries: Sequence[str], limit: int = 8, *,
         sql = replace(sql, version_ids=[v for v, _ in _scoped_versions(conn, scope)])
     small = documents is not None and documents <= SMALL_SCOPE_DOCUMENTS
     n = SMALL_SCOPE_CANDIDATES if small else CANDIDATES
+    if tally is not None:
+        tally["depth"] = n
     if window:
         limit = max(limit, n)
     scores: dict = {}
@@ -365,6 +407,8 @@ def search_evidence(conn: Connection, queries: Sequence[str], limit: int = 8, *,
         ranking = (query_tokens(_strip_places(base_normalize(q), [*place_terms, *KNOWN_CITIES])) if small
                    else tokens) or tokens
         lexical = _lexical(conn, ranking, sql, n)
+        if tally is not None:
+            tally["lexical"] += len(lexical)
         alpha = _alpha(ranking) if ranking else ""
         if alpha and alpha not in fuzzy_of:  # variants that spell the same letters read the chunks once
             fuzzy_of[alpha] = _trigram(conn, alpha, sql, n)
@@ -374,6 +418,8 @@ def search_evidence(conn: Connection, queries: Sequence[str], limit: int = 8, *,
         for weight, ranked in zip(RRF_WEIGHTS, [lexical, fuzzy, _semantic(conn, q, sql, n)], strict=True):
             for rank, chunk_id in enumerate(ranked):
                 scores[chunk_id] = scores.get(chunk_id, 0.0) + weight / (RRF_K + rank + 1)
+    if tally is not None:
+        tally["fused"] = len(scores)
     ranked = sorted(scores, key=lambda cid: -scores[cid])
     # The best exact-term matches of the question always get a slot: semantic neighbours must not crowd them out.
     for pos, chunk_id in enumerate(guaranteed):
