@@ -37,7 +37,9 @@ The spans a kind covers:
 ``Doc`` also keeps, for every character of the model's own text, the offset it had in the text the model wrote (``origin``;
 -1 for a server span), so the final check (round 8 U6, ``app.chat.final_check``) can tell which sentence of the answer a
 sentence of the saved text came from, whatever was cut around it. The registry is what is saved with the message
-(``SERVER_SPANS_FIELD``); ``strip_server_spans`` gives a later turn the earlier answer without the server's words (R28)."""
+(``SERVER_SPANS_FIELD``); ``strip_server_spans`` gives a later turn the earlier answer without the server's words (R28), and
+``history_notes`` gives it, beside that prose, the meaning those words carried - the condition, scope, caveat or gap - as labelled system
+notes by ``SPAN_ROLES`` (round 22 U11, KTD10, R19): UI and citation spans are dropped, the rest become a note on their datum."""
 
 from __future__ import annotations
 
@@ -45,6 +47,8 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+
+from app.providers.llm import prompt_attr, prompt_text
 
 if TYPE_CHECKING:
     from app.chat.engine import FinalAnswer
@@ -93,6 +97,118 @@ def strip_server_spans(markdown: str, spans) -> str:
     text = re.sub(r"[ \t]{2,}", " ", "".join(out))
     text = re.sub(r"[ \t]+\n", "\n", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+# --- what a later turn is shown of each kind of server span (round 22 U11, KTD10, R19) ---------------------------------------------------------
+# The role of every kind in ``SERVER_KINDS``: a ``meaning`` span says something that changes how a datum is read (its condition, scope, the
+# part left out, what was not found, what a limit meant), so the next turn sees it as a system note beside the answer; a ``ui`` span is a
+# display or citation device (the ``[S#]`` link, the cut placeholder) and is not shown. The cut placeholder is the one ui span that leaves a
+# trace: a note that a part of the sentence was omitted, never the placeholder's text.
+ROLE_MEANING, ROLE_UI = "meaning", "ui"
+SPAN_ROLES = {
+    "qualifier": ROLE_MEANING, "scope_note": ROLE_MEANING, "conditional_note": ROLE_MEANING, "uncertainty_line": ROLE_MEANING,
+    "partial_mark": ROLE_MEANING, "removal_note": ROLE_MEANING, "request_note": ROLE_MEANING, "gap_paragraph": ROLE_MEANING,
+    "item_gap": ROLE_MEANING, "coverage_note": ROLE_MEANING, "membership_note": ROLE_MEANING, "limit_sentence": ROLE_MEANING,
+    "unread_notice": ROLE_MEANING, "replacement": ROLE_MEANING,
+    "citation": ROLE_UI, "marker": ROLE_UI,
+}
+HISTORY_NOTES_MAX = 8  # notes shown for one earlier answer; the rest are counted
+HISTORY_NOTES_CHARS = 1800  # the block's own budget (the answer prose has its own cut, which never takes a note)
+HISTORY_NOTE_TEXT_CHARS = 240  # the server text of one note
+HISTORY_LABEL_CHARS = 60  # the words of the answer that name the datum of a note
+NOTE_LINE = 'הערת מערכת על "{label}": {text}'
+OMISSION_NOTE = "חלק מהמשפט לא אומת מול המקור והושמט מהתשובה"
+NOTES_OVERFLOW = "(ועוד {n} הערות מערכת לא הוצגו)"
+WHOLE_ANSWER_LABEL = "התשובה כולה"
+REPLACEMENT_STAND_IN = "(העוזר לא הצליח לבסס תשובה בתור זה)"
+ONLY_NOTES_STAND_IN = "(בתור זה העוזר מסר רק הערות מערכת)"
+_CITATION = re.compile(r"\s*\[[SMCPVA]\d+(?:\s*[,،;]\s*[SMCPVA]\d+)*\]")
+_SENTENCE_END = re.compile(r"[.;!?]\s+|\n")
+
+
+def stand_in(spans) -> str:
+    """The one line an earlier answer leaves when nothing but server text is left of it, so the turn is not lost (KTD10): a replacement
+    sentence says the assistant could not ground an answer; any other all-server answer says it gave only system notes."""
+    kinds = {(s.kind if isinstance(s, ServerSpan) else (s or {}).get("kind")) for s in spans or ()}
+    return REPLACEMENT_STAND_IN if "replacement" in kinds else ONLY_NOTES_STAND_IN
+
+
+def _note_text(raw: str) -> str:
+    """The server text of a span as a note: no citations, markup, blockquote marks or enclosing brackets, on one line."""
+    t = _CITATION.sub("", raw)
+    t = re.sub(r"(?m)^\s*>+\s*", "", t).replace("**", "").replace("*", "")
+    t = " ".join(t.split())
+    while len(t) > 1 and t[0] == "(" and t[-1] == ")" and "(" not in t[1:-1]:
+        t = t[1:-1].strip()
+    return t.strip(" ")
+
+
+def _cap(t: str, limit: int) -> str:
+    return t if len(t) <= limit else t[:limit].rstrip() + "…"
+
+
+def _nearby_words(markdown: str, at: int, ranges: list[tuple[int, int]]) -> str:
+    """The answer's own words just before ``at``, in its clause: the label of an addition that has no datum record. A span at the start of a
+    line is not about the words before it (a gap line, a coverage note), so it is about the whole answer."""
+    line_start = markdown.rfind("\n", 0, at) + 1
+    kept, pos = [], line_start
+    for a, b in sorted(r for r in ranges if r[1] > line_start and r[0] < at):
+        kept.append(markdown[pos:max(pos, min(a, at))])
+        pos = max(pos, min(b, at))
+    kept.append(markdown[pos:at])
+    before = " ".join(_CITATION.sub("", "".join(kept)).split())
+    if not before:
+        return WHOLE_ANSWER_LABEL
+    clause = _SENTENCE_END.split(before + " ")[-1] or before
+    clause = clause.strip(" ,;:-–()") or before
+    if len(clause) > HISTORY_LABEL_CHARS:
+        clause = clause[-HISTORY_LABEL_CHARS:]
+        clause = clause.split(" ", 1)[1] if " " in clause else clause
+    return clause.strip(" ,;:-–()") or WHOLE_ANSWER_LABEL
+
+
+def history_notes(markdown: str, spans, labels: dict[str, str] | None = None) -> list[str]:
+    """The system-note lines of an earlier answer for a later turn (round 22 U11, KTD10, R19): one ``NOTE_LINE`` per meaning-bearing span of
+    its stored registry, in the text's order, naming the datum it belongs to - ``labels`` (the datum id -> the label the answer stored for
+    it) when the span has a datum, otherwise the answer's own words just before it. Citations and markers are not notes (a marker leaves
+    ``OMISSION_NOTE``). The document-derived part is sanitized for a prompt, capped in length and one line; at most ``HISTORY_NOTES_MAX``
+    notes and ``HISTORY_NOTES_CHARS`` characters, the rest counted in a last line. A message with no registry, or one that does not index
+    this text (an older message), has no notes: nothing is derived from its Markdown. A note is context for reading the earlier answer, never
+    evidence for a claim of the next one: verification grounds only in the turn's sources."""
+    found: list[tuple[int, int, str, str]] = []
+    for s in spans or ():
+        d = s.as_dict() if isinstance(s, ServerSpan) else s
+        a, b, kind = d.get("start"), d.get("end"), d.get("kind")
+        if not (isinstance(a, int) and isinstance(b, int)) or not 0 <= a <= b <= len(markdown):
+            return []
+        if kind in SPAN_ROLES:
+            found.append((a, b, kind, d.get("datum") or ""))
+    found.sort()
+    ranges = [(a, b) for a, b, _, _ in found]
+    lines: list[str] = []
+    for a, b, kind, datum in found:
+        if SPAN_ROLES[kind] == ROLE_UI:
+            note = OMISSION_NOTE if kind == "marker" else ""
+        else:
+            note = _note_text(markdown[a:b])
+        if not note:
+            continue
+        label = (labels or {}).get(datum) if datum else None
+        at_line_start = not markdown[:a].rstrip(" \t").rsplit("\n", 1)[-1].strip()
+        label = label or (WHOLE_ANSWER_LABEL if at_line_start else _nearby_words(markdown, a, ranges))
+        line = NOTE_LINE.format(label=prompt_attr(_cap(" ".join(label.split()), HISTORY_LABEL_CHARS)),
+                                text=prompt_text(_cap(note, HISTORY_NOTE_TEXT_CHARS)))
+        if line not in lines:
+            lines.append(line)
+    out, used = [], 0
+    for line in lines:
+        if len(out) >= HISTORY_NOTES_MAX or used + len(line) > HISTORY_NOTES_CHARS:
+            break
+        out.append(line)
+        used += len(line)
+    if len(lines) > len(out):
+        out.append(NOTES_OVERFLOW.format(n=len(lines) - len(out)))
+    return out
 
 
 @dataclass(frozen=True)

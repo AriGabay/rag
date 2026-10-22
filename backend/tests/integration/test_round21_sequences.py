@@ -439,7 +439,11 @@ def test_ae7_a_numbered_item_stated_with_its_label_inflected_gets_no_read_and_no
 def test_protection_ae8_a_follow_up_about_another_group_carries_no_condition_of_the_previous_answer(client, office, monkeypatch):
     """Not reproduced on the round-20 build: the previous answer reaches the follow-up only as its history without the spans the server wrote
     (the registry saved with the message), and the item ledger is the turn's own, so no condition of the first answer is written, kept or
-    shown in the second. Kept as a protection: the binding record of U2 must not introduce a carrier between turns."""
+    shown in the second. Kept as a protection: the binding record of U2 must not introduce a carrier between turns.
+
+    Round 22 U11 (KTD10): history keeps the meaning the server added, so the condition now reaches the next turn - but only as a marked
+    system note beside the answer, never inside the answer prose, and never as a fact the second answer states. What stays protected is that
+    the model never copies a server mark as a source fact."""
     doc = ingest_pdf(office, monkeypatch, LOTS)
     DOCUMENT_OF[0] = doc
     first = f"שטח קבוצת מגרשים א׳ הוא {GROUP_A_ROW[2]} מ״ר, לפי {GROUP_A_ROW[1]} [S1]."
@@ -460,7 +464,11 @@ def test_protection_ae8_a_follow_up_about_another_group_carries_no_condition_of_
     assert m2["status"] == "done" and GROUP_B_ROW[2] in md, m2
     assert "מינהל" not in md and "התנאי לפי המקור" not in md, md
     history = agent.seen[shown][0]["content"]
-    assert "מינהל" not in history and "התנאי לפי המקור" not in history, history  # the earlier answer arrives without the server's words
+    prose = [ln for ln in history.splitlines() if ln.startswith("עוזר:")]
+    assert prose and not any("מינהל" in ln or "התנאי לפי המקור" in ln for ln in prose), prose  # the answer prose arrives without the server's words
+    # the condition is there once, as a system note that says what it is
+    notes = [ln for ln in history.splitlines() if "מינהל" in ln]
+    assert notes and all(ln.lstrip().startswith("הערת מערכת על") for ln in notes), history
 
 
 # --- 12. a captured source rebuilds its text from its locator (U1, KTD9) -------------------------------------------------------------------
