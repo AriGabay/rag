@@ -197,4 +197,8 @@ def test_a_follow_up_reads_the_earlier_answer_without_the_words_the_server_wrote
     monkeypatch.setattr("app.providers.llm.get_selected_provider", lambda: second)
     send(client, cid, "ומה עוד?")
     context = second.seen[0][0]["content"]
-    assert "דמי השכירות הראויים הם 55" in context and verify.REMOVAL_SENTENCES["absent_from_source"] not in context
+    # round 22 U11: the server's removal note reaches the next turn only as a marked system note beside the answer, never inside the
+    # answer's prose (history keeps the meaning the user saw, framed so it cannot be taken as a source fact)
+    assert "דמי השכירות הראויים הם 55" in context
+    removal = verify.REMOVAL_SENTENCES["absent_from_source"]
+    assert all(line.lstrip().startswith("הערת מערכת על") for line in context.split("\n") if removal in line), context
