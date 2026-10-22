@@ -814,17 +814,26 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
 
 
 def _part_stated(o: dict, given_text: str) -> bool:
-    """Whether the units that give a partly given component state the part the judge named missing (round 21 G5): the part has words or
-    numbers of its own beyond the component's (the property, the plot, the period it narrows the request by) and every one of them stands in
-    the units. "Not in the part read" and "not located, no search covered it" both say the datum was not found; of such a component they
-    are false, and it keeps its status with no reason and no line of the server's. A part that is only the component's own words
-    ("the rates") narrows nothing, so the units cannot be said to state it."""
+    """Whether the units that give a partly given component STATE the part the judge named missing (round 21 G5; round 22 U6, KTD6, R16): the
+    part has words, numbers or designators of its own beyond the component's (the property, the plot, the period it narrows the request by)
+    and a clause of the units states them positively - no negation or absence on them, and not the row of another plot or building. «מועד
+    הסיום למגרש א לא נמצא» holds every word of the part and states nothing; «מועד הסיום למגרש ב: 2025 (א) הערה» holds its letter and is another
+    plot's. "Not in the part read" and "not located, no search covered it" both say the datum was not found; of a component the units state they
+    are false, and it keeps its status with no reason and no line of the server's. A part that is only the component's own words ("the rates")
+    narrows nothing, so the units cannot be said to state it."""
+    from app.chat.items import designators, positive_text, without_designators
     from app.chat.verify import _loose_forms, _part_words, words_stand_in
 
     part = o.get("missing_part") or ""
     asked = {f for w in _part_words(o.get("text") or "") for f in _loose_forms(w)}
-    own = [w for w in _part_words(part) if not _loose_forms(w) & asked]
-    return bool(own) and words_stand_in(" ".join(own), given_text)
+    wanted = designators(part)
+    # the part's words, without the designator phrases (a noun and its letter or number: they are decided as designators)
+    rest = without_designators(part)
+    own = [w for w in _part_words(rest) if not _loose_forms(w) & asked]
+    if not own and not wanted:
+        return False
+    stated = positive_text(given_text, wanted, True)
+    return wanted <= designators(stated) and (not own or words_stand_in(" ".join(own), stated))
 
 
 def _read_not_used(ws: Workspace, sid: str, quote: str = "") -> dict:

@@ -159,3 +159,120 @@ def test_a_conflict_without_conflicting_values_is_not_stated():
     _value(ws, "V2", DOC, "192", subject="מחסן", facet="שטח המחסן")  # another component of the unit (round 13 U4): no conflict
     (r,) = coverage.validate_requested(ws, [_req("sources_conflict", label="השטח הבנוי")])
     assert r["status"] == "found"
+
+
+# --- round 22 U6 (KTD6, KTD11; R16, R2): one negation and absence reader --------------------------------------------------------------
+#
+# «Not found», «not stated», «not computed», «not determined» and «cannot be known» were read by six lists that shared no word
+# (``verify.NOT_FOUND`` / ``ABSENCE`` / ``_NOT_DETERMINED``, ``meaning.ABSENCE_SENTENCE``, ``compose.is_absence_claim``, ``verify._NEGATIONS``).
+# The reader is ``normalize_text`` 's, over clauses; a clause states an absence of its datum, and a text states one when every clause
+# that holds a figure does.
+
+ABSENT_CLAUSES = [
+    "מועד הסיום לא נמצא במסמכים.", "מועד הסיום לא צוין בדוח.", "לא נמצא מידע על מועד הסיום.", "אין ציון של מועד הסיום.",
+    "מועד הסיום חסר בדוח.", "הדוח אינו מתייחס למועד הסיום.", "מועד הסיום טרם נקבע.", "לא ניתן לדעת את מועד הסיום.",
+    "המסמך לא פורסם ומועד הסיום לא ידוע.", "הסכום לא חושב כאן.", "אין אפשרות לחשב את הסכום",
+    "לא ניתן לקבוע את השווי", "לא נמצא שטח", "בשומה השנייה לא נמסר גובה התקרה בדירה", "אין בהם נתון ישיר על הגודל",
+    "המסמך אינו מציין את השטח", "אין במסמכי הראיות כל מידע על כך", "הנתון אינו מופיע בשומה", "ללא ציון של הגובה",
+    "אי אפשר לדעת מהקטעים", "השמאי לא התייחס לכך", "לא קיים בהם מידע על השטח", "לא נמסרו נתונים",
+]
+NOT_ABSENT_CLAUSES = [
+    "מועד הסיום אינו כולל מע״מ.", "הקומה אינה כלולה בשטח", "אין מעלית בבניין", "אין בדירה ממ״ד", "השמאי מציין שאין בבניין מעלית",
+    "לא ניתן היתר לתוספת הבנייה", "הדירה לא נמצאת בקומת הקרקע", "השמאי לא הביא בחשבון את הנתונים של העסקה", "הבניין אינו כולל מעלית",
+    "בשומה מצוין כי לא קיים ממ״ד בדירה", "דירה ללא ממ״ד", "הנכס אינו רשום כדירת גן", "הסכום 1,200 ₪ ללא מע״מ",
+    "לא נמצאו חריגות; מועד הסיום 2026.",                       # an absence of one datum beside a positive figure
+    "בבניין א לא צוינו דמי ניהול, ובבניין ב הם 1,200 ₪.",
+]
+
+
+def test_one_reader_tells_an_absence_from_a_fact_about_an_absence():
+    from app.extraction import normalize_text as nt
+
+    assert [t for t in ABSENT_CLAUSES if not nt.states_absence(t)] == []
+    assert [t for t in NOT_ABSENT_CLAUSES if nt.states_absence(t)] == []
+
+
+def test_the_chat_and_the_answering_compose_read_absence_through_that_one_reader():
+    from app.answering import compose as answering_compose
+    from app.chat import meaning, verify
+    from app.extraction import normalize_text as nt
+
+    assert verify.states_absence is nt.states_absence
+    for text in ABSENT_CLAUSES + NOT_ABSENT_CLAUSES:
+        assert verify.states_absence(text) == nt.states_absence(text)
+    assert [n for n in ("NOT_FOUND", "ABSENCE", "_NOT_DETERMINED") if hasattr(verify, n)] == []
+    assert not hasattr(meaning, "ABSENCE_SENTENCE") and not hasattr(answering_compose, "is_absence_claim")
+
+
+def test_an_absence_clause_is_found_by_its_span_and_a_positive_clause_beside_it_is_not():
+    from app.chat import meaning
+
+    text = "הסכום לא צוין אם הוא כולל מע״מ; דמי הניהול הם 1,200 ₪ ללא מע״מ."
+    spans = meaning.absence_spans(text)
+    assert [text[a:b].strip() for a, b in spans] == ["הסכום לא צוין אם הוא כולל מע״מ"]
+
+
+def test_the_backstop_removes_an_uncited_absence_sentence_in_any_wording_the_reader_knows():
+    """The judge neither links nor marks the sentence (it is «not factual»); the server states the gap itself, so a sentence that says the
+    component is absent - «not stated», «not determined», «does not refer to» too, not only «not found» - is replaced by that statement."""
+    import json
+
+    from app.chat import calc
+    from app.chat.verify import verify_answer
+    from tests.unit.test_coverage import _answer as coverage_answer
+    from tests.unit.test_coverage import _finish, _scores, _turn
+    from tests.unit.test_coverage import _judge as judge
+    from tests.unit.test_coverage import _value as value
+    from tests.unit.test_coverage import _ws as ws_of
+
+    for sentence in ("היחס לסף לא נמצא בחיפוש במסמכים.", "היחס לסף לא צוין בדוח.", "הדוח אינו מתייחס ליחס לסף.", "אין אפשרות לחשב את היחס לסף."):
+        ws = ws_of("סיכום: השווי למ\"ר הוא 9,500 ₪. סף ההשוואה הוא 8,000 ₪ למ\"ר.")
+        v1, v2 = value(ws, "9,500", "השווי למ\"ר"), value(ws, "8,000", "סף ההשוואה")
+        turn = _turn({"id": "1", "text": "השווי למ\"ר"}, {"id": "2", "text": "היחס לסף", "kind": "calculation"})
+        turn.record("calculate", json.dumps({"expression": "V1 / V2", "label": "היחס לסף"}),
+                    f"שגיאה: אי אפשר לחשב: היחידות אינן מתאימות (V1 / V2). {calc.MSG_FAILED}")
+        a = coverage_answer("השווי למ\"ר הוא 9,500 ₪ [S1].\n" + sentence)
+        p = judge(_scores({"N1": {"status": "full", "units": [0]}, "N2": {"status": "missing", "related": [v1, v2, "F1"]}}),
+                  rule=lambda t: "not_factual" if "היחס" in t and "[S1]" not in t else "supported")
+        r = verify_answer(p, a, ws, "?", [], requirements=turn)
+        final, _ = _finish(ws, a, r, turn)
+        assert sentence not in final.answer_markdown, sentence
+        assert "9,500" in final.answer_markdown
+
+
+def test_a_claim_of_kind_absence_is_removed_by_the_backstop_whatever_its_wording():
+    """The claim record carries the kind: an uncited unit whose claim the judge called an absence is replaced by the server's statement even
+    when the reader knows no word of its sentence."""
+    from app.chat.verify import verify_answer
+    from tests.unit.test_coverage import _answer as coverage_answer
+    from tests.unit.test_coverage import _finish, _scores, _turn
+    from tests.unit.test_coverage import _judge as judge
+    from tests.unit.test_coverage import _ws as ws_of
+
+    ws = ws_of("סיכום: השווי למ\"ר הוא 9,500 ₪.")
+    turn = _turn({"id": "1", "text": "השווי למ\"ר"}, {"id": "2", "text": "היחס לסף"})
+    sentence = "מה שנוגע ליחס לסף נותר בלי מענה בטקסט."
+    a = coverage_answer("השווי למ\"ר הוא 9,500 ₪ [S1].\n" + sentence)
+    p = judge(_scores({"N1": {"status": "full", "units": [0]}, "N2": {"status": "missing", "related": ["H1"]}}))
+    r = verify_answer(p, a, ws, "?", [], requirements=turn)
+    (record,) = r.claims[1]
+    record.kind = "absence"  # what the judge's claim kind says; the wording is one the reader does not know
+    final, _ = _finish(ws, a, r, turn)
+    assert sentence not in final.answer_markdown and "9,500" in final.answer_markdown
+
+
+def test_a_vat_phrase_is_ignored_only_inside_the_absence_clause_not_in_the_clause_beside_it():
+    """Round 22 U6: the one reader of absence is wider than the lists it replaced; the VAT readers skip the absence CLAUSE, so a real VAT basis stated
+    beside it (the partial mark of a number whose basis differs) is still read."""
+    from app.chat import meaning
+    from app.chat.verify import vat_attachments
+
+    def forms(text):
+        return {polarity for _, polarity in vat_attachments(text, skip_absence=True)[0]}
+
+    assert forms("לא ניתן לדעת אם 5,000 ₪ כולל מע״מ") == set()
+    assert forms("לא צוין אם הסכום 5,000 ₪ כולל מע״מ") == set()
+    assert forms("הדוח אינו מתייחס לכך, והשכר 5,000 ₪ ללא מע״מ") == {"excluded"}
+    assert forms("הסכום טרם נקבע, והוא 5,000 ₪ כולל מע״מ") == {"included"}
+    text = "הדוח אינו מתייחס לכך, והשכר 5,000 ₪ ללא מע״מ."
+    assert [text[a:b] for a, b in meaning.absence_spans(text)] == ["הדוח אינו מתייחס לכך"]

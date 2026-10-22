@@ -99,7 +99,7 @@ from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from typing import NamedTuple
 
-from app.answering.numread import number_forms, number_spans
+from app.answering.numread import number_forms, number_spans, number_words, whole_number_word
 from app.answering.verify import _QUANTITY_AFTER, not_an_amount, numbers_in
 from app.chat import conditions, scopes
 from app.chat.evidence import OTHER_ITEM, claim_terms
@@ -131,6 +131,13 @@ from app.chat.verify import (
     shared_request_words,
     shares_request_word,
     unit_referent,
+)
+from app.extraction.normalize_text import (
+    absence_clause,
+    clause_spans,
+    holds_absence,
+    negated_spans,
+    negations_in,
 )
 from app.platform import dates as shared_dates
 
@@ -1426,10 +1433,129 @@ def figures_stated(quote: str, text: str) -> bool | None:
     if plan is None:
         return None
     groups, dates = plan
+    text = positive_text(text, designators(quote), False, *_own_negation((quote,)))  # round 22 U6: only a clause that states them positively, for the quote's own designators
     if dates and not _stated_dates(dates, text):
         return False
     have = _have(text) | _ranged(text)
     return all(g & have for g in groups)
+
+
+# --- the positive statement of a datum (round 22 U6, KTD6; R16, R17) -------------------------------------------------------------------
+#
+# A block states an item's datum when a CLAUSE of it holds the value or the words with no negation or absence on them, and the clause is not the
+# row of another item. The clause is the unit (``normalize_text.clause_spans``): «דמי הניהול בבניין א לא צוינו; בבניין ב הם 1,200 ₪» is two
+# clauses, the first says A's fee is absent, the second states B's. What the block states positively is its text with the clauses that state
+# an absence, the words a negation governs («אינם 1,200 ₪») and the clauses of another designator's row blanked out (``positive_text``); every
+# check of coverage reads that text, never the block's raw words. A single letter or number next to a noun that names a plot, a building or a lot
+# is a DESIGNATOR («בניין א», «תא שטח 2»; the nouns of places only - never a document, a plan or a section, whose code is its name): it is coverage-local, so the search stopwords stay as they are; an item whose label writes
+# one is stated only by a clause that writes it, or by one that writes no designator of that noun at all (a clause that says «הם 1,200 ₪»
+# under the heading «בניין א»), never by a clause that writes another.
+
+_DESIGNATOR_NOUNS = (r"תא[\s-]+שטח|תת[\s-]*חלקה|מגרש|בניין|מבנה|חלקה|גוש|יחידה|דירה|קומה|אגף|כניסה|שלב|מתחם|אתר|נכס|חנות|משרד|מחסן|מגדל|בית|"
+                     r"חדר|קבוצה|אשכול|פרויקט")
+_DESIGNATOR = re.compile(
+    rf"(?<![א-ת])[ובהלמש]{{0,2}}(?P<noun>{_DESIGNATOR_NOUNS})[׳']?\s*(?:מס(?:פר|[׳'.])?\s*)?[:\-–]?\s*"
+    r"(?P<token>[A-Za-z](?![A-Za-z])|\d{1,4}(?![\d]|[.,]\d)(?!\s*(?:₪|ש[\"״]ח|מ[\"״][רק]|דונם|%|אלף|מיליון|מטר))|[א-ת][א-ת׳']*)"
+    r"(?!\s?[/\\]\s?\d)")  # (a plan or file code - «ג/4521», «12/3» - names a document or a sub-parcel, not a row)
+
+
+def _designator(m: re.Match) -> tuple[str, str] | None:
+    token = m.group("token").rstrip("׳'")
+    if token.isdigit():
+        token = str(int(token))
+    elif len(token) > 1:  # a number written in words («שתיים»); any other word is no designator
+        if (value := whole_number_word(token)) is None:
+            return None
+        token = str(value)
+    return re.sub(r"[\s-]", "", m.group("noun")), token.casefold()
+
+
+def _designator_matches(text: str):
+    """(match, designator) of each designator phrase of ``text``. A noun followed by an ordinary word is no designator, and the word is not
+    swallowed with it: «משטח החלקה ובחלקה 57» holds the designator of plot 57 (the second noun is not consumed as the first one's token)."""
+    pos = 0
+    while (m := _DESIGNATOR.search(text, pos)) is not None:
+        d = _designator(m)
+        if d is not None:
+            yield m, d
+            pos = m.end()
+        else:
+            pos = m.end("noun")
+
+
+@functools.lru_cache(maxsize=4096)
+def designators(text: str) -> frozenset[tuple[str, str]]:
+    """The designators ``text`` writes: a single letter, a number of up to four digits or a number written in words, right after a noun
+    that names a plot, a building, a unit or a lot, as (noun without its prefix letters, token). A letter in brackets, a list number and a
+    number that has a unit after it are none."""
+    return frozenset(d for _, d in _designator_matches(text))
+
+
+def without_designators(text: str) -> str:
+    """``text`` without its designator phrases (a noun, its prefix and its letter or number): the words that are left are the text's own."""
+    out, last = [], 0
+    for m, _ in _designator_matches(text):
+        out += [text[last:m.start()], " "]
+        last = m.end()
+    return "".join(out) + text[last:]
+
+
+def _foreign(own: frozenset[tuple[str, str]], found: frozenset[tuple[str, str]]) -> bool:
+    """Whether a clause that writes the designators ``found`` speaks of another row than the item whose designators are ``own``: it writes
+    a designator of a noun the item also writes, and none of the item's tokens of that noun."""
+    for noun in {n for n, _ in own}:
+        theirs = {t for n, t in found if n == noun}
+        if theirs and not theirs & {t for n, t in own if n == noun}:
+            return True
+    return False
+
+
+@functools.lru_cache(maxsize=4096)
+def positive_text(text: str, own: frozenset[tuple[str, str]] = frozenset(), whole_clause: bool = False,
+                  own_negations: frozenset[str] = frozenset(), own_absence: bool = False) -> str:
+    """``text`` as far as it STATES positively (KTD6): the clauses that state an absence, the words a negation governs and, for an item that writes
+    designators (``own``), the clauses of another designator's row are replaced by blanks. The rest of the text, its figures and its dates,
+    is where it was. ``whole_clause``: a clause with a negation is blanked whole, not only the words the negation governs - for a part of a
+    request that names no value of its own («מועד סיום למגרש א»), the clause that negates anything says nothing positive of it. A negation is a negation of the datum unless
+    the datum itself carries it: ``own_negations`` are the negations the item's own quote writes («לא הוגשו הצעות», «שאינם מושכרים»), and
+    ``own_absence`` says its quote is an absence statement itself; an answer that says the same is stating it, not negating it."""
+    chars = list(text)
+
+    def blank(a: int, b: int) -> None:
+        chars[a:b] = " " * (b - a)
+
+    for a, b in clause_spans(text):
+        clause = text[a:b]
+        if (absence_clause(clause) and not own_absence) or (own and _foreign(own, designators(clause))):
+            blank(a, b)
+            continue
+        spans = negated_spans(clause, own_negations)
+        if whole_clause and spans:
+            blank(a, b)
+            continue
+        for x, y in spans:
+            blank(a + x, a + y)
+    return "".join(chars)
+
+
+def _own_designators(item: Item) -> frozenset[tuple[str, str]]:
+    """The designators of the row an item is: its label's, else its quote's. Never its condition's: that is the agent's wording about what limits
+    the datum («שיוכו לחלקה 56 לא מאומת»), where a designator may stand under a negation."""
+    return designators(item.label) or designators(item.quote)
+
+
+@functools.lru_cache(maxsize=2048)
+def _own_negation(texts: tuple[str, ...]) -> tuple[frozenset[str], bool]:
+    """The negations the item's own words write and whether they state an absence: the datum's own (round 22 U6 fix)."""
+    joined = "\n".join(texts)
+    return negations_in(joined), holds_absence(joined)
+
+
+def _positive(item: Item, text: str) -> str:
+    """The text of a block as it states the ``item`` positively (``positive_text``), without its list number. The negations and the absence the
+    item's own quote, value, label or condition write are its datum's («לא הוגשו הצעות במכרז» is what the item says), never counted against it."""
+    negations, absence = _own_negation((item.label, item.condition, item.quote, item.value))
+    return positive_text(_without_list_number(text), _own_designators(item), False, negations, absence)
 
 
 _HEADING_MARK = re.compile(r"\A\s*(?:#{1,6}\s|(?:[א-ת]|\d{1,2})[.)]\s|\d{1,2}(?:\.\d{1,3})+\.?\s)")
@@ -1438,7 +1564,7 @@ HEADING_WORDS = 10  # a heading line has few words
 
 def heading_only(quote: str) -> bool:
     """Whether a quoted part of a source is only a heading line (round 21 G1): one line of at most ``HEADING_WORDS`` words that is marked
-    as a heading — a markdown mark, a section number or letter ("ד.", "3.2"), or a closing colon — and states no amount and no date
+    as a heading — a markdown mark, a section number or letter ("ד.", "3.2"), or a closing colon — that is no sentence (it holds no negation or absence and does not end like a sentence: round 22 U6) and states no amount and no date
     (the digits of a lot list "4-6, 9" or of the heading's number are not one). A heading names what follows it; the part that follows
     is the item, never the line, so a heading is no part of the asked kind that the answer omits."""
     text = quote.strip()
@@ -1446,26 +1572,26 @@ def heading_only(quote: str) -> bool:
         return False
     if not (_HEADING_MARK.match(text) or text.endswith(":")):
         return False
+    # round 22 U6 (KTD6): a line that says something is a sentence, not a heading - it negates or states an absence («3.2 מועד סיום לא נקבע»),
+    # or it is closed like a sentence («ד. מועד הסיום הוסכם בין הצדדים.»)
+    if absence_clause(text) or negated_spans(text) or (not text.startswith("#") and re.search(r"[.!?]\s*$", text)):
+        return False
     return not shared_dates.find_all(text) and all(_stray(g) for g in headline(text, text))
 
 
 # a count written as a word ("שתי קומות", two floors) is the digit the source writes ("2 קומות"), when it stands directly before the noun the
-# source writes after the digit (round 20 U5, KTD5; R17): "one", "two" and the like are ordinary words elsewhere
-COUNT_WORD_MAX = 10
-_ADJACENT_WORDS = re.compile(r"([^\W\d_]+)[ \t]+(?=([^\W\d_]+))")
+# source writes after the digit (round 20 U5, KTD5; R17): "one", "two" and the like are ordinary words elsewhere. The words are read by
+# ``numread.number_words`` (round 22 U6/U10: "שנים עשר תשלומים" is 12, not a 2 and a 10), a claim's reading: no "one", no definite count
+_NOUN_AFTER_WORD = re.compile(r"[ \t]+([^\W\d_]+)")
 
 
 @functools.lru_cache(maxsize=2048)
 def _counts_before_nouns(text: str) -> tuple[tuple[str, frozenset[str]], ...]:
-    """For each count word of ``text`` that is directly followed by a word (only blanks between them), the count (as a digit) and the words
-    of the noun it stands before."""
-    out = []
-    for first, second in _ADJACENT_WORDS.findall(_unjoined(text)):
-        # the count word with up to two prefix letters ("ובשתי": ``numbers_in`` strips one)
-        for n in numbers_in(first, words=True) | (numbers_in(first[1:], words=True) if len(first) > 3 else set()):
-            if n.isdigit() and 1 <= int(n) <= COUNT_WORD_MAX:
-                out.append((n, _words(second)))
-    return tuple(out)
+    """For each count word (a phrase: «שנים עשר») of ``text`` that is directly followed by a word (only blanks between them), the count (as a
+    digit string) and the words of the noun it stands before."""
+    joined = _unjoined(text)
+    return tuple((str(w.value), _words(m.group(1))) for w in number_words(joined, claim=True)
+                 if (m := _NOUN_AFTER_WORD.match(joined, w.end)))
 
 
 @functools.lru_cache(maxsize=2048)
@@ -1480,10 +1606,10 @@ def _noun_after(count: str, value: str, quote: str) -> frozenset[str]:
 
 def _stated(item: Item, text: str, have: frozenset[str], group: frozenset[str]) -> bool:
     """Whether ``text`` states the headline value ``group`` of the item: a form of it among the numbers ``text`` writes (``have``), or, for a
-    small count, the count written as a word right before the noun the item's source writes after the digit (round 20 U5, KTD5)."""
+    count, the count written as a word right before the noun the item's source writes after the digit (round 20 U5, KTD5)."""
     if group & have:
         return True
-    counted = [d for d in group if d.isdigit() and 1 <= int(d) <= COUNT_WORD_MAX]
+    counted = [d for d in group if d.isdigit() and int(d) >= 2]
     return bool(counted) and any(n == d and (nouns := _noun_after(d, item.value, item.quote)) and nouns & after
                                  for d in counted for n, after in _counts_before_nouns(text))
 
@@ -1760,14 +1886,19 @@ def quote_in_blocks(quote: str, units: Sequence[Unit], component: str = "", *, b
     need = (len(words) + 1) // 2
     groups = headline(quote, quote)
 
+    own, negation = designators(quote), _own_negation((quote,))
+
     def stated(block: Block) -> bool:
+        # the block states the quote only by the clauses that state it positively (round 22 U6, KTD6): not a "not found" sentence that repeats
+        # its figures, a negation of them, or the row of another designator
+        text = positive_text(_without_list_number(block.unit.text), own, False, *negation)
         # a quote that is its figures (a date, several amounts, an enumeration of lots) is asked by them, a range and an enumeration read as
         # one set; its words are the source's and the answer's own (round 21 G1)
-        if (by_figures := figures_stated(quote, _without_list_number(block.unit.text))) is not None:
+        if (by_figures := figures_stated(quote, text)) is not None:
             return by_figures
-        if not all(g & _have(_without_list_number(block.unit.text)) for g in groups):
+        if not all(g & _have(text) for g in groups):
             return False
-        have = _words(block.unit.text)
+        have = _words(text)
         if len(words & have) >= need:
             return True
         # every headline value stands in the block (the quote has none, or each of them does): the label may be inflected ("שווי" / "שוויו"), a
@@ -1808,7 +1939,7 @@ def _names_row(item: Item, words: frozenset[str]) -> bool:
 def _value_check(item: Item, text: str, words: frozenset[str]) -> _Check:
     """Whether the block's ``text`` states the item's value: a date value by its date; else every headline value (``headline``), and, for an item
     with none, half of the words of its value, its label or its quote (the first that has content words)."""
-    text = _without_list_number(text)
+    text = _positive(item, text)  # only the clauses that state it positively, for its own designators (round 22 U6, KTD6)
     if parsed := shared_dates.parse(item.value):
         return _Check("" if any(p.iso.startswith(parsed.iso) for p in shared_dates.find_all(text)) else "value_not_stated")
     groups = headline(item.value, item.quote)
@@ -1879,11 +2010,12 @@ def _check_block(item: Item, block: Block, ws, shared: bool, rivals: frozenset[s
     unit = block.unit
     if not _attributed(item, unit, ws):
         return _Check("not_attributed")
-    words = _words(unit.text)
-    verdict = _value_check(item, unit.text, words | _words(unit.context))
+    text = _positive(item, unit.text)  # what the block states positively for this item's row (round 22 U6, KTD6)
+    words = _words(text)
+    verdict = _value_check(item, text, words | _words(unit.context))
     if verdict.why:
         return verdict
-    if not _states_date(item, unit.text, lead):
+    if not _states_date(item, text, lead):
         return _Check("date_not_stated")
     if shared and not _tells_apart(item, words, rivals, rival_dates):
         return _Check("condition_not_stated")
@@ -1900,9 +2032,9 @@ def _giving_parts(item: Item, block: Block, ws=None) -> list[Unit]:
     if len(block.parts) == 1:
         return list(block.parts)
     if parsed := shared_dates.parse(item.value):
-        mine = [u for u in block.parts if any(p.iso.startswith(parsed.iso) for p in shared_dates.find_all(u.text))]
+        mine = [u for u in block.parts if any(p.iso.startswith(parsed.iso) for p in shared_dates.find_all(_positive(item, u.text)))]
     elif groups := headline(item.value, item.quote):
-        mine = [u for u in block.parts if any(_stated(item, (t := _without_list_number(u.text)), _have(t), g) for g in groups)]
+        mine = [u for u in block.parts if any(_stated(item, (t := _positive(item, u.text)), _have(t), g) for g in groups)]
     elif fractions := value_tokens(item.value, item.quote)[1]:
         # a share ("2/3") is no headline number, so every sibling sentence of the block gave the item: the sentence that holds the item's own
         # fraction is the one that gives it (round 21 U2, KTD1, R1, R6); none holds it: all of them, and nothing is written next to any

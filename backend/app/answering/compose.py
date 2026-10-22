@@ -12,7 +12,7 @@ renders the answer text from the claims that pass both verification layers (``ve
   stated value: it is listed as missing, never cited as a side's statement, and an answer made only of such
   claims is a ``not_stated`` abstention. A document's own statement that something is absent ("אין גינה")
   is an ordinary claim. When a provider leaves the field out (or in demo mode) a general detector reads the
-  wording instead (``is_absence_claim``). An absence claim that carries a value number is rejected;
+  wording instead (``normalize_text.states_absence``, the one reader of absence). An absence claim that carries a value number is rejected;
   one the detector found but that carries a value is verified as an ordinary claim;
 - a comparison or conflict question shows every side: a side whose claims verification dropped is quoted from
   the passage the model answered from (only a passage that shares the claim's own words, never a title or
@@ -50,7 +50,16 @@ from app.answering.verify import (
     strip_label_numbers,
 )
 from app.db import TenantContext
-from app.extraction.normalize_text import STOPWORDS, base_normalize, inflection_variants, is_negation
+from app.extraction.normalize_text import (
+    _DOC_NOUN,
+    _FINALS,
+    STOPWORDS,
+    _forms,
+    _is,
+    base_normalize,
+    inflection_variants,
+    states_absence,
+)
 from app.providers.llm import (
     SYSTEM_POLICY,
     CallStatus,
@@ -149,76 +158,6 @@ def dedupe_units(text: str) -> str:
     return text
 
 
-# --- Absence of a datum, read from the wording (the fallback when ``Claim.asserts_absence`` is not given) -----
-#
-# A claim reports missing information when a negation governs a word of stating or giving information:
-# "לא נמסר", "אינו מציין", "אין בהם נתון", "לא מופיע בשומה", "ללא פירוט", "לא ניתן לקבוע". A negation of
-# anything else is what a document says ("אין בדירה גינה", "אינו כולל גינה", "השמאי מציין שאין גינה").
-# Word classes, matched on whole words with final letters unified and conjunction/preposition prefixes off:
-_FINALS = str.maketrans("ךםןףץ", "כמנפצ")
-_INFLECTION = r"(?:ה|ו|ת|ימ|ות|נו)?"
-# verbs of stating, mentioning or reporting (a negation right before them, at most one word between)
-_STATING = re.compile(r"(?:מ?צוי{1,2}נ|מציי?נ|ציי?נ|מ?פורט|מפרט|פירט|הוזכר|מוזכר|מזכיר|הזכיר|נזכר"
-                      r"|מ?תייחס|התייחס|נאמר|נמסר|מסר|מוסר|מ?דווח|דיווח)" + _INFLECTION)
-# verbs of appearing in a text: absence when a document word or an information noun follows
-_APPEARING = re.compile(r"(?:מופיע|הופיע|נמצא|נכתב|כתוב|מובא|הובא|מוצג|הוצג)" + _INFLECTION)
-# verbs of existing or being given: absence only when an information noun follows ("לא קיים מידע")
-_GIVEN = re.compile(r"(?:קיימ|ניתנ)" + _INFLECTION)
-_INFO_NOUN = re.compile(r"מידע|נתונ|נתונימ|פירוט|פרטימ|התייחסות|אזכור|ציונ|תיעוד|אינדיקציה")
-_DOC_NOUN = re.compile(r"(?:מסמכ|קטע|מקור|טקסט|דוח)\w*|ראיות|ראיה|ראייה|שומה|שומות|שומת")
-_KNOWING = re.compile(r"לקבוע|לדעת|לזהות|למצוא|להסיק|לאתר")
-_POSSIBLE = re.compile(r"ניתנ|אפשר|אפשרות")
-_QUANTIFIERS = frozenset({"כל", "שום", "כלל"})
-_WORD_PREFIXES = "והבלמשכ"
-_HEB_WORD = re.compile(r"[א-ת][א-ת״׳]*")
-
-
-def _forms(word: str) -> set[str]:
-    """A word with final letters unified, and without one or two leading prefix letters (three letters stay)."""
-    w = word.translate(_FINALS)
-    out = {w}
-    for k in (1, 2):
-        if len(w) - k >= 3 and all(ch in _WORD_PREFIXES for ch in w[:k]):
-            out.add(w[k:])
-    return out
-
-
-def _is(pattern: re.Pattern, word: str) -> bool:
-    return any(pattern.fullmatch(f) for f in _forms(word))
-
-
-def _first_content_word(words: list[str]) -> str | None:
-    """The first word that is not a short function word ("בהם", "את"), a quantifier ("כל") or a document
-    word ("במסמכים"): what a negation governs in "אין בהם נתון" or "אין במסמכי הראיות כל מידע"."""
-    return next((w for w in words if not (len(w) <= 3 or w in _QUANTIFIERS or _is(_DOC_NOUN, w))), None)
-
-
-def is_absence_claim(text: str) -> bool:
-    """True for a claim whose wording reports missing information ("הנתון לא נמסר", "אין בהם נתון"), not for
-    a fact the document states about an absence ("אין בדירה גינה", "השמאי מציין שאין גינה")."""
-    words = _HEB_WORD.findall(base_normalize(CITE.sub(" ", text)))
-    for i, w in enumerate(words):
-        if w == "אי" and words[i + 1:i + 2] == ["אפשר"] and len(words) > i + 2 and _is(_KNOWING, words[i + 2]):
-            return True
-        if not is_negation(w, ambiguous=False):
-            continue
-        after = words[i + 1:i + 6]
-        if any(_is(_STATING, x) for x in after[:2]):  # "לא נמסר", "אינם מפרטים"
-            return True
-        if len(after) >= 2 and _is(_POSSIBLE, after[0]) and _is(_KNOWING, after[1]):  # "לא ניתן לקבוע"
-            return True
-        governed = _first_content_word(after)
-        if governed is not None and _is(_INFO_NOUN, governed):  # "אין בהם נתון", "ללא פירוט"
-            return True
-        for j, x in enumerate(after[:2]):  # "אינו מופיע בשומה", "לא קיים מידע"
-            rest = after[j + 1:j + 5]
-            if _is(_APPEARING, x) and any(_is(_DOC_NOUN, y) or _is(_INFO_NOUN, y) for y in rest):
-                return True
-            if _is(_GIVEN, x) and any(_is(_INFO_NOUN, y) for y in rest):
-                return True
-    return False
-
-
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -234,7 +173,7 @@ class Claim(_Strict):
     kind: Literal["explicit", "inferred", "computed"]
     numbers: list[str]
     # The claim only says the evidence (or one document) does not state the datum. Optional for providers
-    # and scripts that leave it out: then ``is_absence_claim`` reads the wording.
+    # and scripts that leave it out: then ``states_absence`` reads the wording.
     asserts_absence: bool = Field(False, json_schema_extra=_required_in_schema)
 
 
@@ -672,7 +611,7 @@ def compose_answer(provider: LLMProvider | None, question: str, evidence: list[d
     for n, claim in enumerate(parsed.claims):
         flagged = claim.asserts_absence
         detected = (not flagged and "asserts_absence" not in claim.model_fields_set and claim.kind != "computed"
-                    and is_absence_claim(claim.text))
+                    and states_absence(CITE.sub(" ", claim.text)))
         if flagged or detected:
             if not _absence_values(claim, labels, question):
                 absent.append(" ".join(CITE.sub(" ", claim.text).split()))

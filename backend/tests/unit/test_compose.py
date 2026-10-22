@@ -14,9 +14,9 @@ from app.answering.compose import (
     combined_abstention_kind,
     compose_answer,
     dedupe_units,
-    is_absence_claim,
 )
 from app.answering.verify import JUDGE_POLICY
+from app.extraction.normalize_text import states_absence
 from app.providers.llm import SYSTEM_POLICY, CallStatus, MockLLM, Purpose
 from tests.support.scripted_provider import ScriptedProvider
 
@@ -303,8 +303,8 @@ def test_a_document_stating_that_something_is_absent_is_an_answer():
     p = scripted(answer(claim("הבניין ברחוב הירדן 30 אינו כולל מעלית.", ["E2"])), verdicts("supported"))
     out = compose_answer(p, "האם יש מעלית בבניין ברחוב הירדן 30?", YARDEN)
     assert out.abstention_kind is None and out.text == "הבניין ברחוב הירדן 30 אינו כולל מעלית. [E2]"
-    assert is_absence_claim("אין מעלית בבניין") is False and is_absence_claim("אין בדירה ממ״ד") is False
-    assert is_absence_claim("המסמך אינו מציין את שטח הממ״ד") and is_absence_claim("אין במסמכים מידע על החניה")
+    assert states_absence("אין מעלית בבניין") is False and states_absence("אין בדירה ממ״ד") is False
+    assert states_absence("המסמך אינו מציין את שטח הממ״ד") and states_absence("אין במסמכים מידע על החניה")
 
 
 def test_an_absence_next_to_an_answer_becomes_a_limitation():
@@ -612,7 +612,7 @@ def test_gq45_absence_wording_with_words_between_is_a_not_stated_abstention():
     "אי אפשר לדעת מהקטעים", "השמאי לא התייחס לכך", "לא קיים בהם מידע על השטח", "לא נמסרו נתונים",
 ])
 def test_absence_detector_reads_a_negated_word_of_stating(text):
-    assert is_absence_claim(text)
+    assert states_absence(text)
 
 
 @pytest.mark.parametrize("text", [
@@ -622,7 +622,7 @@ def test_absence_detector_reads_a_negated_word_of_stating(text):
 ])
 def test_a_negation_of_something_else_is_what_the_document_says(text):
     """Counter-tests: a negation that does not govern a word of stating information is a document's fact."""
-    assert not is_absence_claim(text)
+    assert not states_absence(text)
 
 
 # --- GQ20: dropped sides, all-dropped comparisons and conflicts ------------------------------------------------

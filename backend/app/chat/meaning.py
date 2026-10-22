@@ -73,6 +73,7 @@ from app.answering.verify import not_an_amount, numbers_in
 from app.chat.datum import STATUS_NOT_READ
 from app.chat.evidence import _content_words
 from app.chat.scopes import row_cells as _row_cells
+from app.extraction.normalize_text import absence_spans as _absence_clauses
 from app.measurements.extract import (
     _MONTH_WORDS,
     _YEAR_WORDS,
@@ -136,13 +137,6 @@ _CLAUSE_END = re.compile(r"(?<!מ\.ע)[.;\n](?!\d)(?!ע\.?מ(?![א-ת]))")
 # amount after the label's; ``_CLAUSE_END`` itself (read by the VAT and condition checks, whose clauses run across cells) is unchanged
 _QUALIFIER_END = re.compile(_CLAUSE_END.pattern + r"|\||:\*\*|\*\*\s?:")
 _ROW = " | "
-# a clause saying the source does not state / does not show something ("לא צוין אם הסכום כולל מע״מ", "אינו מופיע"): it
-# claims no basis, period or VAT for the numbers it names, so no number-meaning check applies to it (round 9 U12)
-ABSENCE_SENTENCE = re.compile(
-    r"(?<![א-ת])(?:לא|אינו|אינה|אינם|אינן)\s+(?:צוין|צוינה|צוינו|מצוין|מצוינת|מצוינים|מצוינות|ציין|ציינה|ציינו|נכתב|"
-    r"נכתבה|נכתבו|נאמר|נאמרה|פורט|פורטה|פורטו|מפורט|מפורטת|הוזכר|הוזכרה|הוזכרו|מוזכר|מוזכרת|נמסר|נמסרה|ידוע|ידועה|"
-    r"ברור|ברורה|נמצא|נמצאה|נמצאו|נמצאים|אותר|אותרה|אותרו|מופיע|מופיעה|מופיעים|מופיעות)(?![א-ת])"
-    r"|(?<![א-ת])אין\s+(?:ציון|פירוט|אזכור|התייחסות|מידע|נתון)(?![א-ת])")
 # a period word right after a rate's noun ("ריבית שנתית", "שיעור היוון שנתי", "תשואה לשנה") is that rate's: it
 # qualifies a percent of its own clause ("בריבית שנתית של 6%") and never an amount, and it states nothing for the
 # source's other numbers
@@ -585,12 +579,14 @@ def _only(q: Qualifiers, kind: str, keep: bool = True) -> Qualifiers:
 
 
 def absence_spans(text: str) -> list[tuple[int, int]]:
-    """The spans of the clauses of ``text`` (split as ``attached`` splits them) that state something is not stated."""
+    """The spans of the clauses of ``text`` (split as ``attached`` splits them, then by clause) that state something is not stated: a clause says the source
+    does not state / show something ("לא צוין אם הסכום כולל מע״מ", "אינו מופיע"), so it claims no basis, period or VAT for the numbers it names
+    and no number-meaning check applies to it (round 9 U12; the reader of absence is ``normalize_text.absence_clause``, round 22 U6)."""
     out, start = [], 0
     for end_m in [*_QUALIFIER_END.finditer(text), None]:
         end = end_m.end() if end_m else len(text)
-        if ABSENCE_SENTENCE.search(text[start:end]):
-            out.append((start, end))
+        # only the absence clause inside the piece: a positive clause beside it (", והשכר 5,000 ₪ ללא מע״מ") keeps its own meaning checks
+        out += [(start + a, start + b) for a, b in _absence_clauses(text[start:end])]
         start = end
     return out
 

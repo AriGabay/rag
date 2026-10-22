@@ -139,7 +139,7 @@ reading covered, is a problem for the repair round (``kind="requirement"``, noth
 assumption or a clarification is never sent to search (R4); a unit saying "not found" for a component whose values
 were found is removed. What is still missing is stated once, by the server, after the answer
 (``coverage.state_components``); a unit the judge marked as stating the absence of a component the server states,
-and — the backstop — an uncited unit the judge did not mark that states an absence (``ABSENCE``) when the server
+and — the backstop — an uncited unit the judge did not mark that states an absence (``states_absence``) when the server
 states a gap, are removed then (``VerifyReport.supersede``, ``kind="absence"``): the server's statement replaces
 them, so they are not counted as claims that failed.
 
@@ -233,6 +233,7 @@ from app.chat.evidence import (
 )
 from app.chat.request import ID_PREFIX, Aspect, Kind
 from app.config import get_settings
+from app.extraction.normalize_text import absence_spans, negation_form, states_absence
 from app.measurements.extract import VAT_TERM, stance_label
 from app.platform import dates as shared_dates
 from app.platform import source_kinds
@@ -558,13 +559,6 @@ COMPONENT_STATUSES = ("full", "partial", "not_answered", "needs_clarification", 
 # the kinds of requirement that are about the documents: only these are completed from found data or searched for
 SEARCHABLE_KINDS = ("information", "calculation")
 _RANK = {s: n for n, s in enumerate(REQUIREMENT_STATUSES)}
-# a sentence saying a datum was not found ("לא נמצא", "לא נמצאו", "לא אותר")
-NOT_FOUND = re.compile(r"(?<![א-ת])לא\s+(?:נמצא|נמצאה|נמצאו|אותר|אותרה|אותרו)(?![א-ת])")
-# the backstop (KTD4): a sentence stating that something is absent — not found, not located, does not appear. Not a
-# list of what a question asks: it reads only the negated verb, and acts only on an uncited unit the judge did not
-# mark, when the server states a gap itself
-ABSENCE = re.compile(r"(?<![א-ת])(?:לא|אינו|אינה|אינם|אינן)\s+(?:נמצא|נמצאה|נמצאו|נמצאים|אותר|אותרה|אותרו|מופיע|"
-                     r"מופיעה|מופיעים|מופיעות)(?![א-ת])")
 WORKSPACE_MEASUREMENTS = 30  # measurements listed for the judge (a listing may hold hundreds)
 # the passages the turn read, in the requirements call (round 16 U1, KTD1): the whole block, one passage of it, and the least
 # room worth giving a passage. Measured on a typical synthetic case in ``test_coverage`` (a few thousand characters)
@@ -1078,24 +1072,14 @@ def has_qualifier(text: str) -> bool:
 LOST_WORD_SHARE = 0.75  # the share of a number-free claim's content words a rephrasing must keep (``lost_supported``)
 
 
-# a clause saying something was not computed or not determined ("הסכום החדש לא חושב כאן", "לא נקבע"): with ``ABSENCE`` and
-# ``meaning.ABSENCE_SENTENCE`` the statements of an absence, which a repair round fills and never has to keep
-_NOT_DETERMINED = re.compile(
-    r"(?<![א-ת])(?:לא|אינו|אינה|אינם|אינן)\s+(?:חושב|חושבה|חושבו|חושבים|נחשב|נחשבה|נקבע|נקבעה|נקבעו|נקבעים|הוגדר|"
-    r"הוגדרה|הוגדרו|נבדק|נבדקה|נבדקו)(?![א-ת])|(?<![א-ת])לא\s+ניתן\s+(?:לחשב|לקבוע|לדעת|לברר)(?![א-ת])"
-    r"|(?<![א-ת])אין\s+(?:אפשרות|דרך)\s+ל")
-
-
-def states_absence(clause: str) -> bool:
-    """Whether a clause says that a datum is not stated, not found, not computed or not determined."""
-    return bool(ABSENCE.search(clause) or meaning.ABSENCE_SENTENCE.search(clause) or _NOT_DETERMINED.search(clause))
-
-
 def _without_absence(text: str) -> str:
     """``text`` without its clauses that state an absence. The repair guard does not protect them (``lost_supported``):
     filling an absence is what a repair is for, and an absence it drops without the datum is reported as a gap by the
-    completeness check. A negation that qualifies a positive claim ("אינו כולל מע״מ") stays."""
-    return "".join(c for c in re.split(r"(?<=[.;\n])", text or "") if not states_absence(c))
+    completeness check. A negation that qualifies a positive claim ("אינו כולל מע״מ") stays, and so does a positive clause beside an absence
+    one (round 22 U6: the clause is the unit, ``normalize_text.clause_spans``)."""
+    text = text or ""
+    gone = absence_spans(text)
+    return "".join(text[x:y] for x, y in zip([0, *(b for _, b in gone)], [*(a for a, _ in gone), len(text)], strict=True))
 
 
 def _supported_claim(r: ClaimRecord) -> str:
@@ -1104,7 +1088,7 @@ def _supported_claim(r: ClaimRecord) -> str:
     if r.verdict != "supported" or r.action not in ("kept", "qualified", "cited") or r.kind == "absence":
         return ""
     claim = _without_absence(r.text)
-    return claim if claim.strip() else ""
+    return claim if re.search(r"\w", claim) else ""
 
 
 # the words that state the VAT basis of a number ("ללא מע״מ", "כולל מע״מ"): a partly verified number a repair round keeps must keep them, or
@@ -2172,7 +2156,7 @@ class VerifyReport:
                 p.defect == "none" or p.failure_kind == CONTEXT_NOT_READ or (p.defect == "units" and r.source_sentence)) for p in mine):
             return ""
         claim = _without_absence(r.text)
-        return claim if claim.strip() else ""
+        return claim if re.search(r"\w", claim) else ""
 
     def _protected(self, r: ClaimRecord) -> tuple[str, bool]:
         """What a repair round must keep of claim ``r``, and whether only its numbers are protected: a supported claim (all of it) or a
@@ -3048,7 +3032,7 @@ class VerifyReport:
     def supersede(self, outcomes: list[dict]) -> bool:
         """Remove the units that state the absence of a component the server states (``stated``, R9, KTD4): a unit
         the judge marked as saying that component is missing (``absence_units``) and — the backstop, when the judge
-        judged the answer — an uncited unit it marked for no component that states an absence (``ABSENCE``). A unit
+        judged the answer — an uncited unit it marked for no component that states an absence (``states_absence``, or a claim of kind ``absence``). A unit
         that gives a component, or holds a claim judged supported that is not an absence (``_supported_claim``), is
         kept (removing it would take the data with it). Each removal is a problem of kind
         ``absence``: replaced by the server's statement, not counted as a claim that failed. Whether any was added."""
@@ -3065,7 +3049,8 @@ class VerifyReport:
                 continue
             if u.index in marked:
                 reason = ABSENCE_REPLACED
-            elif self.judged and not u.ids and u.index not in marked_any and ABSENCE.search(u.text):
+            elif self.judged and not u.ids and u.index not in marked_any and (
+                    states_absence(u.text) or any(r.kind == "absence" for r in self.claims.get(u.index, []))):
                 reason = ABSENCE_UNCITED
             else:
                 continue
@@ -4362,9 +4347,10 @@ def _vat_phrases(text: str, skip_absence: bool):
         clause = text[start:end]
         numbers = list(_NUM_AT.finditer(clause))
         nums = [(n.start(), _value_forms(clause, n)) for n in numbers if _vat_bearing(clause, n)]
-        for v in [] if skip_absence and meaning.ABSENCE_SENTENCE.search(clause) else _VAT.finditer(clause):
+        silent = absence_spans(clause) if skip_absence else []  # the absence clauses of it: a phrase inside one gives nothing (round 22 U6)
+        for v in _VAT.finditer(clause):
             polarity = _vat_polarity(v)
-            if not polarity:
+            if not polarity or any(a <= v.start() < b for a, b in silent):
                 continue
             before = [forms for pos, forms in nums if pos < v.start()]
             opened = _open_parenthesis(clause, v.start())
@@ -5895,8 +5881,7 @@ MSG_RESCUED = "נתמך במקור {sid}, שיחידה סמוכה בתשובה �
 MSG_RESCUED_OWN = "המספר והמילים של הטענה נמצאים בשורה של {sid}, שהיחידה מצטטת, אך הבדיקה לא אישרה את מלוא הטענה; הנתון נשאר מסומן כמאומת חלקית"
 MSG_RESCUE_CITE = "נתמך ב-{sid}, שהתשובה לא ציטטה ליד המשפט"
 # the negations of a claim or a sentence, compared without their prefix letters ("ולא", "שלא", "מבלי"): a sentence that negates what the
-# claim states is no holder of it
-_NEGATIONS = frozenset({"לא", "אין", "אינו", "אינה", "אינם", "אינן", "ללא", "בלי", "בלא", "מבלי", "לבלתי", "טרם"})
+# claim states is no holder of it (the one negation vocabulary, ``normalize_text.negation_form``)
 _NUMBER_RUN = re.compile(r"\d[\d.,%/:-]*")
 _RESCUE_SENTENCE = re.compile(r"(?<=[.!?;])\s+(?=\S)")  # (a colon does not end the sentence: "מתחם גבעת האלה: הכנסה נטו שנתית 610,000")
 # a number as it binds to its label: "1,200" thousands, "4.62" or "4,62" a decimal (a source reading "4,62" is no "4")
@@ -5927,17 +5912,7 @@ class _Profile(NamedTuple):
 
 
 def _negation_set(text: str) -> frozenset[str]:
-    found = set()
-    for w in _MISSING_TOKEN.findall(text or ""):
-        for form in (w, w[1:], w[2:]):
-            if form in _NEGATIONS and all(c in "ושבמלכה" for c in w[:len(w) - len(form)]):
-                found.add(form)
-                break
-    return frozenset(found)
-
-
-def _negations(text: str) -> frozenset[str]:
-    return _negation_set(text)
+    return frozenset(f for w in _MISSING_TOKEN.findall(text or "") if (f := negation_form(w, ambiguous=False)) is not None)
 
 
 def _label_words(text: str, lo: int, hi: int, skip: Sequence[tuple[int, int]] = ()) -> list[str]:
@@ -6047,10 +6022,6 @@ def _rescue_segments(text: str) -> tuple[str, ...]:
         if line:
             out.extend([line] if "|" in line else _RESCUE_SENTENCE.split(line))
     return tuple(out)
-
-
-def _negations(text: str) -> frozenset[str]:
-    return frozenset(w for w in _MISSING_TOKEN.findall(text or "") if w in _NEGATIONS)  # (the stop words "לא" and "אין" count here)
 
 
 def _holds_claim(claim: str, source_text: str) -> bool:
@@ -10611,7 +10582,7 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
             if not evidence or v.status not in ("missing", "partial"):
                 continue
             for i in dict.fromkeys([*v.units, *v.absent]):
-                if i in units and i not in failed and NOT_FOUND.search(units[i].text):
+                if i in units and i not in failed and states_absence(units[i].text):
                     # false, and the server states the component itself: removed as an absence it replaces (the
                     # repair round is asked to use the data by the component's own problem below)
                     failed.add(i)

@@ -19,6 +19,8 @@ import re
 import uuid
 from decimal import Decimal
 
+import pytest
+
 from app.chat import calc, coverage, verify
 from app.chat.engine import FinalAnswer, Part, Requested
 from app.chat.tools import READ_TO_END, Workspace
@@ -4314,3 +4316,103 @@ def test_round21_pass3_h3_a_note_after_a_number_and_its_unit_stands_after_the_wo
     r, _, answer = _text_check("הזכויות הן 41,300 מ״ר עיקרי — והיתר בהמשך [S2].", source)
     text, notes = _server_text(r, answer)
     assert len(notes) == 1 and "41,300 מ״ר עיקרי (התנאי" in text and text.index("(התנאי") < text.index("— והיתר"), text
+
+
+# --- round 22 U6 (KTD6; R16; AE4): a partly given component is stated by a clause that says the missing part positively ------------------
+
+END_QUESTION = "מהו מועד הסיום של מגרש א ושל מגרש ב?"
+
+
+def _end_case(answer: str, missing: str = "מועד סיום למגרש א", *, units=(0,), component: str = "מועד סיום", absent=(),
+              question: str = END_QUESTION):
+    """The judge scores the component ``partial`` (given by ``units``) and names ``missing`` as the part not given."""
+    ws = _ws("מועד סיום העבודות בשומה הוא 2026 ובשומה אחרת 2025.")
+    ws.searches.append("מועד סיום")
+    turn = _turn({"id": "1", "text": component})
+    a = _answer(answer)
+
+    def score(frozen, us):
+        return [_req("", "partial", list(units), ("H1",), i, absent=absent) | {"missing": missing} for i, _ in frozen]
+
+    r = verify_answer(_judge(score), a, ws, question, [], requirements=turn)
+    final, outcomes = _finish(ws, a, r, turn)
+    return a, r, final, outcomes[0]
+
+
+def _kept_open(o: dict) -> bool:
+    """The gap line of the missing part stays: the component is stated partial with a reason."""
+    return o["status"] == "partial" and o["stated"] is True and bool(o["limitation"])
+
+
+def test_ae4_an_answer_that_says_the_end_date_for_plot_a_was_not_found_does_not_cover_the_component():
+    a, r, final, o = _end_case("מועד סיום העבודות למגרש א לא נמצא [S1].")
+    assert _kept_open(o), o
+    assert "**מועד סיום למגרש א**" in _gap(final, a)
+
+
+@pytest.mark.parametrize("answer", [
+    "מועד הסיום לא צוין בשומה עבור מגרש א [S1].",             # "not stated"
+    "לגבי מגרש א לא צוין מועד סיום בשומה [S1].",
+    "מועד סיום העבודות מופיע במגרש ב. מגרש א: הנתון לא אותר [S1].",   # the absence in the sentence after the other plot's datum
+    "מועד סיום העבודות למגרש א אינו 2026 אלא מאוחר ממנו [S1].",      # the value negated
+    "הדוח אינו מתייחס למועד הסיום של מגרש א [S1].",                  # "does not refer to"
+])
+def test_ae4_other_forms_of_not_stated_do_not_cover_the_component_either(answer):
+    _, _, _, o = _end_case(answer)
+    assert _kept_open(o), (answer, o)
+
+
+@pytest.mark.parametrize("answer", [
+    "מועד סיום העבודות למגרש א הוא 2026 [S1].",                        # the plain statement
+    "העבודות במגרש א יסתיימו, לפי השומה, ב-2026 [S1].",                # a paraphrase
+    "2026 הוא מועד הסיום של מגרש א [S1].",                             # reordered
+    "לא נמצאו חריגות; מועד הסיום למגרש א הוא 2026 [S1].",             # an absence of another datum beside it
+    "מועד הסיום למגרש א, שאינו כולל תקופת הרצה, הוא 2026 [S1].",       # a negation of a qualifier
+])
+def test_a_positive_statement_of_the_missing_part_covers_it(answer):
+    _, _, _, o = _end_case(answer)
+    assert o["limitation"] is None and o["stated"] is False, (answer, o)
+
+
+def test_a_number_written_in_words_in_the_designator_covers_the_part():
+    _, _, _, o = _end_case("מועד סיום העבודות בתא שטח שתיים הוא 2026 [S1].", "מועד סיום לתא שטח 2",
+                           question="מהו מועד הסיום של תא שטח 1 ושל תא שטח 2?")
+    assert o["limitation"] is None and o["stated"] is False, o
+
+
+@pytest.mark.parametrize("answer", [
+    "מועד סיום העבודות למגרש ב: 2025 (א) הערה [S1].",                   # the other plot's datum and a stray «(א)»
+    "מועד סיום העבודות למגרש ב הוא 2025 [S1].",
+    "(א) מועד סיום העבודות למגרש ב הוא 2025 [S1].",
+])
+def test_the_other_plots_datum_does_not_cover_plots_a_part_even_with_a_stray_letter(answer):
+    _, _, _, o = _end_case(answer)
+    assert _kept_open(o), (answer, o)
+    # the stray letter in a unit of its own that the judge links as well
+    _, _, _, o = _end_case("מועד סיום העבודות למגרש ב הוא 2025 [S1].\n\n(א) הערה.", units=(0, 1))
+    assert _kept_open(o), o
+
+
+@pytest.mark.parametrize("noun", ["מגרש", "בניין", "חלקה"])
+@pytest.mark.parametrize("letters", [("א", "ב"), ("ג", "ד")])
+def test_property_variants_renamed_designators_and_reordered_sentences(noun, letters):
+    mine, other = letters
+    question = f"מהו מועד הסיום של {noun} {mine} ושל {noun} {other}?"
+    missing = f"מועד סיום ל{noun} {mine}"
+    positive = f"מועד סיום העבודות ב{noun} {mine} הוא 2026 [S1]."
+    twin = f"מועד סיום העבודות ב{noun} {other} הוא 2025 [S1]."
+    absent = f"מועד סיום העבודות ב{noun} {mine} לא נמצא [S1]."
+    for text in (f"{positive} {twin}", f"{twin} {positive}"):  # reordered
+        assert _end_case(text, missing, units=(0, 1), question=question)[3]["limitation"] is None, text
+    for text in (twin, f"{twin} {absent}", f"{absent} {twin}"):
+        assert _kept_open(_end_case(text, missing, units=tuple(range(text.count("[S1]"))), question=question)[3]), text
+
+
+def test_a_plan_code_is_no_designator_so_the_part_naming_it_by_its_number_is_stated_by_the_codes_sentence():
+    """«תכנית ג/4521» and «תכנית 4521» are one plan: only the nouns of places (a plot, a building) carry a designator that must match."""
+    question = "מהו מועד הסיום לפי תכנית 4521?"
+    for answer in ("מועד הסיום לפי תכנית ג/4521 הוא 2026 [S1].", "מועד הסיום לפי תכנית 4521 הוא 2026 [S1]."):
+        _, _, _, o = _end_case(answer, "מועד סיום לפי תכנית 4521", question=question)
+        assert o["limitation"] is None and o["stated"] is False, (answer, o)
+    _, _, _, o = _end_case("מועד הסיום לפי תכנית ג/4521 לא נמצא [S1].", "מועד סיום לפי תכנית 4521", question=question)
+    assert _kept_open(o), o

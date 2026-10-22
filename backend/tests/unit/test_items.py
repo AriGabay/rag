@@ -2455,3 +2455,233 @@ def test_r21_full_the_item_stays_given_by_the_other_sources_sentence_when_no_sen
     answer = f"{OTHER_SENTENCE}\n\nהאישור המסחרי הוא 4,200 מ\"ר [S1]."
     got = _condition(ws, answer, _limit_item())
     assert got["state"] == "covered" and got["covered_by"] == 0 and got["condition_unit"] == 0, got
+
+
+# --- round 22 U6 (KTD6; R16, R17): an item is covered by a clause that states it positively, for its own row ----------------------------
+#
+# Coverage asks one question of a block of the answer: does a clause of it state the item's datum - its value and its own designators - with no
+# negation or absence on them, and not as another item's row. Words and numbers elsewhere in the block, a "not found" sentence that repeats the
+# value, and the same figure of the twin row (a single letter or number is a designator: "בניין א" is not "בניין ב") cover nothing.
+
+LETTERS = "אבגדהוז"
+FEE_NOUN = "בניין"
+
+
+def _fees_ws(n: int = 2, noun: str = FEE_NOUN, value: str = "1,200 ₪") -> Workspace:
+    rows = [f"{noun} {LETTERS[k]} | {value}" for k in range(n)]
+    return _ws("\n".join(["דמי ניהול", f"{noun} | סכום", *rows]))
+
+
+def _fee_items(n: int = 2, noun: str = FEE_NOUN, value: str = "1,200 ₪") -> list[items.Item]:
+    return [_item(label=f"דמי ניהול {noun} {LETTERS[k]}", quote=f"{noun} {LETTERS[k]} | {value}", value=value, condition="") for k in range(n)]
+
+
+def _fee_states(markdown: str, n: int = 2, noun: str = FEE_NOUN, value: str = "1,200 ₪") -> dict[str, str]:
+    got = _states(_fees_ws(n, noun, value), markdown, *_fee_items(n, noun, value))
+    return {k.split()[-1]: o["state"] for k, o in got.items()}
+
+
+@pytest.mark.parametrize("markdown", [
+    "דמי הניהול בבניין א הם 1,200 ₪ [S1].",                      # the plain statement
+    "בבניין א משלמים בעבור הניהול 1,200 ₪ [S1].",                 # a paraphrase
+    "1,200 ₪ הם דמי הניהול של בניין א [S1].",                     # reordered
+    "דמי הניהול בבניין א לא כוללים חניה והם 1,200 ₪ [S1].",       # a negation of something else in the clause
+    "| דמי ניהול | בניין א | 1,200 ₪ [S1] |",                        # another presentation: a table row
+    "- בניין א: 1,200 ₪ [S1]",                                    # a list item
+])
+def test_n7_a_clause_that_states_the_value_for_the_items_own_designator_covers_it_in_any_presentation(markdown):
+    ws = _fees_ws(1)
+    (it,) = _fee_items(1)
+    got = _states(ws, markdown, it)
+    assert got["בניין א"]["state"] == "covered", (markdown, got)
+
+
+@pytest.mark.parametrize("markdown", [
+    "דמי הניהול בבניין א אינם 1,200 ₪ אלא נמוכים מכך [S1].",         # a negation of the value
+    "לא נמצא בדוח סכום של 1,200 ₪ בעבור דמי ניהול בבניין א [S1].",  # a "not found" sentence that repeats the value
+    "דמי הניהול בבניין א לא צוינו; בבניין ב הם 1,200 ₪ [S1].",       # A absent, B stated
+    "דמי הניהול בבניין א לא צוינו, ובבניין ב הם 1,200 ₪ [S1].",
+    "דמי הניהול בבניין ב הם 1,200 ₪ [S1].",                          # only the twin row
+    "דמי הניהול בבניין ב הם 1,200 ₪ [S1]. (א) הערה.",                # ... even with a stray letter
+])
+def test_n7_a_negating_claim_or_the_twins_row_does_not_cover_the_item_even_when_the_value_stands_in_the_block(markdown):
+    got = _fee_states(markdown)
+    assert got["א"] == "omitted", (markdown, got)
+
+
+def test_n7_the_twin_rows_statement_covers_the_twin_and_only_it():
+    got = _fee_states("דמי הניהול בבניין ב הם 1,200 ₪ [S1].")
+    assert got == {"א": "omitted", "ב": "covered"}
+    got = _fee_states("דמי הניהול בבניין א לא צוינו; בבניין ב הם 1,200 ₪ [S1].")
+    assert got == {"א": "omitted", "ב": "covered"}
+
+
+@pytest.mark.parametrize("noun", ["בניין", "מגרש", "חלקה"])
+@pytest.mark.parametrize("n", [2, 7])
+def test_property_variants_each_designator_is_covered_by_its_own_sentence_in_any_order(noun, n):
+    """Renamed designators, item counts of 2 and 7, sentences in reverse order: the sentence that names item k covers item k and no other."""
+    for k in range(n):
+        got = _fee_states(f"דמי הניהול ב{noun} {LETTERS[k]} הם 1,200 ₪ [S1].", n, noun)
+        assert got == {LETTERS[j]: "covered" if j == k else "omitted" for j in range(n)}, (noun, n, k, got)
+    every = "\n".join(f"- דמי הניהול ב{noun} {LETTERS[k]} הם 1,200 ₪ [S1]." for k in reversed(range(n)))
+    assert set(_fee_states(every, n, noun).values()) == {"covered"}
+    absent = "\n".join(f"- דמי הניהול ב{noun} {LETTERS[k]} לא צוינו [S1]." for k in range(n))
+    assert set(_fee_states(absent, n, noun).values()) == {"omitted"}
+
+
+def test_a_number_designator_is_a_designator_too():
+    ws = _ws("\n".join(["דמי ניהול", "תא שטח | סכום", "תא שטח 1 | 1,200 ₪", "תא שטח 2 | 1,200 ₪"]))
+    one = _item(label="דמי ניהול תא שטח 1", quote="תא שטח 1 | 1,200 ₪", value="1,200 ₪", condition="")
+    two = _item(label="דמי ניהול תא שטח 2", quote="תא שטח 2 | 1,200 ₪", value="1,200 ₪", condition="")
+    got = _states(ws, "דמי הניהול בתא שטח 2 הם 1,200 ₪ [S1].", one, two)
+    assert {k: o["state"] for k, o in got.items()} == {"תא שטח 1": "omitted", "תא שטח 2": "covered"}
+
+
+@pytest.mark.parametrize("markdown, covered", [
+    ("פינוי המגרש יושלם עד תום שנה [S1].", True),
+    ("לא נקבע פינוי המגרש ולא נקבע מועד, ולא תום שנה [S1].", False),
+    ("לא נמצא בדוח מידע על פינוי המגרש עד תום שנה [S1].", False),
+])
+def test_an_item_asked_by_its_words_is_covered_by_a_positive_clause_only(markdown, covered):
+    ws = _ws("\n".join(["תנאי הפינוי", "פינוי המגרש עד תום שנה מיום ההיתר"]), kind="paragraph")
+    it = _item(label="מועד פינוי", quote="פינוי המגרש עד תום שנה מיום ההיתר", value="פינוי המגרש עד תום שנה", condition="")
+    got = _states(ws, markdown, it)
+    assert [o["state"] for o in got.values()] == ["covered" if covered else "omitted"], got
+
+
+def test_a_not_found_sentence_does_not_carry_an_item_asked_by_its_figures():
+    quote = "מועד סיום העבודות למגרש א הוא 31.12.2026"
+    assert items.quote_in_blocks(quote, _units("מועד סיום העבודות למגרש א הוא 31.12.2026."), "מועד סיום")
+    for md in ("מועד סיום העבודות למגרש א אינו 31.12.2026.",                       # negated date
+               "לא נמצא מועד סיום העבודות למגרש א, ובמגרש ב 31.12.2026.",         # not found, the date repeated for the twin
+               "מועד סיום העבודות למגרש ב הוא 31.12.2026."):                       # the twin's date
+        assert not items.quote_in_blocks(quote, _units(md), "מועד סיום"), md
+    words = "מגרש א מועד סיום העבודות והמסירה"
+    assert items.quote_in_blocks(words, _units("מועד סיום העבודות והמסירה של מגרש א נקבע."))
+    assert not items.quote_in_blocks(words, _units("מועד סיום העבודות והמסירה של מגרש א לא נמצא."))
+    assert not items.quote_in_blocks(words, _units("מועד סיום העבודות והמסירה של מגרש ב נקבע."))
+
+
+def test_figures_stated_reads_the_clauses_that_state_the_figures_positively():
+    quote = "מגרש א תוקף עד 3.8.2031 ריבית 9.75% מקדם 1.2"
+    assert items.figures_stated(quote, "במגרש א הריבית 9.75% והמקדם 1.2 בתוקף עד 3.8.2031.")
+    assert not items.figures_stated(quote, "במגרש א אין ריבית 9.75% ואין מקדם 1.2 לאחר 3.8.2031.")
+    assert not items.figures_stated(quote, "מגרש ב: ריבית 9.75% מקדם 1.2 תוקף 3.8.2031")
+
+
+@pytest.mark.parametrize("line, heading", [
+    ("ד. תנאי תשלום:", True),
+    ("ד. תנאי תשלום ללא תשלום ראשון", True),
+    ("3.2 תנאי תשלום", True),
+    ("# מועדי סיום", True),
+    ("3.2 מועד סיום לא נקבע", False),            # a negation: a sentence
+    ("מגרש א — לא נמצא מידע:", False),
+    ("3.2 מועד הסיום נקבע לשנת 2026.", False),     # a sentence with a figure
+    ("ד. מועד הסיום הוסכם בין הצדדים.", False),    # a closed sentence
+])
+def test_a_short_numbered_line_is_a_heading_only_when_it_is_not_a_sentence(line, heading):
+    assert items.heading_only(line) is heading
+
+
+@pytest.mark.parametrize("written, covered", [
+    ("שנים עשר תשלומים", True), ("בשנים עשר תשלומים", True), ("12 תשלומים", True), ("שתים עשרה תשלומים", True),
+    ("ארבעה עשר תשלומים", False), ("שלושה תשלומים", False), ("שנים עשר חודשים", False),
+])
+def test_a_count_in_words_above_ten_covers_the_item_that_writes_the_digit(written, covered):
+    ws = _ws("\n".join(["תנאי תשלום", "רכיב | תשלומים", "פריסה | 12 תשלומים"]))
+    it = _item(label="פריסה", quote="פריסה | 12 תשלומים", value="12 תשלומים", condition="")
+    got = _states(ws, f"הפריסה היא {written} [S1].", it)
+    assert [o["state"] for o in got.values()] == ["covered" if covered else "omitted"], got
+
+
+# --- round 22 U6 (second pass): a negation that is the datum's own is no negation of the item (R16, R17) -------------------------------------
+#
+# Replay of real drafts found item gap lines that were false: the answer states the item, and its negation, its limit expression ("not later
+# than"), the clause beside it or the plot beside it was read as a negation of the datum. Invented texts of the same shapes.
+
+def _paragraph_item(quote: str, answer: str, *, label: str, value: str = "", condition: str = "") -> list[str]:
+    ws = _ws("\n".join(["כותרת", quote]), kind="paragraph")
+    got = _states(ws, answer, _item(label=label, quote=quote, value=value, condition=condition))
+    return [o["state"] for o in got.values()]
+
+
+@pytest.mark.parametrize("value", ["", "לא הוגשו הצעות", "אינה נתון השוואה"])
+def test_shape_1_the_negations_an_items_own_quote_writes_are_its_datum_not_a_negation_of_it(value):
+    quote = "העובדה כי לא הוגשו הצעות במכרז אינה מהווה נתון השוואה"
+    answer = "השיעור הוא 7.5% משום שלא הוגשו הצעות — השמאי קבע שאי־הגשת הצעות אינה נתון השוואה [S1]."
+    assert _paragraph_item(quote, answer, label="הצעות במכרז", value=value) == ["covered"]
+
+
+@pytest.mark.parametrize("value", ["", "20% מהתמורה", "לא יאוחר מארבעה חודשים", "20%; 4 חודשים"])
+def test_shape_2_a_limit_expression_is_no_negation_and_a_count_in_words_is_the_digit(value):
+    quote = "סך של 20% מהתמורה, לא יאוחר מארבעה חודשים לאחר התחלת הבניה"
+    answer = "| 20% | לא יאוחר מארבעה חודשים לאחר תחילת הבנייה [V3][S1] |"
+    assert _paragraph_item(quote, answer, label="תשלום ראשון", value=value) == ["covered"]
+
+
+@pytest.mark.parametrize("answer", [
+    "יש תקופה ראשונה, וכן תקופת חכירה נוספת של 49 שנים החל מתום התקופה; המקור אינו מפרט כאן תאריך סיום [S1].",
+    "יש תקופה ראשונה, וכן תקופת חכירה נוספת של 49 שנים החל מתום התקופה (המקור אינו מפרט כאן תאריך סיום) [S1].",
+    "יש תקופה ראשונה, וכן תקופת חכירה נוספת של 49 שנים החל מתום התקופה — המקור אינו מפרט כאן תאריך סיום [S1].",
+    "המקור אינו מפרט כאן תאריך סיום, אך תקופת חכירה נוספת היא של 49 שנים החל מתום התקופה [S1].",
+])
+def test_shape_3_an_absence_beside_the_datum_removes_only_its_own_clause(answer):
+    quote = "תקופת חכירה נוספת: 49 שנים החל מתום תקופת החכירה"
+    assert _paragraph_item(quote, answer, label="תקופת חכירה נוספת", value="49 שנים") == ["covered"]
+    assert _paragraph_item(quote, answer, label="תקופת חכירה נוספת", value="") == ["covered"]
+
+
+@pytest.mark.parametrize("value", ["", "COST בלבד", "COST בלבד, ללא תוספת 15%", "שטחים שאינם מושכרים", "שאינם מושכרים COST"])
+def test_shape_4_a_negation_and_a_preposition_that_are_part_of_the_datum_do_not_remove_it(value):
+    quote = "שטחים שאינם מושכרים דמי הניהול בגינם יהיו COST בלבד ללא תוספת 15%"
+    answer = "בשטחים שאינם מושכרים: דמי הניהול הם COST בלבד, ללא תוספת 15% [S1]."
+    assert _paragraph_item(quote, answer, label="דמי ניהול בשטחים לא מושכרים", value=value) == ["covered"]
+
+
+@pytest.mark.parametrize("answer", [
+    "בחלקה 56 נרשמה תוספת של 3.32% משטח החלקה, ובחלקה 57 תוספת של 4.15% משטח החלקה [S1].",
+    "בחלקה 56 נרשמה תוספת של 3.32% משטח החלקה ובחלקה 57 תוספת של 4.15% משטח החלקה [S1].",      # no comma between the plots
+    "בחלקה 57 תוספת של 4.15% משטח החלקה, ובחלקה 56 תוספת של 3.32% משטח החלקה [S1].",
+])
+@pytest.mark.parametrize("label", ["תוספת שיפור תכנון", "תוספת שיפור תכנון בחלקה 57"])
+def test_shape_5_another_plots_designator_beside_the_items_clause_does_not_block_it(answer, label):
+    quote = "תוספת 4.15% משטח החלקה עבור שיפור תכנון"
+    assert _paragraph_item(quote, answer, label=label, value="4.15%") == ["covered"]
+
+
+def test_protection_the_own_negation_rule_does_not_let_an_unrelated_negation_cover_the_item():
+    """The negations of the item's quote are its datum's; a negation the quote does not write still negates the value."""
+    quote = "תוספת 4.15% משטח החלקה עבור שיפור תכנון"
+    assert _paragraph_item(quote, "התוספת עבור שיפור תכנון אינה 4.15% משטח החלקה [S1].", label="תוספת", value="4.15%") == ["omitted"]
+    assert _paragraph_item(quote, "לא נמצאה תוספת של 4.15% משטח החלקה עבור שיפור תכנון [S1].", label="תוספת", value="4.15%") == ["omitted"]
+
+
+# --- round 22 U6 (third pass): the item's condition is the agent's wording, not a source of negations or designators -------------------------
+
+def test_shape_6_an_absence_the_items_own_condition_states_is_stated_by_the_same_absence_in_the_answer():
+    quote = "תקופת חכירה נוספת: 49 שנים החל מתום תקופת החכירה"
+    answer = "יש תקופה ראשונה, וכן תקופת חכירה נוספת של 49 שנים החל מתום התקופה; המקור אינו מפרט כאן תאריך סיום לתקופה הנוספת [S1]."
+    first = "תקופת חכירה ראשונה: 49 שנים עד תום שנת 2012"
+    for condition in ("החל מתום תקופת החכירה; המקור אינו מפרט כאן תאריך סיום לתקופה", "המקור אינו מפרט כאן תאריך סיום לתקופה"):
+        # a twin item with the same value makes the condition's words the ones that tell the item apart
+        ws = _ws("\n".join(["כותרת", first, quote]), kind="paragraph")
+        item = _item(label="תקופת חכירה נוספת לפי ההסכם", quote=quote, value="49 שנים", condition=condition)
+        twin = _item(label="תקופת חכירה ראשונה", quote=first, value="49 שנים", condition="עד תום שנת 2012")
+        got = _states(ws, answer, item, twin)
+        assert got[quote.split(" | ")[0]]["state"] == "covered", (condition, got)
+    # protection: without that wording in the item, the absence clause of the answer is still not part of what it states
+    ws = _ws("\n".join(["כותרת", quote]), kind="paragraph")
+    item = _item(label="תקופת חכירה נוספת", quote=quote, value="", condition="")
+    (got,) = _states(ws, "המקור אינו מפרט כאן את תקופת החכירה הנוספת [S1].", item).values()
+    assert got["state"] == "omitted"
+
+
+def test_shape_7_a_designator_the_items_condition_negates_is_no_designator_of_the_item():
+    quote = "תוספת 4.15% משטח החלקה עבור שיפור תכנון"
+    condition = "המקור אינו מבהיר לאיזו חלקה שייך הנתון; שיוכו לחלקה 56 לא מאומת"
+    answer = "בחלקה 56 נרשמה תוספת של 3.32% משטח החלקה, ובחלקה 57 תוספת של 4.15% משטח החלקה [S1]."
+    assert _paragraph_item(quote, answer, label="תוספת לשיפור תכנון", value="4.15%", condition=condition) == ["covered"]
+    # the label's own designator still decides, and a quote's too
+    assert _paragraph_item(quote, answer, label="תוספת לשיפור תכנון בחלקה 56", value="4.15%", condition=condition) == ["omitted"]
+    assert _paragraph_item("חלקה 57: " + quote, answer, label="תוספת", value="4.15%", condition=condition) == ["covered"]
+    assert _paragraph_item("חלקה 56: " + quote, answer, label="תוספת", value="4.15%", condition=condition) == ["omitted"]
