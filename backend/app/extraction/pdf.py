@@ -95,9 +95,11 @@ from app.extraction.hebrew import (
 from app.extraction.images import PictureReading, VisionReader
 from app.extraction.regions import PageLayer, ReadingCache, Region
 from app.extraction.tables import (
+    UNDECIDED,
     RawTable,
     assemble_tables,
     clean_cell,
+    furniture_of,
     logical_boxes,
     logical_row,
     reads_left_to_right,
@@ -574,6 +576,9 @@ class _Walker:
     raws: list[RawTable] = field(default_factory=list)
     table_raw: dict[int, RawTable] = field(default_factory=dict)  # table block index -> its piece
     captions: dict[int, str] = field(default_factory=dict)  # id(raw) -> caption
+    gap: list[tuple[int, float | None, str]] = field(default_factory=list)  # blocks since the last table piece (page, top, text)
+    gaps: dict[int, list[tuple[int, float | None, str]]] = field(default_factory=dict)  # id(raw) -> what stood before it
+    extents: dict[int, tuple[float, float]] = field(default_factory=dict)  # id(raw) -> the content area of its page (top, bottom)
     notes: dict[int, list[str]] = field(default_factory=dict)  # id(raw or region) -> note lines under it
     pictures: dict[int, tuple[Region, PictureReading, str]] = field(default_factory=dict)  # image block -> reading
     path: list[str] = field(default_factory=list)
@@ -602,6 +607,7 @@ class _Walker:
         if reason:
             kw |= {"status": "read_uncertain", "note": reason}
         b = self.add(kind, text, page, bbox, method, source="ocr" if method == "ocr" else "text", **kw)
+        self.gap.append((page, bbox[1] if bbox else None, text))
         if reason:
             self.uncertain.append(b)
         return b
@@ -622,9 +628,24 @@ class _Walker:
             return None
         return depth, label
 
+    @staticmethod
+    def _content_area(out: _PageOut) -> tuple[float, float] | None:
+        """The content area of a page, top to bottom in the frame of its lines and table regions: from its first to its last line, table
+        and picture; the whole page when those cover under half of it (a page of one small table). None: the page has no extent."""
+        tops = [ln.top for ln in out.lines] + [r.bbox[1] for r in out.tables if r.bbox] + [p.bbox[1] for p in out.pictures]
+        bottoms = [ln.bottom for ln in out.lines if ln.bottom is not None] + [r.bbox[3] for r in out.tables if r.bbox] \
+            + [p.bbox[3] for p in out.pictures]
+        if not tops or not bottoms:
+            return None
+        top, bottom = min(tops), max(bottoms)
+        if out.height and bottom - top < out.height / 2:
+            return 0.0, out.height
+        return (top, bottom) if bottom > top else None
+
     def page(self, out: _PageOut) -> None:
         page_no = out.page.page_no
         method = out.page.method
+        area = self._content_area(out)
         items: list[tuple[float, int, object]] = []
         for ln in out.lines:
             if ln.text.strip() and not ln.in_table and not is_footer(ln.text):
@@ -657,6 +678,9 @@ class _Walker:
                     self.mark_uncertain(b, item.uncertain)
                 self.table_raw[b.index] = item
                 self.captions[id(item)] = _caption(self.last_text)
+                self.gaps[id(item)], self.gap = self.gap, []
+                if area is not None:
+                    self.extents[id(item)] = area
                 self.raws.append(item)
                 notes_of, notes_bottom = (item, item.bbox[3]) if item.bbox else (None, 0.0)
                 continue
@@ -667,6 +691,7 @@ class _Walker:
                 flush()
                 b = self.add("image", "", page_no, item.bbox, r.method, source=r.method, status=r.status,
                              note=r.note, content_hash=item.content_hash)
+                self.gap.append((page_no, item.bbox[1], ""))  # a picture between two table pieces is no continuation
                 b.picture_text = r.text
                 self.pictures[b.index] = (item, r, _caption(self.last_text))
                 notes_of, notes_bottom = (item, item.bbox[3]) if r.tables else (None, 0.0)
@@ -692,11 +717,27 @@ class _Walker:
             para.append(ln)
         flush()
 
+    def _table_evidence(self) -> None:
+        """What stood between each table piece and the one before it (round 22 U3, KTD3): the headings and paragraphs of the document's
+        blocks that are no page furniture (a normalized line recurring at one place on a large share of the pages), a picture, the
+        caption that introduces the piece and the note lines right under it. ``assemble_tables`` decides from it."""
+        text_blocks = [b for b in self.blocks if b.kind in ("heading", "paragraph")]
+        furniture = furniture_of(((b.page, b.bbox[1] if b.bbox else None, b.text) for b in text_blocks),
+                                 len({b.page for b in self.blocks if b.page is not None}))
+        caption = ""
+        for raw in self.raws:
+            between = [text for _, top, text in self.gaps.get(id(raw), []) if not text or not furniture.covers(top, text)]
+            raw.gap, raw.notes, raw.extent = between, list(self.notes.get(id(raw), [])), self.extents.get(id(raw))
+            introduced = next((t for t in reversed(between) if t), None)
+            caption = _caption(introduced) if introduced is not None else caption
+            raw.caption = caption
+
     def finish(self) -> tuple[list[Block], list]:
         """Assemble the table pieces (a continuation joins the table it continues and leaves no block of its
         own), renumber the blocks and give each table its block, caption, notes and text."""
         from app.extraction.docx import render_table
 
+        self._table_evidence()
         tables = assemble_tables(self.raws)
         kept: list[Block] = []
         renumber: dict[int, int] = {}
@@ -715,7 +756,9 @@ class _Walker:
             if not raw.continues:
                 b = kept[renumber[old]]
                 b.table_index, t.block_index = t.index, b.index
-                t.caption = self.captions.get(id(raw)) or None
+                # an undecided piece (the same shape on the next page, nothing between) is not told its caption by the paragraph above its
+                # candidate: a caption, and the scale in it, are inherited across no candidate link (round 22 U3, KTD3)
+                t.caption = None if raw.decision == UNDECIDED else self.captions.get(id(raw)) or None
             elif raw.uncertain and t.block_index is not None:  # a continuation's uncertainty is its table's
                 self.mark_uncertain(kept[t.block_index], raw.uncertain)
         for t in tables:
@@ -959,8 +1002,6 @@ def assemble_result(windows, page_count: int, warnings: list[str], fix: FontMapF
             if any(o.spaced):
                 spaced.append({"page": o.page.page_no, "joined": o.spaced[0], "uncertain": o.spaced[1]})
         for out in outs:
-            for k, raw in enumerate(sorted(out.tables, key=lambda t: t.top)):
-                raw.first_on_page = k == 0
             if out.page.ok:
                 _merge_region_text(out)
                 walker.page(out)

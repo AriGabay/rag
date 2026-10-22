@@ -12,7 +12,9 @@ table the positions a fresh reading would have stored:
   differently); its word spans come from that run exactly as ``_Walker.add_text`` builds them, moved onto the stored
   text when the two differ only in whitespace or direction marks;
 - a text-layer table is matched to a re-assembled table by its headers and every row's page and cells; its cell boxes
-  come from that table;
+  come from that table. A table an older reading stored merged by the shape-only continuation rule is matched to the
+  concatenation of the consecutive parts the reader now reads (round 22 U3, KTD3), so it keeps its boxes and the old rule
+  is not kept to find it;
 - every page gets its geometry and printed page number.
 
 Pages repaired for a broken font map are read again through the corrections recorded in the ingestion report
@@ -40,7 +42,7 @@ from app.extraction.base import PageGeometry, PageResult, check_deadline
 from app.extraction.chunking import is_footer
 from app.extraction.fontmap import Correction, FontMapFix
 from app.extraction.hebrew import strip_bidi_controls
-from app.extraction.tables import RawTable, assemble_tables, clean_cell
+from app.extraction.tables import RawTable, clean_cell
 
 log = logging.getLogger(__name__)
 
@@ -238,22 +240,44 @@ def _cells(cells) -> list[str]:
     return [_key(clean_cell(c)) for c in cells or []]
 
 
-def _table_matches(structure: dict, table) -> bool:
+def _table_parts(structure: dict, rebuilt: list, start: int) -> int | None:
+    """How many consecutive re-read tables, from ``rebuilt[start]``, a stored table is: its headers are the first one's, its rows are
+    the rows of the first ``k`` tables one after the other (page and cells), and each follows the one before on the next page. The
+    shortest match: a table the reader still reads as one is one part. A table stored merged by the old shape-only continuation rule is
+    several parts now (KTD3): the positions of a stored reading are matched to the concatenation, never to a merge the reader no longer
+    makes (round 22 U3). None: no number of parts is the stored table."""
     rows = structure.get("rows") or []
-    return (_cells(structure.get("headers")) == _cells(table.headers) and len(rows) == len(table.rows)
-            and all(r.get("page") == t.page and _cells(r.get("cells")) == _cells(t.cells)
-                    for r, t in zip(rows, table.rows, strict=True)))
+    if start >= len(rebuilt) or _cells(structure.get("headers")) != _cells(rebuilt[start].headers):
+        return None
+    if not rows:
+        return 1 if not rebuilt[start].rows else None
+    done = 0
+    for k in range(start, len(rebuilt)):
+        part = rebuilt[k]
+        if k > start and (part.page_start is None or rebuilt[k - 1].page_end is None
+                          or part.page_start != rebuilt[k - 1].page_end + 1):
+            return None
+        if done + len(part.rows) > len(rows) or not all(
+                r.get("page") == t.page and _cells(r.get("cells")) == _cells(t.cells)
+                for r, t in zip(rows[done:], part.rows, strict=False)):
+            return None
+        done += len(part.rows)
+        if done == len(rows):
+            return k - start + 1
+    return None
 
 
-def _with_boxes(structure: dict, table) -> dict | None:
-    """The stored structure with the re-read table's cell boxes, stored the way ``_insert_outputs`` stores them;
-    None when the table has none (its pages cannot be converted)."""
-    if not table.header_boxes and not any(r.cell_boxes for r in table.rows):
+def _with_boxes(structure: dict, parts: list) -> dict | None:
+    """The stored structure with the re-read parts' cell boxes, stored the way ``_insert_outputs`` stores them; None when they have
+    none (their pages cannot be converted). The header's boxes are the first part's."""
+    table = parts[0]
+    reread = [r for t in parts for r in t.rows]
+    if not table.header_boxes and not any(r.cell_boxes for r in reread):
         return None
     out = dict(structure)
     out["rows"] = [{k: v for k, v in r.items() if k != "cell_boxes"} | ({"cell_boxes": t.cell_boxes}
                                                                          if t.cell_boxes else {})
-                   for r, t in zip(structure.get("rows") or [], table.rows, strict=True)]
+                   for r, t in zip(structure.get("rows") or [], reread, strict=True)]
     out.pop("header_boxes", None)
     if table.header_boxes:
         out["header_boxes"] = table.header_boxes
@@ -261,13 +285,12 @@ def _with_boxes(structure: dict, table) -> dict | None:
 
 
 def _text_tables(outs: list[reader._PageOut]):
-    """The text-layer tables the reader assembles from these pages (pieces in page order, top to bottom)."""
-    raws: list[RawTable] = []
+    """The text-layer tables the reader assembles from these pages: the block walker over them, so that what stands between two table
+    pieces decides, as it does in a fresh reading (round 22 U3, KTD3)."""
+    walker = reader._Walker()
     for out in outs:
-        for k, raw in enumerate(sorted(out.tables, key=lambda t: t.top)):
-            raw.first_on_page = k == 0
-            raws.append(raw)
-    return assemble_tables(raws)
+        walker.page(out)
+    return walker.finish()[1]
 
 
 # --- the whole version ------------------------------------------------------------------------------------------
@@ -328,12 +351,13 @@ def read_positions(data: bytes, pages: list[StoredPage], blocks: list[StoredBloc
         s = t.structure or {}
         if s.get("ocr") or (s.get("source") or "text") != "text":
             continue  # OCR and vision tables keep no cell boxes (KTD2)
-        hit = next((j for j in range(cursor, len(rebuilt)) if _table_matches(s, rebuilt[j])), None)
-        if hit is None:
+        found = next(((j, n) for j in range(cursor, len(rebuilt)) if (n := _table_parts(s, rebuilt, j)) is not None), None)
+        if found is None:
             out.counts["tables"]["unaligned"] += 1
             continue
-        cursor = hit + 1
-        new = _with_boxes(s, rebuilt[hit])
+        hit, parts = found
+        cursor = hit + parts
+        new = _with_boxes(s, rebuilt[hit:hit + parts])
         if new is None:
             out.counts["tables"]["no_positions"] += 1
             continue

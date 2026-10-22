@@ -1,4 +1,4 @@
-"""Table assembly (R4): logical column order, header detection, cross-page continuation.
+"""Table assembly (R4): logical column order, header detection, cross-page continuation (three-valued: ``piece_boundary``).
 
 Input tables come from pdfplumber (cell grid, columns left -> right) or from OCR word boxes; both are
 converted to logical (right-to-left) column order before assembly, so index 0 is the rightmost column
@@ -15,12 +15,13 @@ import difflib
 import functools
 import math
 import re
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from app.extraction.base import TableResult, TableRow
 from app.extraction.chunking import render_row
-from app.extraction.hebrew import fix_line, has_hebrew, has_latin, visual_to_logical
+from app.extraction.hebrew import fix_line, has_hebrew, has_latin, strip_bidi_controls, visual_to_logical
 
 HEADER_VOCAB = (
     "כתובת", "גוש", "חלקה", "תאריך", "שטח", "מחיר", "סוג", "חדרים", "קומה", "רחוב", "עסקה", "שווי", "יחידה",
@@ -130,19 +131,31 @@ def logical_boxes(boxes_ltr: list | None, left_to_right: bool = False) -> list:
 @dataclass
 class RawTable:
     """One table found on one page, rows already in logical column order. ``assemble_tables`` records which
-    table the piece went into (``table_index``) and whether it continued an earlier one (``continues``)."""
+    table the piece went into (``table_index``) and what it decided about the piece before it (``decision``, ``continues``,
+    ``break_before``).
+
+    The evidence the decision reads is the producer's (round 22 U3, KTD3): ``gap`` the texts of the headings and paragraphs
+    that are no page furniture between the piece before and this one (an empty string: a picture), ``caption`` the text that
+    introduces it, ``notes`` the note lines right under it. ``decision`` is ``CONTINUES``, ``SEPARATE`` or ``UNDECIDED`` (None:
+    the first piece); ``break_before`` the evidence that keeps it apart from the piece before (or, for ``UNDECIDED``, why it
+    could not join it)."""
 
     page: int | None
     rows: list[list[str]]
     ocr: bool = False
     section: str | None = None
-    first_on_page: bool = True
+    break_before: str | None = None
     top: float = 0.0
     bbox: list[float] | None = None
     table_index: int | None = None
     continues: bool = False
     uncertain: str | None = None  # why some of its text is uncertain (an unrepaired font map)
     boxes: list[list[list[float] | None]] | None = None  # each cell's box, parallel to ``rows``; None: no positions
+    gap: list[str] = field(default_factory=list)
+    caption: str | None = None
+    notes: list[str] = field(default_factory=list)
+    decision: str | None = None
+    extent: tuple[float, float] | None = None  # the content area of its page (top, bottom), in the frame of ``bbox`` (the walker's)
 
 
 def _width(t: TableResult) -> int:
@@ -151,37 +164,130 @@ def _width(t: TableResult) -> int:
     return len(t.rows[0].cells) if t.rows else 0
 
 
+# --- the boundary between two table pieces (round 22 U3, KTD3, R6) ---------------------------------------------------------------
+#
+# One decision for the PDF walker (``pdf._Walker.finish``, which knows the blocks between two pieces) and the positions re-read
+# (it runs the same walker): ``piece_boundary``. A piece continues the table before it on a repeated header with nothing
+# between the two parts; a heading or paragraph that is no page furniture, a note closing the first part, another caption, another
+# section or other column x-geometry keeps them apart; the same shape with nothing between but no repeated header continues only
+# when the cell boxes of both sides align column by column and the earlier part ends at the bottom of its page and the later one starts
+# at the top of the next (``REGION_SHARE``); otherwise it is undecided:
+# separate parts, the later one linked to the earlier (``TableResult.candidate_of``), and no consumer crosses that link.
+
+CONTINUES, SEPARATE, UNDECIDED = "continues", "separate", "undecided"
+REGION_SHARE = 1 / 3  # a headerless piece continues only if the part before ends in the last third of its page's content area and it starts in the first third
+GEOMETRY_TOLERANCE = 12.0  # points; a column edge that moves less, or less than a tenth of the table's width, is the same column
+GEOMETRY_SHARE = 0.1
+
+
+def _norm_caption(text: str | None) -> str:
+    return " ".join(strip_bidi_controls(text or "").split())
+
+
+def _column_edges(raw: RawTable) -> list[tuple[float, float]] | None:
+    """The x extent of each column of a piece: the median left and right edge of its cell boxes. None: no positions."""
+    if not raw.boxes:
+        return None
+    width = max((len(b) for b in raw.boxes if b), default=0)
+    out = []
+    for j in range(width):
+        cells = [b[j] for b in raw.boxes if b and j < len(b) and b[j]]
+        if not cells:
+            return None
+        lefts, rights = sorted(c[0] for c in cells), sorted(c[2] for c in cells)
+        out.append((lefts[len(lefts) // 2], rights[len(rights) // 2]))
+    return out
+
+
+def _geometry_differs(prev: RawTable | None, raw: RawTable) -> bool:
+    """Whether the two pieces' columns stand at other x positions: their cell boxes' column edges, else the pieces' own
+    regions. False when either has no positions: no evidence either way."""
+    if prev is None:
+        return False
+    a, b = _column_edges(prev), _column_edges(raw)
+    if a is not None and b is not None and len(a) == len(b):
+        span = max(r for _, r in a) - min(left for left, _ in a)
+        tolerance = max(GEOMETRY_TOLERANCE, GEOMETRY_SHARE * span)
+        return any(abs(x0 - y0) > tolerance or abs(x1 - y1) > tolerance for (x0, x1), (y0, y1) in zip(a, b, strict=True))
+    if prev.bbox and raw.bbox:
+        tolerance = max(GEOMETRY_TOLERANCE, GEOMETRY_SHARE * (prev.bbox[2] - prev.bbox[0]))
+        return abs(prev.bbox[0] - raw.bbox[0]) > tolerance or abs(prev.bbox[2] - raw.bbox[2]) > tolerance
+    return False
+
+
+def _edge_regions(prev: RawTable, raw: RawTable) -> bool:
+    """Whether the earlier piece ends in the bottom ``REGION_SHARE`` of its page's content area and the later one starts in the top
+    ``REGION_SHARE`` of its own (``RawTable.extent``). False when either has no region or no extent: no evidence."""
+    for piece, ends in ((prev, True), (raw, False)):
+        if not piece.bbox or not piece.extent:
+            return False
+        top, bottom = piece.extent
+        span = bottom - top
+        if span <= 0 or (ends and piece.bbox[3] < bottom - REGION_SHARE * span) or (not ends and piece.bbox[1] > top + REGION_SHARE * span):
+            return False
+    return True
+
+
+def _aligned_columns(prev: RawTable, raw: RawTable) -> bool:
+    """Whether both pieces have cell boxes and every column stands in the same x-band (``_geometry_differs`` said it does not move)."""
+    a, b = _column_edges(prev), _column_edges(raw)
+    return a is not None and b is not None and len(a) == len(b)
+
+
+def piece_boundary(prev: TableResult | None, prev_raw: RawTable | None, raw: RawTable, ncols: int, headers: list[str],
+                   carried: Sequence[str] = ()) -> tuple[str | None, str | None]:
+    """What ``raw`` (``ncols`` columns, ``headers`` its header row or ``[]``) is to the table before it (``prev``, last piece
+    ``prev_raw``): ``(decision, evidence)``. ``carried``: what stood between, from pieces with no rows. ``(None, None)`` for the first
+    piece. Pieces on pages that do not follow each other, or of another width, are separate with no link (nothing says they may
+    be the same table); a piece that follows with the same width is decided by the evidence of the module comment above."""
+    if prev is None or prev_raw is None:
+        return None, None
+    if raw.page is None or prev.page_end is None or raw.page != prev.page_end + 1:
+        return SEPARATE, "pages"
+    if _width(prev) != ncols:
+        return SEPARATE, "width"
+    if raw.gap or carried:
+        return SEPARATE, "block"
+    if prev_raw.notes:
+        return SEPARATE, "note"
+    if prev.section != raw.section:
+        return SEPARATE, "section"
+    if prev_raw.caption and raw.caption and _norm_caption(prev_raw.caption) != _norm_caption(raw.caption):
+        return SEPARATE, "caption"
+    if _geometry_differs(prev_raw, raw):
+        return SEPARATE, "geometry"
+    if headers and prev.headers == headers:
+        return CONTINUES, None
+    if not headers and _aligned_columns(prev_raw, raw) and _edge_regions(prev_raw, raw):
+        # no repeated header, but the structure says the rows run on: the same columns at the same x positions (cell boxes on both
+        # sides), the earlier part at the bottom of its page and this one at the top of the next, nothing between (round 22 U3)
+        return CONTINUES, None
+    return UNDECIDED, "no repeated header" if not headers else "header differs"
+
+
 def assemble_tables(raws: list[RawTable]) -> list[TableResult]:
     tables: list[TableResult] = []
+    prev_raw: RawTable | None = None
+    carried: list[str] = []
     for raw in raws:
         rows, boxes = _rows_and_boxes(raw)
         if not rows:
+            carried += [*raw.gap, *raw.notes]  # a piece with no row is no table, but what stood around it still stood between
             continue
         ncols = max(len(r) for r in rows)
         rows = [r + [""] * (ncols - len(r)) for r in rows]
         boxes = [b + [None] * (ncols - len(b)) if b is not None else None for b in boxes]
         has_header = is_header_row(rows[0])
+        headers, body, body_boxes = (rows[0], rows[1:], boxes[1:]) if has_header else ([], rows, boxes)
         prev = tables[-1] if tables else None
-        can_continue = bool(
-            prev
-            and raw.page is not None
-            and prev.page_end is not None
-            and raw.first_on_page
-            and raw.page == prev.page_end + 1
-            and _width(prev) == ncols
-        )
-        if has_header:
-            headers, body = rows[0], rows[1:]
-            if can_continue and prev.headers == headers:
-                # Repeated header on the continuation page (D9): drop it, keep appending rows.
-                _append(prev, body, boxes[1:], raw)
-                continue
-            _new(tables, headers, body, boxes[1:], raw, header_boxes=boxes[0])
-        elif can_continue and prev.headers:
-            # Continuation without a repeated header (D3): same columns, keeps each row's page.
-            _append(prev, rows, boxes, raw)
+        raw.decision, raw.break_before = piece_boundary(prev, prev_raw, raw, ncols, headers, carried)
+        carried = []
+        if raw.decision == CONTINUES:
+            _append(prev, body, body_boxes, raw)  # the repeated header is dropped (D9)
         else:
-            _new(tables, [], rows, boxes, raw)
+            _new(tables, headers, body, body_boxes, raw, header_boxes=boxes[0] if has_header else None,
+                 candidate_of=prev.index if raw.decision == UNDECIDED else None)
+        prev_raw = raw
     return tables
 
 
@@ -198,7 +304,7 @@ def _rows_and_boxes(raw: RawTable) -> tuple[list[list[str]], list[list | None]]:
 
 
 def _new(tables: list[TableResult], headers: list[str], body: list[list[str]], boxes: list[list | None],
-         raw: RawTable, header_boxes: list | None = None) -> None:
+         raw: RawTable, header_boxes: list | None = None, candidate_of: int | None = None) -> None:
     raw.table_index = len(tables)
     tables.append(
         TableResult(
@@ -211,6 +317,7 @@ def _new(tables: list[TableResult], headers: list[str], body: list[list[str]], b
             ocr=raw.ocr,
             section=raw.section,
             header_boxes=header_boxes,
+            candidate_of=candidate_of,
         )
     )
 
@@ -332,6 +439,158 @@ def spans_pages(st: dict | None) -> bool:
     """Whether the rows of a stored table are on more than one page (a table continued across pages; round 22 U0, the
     measurement of how many such tables are served). Reads the stored rows' ``page`` only."""
     return len({r.get("page") for r in (st or {}).get("rows") or [] if isinstance(r, dict) and r.get("page")}) > 1
+
+
+# --- page furniture, and a stored table that spans pages (round 22 U3, KTD3, R9) ---------------------------------------------------
+#
+# Page furniture is a normalized line (digits and punctuation dropped) that recurs at the same place on a large share of the pages: a
+# running header never separates two table pieces. The same idea as ``app.chat.units`` (``FURNITURE_SHARE``: a text on half of the pages,
+# and at least ``FURNITURE_MIN_PAGES``), written here because the extraction layer does not import the chat layer; it adds the place
+# (the top of the line, within ``FURNITURE_TOP_TOLERANCE`` points) so a heading that repeats at other places stays a heading.
+
+FURNITURE_MIN_PAGES = 3
+FURNITURE_SHARE = 0.5
+FURNITURE_TOP_TOLERANCE = 6.0
+_NON_WORD = re.compile(r"[\W\d_]+")
+
+
+def norm_line(text: str | None) -> str:
+    """A line as page furniture is compared: its letters only (no digits, punctuation, direction marks or spacing)."""
+    return " ".join(_NON_WORD.sub(" ", strip_bidi_controls(text or "")).split())
+
+
+class BlockAt(NamedTuple):
+    """A heading or paragraph on a page: ``top`` in the frame of the rendered page (None: not known) and its ``text``."""
+
+    page: int
+    top: float | None
+    text: str
+
+
+@dataclass(frozen=True)
+class Furniture:
+    """The normalized lines that recur, each with the tops they recur at (``None`` among them: at any place)."""
+
+    places: dict[str, tuple[float | None, ...]]
+
+    def covers(self, top: float | None, text: str | None) -> bool:
+        tops = self.places.get(norm_line(text))
+        if not tops:
+            return False
+        return top is None or None in tops or any(abs(top - t) <= FURNITURE_TOP_TOLERANCE for t in tops)
+
+
+def furniture_of(entries: Iterable[tuple[int, float | None, str]], pages_total: int | None = None) -> Furniture:
+    """The page furniture among ``entries`` (page, top, text): a normalized line at one place on at least ``FURNITURE_SHARE`` of the
+    ``pages_total`` pages (by default the pages the entries are on) and at least ``FURNITURE_MIN_PAGES``."""
+    groups: dict[str, list[tuple[int, float | None]]] = {}
+    for page, top, text in entries:
+        key = norm_line(text)
+        if key:
+            groups.setdefault(key, []).append((page, top))
+    total = pages_total if pages_total is not None else len({p for g in groups.values() for p, _ in g})
+    need = max(FURNITURE_MIN_PAGES, math.ceil(FURNITURE_SHARE * total))
+    places: dict[str, tuple[float | None, ...]] = {}
+    for key, group in groups.items():
+        if len({p for p, _ in group}) < need:
+            continue
+        anchors = sorted({round(t, 1) for _, t in group if t is not None})
+        if not anchors:
+            places[key] = (None,)
+            continue
+        kept = [a for a in anchors
+                if len({p for p, t in group if t is None or abs(t - a) <= FURNITURE_TOP_TOLERANCE}) >= need]
+        if kept:
+            places[key] = tuple(kept)
+    return Furniture(places)
+
+
+NO_FURNITURE = Furniture({})
+
+
+def _row_extent(row: dict) -> tuple[float, float] | None:
+    """A stored row's top and bottom on the rendered page, from its cell boxes; None for a row stored without them."""
+    try:
+        boxes = [b for b in row.get("cell_boxes") or [] if b]
+        return min(float(b[1]) for b in boxes), max(float(b[3]) for b in boxes)
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _page_position(page_text: Callable[[int], str | None] | None, page: int, snippet: str) -> int | None:
+    """Where ``snippet`` first stands in the stored text of ``page`` (None: not known)."""
+    text = page_text(page) if page_text is not None else None
+    snippet = (snippet or "").strip()
+    at = text.find(snippet) if text and snippet else -1
+    return at if at >= 0 else None
+
+
+def _first_cell(row: dict) -> str:
+    return next((c.strip() for c in row.get("cells") or [] if c and c.strip()), "")
+
+
+def unconfirmed_pages(st: dict | None, blocks: Iterable[BlockAt], furniture: Furniture | None = None,
+                      page_text: Callable[[int], str | None] | None = None) -> dict[int, str]:
+    """The pages of a stored table whose rows come after a separation: ``{page: the text that separates it}`` (R9). A table whose rows
+    span pages records no parts, so what stood between them is read from the stored blocks. ``blocks``: the headings and paragraphs
+    of the table's pages that come after the table's own block (the continuation pieces left no block of their own, so a block of a
+    later page is either above their rows or below them). Between two row pages, a block is evidence of a separation when it is no
+    page furniture (``furniture``) and it stands under the earlier page's last row, on a page between, or above the later page's first
+    row: by their tops in the frame of the rendered page when both are stored, else by where they stand in the page's stored text
+    (``page_text``), else conservatively (a block whose place is not known counts). The earlier page of a table is the caption's own.
+    Every page after a separation is unconfirmed: it may take its header, scale and notes from nothing. ``{}``: one page, or no
+    separation, and the caption's scale and notes apply to every page."""
+    rows = [r for r in (st or {}).get("rows") or [] if isinstance(r, dict)]
+    order: list[int] = []
+    by_page: dict[int, list[dict]] = {}
+    for r in rows:
+        if r.get("page"):
+            if r["page"] not in by_page:
+                order.append(r["page"])
+            by_page.setdefault(r["page"], []).append(r)
+    if len(order) < 2:
+        return {}
+    furn = furniture or NO_FURNITURE
+    cands = [b for b in blocks if norm_line(b.text) and not furn.covers(b.top, b.text)]
+    out: dict[int, str] = {}
+    why = ""
+    for q, p in zip(order, order[1:], strict=False):
+        if not why:
+            why = _separator(cands, q, p, by_page, q == order[0], page_text)
+        if why:
+            out[p] = why
+    return out
+
+
+def _separator(cands: list[BlockAt], q: int, p: int, by_page: dict[int, list[dict]], q_is_first: bool,
+               page_text: Callable[[int], str | None] | None) -> str:
+    """The text of the first block that separates the rows of page ``q`` from the next rows, on page ``p``; "" when none does."""
+    last = _row_extent(by_page[q][-1])
+    first = _row_extent(by_page[p][0])
+    q_rows_end = _page_position(page_text, q, _first_cell(by_page[q][-1])) if page_text else None
+    p_rows_start = _page_position(page_text, p, _first_cell(by_page[p][0])) if page_text else None
+    for b in cands:
+        if q < b.page < p:
+            return b.text.strip()[:120]
+        if b.page == q:
+            if last is not None and b.top is not None:
+                below = b.top >= last[1]
+            elif q_is_first:
+                below = True  # after the table's own block on the page its first rows are on: under them
+            else:
+                at = _page_position(page_text, q, b.text.strip().split("\n")[0])
+                below = True if at is None or q_rows_end is None else at >= q_rows_end
+            if below:
+                return b.text.strip()[:120]
+        elif b.page == p:
+            if first is not None and b.top is not None:
+                above = b.top <= first[0]
+            else:
+                at = _page_position(page_text, p, b.text.strip().split("\n")[0])
+                above = True if at is None or p_rows_start is None else at <= p_rows_start
+            if above:
+                return b.text.strip()[:120]
+    return ""
 
 
 def serve_structure(st: dict | None) -> dict | None:

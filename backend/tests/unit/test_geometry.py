@@ -187,12 +187,12 @@ def test_cell_boxes_of_a_left_to_right_table_keep_their_order_with_their_cells()
 
 def test_cell_boxes_survive_empty_rows_padding_and_a_continuation_page():
     page1 = [HEADERS, ["התאנה 3", "82", "1,640,000"], ["", " ", ""], ["התאנה 9", "95"]]
-    page2 = [["", "", ""], ["הרימון 4", "77", "1,520,000"]]
+    page2 = [HEADERS, ["", "", ""], ["הרימון 4", "77", "1,520,000"]]  # the header repeats: the piece continues the table
     raws = [
         RawTable(page=1, rows=page1, boxes=[[_box(r, c) for c in range(len(row))] for r, row in enumerate(page1)]),
-        RawTable(page=2, rows=page2, boxes=[[_box(r, c, 2) for c in range(3)] for r in range(2)]),
+        RawTable(page=2, rows=page2, boxes=[[_box(r, c, 2) for c in range(3)] for r in range(3)]),
     ]
-    raws[1].boxes[1][1] = None  # a merged cell has no box of its own
+    raws[1].boxes[2][1] = None  # a merged cell has no box of its own
     [table] = assemble_tables(raws)
     assert [r.cells for r in table.rows] == [["התאנה 3", "82", "1,640,000"], ["התאנה 9", "95", ""],
                                               ["הרימון 4", "77", "1,520,000"]]
@@ -200,9 +200,18 @@ def test_cell_boxes_survive_empty_rows_padding_and_a_continuation_page():
     assert [r.cell_boxes for r in table.rows] == [
         [_box(1, 0), _box(1, 1), _box(1, 2)],
         [_box(3, 0), _box(3, 1), None],  # padded like its cells
-        [_box(1, 0, 2), None, _box(1, 2, 2)],
+        [_box(2, 0, 2), None, _box(2, 2, 2)],
     ]
     assert [r.page for r in table.rows] == [1, 1, 2]
+
+
+def test_cell_boxes_of_a_part_that_repeats_no_header_stay_with_that_part():
+    page2 = [["", "", ""], ["הרימון 4", "77", "1,520,000"]]
+    raws = [RawTable(page=1, rows=[HEADERS, ["התאנה 3", "82", "1,640,000"]], boxes=[[_box(r, c) for c in range(3)] for r in range(2)]),
+            RawTable(page=2, rows=page2, boxes=[[_box(r, c, 2) for c in range(3)] for r in range(2)])]
+    first, second = assemble_tables(raws)  # no repeated header: undecided, two parts (round 22 U3)
+    assert [r.cell_boxes for r in first.rows] == [[_box(1, c) for c in range(3)]]
+    assert [r.cell_boxes for r in second.rows] == [[_box(1, c, 2) for c in range(3)]] and second.header_boxes is None
 
 
 def test_a_repeated_header_on_the_continuation_page_drops_its_boxes_with_it():

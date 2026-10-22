@@ -262,8 +262,13 @@ def _enc_line(ln: _Line) -> list:
 
 
 def _enc_table(t: RawTable) -> list:
-    return [t.page, t.rows, t.ocr, t.section, t.first_on_page, t.top, t.bbox, t.table_index, t.continues,
+    return [t.page, t.rows, t.ocr, t.section, t.break_before, t.top, t.bbox, t.table_index, t.continues,
             t.uncertain, t.boxes]
+
+
+def _dec_table(d: list) -> RawTable:
+    # a window staged before round 22 U3 holds ``first_on_page`` (a bool) where ``break_before`` stands now
+    return RawTable(*[None if k == 4 and isinstance(v, bool) else v for k, v in enumerate(d)])
 
 
 def _enc_region(r: Region) -> list:
@@ -292,7 +297,7 @@ def _dec_page_out(d: list) -> _PageOut:
     geometry = None if page[5] is None else PageGeometry(*page[5])
     return _PageOut(
         PageResult(page[0], page[1], page[2], page[3], page[4], geometry, page[6]),
-        [_Line(*ln) for ln in lines], [RawTable(*t) for t in tables], [_dec_region(r) for r in pictures], [],
+        [_Line(*ln) for ln in lines], [_dec_table(t) for t in tables], [_dec_region(r) for r in pictures], [],
         raw_texts if undecided else None, raw_texts, width, height, [], corruption, warnings,
         None if frame is None else tuple(frame), spaced)
 

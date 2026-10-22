@@ -479,3 +479,63 @@ def test_a_table_served_as_stored_keeps_the_stored_column_and_no_shown_column():
     taken = _row(drawn, "Revenue", None, column_number=4)
     assert taken["anchor"]["column"] == 3 and taken["locator"]["column_number"] == 4 and "column_shown" not in taken["locator"]
     assert taken["written"] == "300"
+
+
+# --- round 22 U3: a stored table whose rows span pages applies its caption scale to a later page only on evidence (KTD3, R9) -----
+
+def _two_page_table(caption="להלן טבלת הוצאות (באלפי ₪)") -> dict:
+    return {"headers": ["סעיף", "סכום"], "units": [None, None], "caption": caption, "title": [], "notes": [],
+            "rows": [{"cells": ["שכירות", "100"], "page": 1}, {"cells": ["אחזקה", "500"], "page": 2}]}
+
+
+def _cell_at(table: dict, row: str, **kw) -> dict:
+    full = T._table_text(table, table["rows"])
+    src = T.Source(sid="S1", document_id=VERSION.document_id, version_id=VERSION.version_id, title="t", section=None,
+                   location="", kind="table", text=full, block_start=0, block_end=0, reading_id="r", status="complete")
+    return T._cell_of(src, full, {"row": row, "column": "סכום"}, table, 0, **kw)
+
+
+def test_without_a_block_above_the_later_rows_the_caption_scale_applies_to_both_pages():
+    table = _two_page_table()
+    for row in ("שכירות", "אחזקה"):
+        taken = _cell_at(table, row, unconfirmed={})
+        assert taken["scale"] == 1000 and not taken.get("unconfirmed") and taken["meaning_from"] == {"unit": "table"}
+
+
+def test_with_a_block_above_the_later_rows_the_later_cell_carries_the_scale_unconfirmed_and_no_table_unit():
+    table = _two_page_table()
+    first = _cell_at(table, "שכירות", unconfirmed={2: "4. עלויות"})
+    later = _cell_at(table, "אחזקה", unconfirmed={2: "4. עלויות"})
+    assert first["scale"] == 1000 and not first.get("unconfirmed")  # the first page is the caption's own
+    assert later["scale"] == 1000 and "4. עלויות" in later["unconfirmed"]  # never silently scale 1
+    assert later["units"] == set() and "unit" not in later["meaning_from"]  # the unit is not the source's for this cell
+
+
+def test_a_later_cell_with_an_unconfirmed_scale_registers_uncertain_so_a_calculation_with_it_is_conditional(monkeypatch):
+    table = _two_page_table()
+    d = _workspace(monkeypatch, table)
+    monkeypatch.setattr(T, "_later_page_blocks", lambda conn, version_id, st, block: ([T.stored_tables.BlockAt(2, 60.0, "4. עלויות")], None, None))
+    _take(d, _loc(row="שכירות", column="סכום"), kind="rent", unit="ILS")
+    _take(d, _loc(row="אחזקה", column="סכום"), kind="rent", unit="ILS")
+    assert "V1" not in d.ws.uncertain_values and "V2" in d.ws.uncertain_values
+    assert "4. עלויות" in d.ws.uncertain_values["V2"]
+    assert d.ws.values["V2"].scale == 1000
+
+
+def test_a_table_with_a_candidate_continuation_link_inherits_no_scale_from_above_its_other_part(monkeypatch):
+    heading = SimpleNamespace(block_index=0, text="ממצאי הבדיקה באלפי ₪", page=1, status="read", section="נתונים",
+                              section_path=["נתונים"], bbox=None, media=None, table_index=None, method=None, note="", kind="heading")
+    first = SimpleNamespace(block_index=1, text="טבלה", page=1, status="read", section="נתונים", section_path=["נתונים"], bbox=None,
+                            media=None, table_index=0, method=None, note="", kind="table")
+    second = SimpleNamespace(block_index=2, text="טבלה", page=2, status="read", section="נתונים", section_path=["נתונים"],
+                             bbox=None, media=None, table_index=1, method=None, note="", kind="table")
+    structures = {0: {"headers": ["א", "ב"], "rows": [{"cells": ["x", "1"], "page": 1}]},
+                  1: {"headers": [], "rows": [{"cells": ["y", "2"], "page": 2}], "candidate_of": 0}}
+    monkeypatch.setattr(T.reader, "blocks_between", lambda conn, vid, a, b, limit=None: [heading, first, second])
+    monkeypatch.setattr(T.reader, "table_structure", lambda conn, vid, ti: structures[ti])
+    monkeypatch.setattr(T.reader, "table_block", lambda conn, vid, ti: (first, second)[ti])
+    monkeypatch.setattr(T.contexts, "of_version", lambda conn, vid, reading: T.contexts.derive([], str(vid)))
+    monkeypatch.setattr(T, "contexts_of", lambda ws, conn, vid: T.contexts.derive([], str(vid)))
+    ws = T.Workspace(ctx=None)
+    assert T._governing_note(ws, None, VERSION.version_id, 1) != ""  # the heading governs the first part
+    assert T._governing_note(ws, None, VERSION.version_id, 2, structures[1].get("candidate_of")) == ""  # not across the link

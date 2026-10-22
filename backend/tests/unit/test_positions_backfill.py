@@ -160,7 +160,7 @@ def test_blocks_of_a_reader_without_block_provenance_align_by_their_page_method(
 def test_a_table_aligns_by_its_content_and_a_changed_table_gets_no_cell_boxes():
     result = fresh(P1)
     pages, blocks, tables = stored(result)
-    [table] = tables
+    table = tables[0]  # the fixture's table runs on to a second page without its header: two parts (round 22 U3)
     extra = StoredTable(0, {"headers": ["א", "ב"], "ocr": True, "source": "ocr", "rows": [{"page": 1, "cells": ["1", "2"]}]})
     moved = StoredTable(1, table.structure)
     got = backfill(P1.read_bytes(), pages, blocks, [extra, moved])
@@ -269,3 +269,45 @@ def test_a_file_that_is_not_a_pdf_is_a_permanent_error():
     with pytest.raises(ExtractionError) as err:
         backfill(b"not a pdf", [], [], [])
     assert err.value.permanent
+
+
+# --- round 22 U3: a table stored merged by the old continuation rule aligns by the concatenation of the re-read parts ------------------
+
+def _merged_of(parts) -> dict:
+    """The structure the old shape-only rule stored for these consecutive parts: the first part's header, every part's rows."""
+    return {"headers": parts[0].headers, "ocr": False, "source": "text",
+            "rows": [{"page": r.page, "cells": r.cells} for t in parts for r in t.rows]}
+
+
+def test_a_stored_merged_table_keeps_its_boxes_when_the_reader_now_reads_it_as_consecutive_parts(monkeypatch):
+    from app.extraction import tables as tables_
+
+    assert len(fresh(P1).tables) == 1  # aligned columns at the page edges: the reader still reads it as one
+    monkeypatch.setattr(tables_, "REGION_SHARE", 0.0)  # a reader that cannot tell the page edges: two undecided parts
+    result = extract_pdf(P1.read_bytes(), time.monotonic() + 600, get_settings())
+    assert len(result.tables) == 2 and result.tables[1].candidate_of == 0
+    merged = _merged_of(result.tables)
+    pages, blocks, _ = stored(result)
+    got = backfill(P1.read_bytes(), pages, blocks, [StoredTable(0, merged)])
+    assert got.counts["tables"] == {"aligned": 1, "unaligned": 0, "no_positions": 0}
+    boxes = [r.get("cell_boxes") for r in got.tables[0]["rows"]]
+    assert boxes == [r.cell_boxes or None for t in result.tables for r in t.rows]
+    assert got.tables[0].get("header_boxes") == (result.tables[0].header_boxes or None)
+    assert [r["cells"] for r in got.tables[0]["rows"]] == [r["cells"] for r in merged["rows"]]  # nothing else is rewritten
+
+
+def test_a_stored_merged_table_matches_consecutive_parts_only_and_all_of_its_rows():
+    from app.extraction.base import TableResult, TableRow
+
+    def part(i, page, headers, rows):
+        return TableResult(i, headers, [None] * len(headers), [TableRow(page, r) for r in rows], page, page)
+
+    income = part(0, 1, ["תאריך", "מחיר"], [["01/2020", "1,000"], ["02/2020", "1,100"]])
+    costs = part(1, 2, [], [["אחזקה", "500"]])
+    other = part(2, 4, [], [["ביטוח", "300"]])
+    merged = {"headers": ["תאריך", "מחיר"], "rows": [{"page": r.page, "cells": r.cells} for t in (income, costs) for r in t.rows]}
+    assert positions._table_parts(merged, [income, costs, other], 0) == 2
+    assert positions._table_parts(merged, [income, other], 0) is None  # not the next page
+    assert positions._table_parts(merged, [income], 0) is None  # rows missing
+    single = {"headers": ["תאריך", "מחיר"], "rows": [{"page": 1, "cells": r.cells} for r in income.rows]}
+    assert positions._table_parts(single, [income, costs], 0) == 1  # the shortest match: a table read as one stays one

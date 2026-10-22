@@ -190,11 +190,12 @@ def test_a_page_whose_geometry_cannot_be_converted_keeps_block_regions_and_recor
     assert second.geometry.issue is None
     on_first = [b for b in result.blocks if b.page == 1 and b.kind in ("heading", "paragraph")]
     assert on_first and all(b.spans is None and b.bbox is not None for b in on_first)
-    [table] = result.tables
-    assert table.header_boxes is None
+    # page 1 has no cell boxes, so nothing says the rows of page 2 align with it: two parts, the later one linked (round 22 U3)
+    table, rest = result.tables
+    assert table.header_boxes is None and rest.candidate_of == 0
     assert all(r.cell_boxes is None for r in table.rows if r.page == 1)
-    assert all(r.cell_boxes is not None for r in table.rows if r.page == 2)
-    assert [b.text for b in result.blocks] == [b.text for b in read(P1).blocks]
+    assert all(r.cell_boxes is not None for r in rest.rows if r.page == 2)
+    assert [b.text for b in result.blocks if b.kind != "table"] == [b.text for b in read(P1).blocks if b.kind != "table"]
 
 
 # --- OCR and vision content get no word or cell positions --------------------------------------------------------

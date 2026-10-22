@@ -94,6 +94,10 @@ class TableResult:
     notes: list[str] = field(default_factory=list)
     block_index: int | None = None
     header_boxes: list[list[float] | None] | None = None  # the header cells' boxes, like ``TableRow.cell_boxes``
+    # round 22 U3 (KTD3): the table whose continuation this one may be (undecided: the same shape on the next page, nothing between,
+    # no repeated header). The parts stay separate: no consumer sums across the link, takes a header from the other part or inherits
+    # a scale across it. None: no candidate (absent in every table stored before).
+    candidate_of: int | None = None
 
 
 @dataclass

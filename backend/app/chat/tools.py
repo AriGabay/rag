@@ -1335,10 +1335,12 @@ def _value_scale(own: str, start: int, end: int, *local: str, governing: str | _
     return scale
 
 
-def _governing_note(ws: Workspace, conn: Connection, version_id, block_index: int | None) -> str | _ScaleNote:
+def _governing_note(ws: Workspace, conn: Connection, version_id, block_index: int | None,
+                    candidate_of: int | None = None) -> str | _ScaleNote:
     """The scale note that governs a figure in block ``block_index`` from above (``calc.governing_note``): the
     blocks before it, nearest first, each with whether it is in the figure's section; a table's with its caption,
-    title and notes. "" when there is none (or the block is not known)."""
+    title and notes. "" when there is none (or the block is not known). ``candidate_of``: the table this one may continue (round 22
+    U3, KTD3): the search stops at it, so nothing above the other part governs this one."""
     if block_index is None or block_index <= 0:
         return ""
     rows = reader.blocks_between(conn, version_id, max(0, block_index - calc.NOTE_WINDOW), block_index)
@@ -1352,6 +1354,8 @@ def _governing_note(ws: Workspace, conn: Connection, version_id, block_index: in
         if segment is not None and r.block_index < segment.first:
             break
         text_, kind = r.text or "", getattr(r, "kind", None) or "paragraph"
+        if candidate_of is not None and kind == "table" and getattr(r, "table_index", None) == candidate_of:
+            break
         if kind == "table" and getattr(r, "table_index", None) is not None:
             st = _table_at(ws, conn, version_id, r.table_index)[0] or {}
             text_ = "\n".join(x for x in [text_, st.get("caption") or "", *(st.get("title") or []),
@@ -6261,7 +6265,52 @@ def _take_cell(ws: Workspace, conn: Connection, src: Source, full: str, loc: dic
     if st is None:
         raise ToolError("הטבלה לא נמצאה בקריאה הנוכחית של המסמך")
     return _cell_of(src, full, loc, st, index,
-                    _governing_note(ws, conn, src.version_id, block.block_index if block is not None else None))
+                    _governing_note(ws, conn, src.version_id, block.block_index if block is not None else None,
+                                    st.get("candidate_of")),
+                    unconfirmed=_later_page_unconfirmed(ws, conn, src.version_id, index, st, block))
+
+
+MSG_LATER_PAGE_UNCONFIRMED = ("שורות העמוד {page} של הטבלה באות אחרי «{text}» (כותרת או פסקה בין חלקי הטבלה): לא ודאי שכותרת הטבלה, "
+                              "קנה המידה וההערות שלה חלים עליהן, ולכן הערך מותנה בכך")
+
+
+def _later_page_blocks(conn: Connection, version_id, st: dict, block) -> tuple[list, Any, Any]:
+    """What the stored data offer to tell whether the rows of a stored table on a later page continue it (round 22 U3, KTD3, R9): the
+    headings and paragraphs after the table's block on its pages, with their tops on the rendered page; the page furniture among them (a
+    text that recurs at the same place on a large share of the pages, looked up for these texts only); the stored text of the pages. The
+    narrowest lookup: three queries, made only for a table whose rows span pages."""
+    pages = sorted({r["page"] for r in st.get("rows") or [] if isinstance(r, dict) and r.get("page")})
+    cols = ("b.page, b.bbox, b.text, p.mediabox, p.cropbox, p.rotation, p.display_width, p.display_height, p.geometry_issue")
+    join = "LEFT JOIN pages p ON p.version_id = b.version_id AND p.page_no = b.page"
+    kinds = "b.kind IN ('heading', 'paragraph') AND b.table_index IS NULL"
+    rows = conn.execute(text(
+        f"SELECT {cols} FROM document_blocks b {join} WHERE b.version_id = :v AND {kinds} AND b.page BETWEEN :a AND :z"
+        " AND b.block_index > :after ORDER BY b.block_index"),
+        {"v": version_id, "a": pages[0], "z": pages[-1], "after": block.block_index if block is not None else -1}).all()
+    blocks = [stored_tables.BlockAt(r.page, contexts.top_of(r) if r.bbox else None, r.text or "") for r in rows]
+    texts = sorted({b.text for b in blocks if b.text})
+    seen = conn.execute(text(
+        f"SELECT {cols} FROM document_blocks b {join} WHERE b.version_id = :v AND {kinds} AND b.text = ANY(:t)"),
+        {"v": version_id, "t": texts}).all() if texts else []
+    total = conn.execute(text("SELECT count(*) FROM pages WHERE version_id = :v"), {"v": version_id}).scalar_one()
+    furniture = stored_tables.furniture_of(((r.page, contexts.top_of(r) if r.bbox else None, r.text or "") for r in seen), total or None)
+    page_texts = dict(conn.execute(text("SELECT page_no, text FROM pages WHERE version_id = :v AND page_no BETWEEN :a AND :z"),
+                                   {"v": version_id, "a": pages[0], "z": pages[-1]}).all())
+    return blocks, furniture, page_texts.get
+
+
+def _later_page_unconfirmed(ws: Workspace, conn: Connection, version_id, index: int, st: dict, block) -> dict[int, str]:
+    """The later pages of a stored table whose rows come after a separation (``tables.unconfirmed_pages``), read once per turn:
+    ``{}`` for a table of one page (no lookup is made) and for a table nothing separates (its caption's scale and notes apply to every
+    page, as before)."""
+    if not stored_tables.spans_pages(st):
+        return {}
+    key = (f"later:{version_id}", index)
+    found = ws.tables.get(key)
+    if found is None:
+        blocks, furniture, page_text = _later_page_blocks(conn, version_id, st, block)
+        found = ws.tables[key] = stored_tables.unconfirmed_pages(st, blocks, furniture, page_text)
+    return found
 
 
 def _cell_facet_in(label: str, header: str, st: dict, cells: list) -> dict:
@@ -6303,12 +6352,16 @@ def _check_quote_of_row(quote: str, rows: list[list[str]], ri: int, ci: int, whe
         "quote_not_in_row")
 
 
-def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str | _ScaleNote = "") -> dict:
+def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str | _ScaleNote = "",
+             unconfirmed: dict[int, str] | None = None) -> dict:
     """The cell a locator names in a table structure (``extracted_tables.structure``, or a visual reading's table in
     the same shape), its number checked against the cell and the source's text, with what the table attests.
     ``governing``: the scale note that governs the table from a block above it (``calc.governing_note``). A table stored in reversed
     cell order is resolved in the order it is drawn (what the agent was shown): the column the locator names is a served position or
-    a served label; the value, its box and the datum's identity are looked up by the STORED column (round 21 U8, KTD6)."""
+    a served label; the value, its box and the datum's identity are looked up by the STORED column (round 21 U8, KTD6).
+    ``unconfirmed``: the pages of a stored multi-page table whose rows come after a separation (``tables.unconfirmed_pages``, round 22 U3,
+    KTD3): a cell on one carries the table's scale as unconfirmed, and no unit, VAT or attribution is taken from the table's caption,
+    title or notes for it (the unit's provenance is then not the source's), so a value read from it is conditional."""
     st = stored_tables.serve_structure(st)
     rows = [list(r.get("cells") or []) for r in st.get("rows") or []]
     headers = list(st.get("headers") or [])
@@ -6402,18 +6455,21 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     column_units = st.get("units") or []
     near = [cell, label, header, str(column_units[ci]) if ci < len(column_units) and column_units[ci] else ""]
     table_text = [st.get("caption") or "", *(st.get("title") or []), *(st.get("notes") or [])]
+    row_page = (st.get("rows") or [])[ri].get("page")
+    later = (unconfirmed or {}).get(row_page)  # why this cell's page is unconfirmed (None: the caption's own, or a continuation)
+    stated_text = [] if later else table_text  # what the table says of this cell: nothing is taken from it when unconfirmed
     # the parts the source states the cell's meaning in, nearest first (round 12 U9, KTD9): the words of each attribute
     # are anchored to the first that writes them
     caption_text = " ".join(x for x in [st.get("caption") or "", *(st.get("title") or [])] if x)
     notes_text = " ".join(x for x in st.get("notes") or [] if x)
     vat_parts = [("cell", cell), ("row", label), ("header", header), ("header", near[3]), ("caption", caption_text),
                  ("note", notes_text)]
-    vats = meaning.vat_attested("\n".join(near + table_text), forms)
+    vats = meaning.vat_attested("\n".join(near + stated_text), forms)
     # the unit of the cell, its row or its column; the table's caption or notes only when those state none. A cell that
     # states no unit of its own takes the one its column header states, before the cell, row label and header are read
     # together (round 15 U1, KTD9): "שווי למ״ר" over a row that names "דירה 3 חדרים" is ₪ per m², not m²
     head_units = set() if meaning.units_attested(cell) else _header_units(header, near[3])
-    units = head_units or meaning.units_attested(" ".join(near)) or meaning.units_attested(" ".join(table_text))
+    units = head_units or meaning.units_attested(" ".join(near)) or meaning.units_attested(" ".join(stated_text))
     # a row label that names money per area gives a cell that states only the currency that unit; a cell or a header
     # that states another unit keeps it (round 15 U1 follow-up, KTD9)
     label_units = (_label_units(label) if not head_units and meaning.units_attested(cell) == {"ILS"}
@@ -6429,13 +6485,13 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     # header: "דירה 90 מ״ר | 21,000" under "(₪)" — the m² describes the row's property, the amount is the caption's. The
     # source does not say which: the value registers with the model's unit and a flag that blocks calculating with it
     row_units = meaning.units_attested(label)
-    caption_units = meaning.units_attested(" ".join(table_text))
+    caption_units = meaning.units_attested(" ".join(stated_text))
     ambiguous = (not head_units and not label_units and not meaning.units_attested(" ".join([cell, header, near[3]])) and bool(row_units)
                  and bool(caption_units) and row_units != caption_units and bool(re.search(r"\d", label)))
     if ambiguous:
         units, unit_from = set(), None
     own_kind_not_money = meaning.nonmonetary(" ".join(near))
-    if not units and not own_kind_not_money and not ambiguous:
+    if not units and not own_kind_not_money and not ambiguous and not later:
         units = _note_units(governing)
         if units:
             unit_from = "governing_note"
@@ -6448,7 +6504,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
                           meaning._norm(" ".join(x for x in table_text if x)), governing=governing))
     # who stated it: the column header, else the row label, else the table's caption, title or notes (KTD8)
     said = (attribution_in(header, adopted=True) or attribution_in(label, adopted=True)
-            or attribution_in(" ".join(x for x in table_text if x), adopted=True))
+            or attribution_in(" ".join(x for x in stated_text if x), adopted=True))
     return {"written": written, "value": value, "forms": forms, "quote": line,
             "qualifiers": meaning.number_qualifiers(_table_text(st, st.get("rows") or []), forms, line),
             "units": units, "vat": vats, "vat_from": _vat_anchors(vats, vat_parts, "note"),
@@ -6461,6 +6517,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
             "table": (str(src.version_id), index), "said": said, "context": " ".join([*near, *table_text]),
             "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale,
             **({"unit_ambiguous": sorted(row_units | caption_units)} if ambiguous else {}),
+            **({"unconfirmed": MSG_LATER_PAGE_UNCONFIRMED.format(page=row_page, text=later)} if later else {}),
             # what the facet is read from (round 13 U3, KTD2): the row label, the column header and the caption and title
             "facet_in": _cell_facet_in(label, header, st, cells),
             # the cell as stored (KTD1): its box is looked up when the answer is stored, never searched for
@@ -7365,6 +7422,12 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
     elif reread is not None and not reread[0]:
         uncertain = reread[1]
         value.reading, value.reading_note = "uncertain", reread[1]
+    elif taken.get("unconfirmed"):
+        # a cell of a later page of a stored multi-page table, after a heading or paragraph: its scale, unit and notes are the
+        # caption's only if the rows continue the table, which the stored data do not show (round 22 U3, KTD3)
+        uncertain = taken["unconfirmed"]
+        value.reading, value.reading_note = "uncertain", uncertain
+        note = " ".join(x for x in (note, uncertain) if x)
     elif (reread is not None and reread[0]) or (
             region and all(r.status not in (reader.UNREAD, reader.UNCERTAIN) for r in region)):
         # confirmed by a focused re-read, or its own region read clearly (never a region left unread, which only a

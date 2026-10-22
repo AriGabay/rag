@@ -240,6 +240,7 @@ def test_docx_output_is_unchanged(name, monkeypatch):
     tables = [dataclasses.asdict(t) for t in r.tables]
     for t in tables:
         assert t.pop("header_boxes") is None
+        assert t.pop("candidate_of") is None  # round 22 U3: a Word table has no candidate continuation
         assert all(row.pop("cell_boxes") is None for row in t["rows"])
     pages = [dataclasses.asdict(x) for x in r.pages]
     assert all(p.pop("geometry") is None and p.pop("printed_label") is None for p in pages)

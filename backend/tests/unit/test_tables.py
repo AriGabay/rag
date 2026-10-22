@@ -55,18 +55,19 @@ def test_single_page_table():
     assert (t.page_start, t.page_end, t.section, t.ocr) == (1, 1, "3. עסקאות השוואה", False)
 
 
-def test_cross_page_continuation_without_repeated_header_keeps_row_pages():
+def test_a_page_of_rows_without_the_header_and_without_cell_boxes_is_its_own_part_with_its_own_row_pages():
+    """Round 22 U3: rows on the next page with no repeated header are not merged on their shape (here the pieces have no cell boxes, so
+    nothing says their columns align); they are a candidate continuation (undecided): separate parts, each keeping its own rows'
+    pages, the later one linked to the earlier."""
     raw = [
         RawTable(page=3, rows=[HEADERS, _row(1), _row(2)]),
         RawTable(page=4, rows=[_row(3), _row(4)]),
     ]
     tables = assemble_tables(raw)
-    assert len(tables) == 1
-    t = tables[0]
-    assert t.headers == HEADERS
-    assert [r.page for r in t.rows] == [3, 3, 4, 4]
-    assert [r.cells[0] for r in t.rows] == ["רחוב 1", "רחוב 2", "רחוב 3", "רחוב 4"]
-    assert (t.page_start, t.page_end) == (3, 4)
+    assert len(tables) == 2
+    assert tables[0].headers == HEADERS and [r.page for r in tables[0].rows] == [3, 3]
+    assert tables[1].headers == [] and [r.page for r in tables[1].rows] == [4, 4] and tables[1].candidate_of == 0
+    assert (tables[0].page_start, tables[0].page_end, tables[1].page_start, tables[1].page_end) == (3, 3, 4, 4)
 
 
 def test_repeated_header_on_continuation_page_is_dropped():
@@ -336,3 +337,357 @@ def test_the_count_by_class_separates_reversed_drawn_boxless_and_hebrew_tables()
     assert tables.classify_stored(NUMBERS_ONLY) == "other"
     counts = tables.count_stored([REVERSED, REVERSED, DRAWN, NO_BOXES, HEBREW, NUMBERS_ONLY, {}])
     assert counts == {"reversed_stored": 2, "drawn_stored": 1, "no_boxes": 2, "hebrew": 1, "other": 1}
+
+
+# --- round 22 U3: a table continues across a page on structural evidence, never on shape alone (KTD3, R6, R9) -----------------------
+#
+# Three values: "continues" (a repeated header and nothing between the parts), "separate" (a heading or paragraph that is no page
+# furniture between them, a note closing the first part, another caption, another section or other column x-geometry) and
+# "undecided" (the same shape and nothing between, but no repeated header): undecided keeps the parts apart with a candidate link
+# (``TableResult.candidate_of``) that no consumer crosses. Every text here is invented.
+
+def _piece(page, rows, **kw) -> RawTable:
+    return RawTable(page=page, rows=rows, **kw)
+
+
+def test_ae1_an_income_table_and_a_costs_table_with_a_heading_between_are_two_tables():
+    income = _piece(1, [HEADERS, _row(1), _row(2)], section="3. הכנסות", caption="להלן טבלת הכנסות (באלפי ₪)")
+    costs_no_header = _piece(2, [_row(3), _row(4)], section="4. עלויות", caption="להלן טבלת עלויות", gap=["4. עלויות", "להלן טבלת עלויות"])
+    tables = assemble_tables([income, costs_no_header])
+    assert len(tables) == 2 and tables[1].section == "4. עלויות" and tables[1].headers == []
+    assert tables[1].candidate_of is None  # a heading between is evidence of "separate", not a candidate continuation
+    assert costs_no_header.decision == "separate" and not costs_no_header.continues
+    costs_same_header = _piece(2, [HEADERS, _row(3)], gap=["4. עלויות"])
+    assert len(assemble_tables([_piece(1, [HEADERS, _row(1)]), costs_same_header])) == 2
+
+
+def test_equal_headers_with_a_caption_change_are_two_tables():
+    first = _piece(1, [HEADERS, _row(1)], caption="טבלה 1 - עסקאות במגרש א")
+    second = _piece(2, [HEADERS, _row(2)], caption="טבלה 2 - עסקאות במגרש ב")
+    tables = assemble_tables([first, second])
+    assert len(tables) == 2 and second.break_before == "caption"
+
+
+def test_a_note_closing_the_first_table_makes_the_next_piece_separate():
+    first = _piece(1, [HEADERS, _row(1)], notes=["(*) המחירים כוללים מע״מ."])
+    second = _piece(2, [HEADERS, _row(2)])
+    assert len(assemble_tables([first, second])) == 2 and second.decision == "separate"
+    assert len(assemble_tables([_piece(1, [HEADERS, _row(1)]), _piece(2, [HEADERS, _row(2)])])) == 1
+
+
+def test_a_section_change_or_other_column_geometry_separates_equal_headers():
+    assert len(assemble_tables([_piece(1, [HEADERS, _row(1)], section="3. א"), _piece(2, [HEADERS, _row(2)], section="4. ב")])) == 2
+    n = len(HEADERS)
+    left = [[10.0 + 50 * c, 100.0, 55.0 + 50 * c, 120.0] for c in range(n)]
+    shifted = [[x0 + 90, top, x1 + 90, bottom] for x0, top, x1, bottom in left]  # the same columns drawn 90 points to the right
+    a = _piece(1, [HEADERS, _row(1)], boxes=[left, left])
+    b = _piece(2, [HEADERS, _row(2)], boxes=[shifted, shifted])
+    assert len(assemble_tables([a, b])) == 2 and b.break_before == "geometry"
+    c = _piece(2, [HEADERS, _row(2)], boxes=[[[x0 + 2, top, x1 + 2, bottom] for x0, top, x1, bottom in left]] * 2)
+    assert len(assemble_tables([_piece(1, [HEADERS, _row(1)], boxes=[left, left]), c])) == 1  # a small drift is one table
+
+
+def test_a_repeated_header_with_nothing_between_continues():
+    second = _piece(2, [HEADERS, _row(2)])
+    [t] = assemble_tables([_piece(1, [HEADERS, _row(1)]), second])
+    assert second.decision == "continues" and second.continues and t.candidate_of is None
+    assert [r.page for r in t.rows] == [1, 2]
+
+
+def test_a_three_page_table_is_one_table():
+    raws = [_piece(1, [HEADERS, _row(1)]), _piece(2, [HEADERS, _row(2)]), _piece(3, [HEADERS, _row(3)])]
+    [t] = assemble_tables(raws)
+    assert (t.page_start, t.page_end) == (1, 3) and [r.page for r in t.rows] == [1, 2, 3]
+
+
+def test_a_noisy_header_spelling_with_nothing_between_is_undecided_separate_parts_and_a_candidate_link():
+    noisy = [*HEADERS[:-1], "מחיר למ״ר ₪"]
+    second = _piece(2, [noisy, _row(2)])
+    tables = assemble_tables([_piece(1, [HEADERS, _row(1)]), second])
+    assert len(tables) == 2 and second.decision == "undecided" and not second.continues
+    assert tables[1].candidate_of == 0 and tables[0].candidate_of is None
+    assert tables[0].headers == HEADERS and tables[1].headers == noisy  # the second part keeps its own header
+
+
+def test_headerless_rows_after_a_hebrew_headed_table_with_no_cell_boxes_are_undecided_not_merged_on_shape():
+    second = _piece(2, [_row(2), _row(3)])
+    tables = assemble_tables([_piece(1, [HEADERS, _row(1)]), second])
+    assert len(tables) == 2 and second.decision == "undecided" and tables[1].candidate_of == 0
+    assert tables[1].headers == [] and [r.page for r in tables[0].rows] == [1]  # nothing was taken from, or given to, the other part
+
+
+# a headerless piece continues on structure: aligned columns (cell boxes on both sides) and the page edges (REGION_SHARE = a third)
+PAGE = (50.0, 800.0)  # the content area of a page, top to bottom
+
+
+def _headerless_pair(first_bottom=780.0, second_top=60.0, shift=0.0, boxes=True, extent=True):
+    n = len(HEADERS)
+    band = [[10.0 + 50 * c, 100.0, 55.0 + 50 * c, 120.0] for c in range(n)]
+    moved = [[x0 + shift, t, x1 + shift, b] for x0, t, x1, b in band]
+    a = _piece(1, [HEADERS, _row(1)], bbox=[10.0, first_bottom - 80, 460.0, first_bottom], boxes=[band, band] if boxes else None,
+               extent=PAGE if extent else None)
+    b = _piece(2, [_row(2), _row(3)], bbox=[10.0 + shift, second_top, 460.0 + shift, second_top + 60],
+               boxes=[moved, moved] if boxes else None, extent=PAGE if extent else None)
+    return a, b
+
+
+def test_a_headerless_piece_with_aligned_columns_at_the_page_edges_continues_the_table():
+    a, b = _headerless_pair()
+    [t] = assemble_tables([a, b])
+    assert b.decision == "continues" and b.continues and t.headers == HEADERS and [r.page for r in t.rows] == [1, 2, 2]
+    a, b = _headerless_pair(shift=5.0)  # a small drift in the columns is the same band
+    assert len(assemble_tables([a, b])) == 1
+
+
+def test_a_headerless_piece_with_aligned_columns_that_starts_mid_page_after_a_long_gap_stays_undecided():
+    a, b = _headerless_pair(second_top=400.0)
+    tables = assemble_tables([a, b])
+    assert len(tables) == 2 and b.decision == "undecided" and tables[1].candidate_of == 0
+    a, b = _headerless_pair(first_bottom=300.0)  # the earlier part ends mid-page
+    assert len(assemble_tables([a, b])) == 2 and b.decision == "undecided"
+
+
+def test_a_headerless_piece_whose_columns_are_not_aligned_is_separate_not_a_continuation():
+    a, b = _headerless_pair(shift=90.0)
+    tables = assemble_tables([a, b])
+    assert len(tables) == 2 and b.decision == "separate" and b.break_before == "geometry" and tables[1].candidate_of is None
+
+
+def test_a_headerless_piece_without_cell_boxes_or_without_a_page_extent_stays_undecided():
+    for kw in ({"boxes": False}, {"extent": False}):
+        a, b = _headerless_pair(**kw)
+        assert len(assemble_tables([a, b])) == 2 and b.decision == "undecided", kw
+    a, b = _headerless_pair()
+    a.boxes = None  # one side only
+    assert len(assemble_tables([a, b])) == 2 and b.decision == "undecided"
+
+
+def test_aligned_headerless_columns_do_not_continue_over_a_heading_a_note_or_a_section_change():
+    for change in ({"gap": ["4. עלויות"]}, {"section": "4. עלויות"}):
+        a, b = _headerless_pair()
+        for k, v in change.items():
+            setattr(b, k, v)
+        assert len(assemble_tables([a, b])) == 2 and b.decision == "separate", change
+    a, b = _headerless_pair()
+    a.notes = ["(*) הערה"]
+    assert len(assemble_tables([a, b])) == 2 and b.decision == "separate"
+
+
+def test_through_the_walker_a_headerless_table_that_runs_from_the_bottom_of_a_page_to_the_top_of_the_next_is_one_table():
+    n = len(HEADERS)
+
+    def boxes(top, rows):
+        return [[[10.0 + 50 * c, top + 20 * r, 55.0 + 50 * c, top + 20 * r + 18] for c in range(n)] for r in range(rows)]
+
+    first = RawTable(1, [HEADERS, _row(1), _row(2)], top=700.0, bbox=[10, 700, 460, 760], boxes=boxes(700.0, 3))
+    second = RawTable(2, [_row(3), _row(4)], top=40.0, bbox=[10, 40, 460, 80], boxes=boxes(40.0, 2))
+    p1, p2 = _out(1, [], [first]), _out(2, [], [second])
+    p1.height = p2.height = 800.0
+    [table] = _document(p1, p2).tables
+    assert table.headers == HEADERS and [r.page for r in table.rows] == [1, 1, 2, 2]
+    mid = RawTable(2, [_row(3), _row(4)], top=400.0, bbox=[10, 400, 460, 440], boxes=boxes(400.0, 2))
+    p1, p2 = _out(1, [], [RawTable(1, [HEADERS, _row(1), _row(2)], top=700.0, bbox=[10, 700, 460, 760], boxes=boxes(700.0, 3))]), _out(2, [], [mid])
+    p1.height = p2.height = 800.0
+    assert len(_document(p1, p2).tables) == 2
+
+
+def test_pieces_of_pages_that_do_not_follow_or_of_another_width_are_separate_without_a_link():
+    far = _piece(3, [HEADERS, _row(2)])
+    narrow = _piece(2, [["א", "ב"], ["1", "2"]])
+    for second in (far, narrow):
+        tables = assemble_tables([_piece(1, [HEADERS, _row(1)]), second])
+        assert len(tables) == 2 and second.decision == "separate" and tables[1].candidate_of is None
+
+
+def test_an_empty_piece_between_does_not_hide_what_stood_between_the_parts():
+    empty = _piece(2, [["", ""]], gap=["4. עלויות"])
+    after = _piece(2, [HEADERS, _row(2)])
+    tables = assemble_tables([_piece(1, [HEADERS, _row(1)]), empty, after])
+    assert len(tables) == 2 and after.decision == "separate"
+
+
+# --- page furniture: a text on a large share of the pages at one place is no evidence ---------------------------------------------
+
+def test_furniture_is_a_normalized_text_on_a_large_share_of_the_pages_at_the_same_place():
+    from app.extraction import tables
+
+    entries = [(p, 20.0, f"דוח שמאות לדוגמה - עמוד {p}") for p in range(1, 7)] + [(2, 300.0, "4. עלויות"), (3, 20.0, "4. עלויות")]
+    fur = tables.furniture_of(entries, pages_total=6)
+    assert fur.covers(20.0, "דוח שמאות לדוגמה - עמוד 9") and fur.covers(22.0, "דוח שמאות לדוגמה - עמוד 3")
+    assert not fur.covers(300.0, "דוח שמאות לדוגמה - עמוד 3")  # another place on the page
+    assert not fur.covers(300.0, "4. עלויות") and not fur.covers(20.0, "4. עלויות")  # two pages are no share
+    assert not tables.furniture_of([(1, 20.0, "דוח"), (2, 20.0, "דוח")], pages_total=2).covers(20.0, "דוח")
+
+
+# --- the real PDF path (pdf.assemble_result) and the re-read of positions share the decision ----------------------------------------
+
+def _line(top, text):
+    from app.extraction import pdf
+
+    return pdf._Line(top, text, bottom=top + 10, x0=50, x1=300, size=10)
+
+
+def _out(no, lines, raws):
+    from app.extraction import pdf
+    from app.extraction.base import PageResult
+
+    return pdf._PageOut(PageResult(no, "\n".join(ln.text for ln in lines), "text_layer", 1.0, True), lines, raws)
+
+
+class _NoFix:
+    def report(self):
+        return {}
+
+
+def _document(*pages):
+    from app.extraction import pdf
+
+    return pdf.assemble_result([list(pages)], len(pages), [], _NoFix(), [])
+
+
+def _income_costs():
+    t1 = RawTable(1, [["תאריך", "מחיר"], ["01/2020", "1,000"], ["02/2020", "1,100"]], top=300.0, bbox=[50, 300, 500, 360])
+    t2 = RawTable(2, [["אחזקה", "500"], ["ביטוח", "300"]], top=160.0, bbox=[50, 160, 500, 200])
+    p1 = _out(1, [_line(100, "3. הכנסות"), _line(130, "להלן טבלת הכנסות (באלפי ₪)"), _line(370, "(*) הערה להכנסות")], [t1])
+    p2 = _out(2, [_line(100, "4. עלויות"), _line(130, "להלן טבלת עלויות בשקלים חדשים בלבד"), _line(210, "(*) הערה לעלויות")], [t2])
+    return p1, p2
+
+
+def test_ae1_through_the_pdf_walker_an_income_and_a_costs_table_stay_two_tables_each_with_its_own_caption_section_and_notes():
+    res = _document(*_income_costs())
+    assert len(res.tables) == 2
+    income, costs = res.tables
+    assert (income.section, costs.section) == ("3. הכנסות", "4. עלויות")
+    assert "הכנסות" in income.caption and "עלויות" in costs.caption
+    assert income.notes == ["(*) הערה להכנסות"] and costs.notes == ["(*) הערה לעלויות"]
+    assert [r.page for r in costs.rows] == [2, 2] and costs.headers == [] and income.page_end == 1
+    assert sum(1 for b in res.blocks if b.kind == "table") == 2
+
+
+def test_the_costs_cell_does_not_inherit_the_income_captions_scale_through_take_value():
+    from types import SimpleNamespace as NS
+
+    from app.chat import tools
+
+    res = _document(*_income_costs())
+    costs = res.tables[1]
+    st = {"headers": costs.headers, "units": costs.units, "caption": costs.caption, "title": costs.title, "notes": costs.notes,
+          "source": "text", "rows": [{"page": r.page, "cells": r.cells} for r in costs.rows]}
+    cell = tools._cell_of(NS(sid="S1", version_id="v", table_index=1), "אחזקה | 500",
+                          {"row": "אחזקה", "column_number": 2, "number": "500"}, st, 1)
+    assert cell["scale"] == 1 and "באלפי" not in cell["facet_in"]["caption"]
+
+
+def _running_header_document(second_gets_heading: bool):
+    """Four pages, each with the same running header line at the top; a Hebrew-headed table on pages 2 and 3 with the header repeated."""
+    pages = []
+    for no in range(1, 5):
+        lines = [_line(20, "דוח שמאות סינתטי לדוגמה"), _line(60, f"פסקה רגילה בעמוד {no}") if no in (1, 4) else None]
+        raws = []
+        if no in (2, 3):
+            raws = [RawTable(no, [HEADERS, _row(no)], top=120.0, bbox=[50, 120, 500, 180])]
+        if no == 3 and second_gets_heading:
+            lines.append(_line(90, "4. עלויות"))
+        pages.append(_out(no, [ln for ln in lines if ln is not None], raws))
+    return _document(*pages)
+
+
+def test_a_running_page_header_above_a_continuation_with_a_repeated_header_stays_one_table():
+    res = _running_header_document(second_gets_heading=False)
+    assert len(res.tables) == 1 and (res.tables[0].page_start, res.tables[0].page_end) == (2, 3)
+
+
+def test_a_real_heading_above_the_continuation_splits_it_even_beside_a_running_header():
+    res = _running_header_document(second_gets_heading=True)
+    assert len(res.tables) == 2 and res.tables[1].section == "4. עלויות"
+
+
+def test_the_positions_reread_decides_like_the_walker():
+    from app.platform import positions
+
+    p1, p2 = _income_costs()
+    rebuilt = positions._text_tables([p1, p2])
+    assert [t.section for t in rebuilt] == ["3. הכנסות", "4. עלויות"]
+    assert len(positions._text_tables(list(_pages_of_a_continuation()))) == 1
+
+
+def _pages_of_a_continuation():
+    for no in (1, 2):
+        yield _out(no, [_line(100, "3. הכנסות")] if no == 1 else [], [RawTable(no, [HEADERS, _row(no)], top=200.0, bbox=[50, 200, 500, 260])])
+
+
+# --- a stored table whose rows span pages and records no parts (R9): evidence is the stored blocks above the later rows ------------------
+
+def _stored_two_pages(with_boxes: bool = True) -> dict:
+    def box(top):
+        return [[300.0, top, 400.0, top + 20], [100.0, top, 300.0, top + 20]]
+
+    rows = [{"page": 1, "cells": ["שכירות", "100"]}, {"page": 1, "cells": ["ביטוח", "200"]},
+            {"page": 2, "cells": ["אחזקה", "500"]}, {"page": 2, "cells": ["ארנונה", "300"]}]
+    if with_boxes:
+        for r, top in zip(rows, (500.0, 530.0, 120.0, 150.0), strict=True):
+            r["cell_boxes"] = box(top)
+    return {"headers": ["סעיף", "סכום"], "units": [None, None], "caption": "להלן טבלת הוצאות (באלפי ₪)", "title": [], "notes": [],
+            "rows": rows}
+
+
+def _block(page, top, text):
+    from app.extraction.tables import BlockAt
+
+    return BlockAt(page, top, text)
+
+
+def test_a_stored_two_page_continuation_with_no_block_above_the_later_rows_applies_to_both_pages():
+    from app.extraction import tables
+
+    assert tables.unconfirmed_pages(_stored_two_pages(), []) == {}
+    below = [_block(2, 400.0, "פסקה שבאה אחרי השורות")]  # on the later page but under its rows
+    assert tables.unconfirmed_pages(_stored_two_pages(), below) == {}
+    assert tables.unconfirmed_pages(_stored_two_pages(), [_block(1, 100.0, "פסקה מעל שורות עמוד 1")]) == {}  # above the first page's rows
+
+
+def test_a_stored_two_page_table_with_a_heading_above_the_later_rows_marks_the_later_page_unconfirmed():
+    from app.extraction import tables
+
+    got = tables.unconfirmed_pages(_stored_two_pages(), [_block(2, 60.0, "4. עלויות")])
+    assert list(got) == [2] and "4. עלויות" in got[2]
+    below_on_the_first_page = tables.unconfirmed_pages(_stored_two_pages(), [_block(1, 700.0, "פסקה מתחת לחלק הראשון")])
+    assert list(below_on_the_first_page) == [2]
+
+
+def test_stored_page_furniture_above_the_later_rows_is_no_evidence_and_a_page_between_is():
+    from app.extraction import tables
+
+    furniture = tables.furniture_of([(p, 20.0, "דוח שמאות סינתטי") for p in range(1, 9)], pages_total=8)
+    assert tables.unconfirmed_pages(_stored_two_pages(), [_block(2, 20.0, "דוח שמאות סינתטי")], furniture) == {}
+    skipped = _stored_two_pages()
+    skipped["rows"][2]["page"] = skipped["rows"][3]["page"] = 3  # the rows run from page 1 to page 3
+    got = tables.unconfirmed_pages(skipped, [_block(2, 20.0, "פסקה בעמוד שבין השניים")])
+    assert list(got) == [3]
+    assert tables.unconfirmed_pages(skipped, [_block(2, 20.0, "דוח שמאות סינתטי")], furniture) == {}
+    three = _stored_two_pages()
+    three["rows"][3]["page"] = 3  # pages 1, 1, 2, 3
+    got = tables.unconfirmed_pages(three, [_block(2, 90.0, "פסקה מעל העמוד השני")])
+    assert sorted(got) == [2, 3]  # once separated, every later page is unconfirmed (the later part may take its scale from the earlier)
+
+
+def test_a_stored_table_without_cell_boxes_is_judged_by_the_page_text_then_conservatively():
+    from app.extraction import tables
+
+    st = _stored_two_pages(with_boxes=False)
+    text = {2: "דוח\n4. עלויות\nאחזקה | 500\nארנונה | 300\nפסקה אחרי הטבלה"}
+    above = _block(2, None, "4. עלויות")
+    below = _block(2, None, "פסקה אחרי הטבלה")
+    assert list(tables.unconfirmed_pages(st, [above], page_text=text.get)) == [2]
+    assert tables.unconfirmed_pages(st, [below], page_text=text.get) == {}
+    assert list(tables.unconfirmed_pages(st, [below])) == [2]  # nothing says where it stands: conservative
+    assert tables.unconfirmed_pages({**st, "rows": st["rows"][:2]}, [above]) == {}  # a one-page table has no later page
+
+
+def test_a_window_staged_before_round_22_decodes_its_first_on_page_flag_as_no_break_and_a_new_one_round_trips():
+    from app.extraction import pdf_windows
+
+    legacy = [1, [["א"]], False, "3. א", True, 12.0, [0, 12, 50, 30], None, False, None, None]  # ``first_on_page`` was a bool here
+    assert pdf_windows._dec_table(legacy).break_before is None
+    piece = RawTable(page=2, rows=[["א", "ב"]], section="4. ב", top=10.0, bbox=[0, 10, 50, 20])
+    assert pdf_windows._dec_table(pdf_windows._enc_table(piece)) == piece

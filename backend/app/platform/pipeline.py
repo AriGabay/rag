@@ -262,6 +262,8 @@ def _insert_outputs(conn: Connection, info: VersionInfo, result: ExtractionResul
         }
         if t.header_boxes:
             structure["header_boxes"] = t.header_boxes
+        if t.candidate_of is not None:
+            structure["candidate_of"] = t.candidate_of
         conn.execute(
             text(
                 "INSERT INTO extracted_tables (office_id, document_id, version_id, table_index, page_start,"
