@@ -896,6 +896,13 @@ def _recurring_row(label: str) -> bool:
     return not (_ONE_TIME_WORDS.search(c) or any(kind_attested(k, c) for k in _ONE_TIME_KINDS))
 
 
+def _rate_period(text: str) -> bool:
+    """Whether every period word of ``text`` is a rate's own (``_of_rate``: "שיעור היוון שנתי", "תשואה לשנה"), so that a label or a
+    header that says "לחודש" of its rent is not the period of a percent in the same row or column (round 21 full measurement). A text
+    with no period word is vacuously one."""
+    return not any(kind == "period" for _, kind, _, _ in _scan(_read(text), rates=False))
+
+
 def _gated(q: Qualifiers, kind: str, owned: bool) -> Qualifiers:
     """What a row label or a column header gives a cell of ``kind``: a period only to a cell that can be a rate, or — for the
     row's own label and the column's own header cell — to a quantity other than a duration or a count. A period stated above
@@ -1054,8 +1061,14 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                     row_meaning = own + " " + head
                     kind = after_kind(cell, at + len(written_at(cell, at))) or context_kind(row_meaning)
                     q = _tagged(q, "cell")
+                    # a percent takes a period from its row's label or its column's header only when the text states it as a rate's own
+                    # ("שיעור היוון שנתי"): the "לחודש" of a rent row's label is the rent's, not its capitalisation rate's (round 21 full measurement)
+                    end = at + len(written_at(cell, at))
+                    percent = bool(_PERCENT_AFTER.match(cell, end) or cell[max(0, at - 1):at] == "%")
                     if i > 0:
                         label_q = _gated(_all(cells[0]), kind, True)  # the row's label
+                        if percent and not _rate_period(cells[0]):
+                            label_q = _only(label_q, "period", keep=False)
                         if capitalised_label(cells[0]):
                             # "capitalisation of the MONTHLY rents": the word modifies the rents, the cell is a one-time total. A rate
                             # row ("שיעור היוון שנתי") is no capitalised label (``capitalised_label``) and keeps its period (round 21 packet A, Q2)
@@ -1066,6 +1079,8 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                     header_period = not q.keys("period") and (i == 0 or _recurring_row(cells[0]))
                     for heads, owned in ((own_heads[i], True), (upper_heads[i], False)):
                         given = _gated(_all(heads), kind, owned)  # the column's own header, then a header above it or spanned over it
+                        if percent and not _rate_period(heads):
+                            given = _only(given, "period", keep=False)
                         q.merge(given if header_period else _only(given, "period", keep=False), "header")
                     if _PER_AREA.search(cells[0] + " " + head + " " + cell):
                         defined = table.found.get("basis", {})

@@ -1543,6 +1543,42 @@ def test_a21_q2_a_rate_row_keeps_the_period_of_its_own_label():
     assert _cell_period(CAPITALISED_TABLE, "6.4") == {"year"}
 
 
+# --- round 21 full measurement: a percent takes a period from its row's label or column's header only when it is a rate's own ------
+
+def test_a21_fm_the_monthly_period_of_a_rent_rows_label_is_not_its_capitalisation_rates():
+    table = "\n".join(["תמהיל הכנסות", "רכיב | סכום | שיעור היוון", "דמי שכירות בסיסיים לחודש | 85,000 | 6.3%"])
+    assert _cell_period(table, "85,000") == {"month"}
+    assert _cell_period(table, "6.3") == set()
+
+
+def test_a21_fm_a_rate_row_keeps_the_annual_period_of_its_own_label():
+    table = "\n".join(["תמהיל הכנסות", "רכיב | שיעור", "שיעור היוון שנתי | 6.3%"])
+    assert _cell_period(table, "6.3") == {"year"}
+
+
+def test_a21_fm_a_header_that_states_a_rates_period_reaches_the_percents_of_its_column():
+    table = "\n".join(["תמהיל הכנסות", "רכיב | תשואה שנתית", "חנויות | 7.45%"])
+    assert _cell_period(table, "7.45") == {"year"}
+
+
+def test_a21_fm_the_monthly_period_of_a_rent_header_reaches_the_rent_and_not_the_percent_of_a_recurring_row():
+    table = "\n".join(["תמהיל הכנסות", "רכיב | דמי שכירות לחודש | שיעור", "משרדים | 40,000 | 7.45%"])
+    assert _cell_period(table, "40,000") == {"month"}
+    assert _cell_period(table, "7.45") == set()
+
+
+def test_a21_fm_a_period_the_percent_cell_states_itself_is_kept():
+    table = "\n".join(["תמהיל הכנסות", "רכיב | סכום | שיעור", "דמי שכירות בסיסיים לחודש | 85,000 | 6.3% לשנה"])
+    assert _cell_period(table, "6.3") == {"year"}
+
+
+def test_a21_fm_rate_period_is_true_only_for_texts_whose_every_period_word_follows_a_rate_noun():
+    assert meaning._rate_period("שיעור היוון שנתי") and meaning._rate_period("תשואה לשנה") and meaning._rate_period("ריבית שנתית")
+    assert meaning._rate_period("רכיב")  # no period word at all
+    assert not meaning._rate_period("דמי שכירות בסיסיים לחודש")
+    assert not meaning._rate_period("דמי שכירות לחודש ושיעור היוון שנתי")
+
+
 def test_a21_q2_the_answer_is_not_told_to_add_a_month_to_a_capitalised_total():
     ws = _ws(CAPITALISED_TABLE)
     assert _problems("השווי לפי גישת היוון ההכנסות הוא 3,300,000 ₪ [S1].", ws) == []
