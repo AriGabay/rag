@@ -602,3 +602,101 @@ def test_a_table_with_a_candidate_continuation_link_inherits_no_scale_from_above
     ws = T.Workspace(ctx=None)
     assert T._governing_note(ws, None, VERSION.version_id, 1) != ""  # the heading governs the first part
     assert T._governing_note(ws, None, VERSION.version_id, 2, structures[1].get("candidate_of")) == ""  # not across the link
+
+
+# --- round 22 U9 (KTD8, R15, AE7): a label that names no kind is the source being silent, not the agent's assertion -----------------------------
+
+def _payments(rows=(("תשלום ראשון", "100,000"), ("תשלום שני", "150,000")), amount="סכום (₪)") -> dict:
+    return _table(["שלב", amount], [list(r) for r in rows])
+
+
+def _taken(monkeypatch, table: dict, takes: list[tuple[str, dict]], amount="סכום (₪)") -> SimpleNamespace:
+    d = _workspace(monkeypatch, table)
+    monkeypatch.setattr(T, "_check_available", lambda ws, leaves: None)
+    for row, meaning_ in takes:
+        T.tool_take_value(d.ws, d.sid, _loc(row=row, column=amount), _meaning(unit="ILS", **meaning_), row)
+    return d
+
+
+def _calculate(d, expression: str) -> dict:
+    import json
+
+    return json.loads(T.tool_calculate(d.ws, expression, "חישוב"))
+
+
+def test_u9_ae7_a_cell_whose_label_names_no_kind_is_silent_and_v1_times_twelve_is_not_conditional(monkeypatch):
+    d = _taken(monkeypatch, _payments(), [("תשלום ראשון", {"kind": "value"})])
+    v = d.ws.values["V1"]
+    assert v.provenance["kind"] == "silent" and v.provenance["unit"] == "source" and v.certainty == "verified"
+    out = _calculate(d, "V1 * 12")
+    assert out["conditional"] is False and "מותנה" not in out["note"] and "לא נמצאו במקור" not in out["note"]
+    assert d.ws.computations["C1"].uncertain == []
+
+
+def test_u9_a_sum_of_two_payment_rows_the_agent_called_value_is_not_conditional(monkeypatch):
+    d = _taken(monkeypatch, _payments(), [("תשלום ראשון", {"kind": "value"}), ("תשלום שני", {"kind": "value"})])
+    assert [d.ws.values[i].provenance["kind"] for i in ("V1", "V2")] == ["silent", "silent"]
+    out = _calculate(d, "V1 + V2")
+    assert out["conditional"] is False and not d.ws.computations["C1"].uncertain
+
+
+def test_u9_a_kind_the_row_states_differently_is_stated_different_and_a_sum_over_it_is_conditional_with_an_honest_note(monkeypatch):
+    from app.chat.verify import conditional_qualifier
+
+    table = _payments(rows=(("שווי המגרש", "3,000,000"), ("שווי הבניין", "1,000,000")))
+    d = _taken(monkeypatch, table, [("שווי המגרש", {"kind": "price"}), ("שווי הבניין", {"kind": "price"})])
+    v = d.ws.values["V1"]
+    assert v.provenance["kind"] == "stated_different" and v.stated["kind"] == "שווי" and v.certainty == "model_asserted"
+    assert _calculate(d, "V1 * 12")["conditional"] is False  # × 12 does not read the kind
+    out = _calculate(d, "V1 + V2")
+    assert out["conditional"] is True
+    note = conditional_qualifier(d.ws.computations["C2"], ws=d.ws)
+    assert "הערך «שווי המגרש» (3,000,000) כתוב במקור; סוג הנתון: המקור מציין «שווי» והחישוב מניח «מחיר»" in note, note
+    assert "לא נמצאו במקור" not in note and "לא נמצאו במקור" not in out["note"]
+
+
+def test_u9_a_unit_nothing_states_stays_conditional_even_for_a_multiplication_by_twelve(monkeypatch):
+    from app.chat.verify import conditional_qualifier
+
+    d = _taken(monkeypatch, _payments(amount="סכום"), [("תשלום ראשון", {"kind": "value"})], amount="סכום")
+    v = d.ws.values["V1"]
+    assert v.provenance["unit"] == "model_asserted" and v.provenance["kind"] == "silent"
+    out = _calculate(d, "V1 * 12")
+    assert out["conditional"] is True
+    note = conditional_qualifier(d.ws.computations["C1"], ws=d.ws)
+    assert "הערך «תשלום ראשון» (100,000) כתוב במקור; היחידה לא נאמרה במקור, והחישוב מניח ₪" in note, note
+    assert "לא נמצאו במקור" not in note and "סוג הנתון" not in note  # the silent kind is not named: only the unit was read unconfirmed
+
+
+def test_u9_a_kind_that_does_not_go_with_the_unit_and_that_nothing_states_is_the_agents_alone(monkeypatch):
+    d = _taken(monkeypatch, _payments(), [("תשלום ראשון", {"kind": "rate"})])
+    v = d.ws.values["V1"]
+    assert v.provenance["kind"] == "model_asserted" and v.certainty == "model_asserted"
+
+
+def test_u9_the_kinds_a_heading_states_for_other_units_do_not_contradict_an_amount(monkeypatch):
+    table = _table(["שלב", "סכום (₪)"], [["תשלום ראשון", "100,000"]], caption="שטח הנכס 120 מ״ר")
+    d = _taken(monkeypatch, table, [("תשלום ראשון", {"kind": "value"})])
+    assert d.ws.values["V1"].provenance["kind"] == "silent"  # "שטח" names an area; an amount in ₪ is not one
+
+
+def test_u9_an_agent_set_vat_the_source_contradicts_still_blocks_the_calculation(monkeypatch):
+    # the protection of round 12 (R8, N11): the VAT the source states and a VAT the agent set are not mixed without a justification
+    table = _table(["סעיף", "א (₪, כולל מע\"מ)", "ב (₪)"], [["תשלום", "100", "50"]])
+    d = _workspace(monkeypatch, table)
+    monkeypatch.setattr(T, "_check_available", lambda ws, leaves: None)
+    T.tool_take_value(d.ws, d.sid, _loc(row="תשלום", column="א (₪, כולל מע\"מ)"), _meaning(kind="value", unit="ILS"), "א")
+    T.tool_take_value(d.ws, d.sid, _loc(row="תשלום", column="ב (₪)"), _meaning(kind="value", unit="ILS", vat="excluded"), "ב")
+    assert d.ws.values["V1"].vat == "included" and d.ws.values["V2"].provenance["vat"] == "model_asserted"
+    with pytest.raises(T.ToolError):
+        T.tool_calculate(d.ws, "V1 + V2", "סכום")
+
+
+def test_u9_taking_a_cell_again_with_another_kind_corrects_a_kind_the_source_was_silent_about_and_keeps_a_stated_one(monkeypatch):
+    d = _taken(monkeypatch, _payments(), [("תשלום ראשון", {"kind": "value"}), ("תשלום ראשון", {"kind": "cost"})])
+    assert len(d.ws.values) == 1 and d.ws.values["V1"].kind == "cost" and d.ws.values["V1"].provenance["kind"] == "silent"
+    table = _payments(rows=(("שווי המגרש", "3,000,000"),))
+    d = _taken(monkeypatch, table, [("שווי המגרש", {"kind": "value"})])
+    with pytest.raises(T.ToolError, match="V1"):
+        T.tool_take_value(d.ws, d.sid, _loc(row="שווי המגרש", column="סכום (₪)"), _meaning(unit="ILS", kind="cost"), "שווי")
+    assert d.ws.values["V1"].kind == "value" and d.ws.values["V1"].provenance["kind"] == "source"

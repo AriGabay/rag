@@ -1203,13 +1203,14 @@ def _asserted(ws: Workspace, vid: str, *attributes: str) -> None:
     ws.values[vid].provenance.update({a: "model_asserted" for a in attributes})
 
 
-def test_u3_a_conditional_note_names_the_details_the_agent_set_and_the_source_did_not_state():
+def test_u3_a_conditional_note_names_the_attribute_the_source_does_not_confirm_and_says_the_value_stands_in_the_source():
     ws = _conditional_sum(("V1",))
     _asserted(ws, "V1", "kind")
     _, text, _ = _composed(ws, "סך העלות הוא 20,220,000 ₪ [C1].")
     assert "התוצאה 20,220,000 ₪ מותנית: " in text
     note = text.split("\n\n")[-1]
-    assert "נקבעו על ידי הסוכן ולא נמצאו במקור" in note and "«בנייה עילית»" in note, note
+    assert "הערך «בנייה עילית» (15,600,000) כתוב במקור; סוג הנתון" in note, note  # round 22 U9: the value stands there; the attribute is named
+    assert "לא נמצאו במקור" not in note and "נקבעו על ידי הסוכן" not in note, note
     assert "אינו ודאי" not in note and "אינם ודאיים" not in note, note  # the reading is clear: it is not called uncertain
 
 
@@ -1219,7 +1220,7 @@ def test_u3_a_conditional_note_keeps_the_uncertain_wording_for_a_value_whose_rea
     ws.uncertain_values["V2"] = "התא לא אושר"
     note = _composed(ws, "סך העלות הוא 20,220,000 ₪ [C1].")[1].split("\n\n")[-1]
     assert "הערך «חניון תת-קרקעי» (4,620,000) אינו ודאי" in note, note
-    assert "«בנייה עילית»" in note and "נקבעו על ידי הסוכן ולא נמצאו במקור" in note, note
+    assert "הערך «בנייה עילית» (15,600,000) כתוב במקור; סוג הנתון" in note and "לא נמצאו במקור" not in note, note
 
 
 def test_u3_a_value_the_agent_set_is_the_only_cause_named_in_the_calculations_own_conditional_text():
@@ -1228,8 +1229,91 @@ def test_u3_a_value_the_agent_set_is_the_only_cause_named_in_the_calculations_ow
     ws = _conditional_sum(())
     _asserted(ws, "V1", "unit")
     assert tools.value_uncertain(ws, "V1") and not tools.reading_unclear(ws, "V1")
-    assert tools.uncertain_reason(ws, "V1") == "תכונות שנקבעו על ידי הסוכן ולא נמצאו במקור: היחידה"
+    assert tools.uncertain_reason(ws, "V1") == "היחידה לא נאמרה במקור, והחישוב מניח ₪"
     assert tools.uncertain_reason(ws, "V2") == ""
+
+
+# --- round 22 U9 (KTD8, R15, AE7): three-state provenance; the note names what the operation read -----------------------------------
+
+def _state(ws: Workspace, vid: str, **states: str) -> None:
+    ws.values[vid].provenance.update(states)
+
+
+def _compute_conditional(ws: Workspace, expression: str, label: str = "חישוב") -> calc.Computation:
+    """A calculation registered as ``tools.tool_calculate`` registers it, conditional on what its operation read of the inputs' kind and unit."""
+    from app.chat import tools
+
+    node = calc.parse(expression)
+    ids = list(dict.fromkeys(calc.ids_of(node)))
+    out = calc.evaluate(node, {i: ws.values[i].operand() for i in ids})
+    c, _ = tools.register_computation(ws, node, out, tools._leaves(ws, ids), label=label, kind="computed")
+    return c
+
+
+def _two_costs() -> Workspace:
+    ws = Workspace(ctx=None)
+    _value(ws, "15,600,000", "בנייה עילית", "cost", "cost")
+    _value(ws, "4,620,000", "חניון תת-קרקעי", "cost", "cost")
+    return ws
+
+
+def test_u9_a_silent_kind_makes_no_computation_conditional_even_when_the_operation_reads_it():
+    ws = _two_costs()
+    _state(ws, "V1", kind="silent")
+    _state(ws, "V2", kind="silent")
+    assert ws.values["V1"].certainty == "verified"
+    assert not _compute_conditional(ws, "V1 * 12").conditional
+    c = _compute_conditional(ws, "V1 + V2")  # an additive check reads the kinds: silence is not a contradiction
+    assert not c.conditional and c.uncertain == []
+
+
+def test_u9_a_stated_different_kind_makes_a_computation_conditional_only_when_the_operation_reads_it():
+    from app.chat.verify import conditional_qualifier
+
+    ws = _two_costs()
+    _state(ws, "V1", kind="stated_different")
+    ws.values["V1"].stated["kind"] = "שווי"
+    assert not _compute_conditional(ws, "V1 * 12").conditional  # × 12 never reads the kind
+    c = _compute_conditional(ws, "V1 + V2")
+    assert c.conditional and c.uncertain == ["V1"]
+    note = conditional_qualifier(c, ws=ws)
+    assert note == ("תוצאה מותנית: הערך «בנייה עילית» (15,600,000) כתוב במקור; סוג הנתון: המקור מציין «שווי» והחישוב מניח «עלות»"), note
+    assert "לא נמצאו במקור" not in note
+
+
+def test_u9_a_unit_nothing_states_makes_even_a_multiplication_by_twelve_conditional():
+    from app.chat.verify import conditional_qualifier
+
+    ws = _two_costs()
+    _state(ws, "V1", unit="model_asserted")
+    c = _compute_conditional(ws, "V1 * 12")
+    assert c.conditional and c.uncertain == ["V1"]
+    note = conditional_qualifier(c, ws=ws)
+    assert "הערך «בנייה עילית» (15,600,000) כתוב במקור; היחידה לא נאמרה במקור" in note and "לא נמצאו במקור" not in note, note
+
+
+def test_u9_a_result_over_an_earlier_conditional_result_keeps_what_the_earlier_one_read():
+    ws = _two_costs()
+    _state(ws, "V1", kind="stated_different")
+    first = _compute_conditional(ws, "V1 + V2", "סכום")
+    assert first.conditional
+    ws.computations[first.cid] = first
+    node = calc.parse(f"{first.cid} * 12")
+    out = calc.evaluate(node, {first.cid: calc.result_operand(first.cid, first.outcome)})  # × 12 alone reads no kind
+    from app.chat import tools
+
+    c, _ = tools.register_computation(ws, node, out, tools._leaves(ws, [first.cid]), label="שנתי", kind="computed")
+    assert c.conditional and ("V1", "kind") in c.outcome.consulted
+
+
+def test_u9_the_judge_sees_the_ids_and_the_user_sees_the_words_for_a_value_the_source_does_not_confirm():
+    from app.chat.verify import conditional_qualifier
+
+    ws = _two_costs()
+    _state(ws, "V2", kind="model_asserted")
+    c = _compute_conditional(ws, "V1 - V2")
+    assert conditional_qualifier(c) == "תוצאה מותנית: הערך V2 אינו ודאי"
+    assert "כתוב במקור" in conditional_qualifier(c, ws=ws)
 
 
 # --- round 21 packet A, R5: the VAT a calculation's measurements carry --------------------------------------------------------------

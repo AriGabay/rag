@@ -5946,13 +5946,17 @@ MSG_UNCERTAIN_INPUTS = "הערכים {ids} אינם ודאיים"
 MSG_SOURCE_UNCERTAIN = "המקור נקרא בקריאה לא ודאית"
 
 
-def value_uncertain(ws: Workspace, vid: str) -> bool:
-    """A value (V#) that cannot be presented as certain: its kind or unit was asserted rather than found in its source
-    (the attributes that define the number: ``calc.Value.certainty``; an asserted stance, speaker, scenario, period, area
-    basis or VAT counts as not stated and leaves it certain, round 13 U5, KTD6), its source was read uncertainly (a
-    visual transcription included), or its region stayed unclear after the focused re-reads
-    (``Workspace.uncertain_values``)."""
-    return ws.values[vid].certainty != "verified" or reading_unclear(ws, vid)
+def value_uncertain(ws: Workspace, vid: str, consulted=None) -> bool:
+    """A value (V#) that cannot be presented as certain: its kind or unit is not confirmed by its source (the attributes that define the
+    number: ``calc.Value.certainty`` — stated differently there, or supported by nothing; a kind the source is silent about, with the
+    unit's family, is not; an asserted stance, speaker, scenario, period, area basis or VAT counts as not stated and leaves it certain,
+    round 13 U5, KTD6), its source was read uncertainly (a visual transcription included), or its region stayed unclear after the focused
+    re-reads (``Workspace.uncertain_values``). ``consulted``: the (id, attribute) pairs one calculation read (``calc.Outcome.consulted``):
+    the value is then uncertain for that calculation only for the unconfirmed attributes it read (round 22 U9, KTD8)."""
+    v = ws.values[vid]
+    if consulted is None:
+        return v.certainty != "verified" or reading_unclear(ws, vid)
+    return v.reading == "uncertain" or reading_unclear(ws, vid) or bool(v.unconfirmed(consulted))
 
 
 def reading_unclear(ws: Workspace, vid: str) -> bool:
@@ -5973,29 +5977,53 @@ def value_status(ws: Workspace, i: str) -> str:
     return STATUS_UNCERTAIN if value_uncertain(ws, i) else STATUS_AUTO
 
 
-_DEFINING_NAMES = {"kind": "הסוג", "unit": "היחידה"}
+MSG_ATTR_KIND_DIFFERENT = "סוג הנתון: המקור מציין «{stated}» והחישוב מניח «{assumed}»"
+MSG_ATTR_KIND_ASSERTED = "סוג הנתון לא נאמר במקור, והחישוב מניח שהוא «{assumed}»"
+MSG_ATTR_KIND_SILENT = "סוג הנתון לא נאמר במפורש בשורה או בכותרת, והחישוב מניח שהוא «{assumed}»"
+MSG_ATTR_UNIT_DIFFERENT = "היחידה: המקור מציין יחידה אחרת מ«{assumed}», שבה החישוב משתמש"
+MSG_ATTR_UNIT_ASSERTED = "היחידה לא נאמרה במקור, והחישוב מניח {assumed}"
 
 
-def asserted_attributes(ws: Workspace, vid: str) -> list[str]:
-    """The defining attributes (kind, unit) of a value that the agent set and the source did not state (``Value.provenance``, confirmed
-    against the source by ``meaning.confirmed_in_source`` when the value was taken), when that is the only thing making it uncertain: a value
-    whose reading is unclear is uncertain for its reading and has none (round 21 U3, KTD3, R3)."""
+def unconfirmed_attributes(ws: Workspace, vid: str, consulted=None) -> list[str]:
+    """The defining attributes (kind, unit) of a value that its source does not confirm — stated differently there, or supported by
+    nothing (``calc.UNCONFIRMED``) — and that a calculation read (``consulted``; None: any), when that is the only thing making it
+    uncertain: a value whose reading is unclear is uncertain for its reading and has none (round 21 U3, KTD3, R3; round 22 U9, KTD8)."""
     v = ws.values.get(vid)
     if v is None or reading_unclear(ws, vid):
         return []
-    return [k for k in calc.DEFINING_ATTRIBUTES if v.provenance.get(k) == "model_asserted"]
+    return v.unconfirmed(consulted)
 
 
-def uncertain_reason(ws: Workspace, vid: str) -> str:
-    """Why an uncertain value is uncertain when the reading is clear and the agent set the attributes that define it: "" for any other."""
-    asserted = asserted_attributes(ws, vid)
-    return "תכונות שנקבעו על ידי הסוכן ולא נמצאו במקור: " + ", ".join(_DEFINING_NAMES[k] for k in asserted) if asserted else ""
+def attribute_clauses(ws: Workspace, vid: str, attributes: list[str]) -> list[str]:
+    """What the source does not confirm about each of ``attributes`` of a value, in words the user reads (round 22 U9, KTD8): the attribute
+    named, what the source says when it says another thing, and what the calculation assumes. Never that the value is not in the source."""
+    v = ws.values[vid]
+    out = []
+    for a in attributes:
+        state = v.provenance.get(a)
+        if a == "kind":
+            assumed = VALUE_KINDS.get(v.kind, v.kind)
+            out.append(MSG_ATTR_KIND_DIFFERENT.format(stated=v.stated.get("kind") or "סוג אחר", assumed=assumed) if state == "stated_different"
+                       else MSG_ATTR_KIND_SILENT.format(assumed=assumed) if state == "silent"
+                       else MSG_ATTR_KIND_ASSERTED.format(assumed=assumed))
+        else:
+            assumed = UNIT_LABELS.get(v.unit, v.unit) or v.unit
+            out.append((MSG_ATTR_UNIT_DIFFERENT if state == "stated_different" else MSG_ATTR_UNIT_ASSERTED).format(assumed=assumed))
+    return out
 
 
-def uncertain_inputs(ws: Workspace, ids) -> list[str]:
+def uncertain_reason(ws: Workspace, vid: str, consulted=None) -> str:
+    """Why an uncertain value is uncertain when the reading is clear and its kind or unit is not confirmed by the source: what the source
+    says and what the calculation assumes; "" for any other (round 22 U9)."""
+    attrs = unconfirmed_attributes(ws, vid, consulted)
+    return "; ".join(attribute_clauses(ws, vid, attrs)) if attrs else ""
+
+
+def uncertain_inputs(ws: Workspace, ids, consulted=None) -> list[str]:
     """The values and measurements among ``ids`` that are uncertain: a calculation resting on any of them is
-    conditional, never certain (R28)."""
-    return [i for i in ids if (i in ws.values and value_uncertain(ws, i))
+    conditional, never certain (R28). ``consulted`` (``calc.Outcome.consulted``): a value counts for its kind or unit only when the
+    calculation read it (``value_uncertain``); a measurement counts as before."""
+    return [i for i in ids if (i in ws.values and value_uncertain(ws, i, consulted))
             or (i in ws.measurements and measurement_uncertain(ws.measurements[i].row))]
 
 
@@ -6841,6 +6869,25 @@ def _kind_anchor(kind: str, parts: list[tuple[str, str]]) -> dict:
     return hit or {"part": parts[0][0] if parts else "paragraph", "written": ""}
 
 
+def _kind_state(kind: str, unit: str, context: str, *, whole: bool) -> tuple[str, str]:
+    """How the words around a number (its row label, column header and caption; the quote of a quoted value) stand to the kind the agent
+    registered it with, and the source's own words for a kind they state instead (round 22 U9, KTD8):
+
+    - ``source``: they name the registered kind;
+    - ``stated_different``: they name another kind that could be this number's — one of the unit's family, so a "מ״ר" in a heading does not
+      make a ₪ amount an area — and not the registered one (the words are returned);
+    - ``silent``: they name no kind, and the registered kind goes with the unit (``calc.kind_fits_unit``: ILS with value, price, rent and
+      the other amounts, % with a rate). ``whole`` False: the words are a fragment, so their silence is no evidence;
+    - ``model_asserted``: nothing supports the kind (the words are silent and it does not go with the unit, or they are a fragment)."""
+    if meaning.kind_attested(kind, context):
+        return "source", ""
+    base = kind.removesuffix("_per_area")
+    for other in meaning.KIND_WORDS:
+        if other != base and calc.kind_in_unit_family(other, unit) and (words := meaning.kind_written(other, context)):
+            return "stated_different", words
+    return ("silent", "") if whole and calc.kind_fits_unit(kind, unit) else ("model_asserted", "")
+
+
 def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict, dict]:
     """The value's meaning: what the source attests about the number is the source's (and fills what the model left
     unknown); what it does not is the model's (``model_asserted``); a contradiction is refused. With the meaning and
@@ -6898,19 +6945,25 @@ def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict, dict]:
                                  "written": out["area_basis"]}
     else:
         prov["area_basis"] = "model_asserted" if said else "not_stated"
-    prov["kind"] = "source" if meaning.kind_attested(given["kind"], taken["kind_context"]) else "model_asserted"
     parts = taken.get("kind_parts") or [("paragraph", taken["kind_context"])]
-    if "model_asserted" in (prov["kind"], prov["unit"]) and taken.get("source_text"):
+    quoted = bool(taken.get("source_text"))  # a quote is a fragment of its sentence; a table cell has its row, header and caption
+    prov["kind"], stated = _kind_state(given["kind"], out["unit"], taken["kind_context"], whole=not quoted)
+    if quoted and (prov["kind"] != "source" or prov["unit"] == "model_asserted"):
         # the quote of a value is often a fragment of its sentence: the same meaning reader is asked about the number's own clause of the
-        # source before the value is called the agent's (round 21 U3, KTD3, C1). A kind or a unit the clause states is the source's
+        # source before the value is called the agent's (round 21 U3, KTD3, C1). A kind or a unit the clause states is the source's; a
+        # clause that is the number's alone and names no kind is the source being silent about it (round 22 U9, KTD8)
         kind_stated, unit_stated, clause = meaning.confirmed_in_source(taken["source_text"], taken["forms"], taken["quote"],
                                                                        given["kind"], out["unit"])
-        if prov["kind"] == "model_asserted" and kind_stated:
-            prov["kind"], parts = "source", [("sentence", clause)]
+        if prov["kind"] != "source" and kind_stated:
+            prov["kind"], stated, parts = "source", "", [("sentence", clause)]
+        elif prov["kind"] != "source" and clause:
+            prov["kind"], stated = _kind_state(given["kind"], out["unit"], taken["kind_context"] + " " + clause, whole=True)
         if prov["unit"] == "model_asserted" and unit_stated:
             prov["unit"] = "source"
     if prov["kind"] == "source":
         anchors["kind"] = _kind_anchor(given["kind"], parts)
+    elif prov["kind"] == "stated_different":
+        anchors["kind_stated"] = {"written": stated}  # the source's words, for the conditional note; not a meaning_from anchor (``_new_value``)
     return out, prov, anchors
 
 
@@ -7013,6 +7066,8 @@ def _new_value(ws: Workspace, src: Source, sid: str, taken: dict, settled: tuple
     """The value a take builds, with the next V# and its facet. It changes nothing in the workspace: ``_register_value`` does,
     as the last step of the registration (round 14 U1, KTD2), so a step that fails in between leaves no orphan V#."""
     fields, prov, who, said, anchors = settled
+    anchors = dict(anchors)
+    stated = anchors.pop("kind_stated", None)  # the source's words for a kind it states differently: the value's, not an anchor
     where = taken["locator"]
     default = (f"{where['row']} — {where['column']}" if "row" in where
                else f"{VALUE_KINDS[fields['kind']]} {fields.get('subject') or ''}".strip())
@@ -7025,6 +7080,8 @@ def _new_value(ws: Workspace, src: Source, sid: str, taken: dict, settled: tuple
                        section=" › ".join(path), stated_by=who["stated_by"], stance=who["stance"],
                        scenario=who["scenario"], attribution=said.evidence if said is not None else "",
                        meaning_from=dict(taken.get("meaning_from") or {}) | anchors, scale=int(taken.get("scale") or 1))
+    if stated:
+        value.stated["kind"] = stated["written"]
     value.facet = _value_facet(ws, src, taken, fields["kind"])
     return value
 
@@ -7200,13 +7257,19 @@ def _value_report(ws: Workspace, value: calc.Value, said: Attribution | None, no
     lines.append(datum_line(value.as_of))
     if (src := ws.sources.get(value.source_id)) is not None and src.link:  # the appraisal is the property's (U12b)
         lines.append(src.link)
-    # only the kind and the unit lower the certainty (round 13 U5, KTD6); any other attribute the model asserted is reported
-    # as not stated, which neither lowers it nor enters a comparison or a calculation
-    defining = [names[k] for k in asserted if k in calc.DEFINING_ATTRIBUTES]
+    # only the kind and the unit lower the certainty (round 13 U5, KTD6), and only when the source does not confirm them (stated differently,
+    # or supported by nothing; round 22 U9, KTD8); any other attribute the model asserted is reported as not stated, which neither lowers it
+    # nor enters a comparison or a calculation
+    defining = [k for k in value.unconfirmed()]
     other = [names[k] for k in asserted if k not in calc.DEFINING_ATTRIBUTES]
-    lines.append("ודאות: " + ("כל התכונות שמגדירות את המספר נמצאו במקור" if not defining else
-                              "נמוכה יותר — תכונות שהמודל קבע ולא נמצאו במקור: " + ", ".join(defining))
-                 + (" | נחשבות כלא צוינו, ואינן מורידות את הוודאות: " + ", ".join(other) if other else ""))
+    if defining:
+        sure = "נמוכה יותר — " + "; ".join(attribute_clauses(ws, value.vid, defining))
+    elif prov.get("kind") == "silent":
+        sure = "הערך כתוב במקור; סוג הנתון לא נאמר במפורש בשורה או בכותרת (נרשם כ" + VALUE_KINDS.get(value.kind, value.kind) \
+               + " בהתאם ליחידה), ואין בכך הפחתה בוודאות"
+    else:
+        sure = "כל התכונות שמגדירות את המספר נמצאו במקור"
+    lines.append("ודאות: " + sure + (" | נחשבות כלא צוינו, ואינן מורידות את הוודאות: " + ", ".join(other) if other else ""))
     if note:
         lines.append(note)
     lines += context or []
@@ -7278,6 +7341,10 @@ def _adopt(first: calc.Value, name: str, value, prov: dict, anchors_: dict, *, a
     first.provenance[name] = prov[name]
     if anchor and name in anchors_:
         first.meaning_from[name] = anchors_[name]
+    if name == "kind":  # the source's words for a kind it states differently follow the kind adopted
+        first.stated.pop("kind", None)
+        if stated := anchors_.get("kind_stated"):
+            first.stated["kind"] = stated["written"]
 
 
 def _registered_at(ws: Workspace, span: tuple | None) -> calc.Value | None:
@@ -7297,9 +7364,10 @@ def _registered_again(ws: Workspace, span: tuple | None, settled: tuple, facet_o
     - same meaning: the first value stays whole — its label, subject, role and stance are the first call's. Source-backed
       meaning this call adds fills only the fields the first left empty; the facet moves forward only (``datum.forward``). The
       one exception is the model's own unsupported stance, speaker or scenario on the first value, which this call replaces;
-    - a defining attribute (``calc.DEFINING_ATTRIBUTES``: kind and unit) that differs: when the first value's field is the model's
-      own assertion, this call corrects it and the value's facet is read again in the new family; when the source attests the first
-      value's field, the call fails naming the first V#, and nothing changes.
+    - a defining attribute (``calc.DEFINING_ATTRIBUTES``: kind and unit) that differs: when the first value's field is not the source's
+      (the model's own assertion, a kind the source states differently or is silent about; round 22 U9), this call corrects it and the
+      value's facet is read again in the new family; when the source attests the first value's field, the call fails naming the first V#,
+      and nothing changes.
 
     ``settled``: this call's ``_settle`` (fields, provenance, who, said, anchors); ``facet_of(kind)``: this call's facet for the
     kind it settled."""
@@ -7311,7 +7379,7 @@ def _registered_again(ws: Workspace, span: tuple | None, settled: tuple, facet_o
     for name in calc.DEFINING_ATTRIBUTES:
         if fields[name] == getattr(first, name):
             continue
-        if first.provenance.get(name) != "model_asserted":
+        if first.provenance.get(name) == "source":
             label, show = _DEFINING_LABELS[name]
             raise ToolError(MSG_SPAN_CONTRADICTS.format(vid=first.vid, field=label, old=show(getattr(first, name)),
                                                         new=show(fields[name])), "span_contradiction")
@@ -8251,6 +8319,13 @@ def computation_operands(ws: Workspace, ids: list[str]) -> dict[str, calc.Operan
     return {i: _operand(ws, i) for i in ids}
 
 
+def carry_consulted(ws: Workspace, out) -> frozenset:
+    """The (id, attribute) pairs a calculation read, with those of the earlier results it was built on (``calc.Outcome.consulted``): a
+    result over C1 rests on what C1 read, so V1's kind that C1 consulted still counts (round 22 U9, KTD8). Set on ``out`` once."""
+    out.consulted = frozenset(out.consulted).union(*(ws.computations[i].outcome.consulted for i in out.inputs if i in ws.computations))
+    return out.consulted
+
+
 def register_computation(ws: Workspace, node, out, leaves: list[str], *, label: str = "", label_prefix: str = "",
                          kind: str, justification: str | None = None, justified: bool = False,
                          notes: list[str] | None = None, reproduces: dict | None = None, near: dict | None = None,
@@ -8267,11 +8342,12 @@ def register_computation(ws: Workspace, node, out, leaves: list[str], *, label: 
 
     inputs = _computation_inputs(ws, out)
     sources, documents = _leaf_sources_docs(ws, leaves)
-    uncertain = uncertain_inputs(ws, leaves)
+    consulted = carry_consulted(ws, out)
+    uncertain = uncertain_inputs(ws, leaves, consulted)
     if uncertain:
         # why each is uncertain, when the turn knows (an unclear region, a cell OCR did not confirm in its place)
         why = [f"{i}: {r}" for i in uncertain
-               if (r := ws.uncertain_values.get(i) or (ws.values[i].reading_note if i in ws.values else "") or uncertain_reason(ws, i))]
+               if (r := ws.uncertain_values.get(i) or (ws.values[i].reading_note if i in ws.values else "") or uncertain_reason(ws, i, consulted))]
         out.conditional.append(MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain))
                                + (f" ({'; '.join(why)})" if why else ""))
     conditional = ("מותנה: " + "; ".join(out.conditional)
@@ -8315,9 +8391,10 @@ def tool_calculate(ws: Workspace, expression: str, label: str = "", justificatio
     elif out.scale != 1:
         notes.append(MSG_RESULT_SCALE.format(unit=calc.scaled_label(calc.unit_label(out.dims, out.period), out.scale),
                                              full=calc.fmt(out.value * out.scale)))
-    asserted = [i for i in leaves if i in ws.values and ws.values[i].certainty == "model_asserted"]
-    if asserted:
-        notes.append("ודאות נמוכה יותר: תכונות של " + ", ".join(asserted) + " נקבעו ולא נמצאו במקור.")
+    consulted = carry_consulted(ws, out)
+    for i in leaves:  # what the source does not confirm about an input, among what this calculation read (round 22 U9, KTD8)
+        if i in ws.values and (reason := uncertain_reason(ws, i, consulted)):
+            notes.append(f"ודאות נמוכה יותר — {i}: {reason}.")
     lost = [i for i in leaves if i in ws.measurements and anchor_lost(ws.measurements[i].row)]
     if lost:
         notes.append("מיקומם של חלק מהערכים במסמך אבד בעיבוד מחדש (" + ", ".join(lost)

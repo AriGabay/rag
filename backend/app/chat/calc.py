@@ -210,6 +210,11 @@ class Outcome:
     scale: int = 1
     step_scales: list[int] = field(default_factory=list)
     rescaled: bool = False
+    # the (input id, defining attribute) pairs the operation read (round 22 U9, KTD8): ``("V1", "unit")`` for the dimensions of V1,
+    # ``("V1", "kind")`` for a check or a conversion that branches on its kind. A computation is conditional on a value's unconfirmed
+    # kind or unit only when the operation consulted it (``Value.unconfirmed``); a result built on an earlier result carries the
+    # earlier one's pairs (``tools.register_computation``)
+    consulted: frozenset = frozenset()
 
 
 def result_operand(cid: str, out: Outcome) -> Operand:
@@ -562,6 +567,11 @@ class _Eval:
         self.step_scales: list[int] = []
         self.n: int | None = None
         self.rescaled = False
+        self.consulted: set[tuple[str, str]] = set()
+
+    def consult(self, attribute: str, *operands: Operand) -> None:
+        """Record that the operation read ``attribute`` (kind or unit) of the inputs these operands rest on (round 22 U9, KTD8)."""
+        self.consulted.update((lf.id, attribute) for o in operands for lf in o.leaves)
 
     def need(self, reason: str) -> None:
         if reason not in self.needs:
@@ -587,6 +597,7 @@ class _Eval:
             if x.dims not in ((), (("%", 1),)):
                 raise CalcError(f"% מותר רק אחרי אחוז או מספר (למשל A1%); {render(node.node, lambda i: i)} הוא "
                                 f"{unit_label(x.dims)}")
+            self.consult("unit", x)
             out = Operand(None, _value(x) / 100, (), x.period, x.vat, x.basis, x.kind, x.role, x.subject, None, None,
                           x.approx, None, x.leaves, x.assumptions)
             return self.step(node, out)
@@ -594,6 +605,7 @@ class _Eval:
             return self.step(node, self.aggregate(node))
         a, b = self.eval(node.left), self.eval(node.right)
         self._literals(node.op, a, b)
+        self.consult("unit", a, b)  # the dimensions of every operand decide what the operation allows and what its result is
         out = self.additive(node.op, a, b) if node.op in "+-" else self.multiplicative(node.op, a, b)
         return self.step(node, out)
 
@@ -637,6 +649,7 @@ class _Eval:
     # + −, and the aggregates ------------------------------------------------------------------------------------
     def _additive_checks(self, items: list[Operand], op: str) -> None:
         ids = ", ".join(_label(o) for o in items if o.id) or "הערכים"
+        self.consult("kind", *items)  # added values must be of one kind: the check reads each one's
         kinds = {o.kind for o in items}
         if kinds & RECURRING_KINDS and kinds & CAPITAL_KINDS:
             raise CalcError(MSG_RENT_CAPITAL.format(ids=ids))
@@ -704,6 +717,7 @@ class _Eval:
         if ranges:
             raise CalcError("חלק מהנתונים הם טווחים ולא ערך יחיד (" + ", ".join(ranges)
                             + "). אפשר לחשב על הערכים היחידים בלבד או להציג את הטווחים")
+        self.consult("unit", *items)
         self._additive_checks(items, "sum" if node.func == "sum" else node.func)
         first = items[0]
         if node.func == "sum" and (any(d in AREA_DIMS and e < 0 for d, e in first.dims) or ("%", 1) in first.dims
@@ -803,23 +817,32 @@ class _Eval:
         return Operand(None, value, dims, period, vat, basis, kind, role, subject, None, None, a.approx or b.approx,
                        None, a.leaves + b.leaves, _union(a.assumptions, b.assumptions), scale)
 
-    @staticmethod
-    def _kind(op: str, a: Operand, b: Operand, dims: Dims) -> str | None:
+    def _kind(self, op: str, a: Operand, b: Operand, dims: Dims) -> str | None:
+        """The kind of a product or quotient. A kind that only passes through (× 12, ÷ 12, a factor) is not read; one the operation
+        converts or branches on (a per-area rate × an area, an amount ÷ an area, a share of a count) is consulted (round 22 U9, KTD8)."""
         if op == "*":
             if b.dims == ():
                 return a.kind
             if a.dims == ():
                 return b.kind
             for x, y in ((a, b), (b, a)):
-                if x.kind in PER_AREA_BASE and _area(y.dims) and not _area(dims):
-                    return PER_AREA_BASE[x.kind]
+                if _area(y.dims) and not _area(dims):
+                    self.consult("kind", x)
+                    if x.kind in PER_AREA_BASE:
+                        return PER_AREA_BASE[x.kind]
             return None
-        if dims == () and (a.dims != () or b.kind == "count"):
-            return "ratio"  # a share: of two quantities of one unit, or of a count
+        if dims == ():
+            if a.dims != ():
+                return "ratio"  # a share: of two quantities of one unit
+            self.consult("kind", b)
+            if b.kind == "count":
+                return "ratio"  # or of a count
         if b.dims == ():
             return a.kind
-        if "ILS" in dict(a.dims) and _area(b.dims) and a.kind in BASE_PER_AREA:
-            return BASE_PER_AREA[a.kind]
+        if "ILS" in dict(a.dims) and _area(b.dims):
+            self.consult("kind", a)
+            if a.kind in BASE_PER_AREA:
+                return BASE_PER_AREA[a.kind]
         return None
 
 
@@ -949,7 +972,7 @@ def evaluate(node, operands: dict[str, Operand], justification: str | None = Non
     return Outcome(_value(out), out.dims, out.period, out.vat, out.basis, out.kind, out.subject, list(ev.needs),
                    ev.steps, list(out.assumptions), list(dict.fromkeys(out.leaves)),
                    list(dict.fromkeys(ids_of(node))), out.approx, ev.n if isinstance(node, Agg) else None,
-                   out.scale, list(ev.step_scales), ev.rescaled)
+                   out.scale, list(ev.step_scales), ev.rescaled, frozenset(ev.consulted))
 
 
 # --- display -----------------------------------------------------------------------------------------------------
@@ -1140,8 +1163,39 @@ def scaled_label(label: str, scale: int) -> str:
 
 # --- what the turn registers ---------------------------------------------------------------------------------------
 
-# the attributes that define the number (round 13 U5, KTD6): only an asserted one of these leaves a value uncertain
+# the attributes that define the number (round 13 U5, KTD6): only an unconfirmed one of these leaves a value uncertain
 DEFINING_ATTRIBUTES = ("kind", "unit")
+# how the source stands to the kind or the unit the value was registered with (round 22 U9, KTD8; ``provenance`` of those two fields):
+#   source            the source states it and it matches
+#   stated_different  the row, header or caption states another kind (or a unit) than the one registered
+#   silent            nothing around the number names a kind, and the registered kind goes with the unit's family
+#   model_asserted    nothing supports it where it matters: no unit is stated, or the kind does not go with the unit
+# A stored V# from before the round has only "source" and "model_asserted"; both keep their meaning.
+UNCONFIRMED = ("stated_different", "model_asserted")  # the states that make a computation conditional when the operation reads them
+_MONEY_KINDS = frozenset({"value", "price", "rent", "management_fee", "cost", "income", "profit", "levy"})
+# the kinds that go with each unit: an amount is in ₪, a per-area amount in ₪ per m², a rate in %; "other" goes with any
+_KIND_UNITS = {**dict.fromkeys(_MONEY_KINDS, {"ILS"}), **dict.fromkeys(PER_AREA_BASE, {"ILS_per_sqm"}),
+               "area": {"sqm", "dunam"}, "rights_area": {"sqm", "dunam"}, "rate": {"percent", "ratio"},
+               "coefficient": {"ratio", "percent"}, "count": {"units"}, "duration": {"years", "months"}}
+_UNIT_FAMILY = {"ILS": "money", "ILS_per_sqm": "money", "sqm": "area", "dunam": "area", "percent": "percent", "ratio": "ratio",
+                "units": "count", "years": "time", "months": "time"}
+_KIND_FAMILY = {**dict.fromkeys(_MONEY_KINDS, "money"), "area": "area", "rights_area": "area", "rate": "percent",
+                "coefficient": "ratio", "count": "count", "duration": "time"}
+
+
+def kind_fits_unit(kind: str, unit: str) -> bool:
+    """Whether a kind of value goes with a unit: ILS with value, price, rent, cost, income and the other amounts, ILS per m² with their
+    per-area kinds, % with a rate; "other" (a kind or a unit) goes with any. A kind that does not go with the unit it was registered with
+    is not supported by the unit (``tools._kind_state``)."""
+    return kind == "other" or unit == "other" or unit in _KIND_UNITS.get(kind, ())
+
+
+def kind_in_unit_family(kind: str, unit: str) -> bool:
+    """Whether a kind word found beside a number could name it, given the number's unit: an amount's unit takes the money kinds (a "מ״ר"
+    in a heading does not make a ₪ amount an area). A unit with no family (meters, other) takes any kind."""
+    family = _UNIT_FAMILY.get(unit)
+    kind_family = _KIND_FAMILY.get(kind.removesuffix("_per_area"))
+    return family is None or kind_family == family or {kind_family, family} == {"percent", "ratio"}
 
 
 @dataclass
@@ -1165,7 +1219,7 @@ class Value:
     area_basis: str
     subject: str
     role: str
-    provenance: dict[str, str]  # field -> "source" | "model_asserted" | "not_stated"
+    provenance: dict[str, str]  # field -> "source" | "model_asserted" | "not_stated"; kind and unit also "stated_different" | "silent"
     locator: dict  # {"table_index", "row", "row_number", "column"} or {"quote"}
     quote: str  # the quote, or the table row as read
     total: bool = False
@@ -1207,18 +1261,29 @@ class Value:
     # purpose phrase of its sentence, a lead-in or heading), never ``label`` or ``subject``; ``datum.not_read()`` until
     # the tools resolve it when the value enters the turn
     facet: dict = field(default_factory=datum.not_read)
+    # the source's own words for a kind it states differently from the one registered ("שווי" for a value registered as a price): only
+    # for an attribute whose provenance is "stated_different" (round 22 U9, KTD8); the conditional note quotes it
+    stated: dict = field(default_factory=dict)
+
+    def unconfirmed(self, consulted=None) -> list[str]:
+        """The defining attributes (kind, unit) the source does not confirm for this value: stated differently, or supported by nothing
+        (``UNCONFIRMED``). ``consulted``: the (id, attribute) pairs one operation read (``Outcome.consulted``) — only those count; None
+        counts them all. A "silent" attribute is never unconfirmed: the value stands in the source, which says nothing against its kind."""
+        return [k for k in DEFINING_ATTRIBUTES if self.provenance.get(k) in UNCONFIRMED
+                and (consulted is None or (self.vid, k) in consulted)]
 
     @property
     def certainty(self) -> str:
-        """"model_asserted": the kind or the unit — the attributes that define the number — was asserted rather than
-        found in its source; "uncertain_reading": its region stayed unclear; otherwise "verified".
+        """"model_asserted": the kind or the unit — the attributes that define the number — is not confirmed by its source (stated
+        differently, or supported by nothing); "uncertain_reading": its region stayed unclear; otherwise "verified". An attribute the
+        source is silent about, with a registered kind that goes with the unit, leaves the value verified (round 22 U9, KTD8).
 
         Round 13 U5 (R7, KTD6): a stance, speaker, scenario, period, area basis or VAT status the model asserted never makes
         the value uncertain. Each counts as not stated in every reader — the timeline's key (``timeline._stated``), a
         calculation's operand (``operand``), the coverage reason, the judge's evidence (source-only qualifiers) — so the
         number is neither marked nor limited for it; a claim that states such an attribute goes through the qualifier edit
         (``verify.plan_qualifier_edits``). The asserted entry stays in ``provenance`` as the model's, never as found."""
-        if any(self.provenance.get(k) == "model_asserted" for k in DEFINING_ATTRIBUTES):
+        if self.unconfirmed():
             return "model_asserted"
         return "uncertain_reading" if self.reading == "uncertain" else "verified"
 
@@ -1249,7 +1314,7 @@ class Value:
                 "reading_id": self.reading_id, "title": self.title, "location": self.location, "kind": self.kind,
                 "unit": self.unit, "unit_label": UNIT_LABELS.get(self.unit, ""), "period": self.period,
                 "vat": self.vat, "area_basis": self.area_basis, "subject": self.subject, "role": self.role,
-                "provenance": dict(self.provenance), "certainty": self.certainty, "locator": dict(self.locator),
+                "provenance": dict(self.provenance), "certainty": self.certainty, "stated": dict(self.stated), "locator": dict(self.locator),
                 "quote": self.quote, "total": self.total, "approx": self.approx, "section": self.section,
                 "stated_by": self.stated_by, "stance": self.stance, "scenario": self.scenario,
                 "attribution": self.attribution, "meaning_from": dict(self.meaning_from), "reading": self.reading,

@@ -756,10 +756,10 @@ TOTAL_ROW_CUT = " (הסכום כולל שורה שחלק ממנה הושמט)"
 CONDITIONAL_LEAD = "תוצאה מותנית: "
 CONDITIONAL_UNCERTAIN_ONE = "הערך {ids} אינו ודאי"
 CONDITIONAL_UNCERTAIN_MANY = "הערכים {ids} אינם ודאיים"
-# a value whose kind or unit the agent set and the source did not state, its reading clear (round 21 U3, KTD3, R3): the note says that, and not
-# that the value is "not certain"
-CONDITIONAL_ASSERTED_ONE = "פרטי הערך {ids} נקבעו על ידי הסוכן ולא נמצאו במקור"
-CONDITIONAL_ASSERTED_MANY = "פרטי הערכים {ids} נקבעו על ידי הסוכן ולא נמצאו במקור"
+# a value whose kind or unit the source does not confirm, its reading clear (round 21 U3, KTD3, R3; round 22 U9, KTD8, R15): the number stands in
+# the source, and the note names the attribute the calculation read and what the source says about it (``tools.attribute_clauses``) — never that
+# the value was not found there
+CONDITIONAL_STANDS = "הערך {name} כתוב במקור; {what}"
 CONDITIONAL_MIX = "לפי הצדקה לערבוב נתונים שאינם תואמים — {needs}"
 CONDITIONAL_UNSTATED = "תוצאת החישוב {cid} מותנית ({why}): השרת כותב זאת ליד התוצאה"
 # a conditional result keeps only this short tag by its number; the reason is said once per calculation, in one server
@@ -3758,13 +3758,15 @@ def _source_parts(ws: Workspace, sid: str, *, dated: bool = True) -> tuple[str, 
     if sid in ws.values:
         v = ws.values[sid].public()
         p = v["provenance"]
-        asserted = [k for k, x in p.items() if x == "model_asserted"]
+        asserted = [k for k, x in p.items() if x in ("model_asserted", "stated_different")]
+        silent = [k for k, x in p.items() if x == "silent"]
         where = (f"שורה «{v['locator']['row']}», עמודה «{v['locator']['column']}»" if "row" in v["locator"]
                  else "ציטוט")
         return (f"{v['title']} — {v['location']} (ערך שאומת ב-{v['source_id']})",
                 f"ערך: {v['label']} = {v['value_text']} (סוג: {v['kind']}, יחידה: {v['unit']}, תקופה: {v['period']}, "
                 f"מע\"מ: {v['vat']}, בסיס שטח: {v['area_basis'] or 'לא צוין'}, נושא: {v['subject'] or 'לא צוין'}, "
-                f"תפקיד: {v['role']}" + (f"; נקבעו ולא נמצאו במקור: {', '.join(asserted)}" if asserted else "")
+                f"תפקיד: {v['role']}" + (f"; המקור אינו מאשר: {', '.join(asserted)}" if asserted else "")
+                + (f"; המקור אינו אומר במפורש: {', '.join(silent)}" if silent else "")
                 + ")" + (f"\nסעיף: {v['section']}" if v.get("section") else "") + "\n" + _attribution_text(v)
                 + f"\nמקום: {where}" + (_date_text(v) + _link_text(ws, v) if dated else "") + f"\nציטוט: {v['quote']}" + _context_text(v)
                 + _scale_text(ws.values[sid]), "value")
@@ -3938,24 +3940,24 @@ def conditional_qualifier(c, stated: bool = False, ws: Workspace | None = None) 
     conditions it recorded beside them. ``stated``: the unit already says the result is conditional, so only the
     reason is given. ``ws``: the qualifier the user reads, which names the inputs in words (``input_words``) instead of by V# and
     C#; without it, the qualifier the judge is shown (ids)."""
-    from app.chat.tools import MSG_UNCERTAIN_INPUTS
+    from app.chat.tools import MSG_UNCERTAIN_INPUTS, attribute_clauses, unconfirmed_attributes
 
     def words(text: str) -> str:
         return _ID_IN_TEXT.sub(lambda m: input_words(ws, m.group(0)), text) if ws is not None else text
 
-    from app.chat.tools import asserted_attributes
-
     uncertain = list(c.uncertain or [])
     said = MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain)) if uncertain else None
     why = []
-    # the user's note tells a value the agent set apart from one whose reading is unclear; the judge's (no workspace) names the ids as before
-    asserted = [i for i in uncertain if ws is not None and asserted_attributes(ws, i)]
-    unclear = [i for i in uncertain if i not in asserted]
-    for ids_, one, many in ((unclear, CONDITIONAL_UNCERTAIN_ONE, CONDITIONAL_UNCERTAIN_MANY),
-                            (asserted, CONDITIONAL_ASSERTED_ONE, CONDITIONAL_ASSERTED_MANY)):
-        if ids_:
-            ids = _join_and([input_words(ws, i) for i in ids_]) if ws is not None else ", ".join(ids_)
-            why.append((one if len(ids_) == 1 else many).format(ids=ids))
+    # the user's note tells a value whose kind or unit the source does not confirm apart from one whose reading is unclear; the judge's (no
+    # workspace) names the ids as before. Only what the calculation read counts (``Outcome.consulted``; a record without any: all)
+    consulted = c.outcome.consulted or None
+    unconfirmed = {i: attrs for i in uncertain if ws is not None and (attrs := unconfirmed_attributes(ws, i, consulted))}
+    unclear = [i for i in uncertain if i not in unconfirmed]
+    if unclear:
+        ids = _join_and([input_words(ws, i) for i in unclear]) if ws is not None else ", ".join(unclear)
+        why.append((CONDITIONAL_UNCERTAIN_ONE if len(unclear) == 1 else CONDITIONAL_UNCERTAIN_MANY).format(ids=ids))
+    for i, attrs in unconfirmed.items():
+        why.append(CONDITIONAL_STANDS.format(name=input_words(ws, i), what="; ".join(attribute_clauses(ws, i, attrs))))
     mix = [words(x) for x in c.outcome.conditional if not (said and x.startswith(said))]
     if mix:
         why.append(CONDITIONAL_MIX.format(needs="; ".join(mix)))
@@ -8485,7 +8487,7 @@ def _workspace_listing(ws: Workspace, turn: TurnRequirements) -> tuple[str, set[
     (E#), searches (H#, in the order made) and the sections, tables and pages read (their S#)."""
     lines: list[tuple[str, str]] = []
     for vid, v in ws.values.items():
-        note = {"model_asserted": "; תכונות שנקבעו ולא נמצאו במקור",
+        note = {"model_asserted": "; סוג או יחידה שהמקור אינו מאשר",
                 "uncertain_reading": "; נקרא בקריאה לא ודאית"}.get(v.certainty, "")
         lines.append((vid, f"ערך: {v.label} = {v.written} («{v.title}»{note})"))
     for mid, m in list(ws.measurements.items())[:WORKSPACE_MEASUREMENTS]:

@@ -861,9 +861,17 @@ def test_u3_c1_a_unit_the_sentence_states_is_the_sources_though_the_quote_is_onl
     assert _settled("הוא 3,100,000", "3,100,000", "value", "sqm", text)["unit"] == "model_asserted"  # the sentence states another unit
 
 
-def test_u3_c1_a_kind_the_sentence_does_not_state_stays_the_agents():
+def test_u3_c1_a_kind_the_sentence_states_differently_is_stated_different_not_the_agents_alone():
+    # round 22 U9: the number's own clause says "שווי"; the agent registered it as rent — the source states another kind
     prov = _settled("3,100,000 ₪", "3,100,000", "rent", "ILS")
-    assert prov["kind"] == "model_asserted" and prov["unit"] == "source"
+    assert prov["kind"] == "stated_different" and prov["unit"] == "source"
+
+
+def test_u9_a_clause_that_is_the_numbers_alone_and_names_no_kind_is_the_source_being_silent():
+    text = "הסכום שהוסכם הוא 5,000 ₪ לפי התחשיב."
+    prov = _settled("5,000 ₪", "5,000", "value", "ILS", text)
+    assert prov["kind"] == "silent" and prov["unit"] == "source"
+    assert _settled("5,000 ₪", "5,000", "rate", "ILS", text)["kind"] == "model_asserted"  # a rate does not go with an amount in ₪
 
 
 def test_u3_c1_a_sentence_with_two_amounts_confirms_nothing_for_either():
@@ -980,3 +988,62 @@ def test_a21_q5_a_request_that_compares_the_contexts_allows_their_values_to_comb
     assert ev.value == Decimal("16000000") and not ev.conditional
     with pytest.raises(CalcError):  # a request that allows other contexts does not
         calc.evaluate(calc.parse("V1 + V2"), ops(a, b), contexts=[frozenset({"v1:1", "v1:3"})])
+
+
+# --- round 22 U9 (KTD8, R15): the calculator records which kind or unit of which input an operation read -----------------------------
+
+def _plain(vid: str, value: str = "1000", kind: str = "cost", unit: str = "ILS", **kw) -> calc.Operand:
+    return operand(vid, value, unit, kind=kind, vat="excluded", **kw)
+
+
+def test_u9_a_multiplication_by_twelve_reads_the_unit_and_never_the_kind():
+    out = run("V1 * 12", ops(_plain("V1", period="month")))
+    assert out.consulted == {("V1", "unit")}
+
+
+def test_u9_an_addition_reads_both_the_kind_and_the_unit_of_each_input():
+    out = run("V1 + V2", ops(_plain("V1"), _plain("V2")))
+    assert out.consulted == {(i, a) for i in ("V1", "V2") for a in ("kind", "unit")}
+
+
+def test_u9_an_aggregate_reads_the_kind_and_the_unit_of_every_item_but_a_count_reads_neither():
+    items = ops(_plain("V1"), _plain("V2"), _plain("V3"))
+    assert run("sum(V1, V2, V3)", items).consulted == {(i, a) for i in ("V1", "V2", "V3") for a in ("kind", "unit")}
+    assert run("count(V1, V2, V3)", items).consulted == set()
+
+
+def test_u9_a_per_area_rate_times_an_area_reads_the_kind_of_the_rate_but_a_plain_factor_does_not():
+    rate = operand("V1", "100", "ILS_per_sqm", kind="rent_per_area", vat="excluded", period="month")
+    area = operand("V2", "50", "sqm", kind="area")
+    out = run("V1 * V2", ops(rate, area))
+    assert ("V1", "kind") in out.consulted and out.kind == "rent"
+    assert ("V1", "kind") not in run("V1 * 12", ops(rate)).consulted
+
+
+def test_u9_a_dimensionless_quotient_reads_the_kind_of_the_divisor_and_a_share_of_two_amounts_reads_no_kind():
+    top, n = operand("V1", "9", "ratio", kind="coefficient"), operand("V2", "3", "ratio", kind="count")
+    out = run("V1 / V2", ops(top, n))
+    assert ("V2", "kind") in out.consulted and out.kind == "ratio"
+    assert not any(a == "kind" for _, a in run("V1 / V2", ops(_plain("V1", "9000"), _plain("V2", "3000"))).consulted)
+
+
+def test_u9_the_calculation_reads_a_value_only_through_the_attributes_that_are_unconfirmed():
+    def value(**prov) -> calc.Value:
+        return calc.Value("V1", Decimal(1000), "1,000", "S1", None, None, None, "t", "l", "תשלום", "value", "ILS", "none", "unknown", "",
+                          "הנכס", "other", {"kind": "source", "unit": "source"} | prov, {"quote": "תשלום 1,000"}, "תשלום 1,000")
+
+    assert value().unconfirmed() == [] and value(kind="silent").unconfirmed() == []
+    assert value(kind="silent").certainty == "verified"
+    assert value(kind="stated_different").unconfirmed() == ["kind"] and value(kind="stated_different").certainty == "model_asserted"
+    assert value(unit="model_asserted").unconfirmed() == ["unit"]
+    assert value(kind="model_asserted", unit="model_asserted").unconfirmed({("V1", "unit")}) == ["unit"]  # only the one an operation read
+    assert value(kind="stated_different").unconfirmed(set()) == []
+
+
+def test_u9_a_kind_goes_with_the_family_of_the_unit_it_was_registered_with():
+    for kind in ("value", "price", "cost", "rent", "income", "other"):
+        assert calc.kind_fits_unit(kind, "ILS")
+    assert calc.kind_fits_unit("rent_per_area", "ILS_per_sqm") and calc.kind_fits_unit("rate", "percent")
+    assert not calc.kind_fits_unit("rate", "ILS") and not calc.kind_fits_unit("value", "percent")
+    assert not calc.kind_fits_unit("value", "ILS_per_sqm")
+    assert calc.kind_in_unit_family("value", "ILS") and not calc.kind_in_unit_family("area", "ILS")
