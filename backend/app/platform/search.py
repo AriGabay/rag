@@ -180,8 +180,9 @@ def _lexical(conn: Connection, tokens: list[str], scope: _Sql | None = None, n: 
              + base.joins + " WHERE " + base.where),
         params | base.params,
     ).one()
-    n = max(stats.n, 1)
-    weights = {f"w{i}": math.log((n + 1) / (getattr(stats, f"d{i}") + 0.5)) for i in range(len(tokens))}
+    # round 22 U2 (R10): the IDF passage count has a name of its own - it once overwrote ``n``, so ``LIMIT :n`` became the pool size
+    pool = max(stats.n, 1)
+    weights = {f"w{i}": math.log((pool + 1) / (getattr(stats, f"d{i}") + 0.5)) for i in range(len(tokens))}
     parts = " || ".join(f"plainto_tsquery('simple', :t{i})" for i in range(len(tokens)))
     score = " + ".join(f"CAST(:w{i} AS float8) * {m}::int" for i, m in enumerate(match))
     return list(conn.execute(
