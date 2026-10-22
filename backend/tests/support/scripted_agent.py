@@ -64,10 +64,12 @@ def requirement(text: str = "", status: str = "full", units: list | None = None,
 
 
 def intent_part(value: str = "unknown", reference: str = "none", item: int | None = None, topic: str = "",
-                standard_refs: list | None = None) -> dict:
-    """The intent part of an analysis or of a resolution, as the model returns it."""
+                standard_refs: list | None = None, list_id: str = "", item_set: list | None = None,
+                item_scope: str = "item") -> dict:
+    """The intent part of an analysis or of a resolution, as the model returns it (``list_id``, ``item_set`` and ``item_scope``: the list
+    a reference to an item names and the places of a "both" reference, round 22 U12)."""
     return {"intent": value, "reference": reference, "item": item, "topic": topic,
-            "standard_refs": standard_refs or []}
+            "standard_refs": standard_refs or [], "list_id": list_id, "item_set": item_set or [], "item_scope": item_scope}
 
 
 def component(text: str, kind: str = "information", id: str = "", parent: str = "", conditional: bool = False,

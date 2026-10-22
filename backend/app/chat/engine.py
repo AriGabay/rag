@@ -602,6 +602,9 @@ class TurnOutcome:
     # each verified draft with the locator of every source it cites (round 21 U1, KTD9: ``draft_record``); diagnostics only, so a replay
     # rebuilds each source's text from stored data without the model
     drafts: list[dict] = field(default_factory=list)
+    # the lists and tables the final answer printed (round 22 U12, KTD14: ``compose.Composition.lists``, built at compose time), which the
+    # conversation's context stores so a later "השני" or "ה-12" binds to the list the user means
+    lists: list[dict] = field(default_factory=list)
 
 
 def usage_summary(usage: list[dict], **extra) -> dict:
@@ -842,7 +845,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             provider, inp.focus, inp.history, inp.question, inp.focus_documents,
             lambda ids: entities.authorized(ctx, ids), titles, usage, deadline,
             lookup=lambda words: entities.lookup(ctx, words, focus_ids, titles), candidates=inp.candidates or None,
-            prior_units=prior_units or None, items=topic_slot.get("items") or None, listing=inp.listing or None,
+            prior_units=prior_units or None, lists=(inp.slots or {}).get("lists") or None, listing=inp.listing or None,
             topic=topic_slot.get("text") or "")
         if cancelled():
             raise TurnCancelled
@@ -852,6 +855,11 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                 ws.named_documents = tuple(str(d) for d in request.document_ids)
         if request is not None and request.located_unit:
             _settle_unit(ctx, ws, request)
+        if (request is not None and request.relation != "new_question" and request.scope != "set" and not request.entity_changed
+                and not request.intent.professional):
+            # an explicit period the previous question stated carries to a follow-up that names no time and keeps the same property
+            # (round 22 U12, KTD14, R21); the slot's period was dropped with its property if that is no longer visible
+            ws.time = timeframe.carried(ws.time, (inp.slots or {}).get("period"))
         if binding is not None and not resolve.reply_binds(request, inp.question):
             # a message that is not the answer is a new question, whatever number it holds: never forced into the old
             # calculation (the resolution failed: only a number alone is surely the answer)
@@ -935,7 +943,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                            _summary(usage, rounds, reused, turn),
                            _pending(ws, turn, final), composed.spans, done.digest, done.stats, ws.clock.summary(),
                            unit, offered_units=offered, shown_documents=shown_documents, requirements_trace=traces,
-                           item_ledger=report.item_diagnostics(), drafts=drafts)
+                           item_ledger=report.item_diagnostics(), drafts=drafts, lists=composed.lists)
 
     def adopt_analysis() -> None:
         """The collected analysis as the turn's requirements: its components frozen and appended as one item, or the

@@ -807,3 +807,46 @@ def test_u4_a_value_per_dwelling_is_no_value_per_area_in_the_request_note():
         assert resolve.mismatch(req, SimpleNamespace(metric_kind="value")) is None, basis  # no per-area scale was asked
         note = resolve.mismatch(req, SimpleNamespace(metric_kind="value_per_area"))
         assert note and "ליחידת שטח" not in note.split("והתשובה")[0] and basis in note, note
+
+
+# --- round 22 U12 (KTD14, R20, R21): the item set in the schema, the list the user's noun names, the carried date field ---------------------
+
+PAYMENTS = {"id": "m-1#2", "title": "לוח התשלומים", "kind": "תשלום", "total": 3, "message_id": "m-1", "document_ids": [DOC], "age": 0,
+            "items": [{"label": "תשלום ראשון"}, {"label": "תשלום שני"}, {"label": "תשלום שלישי"}]}
+PLOT_LIST = {"id": "m-1#1", "title": "המגרשים בשומה", "kind": "מגרש", "total": 3, "message_id": "m-1", "document_ids": [DOC], "age": 0,
+             "items": [{"label": "מגרש הדקל"}, {"label": "מגרש התמר"}, {"label": "מגרש האלון"}]}
+
+
+def _bind(message: str, claim: dict, lists: list[dict]):
+    r = _resolved(relation="same_datum", standalone_question=message, intent=_intent("property", **claim))
+    return validate(r, RENT_FOCUS, message, authorized, TITLES, lookup_in({DOC}), None, focus_titles=[CORPUS[DOC][0]], lists=lists)
+
+
+def test_ae6_the_second_payment_binds_to_the_payments_list_and_a_bare_second_asks():
+    claim = {"reference": "prior_answer_item", "item": 2}
+    req = _bind("ומה לגבי התשלום השני?", claim, [PLOT_LIST, PAYMENTS])
+    assert req.intent.bound == "item" and req.intent.item_label == "תשלום שני" and req.intent.list_id == "m-1#2"
+    assert not req.clarify and "תשלום שני" in req.standalone_question
+    bare = _bind("ומה לגבי השני?", claim, [PLOT_LIST, PAYMENTS])
+    assert bare.server_clarify and "המגרשים בשומה" in bare.clarify and "לוח התשלומים" in bare.clarify
+    assert bare.intent.item is None and bare.resolution["decisions"]["item"].startswith("ask")
+    only = _bind("ומה לגבי השני?", claim, [PAYMENTS])  # one list: the only plausible one
+    assert only.intent.item_label == "תשלום שני" and not only.clarify
+
+
+def test_both_binds_only_a_two_item_set_and_the_schema_version_is_recorded():
+    pair = PLOT_LIST | {"id": "m-1#3", "total": 2, "items": PLOT_LIST["items"][:2]}
+    claim = {"reference": "prior_answer_item", "item_set": [1, 2], "item_scope": "both"}
+    req = _bind("ומה לגבי שניהם?", claim, [pair])
+    assert req.intent.bound == "item_set" and req.intent.item_set == (1, 2) and req.topic == "מגרש הדקל ומגרש התמר"
+    assert req.resolution["schema_version"] == resolve.SCHEMA_VERSION == 2
+    over_three = _bind("ומה לגבי שניהם?", claim, [PLOT_LIST])
+    assert over_three.server_clarify and "3 פריטים" in over_three.clarify and over_three.intent.item_set == ()
+
+
+def test_the_input_shows_the_lists_and_the_date_field_the_follow_up_refers_to():
+    text = resolve._input(RENT_FOCUS | {"date_field": "valuation"}, [], "ומה לגבי המועד?", [], lists=[PLOT_LIST, PAYMENTS])
+    assert "רשימה m-1#2 «לוח התשלומים» (סוג: תשלום, 3 פריטים):" in text and "3. תשלום שלישי" in text
+    assert "date_field" in text and "valuation" in text
+    assert "date_field" not in resolve._input(RENT_FOCUS, [], "ומה לגבי המועד?", [])
+    assert "date_field" in resolve.POLICY and "המועד" in resolve.POLICY

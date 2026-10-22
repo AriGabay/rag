@@ -201,3 +201,63 @@ def test_the_diagnostics_record_carries_mode_source_switch_anchor_and_requested(
     assert set(d["requested"]) == {"kind", "start", "end", "precision", "text"}
     none = TF.resolve("מה השווי?", pref(True)).as_dict()
     assert none["requested"] is None and none["mode"] == "recent"
+
+
+# --- an explicit period carries to a follow-up that names no time (round 22 U12, KTD14, R21) ------------------------------------------------
+
+
+def stated(question: str, message_id: str = "m-1", on: bool = False) -> dict:
+    """The period a property turn leaves for the next one (``period_of``), from the question that stated it."""
+    period = TF.period_of(TF.resolve(question, pref(on)), message_id)
+    assert period is not None, question
+    return period
+
+
+def test_the_period_a_question_stated_is_what_the_turn_leaves_and_a_turn_on_the_switch_leaves_none():
+    period = stated("מה היה השווי ב-2022?")
+    assert period["source_message_id"] == "m-1" and period["requested"]["start"] == "2022" and period["anchor"] == ANCHOR
+    assert TF.period_of(TF.resolve("ומה לגבי השוכר?", pref(True)), "m-2") is None
+    assert TF.period_of(TF.resolve("ומה לגבי השוכר?", pref(False)), "m-2") is None
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_a_follow_up_that_names_no_time_carries_the_previous_questions_explicit_period_with_the_switch_either_way(on):
+    period = stated("מה היה השווי ב-2022?")
+    follow = TF.carried(TF.resolve("ומה לגבי השוכר?", pref(on)), period)
+    assert follow.mode == "explicit" and follow.source == "carried" and follow.carried_from == "m-1"
+    assert shape(follow.requested) == ("point", "2022", "2022", "year") and follow.prefer_recent is on
+    assert follow.as_dict()["carried_from"] == "m-1" and follow.as_dict()["source"] == "carried"
+    assert "בשאלה קודמת" in TF.block(follow) and "2022" in TF.block(follow)
+
+
+def test_a_follow_up_that_states_its_own_time_keeps_it_and_never_inherits_the_old_one():
+    period = stated("מה היה השווי ב-2022?")
+    own = TF.resolve("ומה היה ב-2024?", pref(True))
+    assert TF.carried(own, period) is own and shape(own.requested) == ("point", "2024", "2024", "year")
+    assert own.source == "question" and own.carried_from is None
+
+
+def test_with_the_latest_switch_on_an_explicit_period_still_wins_and_without_a_period_the_switch_decides():
+    period = stated("מה היה השווי ב-2022?", on=True)
+    on = TF.carried(TF.resolve("ומה לגבי השוכר?", pref(True)), period)
+    assert on.mode == "explicit" and on.requested.start == "2022"  # not "recent": the period wins over the switch
+    assert TF.carried(TF.resolve("ומה לגבי השוכר?", pref(True)), None).mode == "recent"
+    assert TF.carried(TF.resolve("ומה לגבי השוכר?", pref(False)), None).mode == "none"
+
+
+def test_the_period_is_carried_on_from_turn_to_turn_with_its_first_source_and_a_relative_period_keeps_its_days():
+    period = stated("מה היה השווי בשנה שעברה?")
+    assert period["requested"]["kind"] == "relative"
+    second = TF.carried(TF.resolve("ומה לגבי השוכר?", pref(True, "2027-03-01")), period)  # a year later: the same days
+    assert second.requested.kind == "point" and (second.requested.start, second.requested.end) == ("2025", "2025")
+    again = TF.period_of(second, "m-2")
+    assert again["source_message_id"] == "m-1"  # the question that stated it, not the message that carried it
+    third = TF.carried(TF.resolve("ומה לגבי המשכיר?", pref(False)), again)
+    assert third.carried_from == "m-1" and third.requested.start == "2025"
+
+
+@pytest.mark.parametrize("period", [None, {}, {"requested": None}, {"requested": {"kind": "point"}},
+                                    {"requested": {"kind": "open", "start": None, "end": None, "precision": "year"}}])
+def test_a_period_that_does_not_read_as_one_carries_nothing(period):
+    t = TF.resolve("ומה לגבי השוכר?", pref(True))
+    assert TF.carried(t, period) is t

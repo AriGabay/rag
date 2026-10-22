@@ -48,6 +48,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from app.chat import slots
 from app.providers.llm import prompt_attr, prompt_text
 
 if TYPE_CHECKING:
@@ -447,6 +448,9 @@ class Composition:
     # for each character of the final Markdown, its offset in the model's draft (-1: the server's); transient — it is
     # not saved, the final check reads it (``Doc.origins``)
     origin: list[int] = field(default_factory=list)
+    # the lists the final answer printed, built here from its own structure (round 22 U12, KTD14: ``slots.lists_of``) and stored in the
+    # conversation's context; transient like ``origin``
+    lists: list[dict] = field(default_factory=list)
 
 
 def compose(ws, answer: FinalAnswer, report, turn, *, question: str, limit_sentences: list[str] | None = None
@@ -481,7 +485,18 @@ def compose(ws, answer: FinalAnswer, report, turn, *, question: str, limit_sente
     report.mark_markers(doc.renumber("marker", MARKER))
     spans = doc.spans()
     report.mark_partials([(s.ordinal, s.claim_ids) for s in spans if s.kind == "partial_mark"])
-    return Composition(edited.answer(answer), spans, outcomes, ledger, doc.origins())
+    return Composition(edited.answer(answer), spans, outcomes, ledger, doc.origins(),
+                       [] if edited.status == "clarification" else _printed_lists(ws, doc.text, spans))
+
+
+def _printed_lists(ws, markdown: str, spans) -> list[dict]:
+    """The lists and tables the composed answer printed (round 22 U12, KTD14, R20), built once, here, from the answer's own structure and
+    never again from stored Markdown: the text without the server's own spans, each list with the documents its items cite (an item that
+    cites none falls back to the documents the answer cites), so the conversation can gate every list apart (R22)."""
+    from app.chat import coverage
+
+    text = strip_server_spans(markdown, spans).replace("\\", "")  # a citation may be written with escaped brackets
+    return slots.lists_of(text, docs_of=lambda t: coverage.cited_documents(ws, t), fallback_documents=coverage.cited_documents(ws, text))
 
 
 def _unread_notice(ws, doc: Doc, report, question: str) -> list[dict]:

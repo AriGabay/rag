@@ -20,8 +20,13 @@ What is not time stays out. The numbers that ``intent`` reads as a block, a parc
 with the very patterns ``intent`` masks them with; prices, areas, percentages, quarters and street numbers are refused by
 the shared parser (``app.platform.dates``), which also refuses a bare year that no date word introduces.
 
-The result is the turn's own: it never writes ``ws.intent``, ``ws.named_documents``, the unit focus or the slots (R16), and
-nothing here is carried to the next turn — the next message resolves its own time from its own recorded state."""
+The result is the turn's own: it never writes ``ws.intent``, ``ws.named_documents``, the unit focus or the slots (R16). Round 11 carried
+nothing to the next turn: the next message resolved its own time from its own recorded state. Round 22 U12 (KTD14, R21) supersedes that
+for ONE case: an explicit period the previous QUESTION stated (``period_of``, stored with the property in the conversation's slots)
+carries to a follow-up that names no time and keeps the same property (``carried``): the turn is ``explicit``, its ``source`` is
+``carried``, and it beats the "latest" switch like any explicit time. It expires when the property changes, when the new question states
+time (that time is the one the question gave) and with the property's permission; a professional turn leaves it dormant. Nothing else is
+carried: the switch is still read from the state each message was recorded with."""
 
 from __future__ import annotations
 
@@ -66,11 +71,14 @@ class TimeMode:
     anchor: date = field(default_factory=today)
     requested: Requested | None = None
     prefer_recent: bool = False
+    carried_from: str | None = None  # the message whose question stated the period, when ``source`` is ``carried`` (round 22 U12)
 
     def as_dict(self) -> dict:
-        """The diagnostics record (``resolution["time"]``): mode, source, switch, anchor, requested time."""
+        """The diagnostics record (``resolution["time"]``): mode, source, switch, anchor, requested time (and, for a carried period,
+        the message that stated it)."""
         return {"mode": self.mode, "source": self.source, "prefer_recent": self.prefer_recent,
-                "anchor": self.anchor.isoformat(), "requested": self.requested.as_dict() if self.requested else None}
+                "anchor": self.anchor.isoformat(), "requested": self.requested.as_dict() if self.requested else None,
+                **({"carried_from": self.carried_from} if self.carried_from else {})}
 
 
 # --- reading the question ----------------------------------------------------------------------------------------------
@@ -220,6 +228,40 @@ def resolve(question: str, time_preference: dict | None) -> TimeMode:
     return TimeMode("recent" if prefer else "none", "switch", anchor, None, prefer)
 
 
+# --- the period that outlives its question (round 22 U12, KTD14, R21) --------------------------------------------------------------
+
+
+def period_of(time: TimeMode, message_id: str | None) -> dict | None:
+    """The period this turn leaves for the conversation's slots (``slots.carry``): the explicit time its own question stated
+    (``source`` ``question``, with this message as its source), or the one it carried (with the message that stated it); None for a turn
+    that ran on the switch. A relative period is stored as the dates it resolved to (the anchor is kept beside), so a later turn means the
+    same days."""
+    if time.mode != "explicit" or time.requested is None:
+        return None
+    return {"requested": time.requested.as_dict(), "anchor": time.anchor.isoformat(),
+            "source_message_id": time.carried_from if time.source == "carried" else message_id}
+
+
+def carried(time: TimeMode, period: dict | None) -> TimeMode:
+    """The turn's time when it keeps the property of the turn before: a question that stated time keeps its own (an explicit period
+    always beats a carried one); otherwise the previous question's explicit ``period`` (``period_of``) is carried, making the turn
+    ``explicit`` with ``source`` ``carried`` - over the "latest" switch, either way. A period that does not read as one (an older or
+    damaged record) carries nothing. The caller decides whether the property is the same; this only applies the period."""
+    if time.source == "question" or not isinstance(period, dict) or not isinstance(period.get("requested"), dict):
+        return time
+    r = period["requested"]
+    try:
+        kind = "point" if r["kind"] == "relative" and r.get("start") == r.get("end") else (
+            "range" if r["kind"] == "relative" else r["kind"])
+        requested = Requested(kind, r.get("start"), r.get("end"), r["precision"], str(r.get("text") or ""))
+    except (KeyError, TypeError):
+        return time
+    if requested.start is None and requested.end is None:
+        return time
+    return TimeMode("explicit", "carried", time.anchor, requested, time.prefer_recent,
+                    carried_from=str(period.get("source_message_id") or "") or None)
+
+
 # --- the model-facing block ---------------------------------------------------------------------------------------------
 
 # the words that qualify a "latest" claim under partial coverage (round 12 U8, R12, KTD8; session-settled): the latest datum
@@ -270,6 +312,9 @@ def block(time: TimeMode) -> str | None:
     if time.mode == "explicit" and time.requested is not None:
         r = time.requested
         lines = [f"- הזמן המבוקש: {_describe(r)}; כפי שנכתב בשאלה: «{prompt_text(r.text)}»."]
+        if time.source == "carried":
+            lines[0] = (f"- הזמן המבוקש: {_describe(r)}; המשתמש ביקש אותו בשאלה קודמת על אותו נכס («{prompt_text(r.text)}»), "
+                        "וההודעה הנוכחית אינה מציינת זמן אחר.")
         if r.kind == "relative":
             lines.append(f"- תאריך העוגן של התקופה היחסית: {time.anchor.isoformat()}.")
         return _EXPLICIT_HEAD + "\n".join(lines) + "\n" + _EXPLICIT_RULES

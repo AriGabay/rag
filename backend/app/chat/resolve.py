@@ -31,11 +31,14 @@ metric, unit, scale, period and area basis. The server then validates the parse:
   beyond what the focus holds. A word that titles share is none, so a general question of the trade ("professional")
   names nothing: it inherits no document, unit or measure from the conversation and the conversation's property is left
   as it was;
-- **references** (round 10 U7; KTD5-KTD7; ``app.chat.slots``): the conversation's slots are given to the call — the items of
-  the list the previous answer printed and the professional topic — and a reference binds only to what the slots hold. An
-  ordinal the model reads as ``prior_answer_item`` binds only on an ordinal form in the message and an item that exists;
-  the standalone question then names the item, and an ordinal that also fits the clarification's candidates or a listing
-  of the previous turn gets one focused question from the server. A pronoun with ``reference: topic`` takes the topic
+- **references** (round 10 U7; KTD5-KTD7; ``app.chat.slots``; round 22 U12, KTD14): the conversation's slots are given to the call —
+  the lists the last answers printed (with ids, titles and every item, up to ``slots.MAX_LISTS``) and the professional topic — and a
+  reference binds only to what the slots hold. An ordinal the model reads as ``prior_answer_item`` binds only on an ordinal form in the
+  message ("השני", "ה-12" when a list that long is in scope, "האחרון", "שניהם") and an item that exists in the list the server SELECTS
+  (the user's noun, else the only list the place fits, else the latest answer's); with several lists and no noun the server asks one
+  question that names them (``Request.clarify``). The standalone question then names the item (or both items), and an ordinal that also
+  fits the clarification's candidates or a listing of the previous turn gets one focused question from the server. The structured
+  schema's version is ``SCHEMA_VERSION`` (the item set was added in version 2); the diagnostics record it. A pronoun with ``reference: topic`` takes the topic
   slot's words, and a question that points at the conversation's property (or mixes the trade with it) restores the
   property even as a new question, unless it names another. A pending clarification binds only the message that refers to
   it: a candidate named by the model's reading of the reply as an answer, by an ordinal or a number alone, or by a complete
@@ -133,6 +136,9 @@ _FAMILY = {"ratio": "proportion", "rate": "proportion"}
 _UNSPECIFIC = {"unknown", "other"}
 
 RESOLVE_OUTPUT_TOKENS = 4000  # the resolution with the request's component list (KTD1)
+# the version of the structured resolution (round 22 U12, KTD14): 2 added the list id and the item set to the intent part. It is recorded in
+# the resolution's diagnostics, so a message resolved by an older schema is told apart
+SCHEMA_VERSION = 2
 
 KIND_OF_RELATION = {"new_question": "new_topic", "same_datum": "follow_up", "correction": "correction",
                     "metric_change": "follow_up", "scale_change": "follow_up",
@@ -376,13 +382,13 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
              lookup: Callable[[str], entities.Outcome] | None = None,
              candidates: list[dict] | None = None, focus_titles: list[str] | None = None,
              user_texts: list[str] | None = None, prior_units: list[dict] | None = None,
-             items: list[str] | None = None, listing: list[dict] | None = None, topic: str = "") -> Request:
+             lists: list[dict] | None = None, listing: list[dict] | None = None, topic: str = "") -> Request:
     """``titles``: every title the user may see (the words that can name a document), or a provider of them, read
     only when needed; ``focus_titles``: the titles of the documents the conversation was about; ``user_texts``: what
     the user wrote in the conversation (the message alone when not given), which a parameter given by the user
     quotes; ``prior_units``: the units of the files the previous turn touched, when that turn was the model's own
     question between appraisals (it left no candidates): a reply that states one's complete name selects it;
-    ``items``: the labels of the list the previous answer printed (an ordinal can name one), ``listing``: the documents a
+    ``lists``: the lists the last answers printed (an ordinal can name an item of one), ``listing``: the documents a
     listing of the previous turn offered, in order ({document_id, title}), ``topic``: the conversation's topic slot (a
     pronoun can bind to it) — round 10 U7, KTD6."""
     decisions: dict[str, str] = {}
@@ -412,7 +418,7 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
     vocabulary = titles() if callable(titles) else titles
     said = " ".join(quotes[n] for n in ("subject", "documents") if n in quotes)  # the model's words for a new entity
     settled = intent_mod.settle(resolved.intent, message, vocabulary, scope=resolved.scope, has_property=bool(focus),
-                                quoted=said, items=items or (), topic=topic)
+                                quoted=said, lists=lists or (), topic=topic)
     professional = settled.professional
     decisions["intent"] = settled.value
     if settled.reasons:
@@ -594,6 +600,7 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
     out.components, out.components_status = analysis.items, analysis.status
     decisions["components"] = "; ".join([analysis.status, *analysis.decisions])
     out.resolution["intent"] = settled.as_dict()
+    out.resolution["schema_version"] = SCHEMA_VERSION
     parse = resolved.model_dump()
     # only documents the user may see are kept, even in diagnostics
     parse["document_ids"] = sorted(authorized(parse["document_ids"])) if parse["document_ids"] else []
@@ -646,21 +653,33 @@ MSG_TWO_LISTS = ("ההפניה למספר {n} מתאימה ליותר מדבר �
 
 def _bind_references(out: Request, resolved: ResolvedRequest, settled: intent_mod.Intent, topic: str,
                      decisions: dict) -> None:
-    """What the references of the message bound to (round 10 U7; KTD6): an ordinal accepted for an item of the previous
-    answer's list names that item in the standalone question and is the request's topic; a pronoun bound to the topic slot
-    takes the slot's words; a rejected ordinal is recorded with its reason. The property slot is restored (or not) with the
-    documents."""
+    """What the references of the message bound to (round 10 U7; KTD6; round 22 U12, KTD14): an ordinal accepted for an item of a list
+    names that item in the standalone question and is the request's topic; "both" names the two items of a two-item list; a message that
+    fits several lists and names none gets the server's one question that names them (``clarify``); a pronoun bound to the topic slot takes
+    the slot's words; a rejected ordinal is recorded with its reason. The property slot is restored (or not) with the documents."""
     claim = resolved.intent
     if claim is not None and claim.reference == "prior_answer_item":
         if settled.bound == "item":
-            decisions["item"] = f"bound: {settled.item} «{settled.item_label}»"
+            decisions["item"] = f"bound: {settled.item} «{settled.item_label}» of «{settled.list_title}»"
             if _norm(settled.item_label) not in _norm(out.standalone_question):
                 out.standalone_question = f"{out.standalone_question.rstrip('?. ')} — הכוונה ל«{settled.item_label}»"
                 decisions["item"] += "; the standalone question now names it"
+        elif settled.bound == "item_set":
+            named = " ו".join(f"«{x}»" for x in settled.item_labels)
+            decisions["item"] = f"bound: both items {named} of «{settled.list_title}»"
+            if not all(_norm(x) in _norm(out.standalone_question) for x in settled.item_labels):
+                out.standalone_question = f"{out.standalone_question.rstrip('?. ')} — הכוונה ל{named}"
+                decisions["item"] += "; the standalone question now names them"
+        elif settled.ask:
+            decisions["item"] = "ask: " + settled.item_rejected
+            if not out.clarify:  # one question, the server's own words: the lists the user saw, nothing of the model's
+                out.clarify, out.server_clarify = settled.ask, True
         else:
             decisions["item"] = "rejected: " + settled.item_rejected
     if settled.bound == "item":
         out.topic = settled.item_label
+    elif settled.bound == "item_set":
+        out.topic = " ו".join(settled.item_labels)
     elif settled.bound == "topic":
         out.topic = topic
         decisions["topic"] = f"bound to the topic slot «{topic}»"
@@ -692,8 +711,22 @@ def _note_two_lists(out: Request, settled: intent_mod.Intent, candidates: list[d
                                                                                               and len(candidates) >= n else "the listing")
 
 
+def _lists_block(lists: list[dict]) -> str:
+    """The lists the last answers printed, as the call is shown them (round 22 U12): each with its id, title, kind and count, its items by
+    their number, and - for a list the answer printed more of than was stored - the number it printed."""
+    out = []
+    for entry in lists:
+        total = max(int(entry.get("total") or 0), len(entry.get("items") or []))
+        head = f"רשימה {entry.get('id', '')}" + (f" «{prompt_text(entry['title'])}»" if entry.get("title") else "")
+        head += (f" (סוג: {prompt_text(entry['kind'])}, " if entry.get("kind") else " (") + f"{total} פריטים" + (
+            ", מתשובה קודמת" if entry.get("age") else "") + "):"
+        out.append("\n".join([head, *(f"{n}. {prompt_text(i['label'])}" for n, i in enumerate(entry["items"], 1))]))
+    return ("הרשימות שהתשובות האחרונות נתנו (השרת בנה אותן מהתשובות; reference prior_answer_item עם list_id ו-item או item_set מצביעים על "
+            "המזהה והמספר שלהם):\n" + "\n\n".join(out))
+
+
 def _input(focus: dict | None, history: list, message: str, documents: list[dict],
-           candidates: list[dict] | None = None, items: list[str] | None = None, topic: str = "") -> str:
+           candidates: list[dict] | None = None, lists: list[dict] | None = None, topic: str = "") -> str:
     parts = []
     if focus:
         def label(labels: dict, key: str) -> str:
@@ -706,6 +739,8 @@ def _input(focus: dict | None, history: list, message: str, documents: list[dict
             f"- period: {label(PERIOD_LABELS, 'period')}", f"- area_basis: {prompt_text(focus.get('area_basis') or '')}",
             f"- vat: {label(VAT_LABELS, 'vat')}", f"- subject: {prompt_text(focus.get('subject') or '')}",
             f"- document_ids: {', '.join(focus.get('document_ids') or [])}",
+            *([f"- date_field (סוג התאריך של הנתון, אליו מתייחס \"המועד\"): {prompt_text(focus['date_field'])}"]
+              if focus.get("date_field") else []),
             *([f"- שומה בתוך הקובץ: {prompt_text(focus['located_unit'].get('display') or MSG_NO_TITLE)}"]
               if focus.get("located_unit") else [])]))
     if documents:
@@ -716,9 +751,8 @@ def _input(focus: dict | None, history: list, message: str, documents: list[dict
             f"- {prompt_text(entities.candidate_label(c))}" for c in candidates))
     if topic:
         parts.append("הנושא המקצועי שהשיחה עסקה בו:\n" + prompt_text(topic))
-    if items:
-        parts.append("פריטי הרשימה האחרונה שתשובה נתנה (השרת חילץ אותם מהתשובה; reference prior_answer_item ו-item מצביעים "
-                     "על המספר שלהם):\n" + "\n".join(f"{n}. {prompt_text(label)}" for n, label in enumerate(items, 1)))
+    if lists:
+        parts.append(_lists_block(lists))
     if history:
         # an answer's system notes (round 22 U11, KTD10) follow it as their own lines: the 400-character cut of the prose never takes one
         lines = ["\n".join([f"{'משתמש' if m.role == 'user' else 'עוזר'}: {prompt_text(m.content[:400])}",
@@ -734,15 +768,15 @@ def resolve(provider: LLMProvider, focus: dict | None, history: list, message: s
             usage: list[dict],
             deadline: float | None = None, lookup: Callable[[str], entities.Outcome] | None = None,
             candidates: list[dict] | None = None, prior_units: list[dict] | None = None,
-            items: list[str] | None = None, listing: list[dict] | None = None, topic: str = "") -> Request | None:
+            lists: list[dict] | None = None, listing: list[dict] | None = None, topic: str = "") -> Request | None:
     """The validated request of a follow-up, or None when the call failed (the turn then goes on as before).
     ``documents``: the documents the conversation was about; ``authorized`` and ``titles``: what the user may see;
     ``lookup``: the documents the user's words name; ``candidates``: what the previous clarification offered;
     ``prior_units``: the units the model's own previous question may have been between (see ``validate``);
-    ``items``, ``listing`` and ``topic``: the conversation's slots a reference can bind to (see ``validate``)."""
+    ``lists``, ``listing`` and ``topic``: the conversation's slots a reference can bind to (see ``validate``)."""
     provider = for_purpose(provider, Purpose.RESOLVE)
     r = call_structured(provider, Purpose.RESOLVE, POLICY,
-                        _input(focus, history, message, documents, candidates, items, topic),
+                        _input(focus, history, message, documents, candidates, lists, topic),
                         ResolvedRequest, max_output_tokens=RESOLVE_OUTPUT_TOKENS, deadline=deadline)
     usage.append(usage_entry("resolve", r, provider.model))
     if r.status != CallStatus.OK or r.parsed is None:
@@ -750,7 +784,7 @@ def resolve(provider: LLMProvider, focus: dict | None, history: list, message: s
     users = [m.content for m in history if getattr(m, "role", None) == "user"]
     return validate(r.parsed, focus, message, authorized, titles, lookup, candidates,
                     focus_titles=[d["title"] for d in documents], user_texts=[*users, message],
-                    prior_units=prior_units, items=items, listing=listing, topic=topic)
+                    prior_units=prior_units, lists=lists, listing=listing, topic=topic)
 
 
 _REPLY_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
@@ -861,7 +895,11 @@ def requested_block(req: Request, unit_handle: str | None = None) -> str:
     if professional:
         lines.append(PROFESSIONAL_NOTE)
     if req.intent.bound == "item":
-        lines.append(f"- ההודעה מפנה לפריט {req.intent.item} ברשימה שבתשובה הקודמת: «{prompt_text(req.intent.item_label)}»")
+        lines.append(f"- ההודעה מפנה לפריט {req.intent.item} ברשימה «{prompt_text(req.intent.list_title)}»: "
+                     f"«{prompt_text(req.intent.item_label)}»")
+    elif req.intent.bound == "item_set":
+        lines.append(f"- ההודעה מפנה לשני הפריטים ברשימה «{prompt_text(req.intent.list_title)}»: "
+                     + " ו".join(f"«{prompt_text(x)}»" for x in req.intent.item_labels))
     if req.topic and req.intent.value in slots.TOPIC_INTENTS:
         lines.append(f"- נושא מקצועי: {prompt_text(req.topic)}")
     if req.intent.no_list:

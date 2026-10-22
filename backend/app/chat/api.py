@@ -38,13 +38,15 @@ migration: ``messages.answer`` is JSON. The next turn's input carries it with ea
 reopens its passage (``_pending_refs``), so the reply is bound to the parameter and nothing is searched again.
 
 The conversation's slots (round 10 U7; KTD4-KTD7, R10-R15) are stored beside it, in ``answer.context`` (``app.chat.slots``;
-schema version 1, no migration): the topic with the items the answer listed, the property with its task parameters, the
-sources cited and the clarification asked. ``_turn_input`` reads them back from the **latest** assistant message, chosen
+schema version 2 since round 22 U12, no migration): the named lists the last answers printed (built when the answer was composed), the
+topic, the property with its task parameters and the period its question stated, the sources cited and the clarification asked. ``_turn_input`` reads them back from the **latest** assistant message, chosen
 before the hidden-message filter: when that message is hidden the turn has no slot at all, so an older message's pending
 clarification is never revived. The property slot is re-authorized each turn and dropped whole (its subject text included)
 when a document of it is no longer visible; it is not a document of the message, so a professional answer that carries it
-is not hidden by it. ``context`` is server-only: ``_message_json`` never sends it. A message stored before the slots is
-read from the fields it had (``_legacy_context``), so older conversations behave as before.
+is not hidden by it; each carried list is gated apart by its own documents (``_authorize_lists``), so hiding one list's document drops
+that list alone. ``context`` is server-only: ``_message_json`` never sends it. A context of version 1 is read as one list
+(``slots.upgrade_v1``), and a message stored before the slots is read from the fields it had (``_legacy_context``, the only reader of
+the Markdown list extractor), so older conversations behave as before.
 """
 
 from __future__ import annotations
@@ -810,7 +812,7 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
     pending = None
     listing: list[dict] = []
     if last is not None:
-        context, notes = _authorize_property(conn, _read_context(last.answer))
+        context, notes = _authorize_context(conn, _read_context(last.answer))
         if (asked := context.get("pending")) is not None:
             payload = asked.get("payload") or {}
             # the documents a server clarification offered: the reply is resolved among them
@@ -834,18 +836,22 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
 
 
 def _read_context(answer: dict) -> dict:
-    """The slots an answer left: its stored context, or — for a message written before the slots — the same slots read from
-    the fields it had (``_legacy_context``)."""
+    """The slots an answer left: its stored context (a version-1 context read as version 2), or - for a message written before the slots -
+    the same slots read from the fields it had (``_legacy_context``)."""
     stored = answer.get("context")
     if isinstance(stored, dict) and stored.get("version") == slots.VERSION:
         return stored
+    if isinstance(stored, dict) and stored.get("version") == 1:
+        return slots.upgrade_v1(stored)
     return _legacy_context(answer)
 
 
 def _legacy_context(answer: dict) -> dict:
     """The slots of an answer stored before ``answer.context``, so an older conversation behaves exactly as it did: the
     focus (or, when it named no datum, the request it answered) with the unit, the candidates a server clarification
-    offered (or, for the model's own question, the files that turn touched) and the parameter a clarification asked for."""
+    offered (or, for the model's own question, the files that turn touched) and the parameter a clarification asked for. This is the
+    ONLY reader of a list out of stored Markdown (round 22 U12, R2): an answer with no lists of its own has the one list its text printed,
+    read by the legacy extractor and resting on the answer's documents; an answer composed since has its lists from compose time."""
     prop, params = slots.split_focus(_with_unit(answer.get("focus") or _request_focus(answer.get("request")),
                                                 answer.get("unit")))
     pending = None
@@ -854,8 +860,10 @@ def _legacy_context(answer: dict) -> dict:
                                 (answer.get("request") or {}).get("candidates") or answer.get("offered_units") or [],
                                 (answer.get("request") or {}).get("named_document_ids") or [], _clarified_documents(answer),
                                 None)
-    return {"version": slots.VERSION, "topic": None, "property": prop, "params": params,
-            "sources": [], "pending": pending}
+    md = strip_server_spans(answer.get("markdown") or "", answer.get(SERVER_SPANS_FIELD))
+    lists = [] if answer.get("status") == "clarification" else slots.legacy_lists(md, _answer_documents(answer) - {None})
+    return {"version": slots.VERSION, "topic": None, "lists": slots.stamp(lists, answer.get("id")), "tombstones": [],
+            "property": prop, "params": params, "period": None, "sources": [], "pending": pending}
 
 
 def _clarified_documents(answer: dict) -> list[str]:
@@ -879,15 +887,34 @@ def _pending_slot(parameter: dict | None, candidates: list[dict], named: list[st
     return {"kind": "parameter" if parameter is not None else "candidates", "payload": payload, "asked_at": asked_at}
 
 
+def _authorize_context(conn: Connection, context: dict) -> tuple[dict, dict[str, str]]:
+    """The context with the property slot and each carried list checked against what the user sees now (KTD4, KTD14, R22)."""
+    context, notes = _authorize_property(conn, context)
+    context, more = _authorize_lists(conn, context)
+    return context, notes | more
+
+
 def _authorize_property(conn: Connection, context: dict) -> tuple[dict, dict[str, str]]:
     """The context with its property slot checked against what the user sees now (KTD4): a slot with any document no
-    longer visible is dropped whole — the subject text and the task parameters with it — and the drop is recorded. The
-    slot is not a document of the message, so this check is its only gate."""
+    longer visible is dropped whole - the subject text, the task parameters and the requested period with it (a period belongs to its
+    property and never outlives it) - and the drop is recorded. The slot is not a document of the message, so this check is its only
+    gate."""
     ids = slots.property_documents(context)
     if ids and not ids <= _visible_ids(conn, ids):
-        return context | {"property": None, "params": None}, {"property": "dropped: a document of the property slot is "
-                                                                          "no longer visible"}
+        return context | {"property": None, "params": None, "period": None}, {
+            "property": "dropped: a document of the property slot is no longer visible"}
     return context, {}
+
+
+def _authorize_lists(conn: Connection, context: dict) -> tuple[dict, dict[str, str]]:
+    """The context with each carried list checked by its own documents (round 22 U12, R22): a list with a document no longer visible is
+    dropped alone (its id kept as a tombstone) and no other list is renumbered, so the lists of still-visible documents stay usable. The
+    rest of the answer is gated by the hidden-message filter (``_hidden``), which a list of the latest answer already passes."""
+    ids = slots.list_documents(context)
+    if not ids:
+        return context, {}
+    context, dropped = slots.gate_lists(context, _visible_ids(conn, ids))
+    return context, ({"lists": "dropped: " + ", ".join(dropped) + " (a document of the list is no longer visible)"} if dropped else {})
 
 
 def _listing(conn: Connection, answer: dict) -> list[dict]:
@@ -1099,24 +1126,32 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
 
 def _context(outcome: engine.TurnOutcome, payload: dict, previous: dict | None, message_id: str | None) -> dict:
     """The conversation's slots after this answer (``slots.carry``; KTD4): the property and its parameters this turn left
-    (a professional turn leaves the previous ones unchanged, dormant), the topic with the items the answer's text listed,
-    the sources it cited and the clarification it asks. The property slot is not registered in ``_answer_documents``:
+    (a professional turn leaves the previous ones unchanged, dormant), the period its question stated, the topic, the lists the answer
+    printed, the sources it cited and the clarification it asks. The property slot is not registered in ``_answer_documents``:
     ``_turn_input`` checks it again every turn."""
     ws, a = outcome.workspace, outcome.answer
     request = payload.get("request") or {}
     intent = ws.intent
     prop, params = slots.split_focus(_property_focus(payload, previous))
+    period = timeframe.period_of(ws.time, message_id)  # the explicit time this turn's question stated, or the one it carried
+    kept = (previous or {}).get("property")
+    if prop is not None and kept and not request.get("entity_changed") and not prop["document_ids"] and not prop.get("located_unit"):
+        # a follow-up that changed only the metric (or nothing) keeps the property (R21): an answer whose focus declared the new datum
+        # without repeating its documents does not empty the property slot - only the metric parameters are the new ones
+        prop = {"document_ids": list(kept.get("document_ids") or []), "located_unit": kept.get("located_unit"),
+                "subject": prop["subject"] or kept.get("subject") or ""}
     if prop is None and previous and not request.get("entity_changed"):
         # a turn that found no datum and moved nowhere (its parse failed, the model asked, a limit was reached) leaves
         # the conversation's property where it was: dormant, as a professional turn leaves it
         prop, params = previous.get("property"), previous.get("params") if previous.get("property") else None
+        period = period or previous.get("period")
     topic = ""
     if intent in slots.TOPIC_INTENTS:
         said = ((outcome.resolution or {}).get("intent") or {}).get("topic") or ""
         current = next((m["text"] for m in ws.user_messages if m.get("current")), "")
         topic = request.get("topic") or said or request.get("standalone_question") or current
-    items = [] if outcome.server_asked else slots.extract_items(
-        strip_server_spans(a.answer_markdown, payload.get(SERVER_SPANS_FIELD)))
+    # the lists of the answer were built when it was composed (``compose.compose``): never read back out of the Markdown (round 22 U12)
+    lists = [] if outcome.server_asked else outcome.lists
     seen: set[tuple] = set()
     cited = []
     for src in payload["sources"]:
@@ -1132,8 +1167,17 @@ def _context(outcome: engine.TurnOutcome, payload: dict, previous: dict | None, 
         # from the history, so the files the turn touched are no longer a pool a reply is looked up in
         asked = _pending_slot(payload.get("pending"), request.get("candidates") or payload.get("offered_units") or [],
                               request.get("named_document_ids") or [], [], datetime.now(UTC).isoformat(timespec="seconds"))
-    return slots.carry(previous, intent=intent, property=prop, params=params, topic=topic, items=items,
-                       message_id=message_id, sources=cited, pending=asked)
+    if prop is not None and (date_field := _date_field(payload)):
+        params = (params or {}) | {"date_field": date_field}  # what "ומה לגבי המועד" refers to: the date of this datum
+    return slots.carry(previous, intent=intent, property=prop, params=params, topic=topic, lists=lists,
+                       message_id=message_id, sources=cited, pending=asked, period=period)
+
+
+def _date_field(payload: dict) -> str:
+    """The kind of date the datum this answer gave carries (``valuation``, ``transaction``, ``stated``, ``range``), from the timeline rows
+    it stands on: what the next turn's "המועד" refers to. Empty when the answer gave no dated datum."""
+    rows = (payload.get("time") or {}).get("timeline") or []
+    return next((r["date_kind"] for r in rows if isinstance(r, dict) and r.get("date_kind")), "")
 
 
 def _property_focus(payload: dict, previous: dict | None) -> dict | None:

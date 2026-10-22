@@ -210,7 +210,9 @@ def test_an_appraisal_date_in_the_question_is_a_point_and_leaves_the_property_sl
     assert _slots(setup, two)["property"] == _slots(setup, one)["property"]
 
 
-def test_the_time_block_does_not_carry_to_the_next_turn(client, setup, monkeypatch):
+def test_the_explicit_period_of_the_previous_question_carries_to_a_follow_up_that_names_no_time_on_the_same_property(client, setup, monkeypatch):
+    """Round 22 U12 (KTD14, R21) supersedes round 11's "nothing carried" for this one case: the question gave 2022, the follow-up names no
+    time and keeps the property, so it runs ``explicit`` with ``source`` ``carried`` - and the time block says where the period came from."""
     parse = _resolution(relation="same_datum", intent=intent_part("property", "conversation_property"),
                         document_ids=[setup.rent])
     first = rent_agent(setup)
@@ -222,8 +224,10 @@ def test_the_time_block_does_not_carry_to_the_next_turn(client, setup, monkeypat
     _next(monkeypatch, second)
     two = ask(client, cid, "ומה היה היוון ההכנסה?")
     assert two["status"] == "done", two
-    assert TIME_BLOCK not in first_item(second)  # nothing of the earlier question's time reaches this turn
-    assert diagnostics(client, two)["time"]["mode"] == "none"
+    assert TIME_BLOCK in first_item(second) and "2022" in first_item(second) and "בשאלה קודמת" in first_item(second)
+    t = diagnostics(client, two)["time"]
+    assert (t["mode"], t["source"], t["carried_from"]) == ("explicit", "carried", one["id"])
+    assert (t["requested"]["kind"], t["requested"]["start"]) == ("point", "2022")
 
 
 def test_a_professional_question_after_a_property_turn_is_unchanged_by_the_switch(client, setup, monkeypatch):

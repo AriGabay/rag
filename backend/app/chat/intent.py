@@ -34,11 +34,13 @@ no claim at all (a missing or invalid parse: the search-only path and a failed a
 follow) is the intent ``property`` when the message holds evidence and ``unknown`` otherwise — ``unknown`` runs no
 lookup and no selection. ``set`` mirrors ``scope``.
 
-A reference to the conversation is settled the same way (round 10 U7; KTD6): ``prior_answer_item`` with ``item: n`` binds
-only when the message holds an ordinal form (an ordinal word, a digit, "האחרון/ה") and the previous answer's item n
-exists (``slots.check_item``); otherwise the reference becomes ``none`` and the reason is recorded — with ``no_list`` when
-an ordinal was written and the previous answer gave no list. ``topic`` and ``conversation_property`` bind to the topic or
-the property slot when it exists.
+A reference to the conversation is settled the same way (round 10 U7; KTD6; round 22 U12, KTD14): ``prior_answer_item`` binds
+only on the message's own words (an ordinal word, a number within a list in scope such as "ה-12", "האחרון/ה", or "שניהם")
+and to a list the conversation holds (``slots.bind``). The list is chosen by the user's noun, else the only list the place fits,
+else the most recent answer's, else the server asks one question that names the lists (``Intent.ask``); the model's claim
+(``item``, ``list_id``, ``item_set``, ``item_scope``) is validated against the SELECTED list. "שניהם" binds only to a two-item
+list. Otherwise the reference becomes ``none`` and the reason is recorded — with ``no_list`` when an ordinal was written and
+the conversation holds no list. ``topic`` and ``conversation_property`` bind to the topic or the property slot when it exists.
 """
 
 from __future__ import annotations
@@ -48,7 +50,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.chat import contexts, entities, slots
 from app.chat.slots import MIXED, PROFESSIONAL  # noqa: F401 - MIXED is read as ``intent.MIXED`` by the engine
@@ -74,13 +76,18 @@ class StandardRef(_Strict):
 
 
 class IntentClaim(_Strict):
-    """The intent as the model returns it (all fields required by the strict schema)."""
+    """The intent as the model returns it (all fields required by the strict schema). Round 22 U12 (KTD14): ``list_id`` - the id of
+    the list ``item`` is a place in ("" when none is named); ``item_set`` - the places a "both" reference names; ``item_scope`` - ``both``
+    for "שניהם"/"שתיהן", else ``item``. The server validates them against the list it selects, never trusting them alone."""
 
     intent: Value
     reference: Reference
     item: int | None
     topic: str
     standard_refs: list[StandardRef]
+    list_id: str = ""
+    item_set: list[int] = Field(default_factory=list)
+    item_scope: Literal["item", "both"] = "item"
 
 
 POLICY = """intent — על מה הבקשה, לפי משמעות ההודעה בהקשר השיחה ולא לפי מילים שמופיעות גם בשמות מסמכים:
@@ -96,8 +103,11 @@ POLICY = """intent — על מה הבקשה, לפי משמעות ההודעה ב
 - reference — במה ההודעה נשענת: none — בלי הפניה; conversation_property — הנכס שבמרכז השיחה ("הנכס הזה", "שם");
   named_entity — נכס או מסמך שההודעה נוקבת בו; prior_answer_item — פריט ברשימה שהתשובה הקודמת נתנה; topic — נושא
   מקצועי שהשיחה עסקה בו; clarification — תשובה לשאלת הבהרה.
-- item — המספר הסידורי של הפריט שההודעה מצביעה עליו ברשימה שהתשובות נתנו ("השני", "3", "האחרון" — מספרו של הפריט האחרון);
-  אחרת null. prior_answer_item רק כשההודעה כוללת מילת סדר או ספרה, והרשימה ניתנה.
+- item — המספר הסידורי של הפריט שההודעה מצביעה עליו ברשימה שהתשובות נתנו ("השני", "3", "ה-12", "האחרון" — מספרו של הפריט
+  האחרון ברשימה); אחרת null. prior_answer_item רק כשההודעה כוללת מילת סדר או ספרה, והרשימה ניתנה.
+- list_id — מזהה הרשימה שהפריט שייך לה, לפי מה שההודעה אומרת עליה ("התשלום השני" — רשימת התשלומים); ריק כשההודעה אינה
+  בוחרת רשימה. item_set — מספרי הפריטים כש-item_scope=both ("שניהם", "שתיהן" — רק רשימה של שני פריטים), אחרת []. item_scope —
+  both רק כשההודעה אומרת "שניהם" או "שתיהן", אחרת item. השרת בוחר את הרשימה בעצמו ושואל את המשתמש כשיש כמה רשימות מתאימות.
 - topic — הנושא המקצועי במילות המשתמש כשהבקשה professional או mixed; אחרת ריק.
 - standard_refs — הפניות לתקן ולסעיף כפי שנכתבו (standard, section; חלק שלא נכתב — ריק). מספר שאחרי "תקן" או "סעיף" הוא
   הפניה מקצועית, לא כתובת ולא מספר בית."""
@@ -106,8 +116,10 @@ POLICY = """intent — על מה הבקשה, לפי משמעות ההודעה ב
 FOLLOW_UP_POLICY = ("- intent בהקשר שיחה: הנכס שבמרכז השיחה אינו קובע את ה-intent. שאלה מקצועית כללית באמצע שיחה על נכס "
                     "היא professional, ו-reference שלה topic או none; הנכס מוזכר רק כשההודעה נשענת עליו. כינוי (\"אותה\", "
                     "\"זה\") מפנה ל-topic (הנושא המקצועי שבקלט) או ל-conversation_property (הנכס שבמרכז השיחה). מילת סדר "
-                    "או ספרה (\"השנייה\", \"3\", \"האחרון\") שמפנה לרשימה שתשובה נתנה היא reference=prior_answer_item עם "
-                    "item=מספר הפריט ברשימת הפריטים שבקלט; גם כשאין רשימה בקלט — סמן אותה והשרת יאמר שלא ניתנה רשימה.")
+                    "או ספרה (\"השנייה\", \"3\", \"ה-12\", \"האחרון\") שמפנה לרשימה שתשובה נתנה היא reference=prior_answer_item עם "
+                    "item=מספר הפריט ו-list_id=מזהה הרשימה שבקלט (כמה רשימות: זו שההודעה מכוונת אליה במילותיה; אם אינה מכוונת "
+                    "לאחת — השאר list_id ריק); \"שניהם\"/\"שתיהן\" — item_scope=both ו-item_set. גם כשאין רשימה בקלט — סמן "
+                    "אותה והשרת יאמר שלא ניתנה רשימה. \"המועד\" הוא תאריך הנתון שבמרכז השיחה (date_field), לא נכס אחר.")
 
 
 @dataclass(frozen=True)
@@ -135,10 +147,12 @@ class Evidence:
 class Intent:
     """The turn's intent after the server's settling. ``claimed``: what the parse said ("" when it gave none or an
     invalid one); ``evidence``: the hard evidence the message holds; ``reasons``: why the value is not the claim.
-    ``item`` and ``item_label``: the item of the previous answer's list the message names, once the server accepted it;
-    ``bound``: what the reference bound to (``item``, ``topic``, ``property``) and "" when it bound to nothing;
-    ``no_list``: an ordinal was written and the previous answer gave no list; ``item_rejected``: why the server did not
-    accept the ordinal the parse claimed ("" when it was accepted or none was claimed)."""
+    ``item`` and ``item_label``: the item of the list the message names, once the server accepted it; ``list_id`` and ``list_title``:
+    the list it was selected in; ``item_set`` and ``item_labels``: the places and labels of a "both" reference (two items of one
+    list); ``ask``: the one question that names the lists when the message fits several (round 22 U12); ``bound``: what the reference
+    bound to (``item``, ``item_set``, ``topic``, ``property``) and "" when it bound to nothing; ``no_list``: an ordinal was written and
+    the conversation holds no list; ``item_rejected``: why the server did not accept the ordinal the parse claimed ("" when it was
+    accepted or none was claimed)."""
 
     value: str = "unknown"
     claimed: str = ""
@@ -152,6 +166,11 @@ class Intent:
     bound: str = ""
     no_list: bool = False
     item_rejected: str = ""
+    list_id: str = ""
+    list_title: str = ""
+    item_set: tuple[int, ...] = ()
+    item_labels: tuple[str, ...] = ()
+    ask: str = ""
 
     @property
     def professional(self) -> bool:
@@ -165,7 +184,8 @@ class Intent:
 
     def as_dict(self) -> dict:
         return {"value": self.value, "claimed": self.claimed, "reference": self.reference, "item": self.item,
-                "item_label": self.item_label, "bound": self.bound, "topic": self.topic,
+                "item_label": self.item_label, "bound": self.bound, "topic": self.topic, "list_id": self.list_id,
+                "item_set": list(self.item_set), "item_labels": list(self.item_labels), "ask": self.ask,
                 "standard_refs": [dict(r) for r in self.standard_refs],
                 "evidence": [e.as_dict() for e in self.evidence], "reasons": list(self.reasons)}
 
@@ -338,14 +358,14 @@ def query_of(items: list[Evidence]) -> str:
 # --- settling ---------------------------------------------------------------------------------------------------------
 
 def settle(claim: IntentClaim | None, message: str, vocabulary: list[str], scope: str = "entity",
-           has_property: bool = False, quoted: str = "", items: list[str] | tuple[str, ...] = (),
+           has_property: bool = False, quoted: str = "", lists: list[dict] | tuple[dict, ...] = (),
            topic: str = "") -> Intent:
     """The turn's intent from the model's claim and the message (see the module docstring). ``scope``: the parse's
     scope (``set`` decides intent ``set``); ``has_property``: the conversation has a property in its centre (only said
     in the reasons: a claim about a property without evidence and without one runs no lookup); ``quoted``: the words
-    the model quoted for a change of subject, whose evidence counts beside the message's; ``items``: the labels of the
-    list the previous answer printed, which an ordinal can name; ``topic``: the conversation's topic slot, which a
-    pronoun can bind to."""
+    the model quoted for a change of subject, whose evidence counts beside the message's; ``lists``: the lists the last answers
+    printed (``slots`` records), which an ordinal can name; ``topic``: the conversation's topic slot, which a pronoun can bind
+    to."""
     found = tuple(dict.fromkeys([*evidence(message, vocabulary), *(evidence(quoted, vocabulary, quoted=True) if quoted else ())]))
     why: list[str] = []
     claimed = claim.intent if claim is not None else ""
@@ -368,15 +388,23 @@ def settle(claim: IntentClaim | None, message: str, vocabulary: list[str], scope
             why.append("no hard evidence in the message: no lookup" + ("" if has_property else ", no property in the conversation"))
     reference = claim.reference if claim else "none"
     item, label, bound, no_list, item_rejected = None, "", "", False, ""
+    chosen = slots.Binding()
     if reference == "prior_answer_item":
-        # an ordinal binds only to an item the previous answer printed, on the message's own words (KTD6)
-        rejected = slots.check_item(claim.item, message, list(items))
-        if rejected is None:
-            item, label, bound = claim.item, items[claim.item - 1], "item"
-            why.append(f"ordinal {item} bound to the previous answer's item «{label}»")
+        # a reference to a list item binds only to a list the conversation holds, on the message's own words (KTD6, KTD14)
+        chosen = slots.bind(message, lists, list_id=claim.list_id, item=claim.item, item_set=claim.item_set,
+                            both=claim.item_scope == "both")
+        if chosen.kind == "item":
+            item, label, bound = chosen.items[0], chosen.labels[0], "item"
+            why.append(f"ordinal {item} bound to the item «{label}» of the list «{chosen.title}»")
+        elif chosen.kind == "set":
+            bound = "item_set"
+            why.append(f"«both» bound to the items {', '.join(f'«{x}»' for x in chosen.labels)} of the list «{chosen.title}»")
+        elif chosen.kind == "ask":
+            reference, item_rejected = "none", chosen.reason
+            why.append("prior_answer_item needs a clarification: " + chosen.reason)
         else:
-            reference, no_list, item_rejected = "none", not items and bool(slots.ordinal_forms(message)), rejected
-            why.append("prior_answer_item rejected: " + rejected)
+            reference, no_list, item_rejected = "none", chosen.no_list, chosen.reason
+            why.append("prior_answer_item rejected: " + chosen.reason)
     elif reference == "topic":
         bound = "topic" if topic else ""
         if not topic:
@@ -389,4 +417,6 @@ def settle(claim: IntentClaim | None, message: str, vocabulary: list[str], scope
                   topic=" ".join(claim.topic.split()) if claim else "",
                   standard_refs=tuple(r.model_dump() for r in claim.standard_refs) if claim else (),
                   evidence=found, reasons=tuple(why), item_label=label, bound=bound, no_list=no_list,
-                  item_rejected=item_rejected)
+                  item_rejected=item_rejected, list_id=chosen.list_id, list_title=chosen.title, item_set=chosen.items
+                  if chosen.kind == "set" else (), item_labels=chosen.labels if chosen.kind == "set" else (),
+                  ask=chosen.ask)

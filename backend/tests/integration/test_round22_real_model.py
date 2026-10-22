@@ -153,3 +153,102 @@ def _shape(first: Turn21, produced: bool) -> None:
 def _property_kept(second: Turn21, doc: str) -> None:
     assert stated(second, AREA_B), ("the second answer does not state group B's area", second.markdown[:500])
     cites_document(second, doc)
+
+
+# --- round 22 U12 (KTD14, R20): two lists bind on the REAL resolve call ------------------------------------------------------------------
+#
+# The real model reads the new message against the lists the previous answer printed (``resolve._input`` shows each with its id, title and
+# items) and claims ``prior_answer_item`` with the item, the list id or the item set; the SERVER then selects the list and validates the claim
+# (``slots.bind``). The state is built by hand - what ``compose.compose`` stores for an answer that printed a plots list and a payments list -
+# so the repetition measures the resolve call alone (no documents, no agent). Every name is invented. Four sequences, ``ATTEMPTS`` times each:
+#
+# - the payment: «ומה לגבי התשלום השני?» binds to item 2 of the payments list (its label), never plot 2;
+# - the bare ordinal: «ומה לגבי השני?» over the two lists of one answer is never bound to either - the server asks one question that
+#   names both lists;
+# - the twelfth: «ומה לגבי המגרש ה-12?» binds to the twelfth of a list of fifteen;
+# - both: «ומה לגבי שניהם?» binds to the two items of a two-item list.
+#
+# Checks are by the server's decision (``Request.intent``, ``clarify``); a repetition in which the model did not claim an item reference at all
+# is recorded as ``shape not produced`` and is not a pass. Recorded under ``real_documents/eval/round22/real-model/`` (gitignored).
+
+LISTS_RESULTS_FILE = RESULTS_DIR / f"two-lists-{STAMP}.json"
+LISTS_RECORDS: list[dict] = []
+PLOT_NAMES = ["הדקל", "התמר", "האלון", "הארז", "הברוש", "הגפן", "הדולב", "הזית", "החרוב", "הלוז", "המילה", "הנרקיס", "הסביון", "העפרוני", "הפרג"]
+
+
+def _a_list(mid: str, n: int, title: str, labels: list[str], age: int = 0) -> dict:
+    from app.chat import slots
+
+    (entry,) = slots.stamp([{"title": title, "kind": slots._kind(labels), "items": [{"label": x} for x in labels], "total": len(labels),
+                             "document_ids": ["doc-1"]}], mid)
+    return entry | {"id": f"{mid}#{n}", "age": age}
+
+
+def _answer_text(*lists: dict) -> str:
+    out = []
+    for entry in lists:
+        out.append(f"**{entry['title']}:**\n" + "\n".join(f"{i}. {x['label']} [S1]" for i, x in enumerate(entry["items"], 1)))
+    return "\n\n".join(out)
+
+
+def _resolve_real(message: str, lists: list[dict]):
+    """The follow-up resolved by the real model against the lists the previous answer printed; the validated request."""
+    from app.chat import resolve
+    from app.chat.engine import HistoryMessage
+    from app.providers import llm
+
+    history = [HistoryMessage("user", "אילו מגרשים ותשלומים יש בשומה?"), HistoryMessage("assistant", _answer_text(*lists))]
+    focus = {"metric_as_written": "שטח", "metric_kind": "area", "unit": "unknown", "period": "unknown", "area_basis": "", "vat": "unknown",
+             "subject": "הנכס בהתמר 9", "value_role": "appraiser_determination", "document_ids": ["doc-1"]}
+    usage: list[dict] = []
+    return resolve.resolve(llm.get_selected_provider(), focus, history, message, [{"document_id": "doc-1", "title": "שומה סינתטית"}],
+                           lambda ids: {i for i in ids if i == "doc-1"}, ["שומה סינתטית"], usage, lists=lists)
+
+
+def _record(name: str, attempt: int, request, outcome: str, info: dict) -> dict:
+    rec = {"sequence": name, "attempt": attempt, "outcome": outcome, "info": info,
+           "intent": request.intent.as_dict() if request is not None else None,
+           "clarify": request.clarify if request is not None else None}
+    LISTS_RECORDS.append(rec)
+    LISTS_RESULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LISTS_RESULTS_FILE.write_text(json.dumps({"model": "gpt-6-luna (settings)", "attempts": LISTS_RECORDS}, ensure_ascii=False, indent=2,
+                                             default=str), encoding="utf-8")
+    return rec
+
+
+def _claimed_an_item(request) -> bool:
+    """Whether the model's parse claimed a reference to an item of a list (the shape this test is about)."""
+    claim = ((request.resolution.get("parse") or {}).get("intent") or {}) if request is not None else {}
+    return claim.get("reference") == "prior_answer_item"
+
+
+def test_two_lists_bind_on_the_real_resolve_call(real_key):  # noqa: F811
+    plots = _a_list("m-1", 1, "המגרשים בשומה", [f"מגרש {n}" for n in PLOT_NAMES[:3]])
+    payments = _a_list("m-1", 2, "לוח התשלומים", ["תשלום ראשון", "תשלום שני", "תשלום שלישי"])
+    fifteen = _a_list("m-1", 1, "מגרשי השומה", [f"מגרש {n}" for n in PLOT_NAMES])
+    pair = _a_list("m-1", 1, "הבניינים בשומה", ["בניין הדקל", "בניין התמר"])
+    failures: list[str] = []
+    for attempt in range(1, ATTEMPTS + 1):
+        cases = [
+            ("payment", "ומה לגבי התשלום השני?", [plots, payments],
+             lambda r: r.intent.bound == "item" and r.intent.item_label == "תשלום שני" and r.intent.list_id == payments["id"]),
+            ("bare_ordinal", "ומה לגבי השני?", [plots, payments],
+             lambda r: r.intent.bound != "item" and r.server_clarify and "לוח התשלומים" in r.clarify and "המגרשים בשומה" in r.clarify),
+            ("twelfth", "ומה לגבי המגרש ה-12?", [fifteen],
+             lambda r: r.intent.bound == "item" and r.intent.item == 12 and r.intent.item_label == "מגרש הנרקיס"),
+            ("both", "ומה לגבי שניהם?", [pair],
+             lambda r: r.intent.bound == "item_set" and r.intent.item_set == (1, 2))]
+        for name, message, lists, passes in cases:
+            request = _resolve_real(message, lists)
+            if request is None:
+                _record(name, attempt, None, "fail", {"failure": "the resolve call failed"})
+                failures.append(f"attempt {attempt} / {name}: the resolve call failed")
+            elif not _claimed_an_item(request):
+                _record(name, attempt, request, "shape not produced", {"note": "the model did not claim prior_answer_item"})
+                failures.append(f"attempt {attempt} / {name}: SHAPE NOT PRODUCED (the model did not claim an item reference)")
+            elif not passes(request):
+                _record(name, attempt, request, "fail", {"decision": request.resolution.get("decisions", {}).get("item")})
+                failures.append(f"attempt {attempt} / {name}: bound {request.intent.as_dict()} clarify={request.clarify!r}")
+            else:
+                _record(name, attempt, request, "pass", {})
+    assert not failures, failures

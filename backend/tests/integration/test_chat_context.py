@@ -135,6 +135,11 @@ def _answer_row(world, m: dict) -> dict:
         return conn.execute(text("SELECT answer FROM messages WHERE id = :m"), {"m": m["id"]}).scalar_one()
 
 
+def _labels(ctx: dict) -> list[str]:
+    """The labels of the newest list a context carries (round 22 U12: lists, not ``topic.items``)."""
+    return [i["label"] for i in ctx["lists"][0]["items"]]
+
+
 def _context(world, m: dict) -> dict:
     return _answer_row(world, m)["context"]
 
@@ -207,7 +212,7 @@ def test_ae3_how_to_apply_it_to_this_property_restores_the_property_beside_the_t
     assert "גישות השומה" in _task(agent)
     ctx = _context(world, m)
     assert ctx["property"]["document_ids"] == [world.rent] and ctx["topic"]["text"] == "גישות השומה"
-    assert ctx["topic"]["items"] == APPROACHES  # the list is still the one the answer printed
+    assert _labels(ctx) == APPROACHES  # the list is still the one the answer printed
 
 
 def test_ae5_a_metric_change_keeps_the_property_and_a_named_address_replaces_it(world):
@@ -235,9 +240,10 @@ def test_ae5_a_metric_change_keeps_the_property_and_a_named_address_replaces_it(
 
 def test_the_items_of_a_numbered_answer_are_stored_as_labels(world):
     m, _ = _professional_list(world, first=True)
-    topic = _context(world, m)["topic"]
-    assert topic["items"] == APPROACHES and topic["message_id"] == m["id"]
-    assert _context(world, m)["version"] == 1 and _context(world, m)["pending"] is None
+    ctx = _context(world, m)
+    (entry,) = ctx["lists"]
+    assert _labels(ctx) == APPROACHES and entry["message_id"] == m["id"] and entry["id"] == f"{m['id']}#1" and entry["total"] == 3
+    assert _context(world, m)["version"] == 2 and _context(world, m)["pending"] is None
     assert {s["document_id"] for s in _context(world, m)["sources"]} == {world.guide}
 
 
@@ -257,7 +263,7 @@ def test_ae2_the_second_approach_names_the_second_item_of_the_list(world):
     assert "גישת ההכנסות" in task and "זו שאלה מקצועית כללית" in task
     assert "2. גישת ההכנסות" in _resolve_input(agent)  # the model was shown the items of the previous answer
     assert _context(world, m)["topic"]["text"] == "גישת ההכנסות"
-    assert _context(world, m)["topic"]["items"] == APPROACHES  # a later answer lists none: the list persists
+    assert _labels(_context(world, m)) == APPROACHES  # a later answer lists none: the list persists
 
 
 def test_an_ordinal_with_no_list_in_the_previous_answer_is_rejected_recorded_and_answered_as_asked(world):
@@ -488,7 +494,7 @@ def test_a_revoked_property_document_drops_the_slot_whole_and_later_professional
         standalone_question="ומה הגישה השנייה?", intent=intent_part("professional", "prior_answer_item", item=2)))
     assert _decisions(world, again)["property"].startswith("dropped")
     ctx = _context(world, again)
-    assert ctx.get("property") is None and ctx.get("params") is None and ctx["topic"]["items"] == APPROACHES
+    assert ctx.get("property") is None and ctx.get("params") is None and _labels(ctx) == APPROACHES
     shown = world.client.get(f"/api/chat/conversations/{world.cid}/messages").json()["messages"]
     answers = [x for x in shown if x["role"] == "assistant"]
     assert answers[0]["answer"].get("hidden") is True  # the property answer itself is gone
