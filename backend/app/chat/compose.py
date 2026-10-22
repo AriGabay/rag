@@ -237,20 +237,22 @@ class Doc:
         return changed
 
     def _next_audit(self, datum_ranges, kinds):
-        pos = {o: i for i, o in enumerate(self._origin) if o >= 0}
+        pos = None  # the position of each draft character in the text, built when a span needs it
         for span, ref in self.refs():
             tag = self._tag[span.start]
             if span.kind not in kinds or not (span.claim_ids or span.datum) or self._anchor.get(tag, -1) < 0:
                 continue
-            ranges = datum_ranges(span)
-            if ranges is None:
-                continue
             here = self._origin_before(span.start)
             if here == -2 or here == self._anchor[tag]:
                 continue  # at its anchor (or the text before it is not the draft's: nothing to compare)
+            ranges = datum_ranges(span)  # asked only of a span that moved
+            if ranges is None:
+                continue
             alive = self.survivors(ranges)
             if not alive:
                 return span, ref, None  # the datum is no longer in the answer: its addition goes
+            if pos is None:
+                pos = {o: i for i, o in enumerate(self._origin) if o >= 0}
             if self._anchor[tag] in pos:
                 return span, ref, pos[self._anchor[tag]] + 1  # the character it followed is there: it follows it again
             before = [i for i in self.survivors(ranges, letters=False) if self._origin[i] < self._anchor[tag]]

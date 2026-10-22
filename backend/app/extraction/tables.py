@@ -12,11 +12,14 @@ row ``k``, column ``j`` of an assembled table belongs to the value at ``rows[k].
 from __future__ import annotations
 
 import difflib
+import functools
 import math
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from app.extraction.base import TableResult, TableRow
+from app.extraction.chunking import render_row
 from app.extraction.hebrew import fix_line, has_hebrew, has_latin, visual_to_logical
 
 HEADER_VOCAB = (
@@ -88,6 +91,12 @@ def _period(cell: str | None) -> tuple[int, int] | None:
     return (year + 2000 if year < 100 else year), quarter
 
 
+def _periods_rise(cells: list[str]) -> bool:
+    """Whether the years or quarters a row writes (at least two) rise from left to right."""
+    periods = [p for p in map(_period, cells) if p is not None]
+    return len(periods) >= 2 and all(a < b for a, b in zip(periods, periods[1:], strict=False))
+
+
 def reads_left_to_right(grid: list[list[str | None]], page_has_hebrew: bool) -> bool:
     """Whether a text-layer table is stored in the order it reads: neither the table nor its page holds a Hebrew letter, and the
     table gives a left-to-right cue: a cell with Latin letters in its first row, or years or quarters that rise from left to
@@ -97,11 +106,7 @@ def reads_left_to_right(grid: list[list[str | None]], page_has_hebrew: bool) -> 
     first = next((row for row in grid if any(clean_cell(c) for c in row)), [])
     if any(has_latin(c or "") for c in first):
         return True
-    for row in grid:
-        periods = [p for p in map(_period, row) if p is not None]
-        if len(periods) >= 2 and all(a < b for a, b in zip(periods, periods[1:], strict=False)):
-            return True
-    return False
+    return any(_periods_rise(row) for row in grid)
 
 
 def logical_row(cells_ltr: list[str | None], visual_default: bool = True, left_to_right: bool = False) -> list[str]:
@@ -250,8 +255,13 @@ def _boxes_descend(rows_of_boxes) -> bool | None:
     return None if not verdicts else all(verdicts)
 
 
-def _texts(st: dict) -> list[str]:
-    return [c or "" for c in [*(st.get("headers") or []), *(c for r in st.get("rows") or [] for c in r.get("cells") or [])]]
+def _texts(st: dict) -> Iterator[str]:
+    """The header and cell texts of a stored structure, one at a time (a caller that looks for a Hebrew letter stops at the first)."""
+    for c in st.get("headers") or []:
+        yield c or ""
+    for r in st.get("rows") or []:
+        for c in r.get("cells") or []:
+            yield c or ""
 
 
 def stored_reversed(st: dict | None) -> bool:
@@ -261,8 +271,7 @@ def stored_reversed(st: dict | None) -> bool:
     and none in its cells is judged by its boxes and its cue alone."""
     if not st or st.get("columns") is not None:  # a structure already served
         return False
-    texts = _texts(st)
-    if any(has_hebrew(c) for c in texts):
+    if any(has_hebrew(c) for c in _texts(st)):
         return False
     rows = st.get("rows") or []
     if _boxes_descend([st.get("header_boxes"), *(r.get("cell_boxes") for r in rows)]) is not True:
@@ -293,16 +302,43 @@ def fix_sign(cell: str) -> str:
     return text
 
 
+def _pick(seq, order: list[int], default):
+    """``seq`` at the stored positions ``order`` names; ``default`` where ``seq`` is shorter than a position."""
+    return [seq[i] if i < len(seq) else default for i in order]
+
+
 def serve_cells(order: list[int], cells: list[str], fixed: bool = True) -> list[str]:
     """A stored row's cells at the served positions (``order``); a stored cell the row lacks is empty."""
-    return [fix_sign(c) if fixed else c for c in ((cells[i] if i < len(cells) else "") for i in order)]
+    return [fix_sign(c) if fixed else c for c in _pick(cells, order, "")]
+
+
+class _ById:
+    """A stored structure as a cache key: equal when it is the very same object (a stored structure is read once per turn and never
+    changed), hashed by identity. The cache holds the key, so the structure it names stays alive and its identity stays its own."""
+
+    __slots__ = ("st",)
+
+    def __init__(self, st: dict):
+        self.st = st
+
+    def __hash__(self) -> int:
+        return id(self.st)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _ById) and other.st is self.st
 
 
 def serve_structure(st: dict | None) -> dict | None:
     """A stored table structure in the order it is drawn, when the stored data show it was stored reversed (``stored_reversed``);
     ``st`` itself otherwise. The served structure holds the headers, units, cells and cell boxes at the served positions and
     ``columns``: the stored column index at each position (a value's box and its datum are looked up by it). Nothing stored is
-    changed: a new structure is built."""
+    changed: a new structure is built, once per stored structure (the callers only read it)."""
+    return _served(_ById(st)) if st else st
+
+
+@functools.lru_cache(maxsize=64)
+def _served(key: _ById) -> dict:
+    st = key.st
     order = column_order(st)
     if order is None:
         return st
@@ -311,12 +347,12 @@ def serve_structure(st: dict | None) -> dict | None:
     out = dict(st)
     out["columns"] = order
     out["headers"] = serve_cells(order, headers, fixed=False) if any(headers) else []
-    out["units"] = [units[i] if i < len(units) else None for i in order] if units else []
+    out["units"] = _pick(units, order, None) if units else []
     if st.get("header_boxes"):
-        out["header_boxes"] = [st["header_boxes"][i] if i < len(st["header_boxes"]) else None for i in order]
+        out["header_boxes"] = _pick(st["header_boxes"], order, None)
     out["rows"] = [
         {**r, "cells": serve_cells(order, list(r.get("cells") or [])),
-         **({"cell_boxes": [r["cell_boxes"][i] if i < len(r["cell_boxes"]) else None for i in order]} if r.get("cell_boxes") else {})}
+         **({"cell_boxes": _pick(r["cell_boxes"], order, None)} if r.get("cell_boxes") else {})}
         for r in st.get("rows") or []]
     return out
 
@@ -331,11 +367,6 @@ def served_position(st: dict | None, column: int) -> int:
     """The served position of a stored column (the column itself in a table served as stored)."""
     order = (st or {}).get("columns")
     return order.index(column) if order is not None and column in order else column
-
-
-def _periods_rise(cells: list[str]) -> bool:
-    periods = [p for p in map(_period, cells) if p is not None]
-    return len(periods) >= 2 and all(a < b for a, b in zip(periods, periods[1:], strict=False))
 
 
 def served_labels(sst: dict) -> tuple[list[str], int | None]:
@@ -355,32 +386,32 @@ def served_labels(sst: dict) -> tuple[list[str], int | None]:
     return [], None
 
 
-def _render_row(headers: list[str], cells: list[str], units: list[str | None] | None = None) -> str:
-    from app.extraction.chunking import render_row
+def _served_units(sst: dict) -> list[str | None] | None:
+    """The units ``render_row`` pairs with the labels of a served table: its own, when it has headers; none otherwise."""
+    return sst.get("units") or None if any(sst.get("headers") or []) else None
 
-    return render_row(headers, cells, units)
 
-
-def render_served_row(sst: dict, index: int) -> str:
+def render_served_row(sst: dict, index: int, labels: tuple[list[str], int | None] | None = None) -> str:
     """One row of a served table as a row chunk renders it (``render_row``): each cell paired with its column label, in the order
-    the table is drawn. The row that holds the labels is its cells in order; a table with no label gives its cells in order."""
+    the table is drawn. The row that holds the labels is its cells in order; a table with no label gives its cells in order.
+    ``labels``: ``served_labels(sst)`` when the caller renders several rows of the table."""
     row = sst["rows"][index]
     cells = list(row.get("cells") or [])
-    labels, label_row = served_labels(sst)
+    labels, label_row = labels if labels is not None else served_labels(sst)
     if not labels or index == label_row:
         return " | ".join(cells)
-    return _render_row(labels, cells, sst.get("units") or None if any(sst.get("headers") or []) else None)
+    return render_row(labels, cells, _served_units(sst))
 
 
-def render_served_cells(sst: dict, cells: list[str]) -> str:
+def render_served_cells(sst: dict, cells: list[str], labels: tuple[list[str], int | None] | None = None) -> str:
     """The same for a row that is not one of the structure's own (a window the caller cut): its stored cells are put in served
-    order first."""
+    order first. ``labels``: ``served_labels(sst)`` when the caller renders several rows of the table."""
     order = sst.get("columns") or []
     served = serve_cells(order, cells)
-    labels, _ = served_labels(sst)
+    labels, _ = labels if labels is not None else served_labels(sst)
     if not labels or served == labels:
         return " | ".join(served)
-    return _render_row(labels, served, sst.get("units") or None if any(sst.get("headers") or []) else None)
+    return render_row(labels, served, _served_units(sst))
 
 
 def serve_text(st: dict | None, text: str) -> str:
@@ -394,10 +425,11 @@ def serve_text(st: dict | None, text: str) -> str:
     headers = st.get("headers") or []
     if any(headers):
         mapping[" | ".join(headers)] = " | ".join(sst["headers"])
+    labels = served_labels(sst)
     for i, r in enumerate(st.get("rows") or []):
         line = " | ".join(r.get("cells") or [])
         if line.strip(" |"):
-            mapping.setdefault(line, render_served_row(sst, i))
+            mapping.setdefault(line, render_served_row(sst, i, labels))
     return "\n".join(mapping.get(ln, ln) for ln in text.split("\n"))
 
 
@@ -409,7 +441,7 @@ def serve_row_text(st: dict | None, row_index: int | None, text: str) -> str:
     rows = (st or {}).get("rows") or []
     if sst is st or row_index is None or not 0 <= row_index < len(rows):
         return text
-    stored = _render_row(st.get("headers") or [], list(rows[row_index].get("cells") or []), st.get("units") or None)
+    stored = render_row(st.get("headers") or [], list(rows[row_index].get("cells") or []), st.get("units") or None)
     if not stored or not text.endswith(stored):
         return text
     return text[:len(text) - len(stored)] + render_served_row(sst, row_index)

@@ -353,9 +353,11 @@ def _period_word_ok(text: str, m: re.Match) -> bool:
     word = m.group(0).lstrip("ו")
     if word[:1] in ("ל", "ב", "/"):  # a noun after its prefix or a slash, or an abbreviation
         return True
+    written = _number_before(text, m.start())
+    counted = bool(written and _can_count_time(written))  # the word follows a number that counts time
     if word[:1].isascii():  # English (round 21 U3): "per month" is a noun phrase like "לחודש" ("500 per month" is an amount), the adjectives
-        return word.lower().startswith("per") or not ((written := _number_before(text, m.start())) and _can_count_time(written))
-    if (written := _number_before(text, m.start())) and _can_count_time(written):
+        return word.lower().startswith("per") or not counted
+    if counted:
         return False
     if word[:1] != "ה" and word.endswith(("ים", "ות")):
         return not _after_duration_preposition(text, m.start()) and _after_plural_noun(text, m.start())
@@ -736,9 +738,11 @@ def _period_lines(lines: list[str], is_row: list[bool]):
             q.add("period", found[0][2], found[0][3])
         return q
 
+    @cache
     def row_numbers(j: int) -> bool:  # a page-text line of a column layout's rows: three numbers or more, no table row
         return 0 <= j < len(lines) and not is_row[j] and len(_numbers(_ENUMERATION.sub("", lines[j]))) >= COLUMN_ROW_NUMBERS
 
+    @cache
     def heads_columns(k: int) -> bool:
         """Whether line ``k`` is the header line of a column layout of page text: a line with no number that does not end a sentence, over two
         lines or more of rows of numbers. Its words name columns; they are no sentence about the numbers below it (round 21 second pass)."""
@@ -858,6 +862,7 @@ _VALUATION = re.compile(r"(?<![א-ת])[והבלמש]?שווי(?![א-ת])(?!\s+(?
                         r"|(?<![A-Za-z])(?i:value|valuation)(?![A-Za-z])")
 
 
+@lru_cache(maxsize=512)
 def capitalised_label(label: str) -> bool:
     """Whether a row label names a capitalised amount: the participle, the noun "היוון" (not the rate of capitalisation: a rate noun before
     it makes it a percent's label) or the English words (round 21 packet A, Q1, Q2)."""
@@ -877,6 +882,7 @@ def _valuation_label(label: str) -> bool:
     return False
 
 
+@lru_cache(maxsize=512)
 def _recurring_row(label: str) -> bool:
     """Whether a table row can carry its column header's period (round 21 U3, KTD3): a capitalised amount cannot, whatever kind it names (and
     in either word of capitalisation, round 21 packet A, Q1); the value of something ("שווי ההכנסות") cannot; a row of a recurring kind
@@ -1082,6 +1088,7 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                     occurrences.append((f, Occurrence(q, line, area=area)))
             continue
         found, _ = attached(line, noun_period=False)
+        column = None  # the line's column layout period, worked out once for the line (read-only: the occurrences share it)
         # a table's title, caption or notes state an area basis for its numbers — a period, for the numbers it governs
         # (``_period_lines``); a sentence with no number elsewhere gives no basis to other numbers
         if n in captions:
@@ -1101,7 +1108,9 @@ def parse_source(text: str) -> tuple[tuple[tuple[frozenset[str], Occurrence], ..
                 for pos, kind, key, written in _scan(lines[n - 1]):
                     if kind == "period" and _of_rate(lines[n - 1], pos):
                         q.add(kind, key, written, "sentence")
-            occurrences.append((f, Occurrence(q, line, column_period=column_period(n))))
+            if column is None:
+                column = column_period(n)
+            occurrences.append((f, Occurrence(q, line, column_period=column)))
     return tuple(occurrences), general
 
 
@@ -1423,6 +1432,8 @@ class Fetcher:
     def unread_for(self, unit: Unit) -> bool:
         """Whether evidence around the unit's cited passages was not read: a table or a section of a cited source's version, or the stored
         measurements of a cited document. What was not read is not known to be silent, so the check says nothing is "not stated" (round 21 U3)."""
+        if not self.not_read:
+            return False
         versions = {str(self.ws.sources[i].version_id) for i in unit.ids if i in self.ws.sources}
         documents = {str(self.ws.sources[i].document_id) for i in unit.ids if i in self.ws.sources} \
             | {str(self.ws.measurements[i].document_id) for i in unit.ids if i in self.ws.measurements}

@@ -102,7 +102,7 @@ from datetime import date
 from typing import TYPE_CHECKING, NamedTuple
 
 from app.chat import contexts
-from app.chat.compose import line_cut
+from app.chat.compose import AUDITED_KINDS, line_cut
 from app.chat.dates import COMPARABLE_ORIGIN, HISTORY_ORIGIN
 from app.chat.intent import PROFESSIONAL
 from app.chat.tools import (
@@ -1011,7 +1011,8 @@ def component_outcomes(ws: Workspace, report, applied: FinalAnswer, turn: TurnRe
             continue
         if signal is None:
             signal = unit_signal(ws)
-        given = "\n".join(texts.get(i, "") for i in o.get("units") or [])
+        # the text of the units that give it: read only for a partly given component with units (``reason_of``, ``_part_stated``)
+        given = "\n".join(texts.get(i, "") for i in o.get("units") or []) if o["status"] == "partial" and o.get("units") else ""
         why = reason_of(ws, o, turn, claims.get(o["id"]), opened, signal, shown, given)
         o |= {"limitation": why["reason"], "limitation_text": REASONS.get(why["reason"]), "place": why.get("place"),
               "document": why.get("document"), "document_id": why.get("document_id"), "searched": why["searched"],
@@ -1053,9 +1054,7 @@ def _garbled_part(part: str, text: str) -> bool:
     or it is a tail of the component's own text (the words after the component's first words, cut off its head)."""
     if _PREPOSITION_OPEN.match(part):
         return True
-    named, asked = part.split(), text.split()
-    clean = lambda ws_: [w.strip(_TRIM) for w in ws_]  # noqa: E731
-    named, asked = clean(named), clean(asked)
+    named, asked = [w.strip(_TRIM) for w in part.split()], [w.strip(_TRIM) for w in text.split()]
     return 0 < len(named) < len(asked) and asked[-len(named):] == named
 
 
@@ -1204,12 +1203,18 @@ def audit_server_spans(ws: Workspace, report, doc) -> int:
     is registered with (``ServerSpan.claim_ids``); an addition that names only a datum is read by that datum's value tokens (a V# by its
     written form, a ledger item by its headline forms and fractions) and, for an item with no figure, by the claims of the sentence that
     gives it. What cannot be read is left alone. No judge call. Returns the number of additions dropped or moved."""
+    if not any(s.kind in AUDITED_KINDS and (s.claim_ids or s.datum) for s in doc.spans()):
+        return 0  # no addition names a claim or a datum: nothing to compare, nothing to read
     ranges = {r.id: (r.start, r.end) for records in report.claims.values() for r in records}
     states: dict[str, dict] = {}
+    loaded = False
 
     def of_datum(span) -> list[tuple[int, int]] | None:
-        if not states and report.item_ledger is not None:
-            states.update({x["id"]: x for x in report.item_states()})
+        nonlocal loaded
+        if not loaded:  # the ledger's item states, read on the first datum that needs them (and once)
+            loaded = True
+            if report.item_ledger is not None:
+                states.update({x["id"]: x for x in report.item_states()})
         found: list[tuple[int, int]] = []
         known = False
         for datum in (d for d in span.datum.split(",") if d):

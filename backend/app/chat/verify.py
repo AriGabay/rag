@@ -1460,14 +1460,25 @@ def _match(old: list[str], new: list[tuple[int, str]]) -> dict[int, int]:
     return out
 
 
+def _line_starts(lines: Sequence[str]) -> list[int]:
+    """The offset where each line of a Markdown split on newlines starts, and one past the end (round 21 simplification)."""
+    starts = [0]
+    for line in lines:
+        starts.append(starts[-1] + len(line) + 1)
+    return starts
+
+
+def _line_at(starts: Sequence[int], lines: Sequence[str], off: int) -> int:
+    """The index of the line that holds the offset ``off`` of the Markdown ``starts`` (``_line_starts``) describes."""
+    return min(max(bisect.bisect_right(starts, off) - 1, 0), len(lines) - 1)
+
+
 def _headings_above(markdown: str, units: list[Unit]) -> dict[int, str]:
     """For each unit, the chain of headings above its line (without citations), outermost first, joined by " › ":
     the Markdown headings that enclose it by level, then the nearest label or numbered heading under them. What it is
     about (R7): "מצב מוצע" under "נתוני תכנון" is another context than the same sentence under "מצב מאושר"."""
     lines = markdown.split("\n")
-    starts = [0]
-    for line in lines:
-        starts.append(starts[-1] + len(line) + 1)
+    starts = _line_starts(lines)
     stack: list[tuple[int, str]] = []  # the Markdown headings open at this line: (level, text)
     label = ""  # the nearest label or numbered heading since the last Markdown heading
     chains: list[str] = []  # the chain above each line
@@ -1486,7 +1497,7 @@ def _headings_above(markdown: str, units: list[Unit]) -> dict[int, str]:
             stack.append((len(m.group(1)), text[len(m.group(1)):].strip()))
         else:
             label = text
-    return {u.index: chains[min(max(bisect.bisect_right(starts, u.start) - 1, 0), len(lines) - 1)] for u in units}
+    return {u.index: chains[_line_at(starts, lines, u.start)] for u in units}
 
 
 # a line that names a scope below the property (round 20 U2, KTD2, KTD3): a plan, parcel, lot group, contract, alternative, stage or
@@ -1520,6 +1531,7 @@ _UNIT_STATED = re.compile(
     r"|\(\s*(?:₪|ש[\"״]ח|מ[\"״]ר|%|אלפי\s+₪)\s*\)|(?<![א-ת])בסיס\s+(?:ה)?(?:שטח|חישוב|מדידה)|ב[-־]?(?:₪|%)")
 
 
+@functools.lru_cache(maxsize=2048)
 def defining_line(line: str) -> bool:
     """Whether a line states the unit, scale, period, VAT, basis or scope of what follows it (round 21 U6, KTD4, R9): a scope below the
     property (``names_scope``), a VAT phrase, a period or area-basis word (``meaning._scan``, the reading the meaning check uses) or the unit a
@@ -1537,14 +1549,12 @@ def defining_leads(markdown: str, units: Sequence[Unit]) -> dict[int, str]:
     its context (``Unit.context``); the sentences of a paragraph are each their own statement, so the first of them defines nothing for the
     next. Empty for a unit with none: an unrelated lead is no part of what a verdict depends on."""
     lines = markdown.split("\n")
-    starts = [0]
-    for line in lines:
-        starts.append(starts[-1] + len(line) + 1)
+    starts = _line_starts(lines)
     out: dict[int, str] = {}
     for u in units:
         if u.table_span is not None or not u.list_item:
             continue
-        n = min(max(bisect.bisect_right(starts, u.start) - 1, 0), len(lines) - 1)
+        n = _line_at(starts, lines, u.start)
         while n > 0:
             above = lines[n - 1]
             if not above.strip() or _LIST_ITEM.match(above.strip()) or above[:1] in (" ", "\t"):
@@ -1561,15 +1571,13 @@ def table_contexts(markdown: str, units: Sequence[Unit]) -> dict[int, str]:
     """``Unit.context`` of each table row of ``units`` as ``split_units`` writes it, read from ``markdown`` (round 21 U6): the final check
     reads it from the text with the server's spans blanked, so a note written in the line before a table is not a new lead of its rows."""
     lines = markdown.split("\n")
-    starts = [0]
-    for line in lines:
-        starts.append(starts[-1] + len(line) + 1)
+    starts = _line_starts(lines)
     out: dict[int, str] = {}
     for u in units:
         if u.table_span is None:
             continue
-        n = min(max(bisect.bisect_right(starts, u.start) - 1, 0), len(lines) - 1)
-        first = min(max(bisect.bisect_right(starts, u.table_span[0]) - 1, 0), len(lines) - 1)
+        n = _line_at(starts, lines, u.start)
+        first = _line_at(starts, lines, u.table_span[0])
         before = next((lines[i].strip() for i in range(first - 1, -1, -1) if lines[i].strip()), "")
         out[u.index] = (lines[first].strip() if first < n else "") + "\n" + before
     return out
@@ -2360,7 +2368,7 @@ class VerifyReport:
         def one(x: Unbound) -> str:
             who = f"«{x.label}»" + (f" ({x.value})" if x.value and x.value not in x.label else "")
             detail = _norm(x.detail).rstrip(" .;:")
-            detail = detail if len(detail) <= UNBOUND_DETAIL_CHARS else detail[:UNBOUND_DETAIL_CHARS].rsplit(" ", 1)[0] + "…"
+            detail = _clip_words(detail, UNBOUND_DETAIL_CHARS)
             return f"{who}: {detail}"
 
         line = UNBOUND_LINE.format(what=kinds(data), data="; ".join(one(x) for x in named))
@@ -2490,11 +2498,9 @@ class VerifyReport:
         offset ``at`` of ``unit`` when it is given and the unit's claims have spans of their own, else every claim of the unit."""
         recs = self.claims.get(index, [])
         if at is not None and unit is not None and len(recs) > 1:
-            to_raw = _text_to_raw(unit)
-            if to_raw is not None and 0 <= at < len(to_raw):
-                held = tuple(r.id for r in recs if r.exact and r.start <= unit.start + to_raw[at] < r.end)
-                if held:
-                    return held
+            held = _claims_at(unit, at, recs)
+            if held:
+                return tuple(held)
         return tuple(r.id for r in recs)
 
     def partial_claim_ids(self, index: int, cell_end: int | None = None) -> tuple[str, ...]:
@@ -2655,7 +2661,8 @@ class VerifyReport:
         what the candidate offer held (``{}`` without items)."""
         ledger = self.item_ledger
         # round 21 U2: the data a condition or a scope could not be placed next to are recorded, never silent (the uncertainty line states them)
-        unbound = {"unbound": [dataclasses.asdict(x) for x in self.unbound_data()]} if self.unbound_data() else {}
+        data = self.unbound_data()
+        unbound = {"unbound": [dataclasses.asdict(x) for x in data]} if data else {}
         if ledger is None or not (ledger.items or ledger.excluded or ledger.misattributed):
             return unbound
         # round 18 U5: the conditions an agent wrote that stand only in another item's context are recorded, never silent
@@ -2863,8 +2870,8 @@ class VerifyReport:
                  # the judge's validated support, less what the ledger closed; and the omitted items, which are the same kind of
                  # evidence (a part of the asked kind that a read source states and the answer does not give)
                  "support": [x for x in self.text_support.get(r["id"], [])
-                             if (r["id"], self._evidence_of(x["id"], x["quote"])) not in closed
-                             and not _rows_covered(self._evidence_of(x["id"], x["quote"])[:2], x["quote"], covered_ev.get(r["id"], []))]}
+                             if (r["id"], (ev_key := self._evidence_of(x["id"], x["quote"]))) not in closed
+                             and not _rows_covered(ev_key[:2], x["quote"], covered_ev.get(r["id"], []))]}
             validated = list(o["support"]) if kind in SEARCHABLE_KINDS else []  # the judge's validated part: evidence of a gap (R2)
             omitted = omitted_by.get(r["id"], []) if kind in SEARCHABLE_KINDS else []
             unchecked = unchecked_by.get(r["id"], []) if kind in SEARCHABLE_KINDS else []
@@ -3076,7 +3083,7 @@ class VerifyReport:
         qualifiers = self.edits()
         markdown = answer.answer_markdown
         cuts = _sentence_cuts(markdown, self.units, errors)
-        totals = _total_qualifiers(markdown, self.units, errors, set(planned), cuts, {i: self._claim_ids(i) for i in self.claims})
+        totals = _total_qualifiers(markdown, self.units, errors, set(planned), cuts, self._claim_ids)
         if not (errors or partial or notes or requests or cites or planned or totals or qualifiers):
             return Edited(Doc(markdown), answer.status, answer.claims)
         spans = [(g.start, g.end) for groups in planned.values() for g in groups]
@@ -3322,7 +3329,7 @@ def _first_cell_end(u: Unit) -> int | None:
 
 
 def _total_qualifiers(markdown: str, units: list[Unit], errors: set[int], cut: set[int],
-                      cuts: list[tuple[int, int]], claim_ids: Mapping[int, tuple[str, ...]] | None = None
+                      cuts: list[tuple[int, int]], claim_ids: Callable[[int], tuple[str, ...]] | None = None
                       ) -> list[tuple[int, int, str, str | None, tuple]]:
     """The qualifier a total or summary row gets when a row of its table went or lost a claim (R12): the total was
     written over what the table showed, so it says it includes a row the answer no longer shows. A total is a row whose
@@ -3344,9 +3351,13 @@ def _total_qualifiers(markdown: str, units: list[Unit], errors: set[int], cut: s
                 continue
             others = [u for u in rows if u is not total]
             if any(u.index in errors for u in others):
-                out.append((at, at, TOTAL_ROW_REMOVED, "qualifier", ref_of((claim_ids or {}).get(total.index, ()))))
+                note = TOTAL_ROW_REMOVED
             elif any(u.index in cut for u in others):
-                out.append((at, at, TOTAL_ROW_CUT, "qualifier", ref_of((claim_ids or {}).get(total.index, ()))))
+                note = TOTAL_ROW_CUT
+            else:
+                continue
+            # the claims of the total's unit (``claim_ids``: asked only for a total that gets a qualifier)
+            out.append((at, at, note, "qualifier", ref_of(claim_ids(total.index) if claim_ids else ())))
     return out
 
 
@@ -3474,9 +3485,7 @@ def split_units(markdown: str) -> list[Unit]:
     units: list[Unit] = []
     offset = 0
     lines = markdown.split("\n")
-    starts = [0]
-    for line in lines:
-        starts.append(starts[-1] + len(line) + 1)
+    starts = _line_starts(lines)
     block, shape = -1, ""  # the current block, and the shape of the last line ("" after a blank line)
     for n, line in enumerate(lines):
         line_start = offset
@@ -4894,21 +4903,23 @@ _BARE_NUMBER = re.compile(r"(?<![\d.,/:%])\d{1,4}(?![\d%₪$€/:]|[.,]\d)")
 _LIST_GAP = re.compile(r"\s*[,،]\s*(?:ו[־\-]?\s*)?|\s+ו[־\-]?\s*|\s+(?:או|and)\s+")
 
 
-def _enumerations(text: str) -> list[list[tuple[int, int]]]:
+@functools.lru_cache(maxsize=2048)
+def _enumerations(text: str) -> tuple[tuple[tuple[int, int], ...], ...]:
     """The enumerations of bare numbers ``text`` writes, each as the (start, end) offsets of its members, two members or more: "20, 22, 24 ו־26"
-    is one; "20 מ״ר, 22 מ״ר", a range, a date, a decimal and an amount are not (round 21 third pass, H1)."""
-    runs: list[list[tuple[int, int]]] = []
+    is one; "20 מ״ר, 22 מ״ר", a range, a date, a decimal and an amount are not (round 21 third pass, H1). A function of the text alone, kept per
+    text."""
+    runs: list[tuple[tuple[int, int], ...]] = []
     cur: list[tuple[int, int]] = []
     for m in _BARE_NUMBER.finditer(text):
         if cur and _LIST_GAP.fullmatch(text[cur[-1][1]:m.start()]):
             cur.append((m.start(), m.end()))
             continue
         if len(cur) > 1:
-            runs.append(cur)
+            runs.append(tuple(cur))
         cur = [(m.start(), m.end())]
     if len(cur) > 1:
-        runs.append(cur)
-    return runs
+        runs.append(tuple(cur))
+    return tuple(runs)
 
 
 def _list_members_only(text: str, places: Sequence[Sequence[tuple[int, int]]]) -> bool:
@@ -4948,22 +4959,16 @@ def _claim_anchor(u: Unit, ws: Workspace, claims: Sequence, report: VerifyReport
     in this order: the written form of the V# the unit cites; the value tokens of the ledger items the unit gives; the one amount the
     claim's own text writes. Each step that has candidates decides: exactly one place anchors, several (or a token the unit does not state
     once) anchor nothing — the next step is not tried, and the number nearest, last or shared with the source is never a reason."""
-    from app.chat.items import token_places, value_tokens
-
-    def unique(places: list[list[tuple[int, int]]]) -> tuple[str, int] | None:
-        if not places or any(len(p) != 1 for p in places) or _list_members_only(u.text, places):
-            return None
-        a, b = max((p[0] for p in places), key=lambda x: x[1])
-        return u.text[a:b], a
+    from app.chat.items import value_tokens
 
     written = [ws.values[i].written for i in dict.fromkeys(u.ids) if i in ws.values and ws.values[i].written]
     if written:
-        found = {unique(token_places(u.text, [g], ())) for g in (frozenset(numbers_in(w)) for w in dict.fromkeys(written)) if g}
+        found = {datum_anchor(u, [g], ()) for g in (frozenset(numbers_in(w)) for w in dict.fromkeys(written)) if g}
         return found.pop() if len(found) == 1 else None
     given = [st for st in (report.item_states() if report is not None and report.item_ledger is not None else [])
              if st["state"] == ITEM_COVERED and u.index in (st.get("covered_by"), st.get("condition_unit"))]
     if given:
-        found = {unique(token_places(u.text, *value_tokens(st.get("value") or "", st.get("quote") or ""))) for st in given}
+        found = {datum_anchor(u, *value_tokens(st.get("value") or "", st.get("quote") or "")) for st in given}
         return found.pop() if len(found) == 1 else None
     base = u.text
     own = [c.text.strip() for c in claims if not c.whole_unit and c.text.strip() and c.text.strip() in base]
@@ -5013,6 +5018,18 @@ def _read_in(sources: list[tuple[str, Source]]) -> str:
     return ", ".join(k + (f" ({s.location})" if s.location else "") for k, s in sources)
 
 
+def _scope_limit_note(standing: Sequence[str]) -> str:
+    """The note for a scope the cited sources do not all state: the reason they share for not stating it (``SCOPE_LIMIT_NOTES``), else the
+    general one (``MSG_SCOPE_LIMIT``) — also when one source does not hold the phrase at all."""
+    reasons = [x for x in standing if x in SCOPE_REASONS]
+    return SCOPE_LIMIT_NOTES[_reason_of(reasons)] if reasons and "absent" not in standing else MSG_SCOPE_LIMIT
+
+
+def _sole_id(recs: Sequence) -> str:
+    """The id of the one claim in ``recs``; "" when there are none or several (a note is never linked to a claim it may not be about)."""
+    return recs[0].id if len(recs) == 1 else ""
+
+
 def scope_outcome(u: Unit, phrase: str, ws: Workspace, text: str | None = None, claims: Sequence = (),
                   report: VerifyReport | None = None) -> tuple[bool, Problem | None]:
     """What the server does with a judge's defect ``scope`` on ``u`` (KTD5): (``handled``, the problem to add). The phrase
@@ -5034,28 +5051,24 @@ def scope_outcome(u: Unit, phrase: str, ws: Workspace, text: str | None = None, 
         return True, None
     standing = [_scope_standing(scope, s) for _, s in sources] if scope else ["absent"]
     anchor = _claim_anchor(u, ws, claims, report)
-    if anchor is None and _uniform_scope(u, sources, standing, [c for c in claims if c.verdict not in FAILING_VERDICTS]):
+    live = [c for c in claims if c.verdict not in FAILING_VERDICTS]
+    if anchor is None and _uniform_scope(u, sources, standing, live):
         # every amount of the claim rests on the cited evidence and that evidence has one scope: the datum is the claim itself, bound by its
         # claim id, and the note joins the end of the claim's own clause (its sentence, or its cell in a table row) — no number is guessed
         # (round 21 U2, KTD1; orchestrator decision)
-        live = [c for c in claims if c.verdict not in FAILING_VERDICTS]
-        claim = live[0].id if len(live) == 1 else ""
+        claim = _sole_id(live)
         first = sources[0][0]
         if all(x == "ok" for x in standing):
             return True, Problem(u, MSG_SCOPE_FOUND.format(sid=first, phrase=scope), kind="missing_qualifier", annotation=scope, cite=first,
                                  defect="scope", check=SCOPE_CHECK, claim_id=claim, clause_anchor=True)
-        reasons = [x for x in standing if x in SCOPE_REASONS]
-        note = SCOPE_LIMIT_NOTES[_reason_of(reasons)] if reasons and "absent" not in standing else MSG_SCOPE_LIMIT
         return True, Problem(u, MSG_SCOPE_UNVERIFIED.format(sid=", ".join(k for k, _ in sources)), kind="missing_qualifier",
-                             annotation=note.format(where=_read_in(sources)), defect="scope", check=SCOPE_LIMIT_CHECK, claim_id=claim,
-                             clause_anchor=True)
+                             annotation=_scope_limit_note(standing).format(where=_read_in(sources)), defect="scope", check=SCOPE_LIMIT_CHECK,
+                             claim_id=claim, clause_anchor=True)
     if anchor is None:
         if report is not None:
             # the line states the scope only as far as the sources do: a phrase the context does not state is not asserted as the source's
-            reasons = [x for x in standing if x in SCOPE_REASONS]
-            limit = SCOPE_LIMIT_NOTES[_reason_of(reasons)] if reasons and "absent" not in standing else MSG_SCOPE_LIMIT
-            detail = scope if all(x == "ok" for x in standing) else limit.format(where=_read_in(sources))
-            report.unbound.append(Unbound(u.index, "", _unit_label(u, claims), "", detail, "scope", claims[0].id if len(claims) == 1 else ""))
+            detail = scope if all(x == "ok" for x in standing) else _scope_limit_note(standing).format(where=_read_in(sources))
+            report.unbound.append(Unbound(u.index, "", _unit_label(u, claims), "", detail, "scope", _sole_id(claims)))
         return True, None
     number, at = anchor
     datum = next((i for i in dict.fromkeys(u.ids) if i in ws.values), "")
@@ -5064,11 +5077,8 @@ def scope_outcome(u: Unit, phrase: str, ws: Workspace, text: str | None = None, 
     if all(x == "ok" for x in standing):
         return True, Problem(u, MSG_SCOPE_FOUND.format(sid=first, phrase=scope), kind="missing_qualifier", number=number, at=at,
                              annotation=scope, cite=first, defect="scope", check=SCOPE_CHECK, datum=datum, claim_id=claim)
-    reasons = [x for x in standing if x in SCOPE_REASONS]
-    note = (SCOPE_LIMIT_NOTES[_reason_of(reasons)] if reasons and "absent" not in standing
-            else MSG_SCOPE_LIMIT)
     return True, Problem(u, MSG_SCOPE_UNVERIFIED.format(sid=", ".join(k for k, _ in sources)), kind="missing_qualifier",
-                         number=number, at=at, annotation=note.format(where=_read_in(sources)), defect="scope",
+                         number=number, at=at, annotation=_scope_limit_note(standing).format(where=_read_in(sources)), defect="scope",
                          check=SCOPE_LIMIT_CHECK, datum=datum, claim_id=claim)
 
 
@@ -5089,13 +5099,24 @@ def _claim_id_at(u: Unit, at: int, claims: Sequence) -> str:
     """The claim of the unit whose own span holds the text offset ``at`` (the claim a note written there is about); the unit's one claim
     when it has one; else "" (a note is never linked to a claim it may not be about)."""
     if len(claims) == 1:
-        return claims[0].id
-    to_raw = _text_to_raw(u)
+        return _sole_id(claims)
+    held = _claims_at(u, at, claims)
+    return held[0] if held is not None and len(held) == 1 else ""
+
+
+def _claims_at(unit: Unit, at: int, recs: Sequence) -> list[str] | None:
+    """The ids of the claims in ``recs`` whose own span holds the text offset ``at`` of ``unit``; None when the offset maps to no place of the
+    unit's raw text (a unit a composer changed, an offset out of range). Each caller keeps its own fallback."""
+    to_raw = _text_to_raw(unit)
     if to_raw is None or not 0 <= at < len(to_raw):
-        return ""
-    pos = u.start + to_raw[at]
-    held = [c.id for c in claims if c.exact and c.start <= pos < c.end]
-    return held[0] if len(held) == 1 else ""
+        return None
+    pos = unit.start + to_raw[at]
+    return [c.id for c in recs if c.exact and c.start <= pos < c.end]
+
+
+def _clip_words(text: str, limit: int) -> str:
+    """``text`` cut at ``limit`` characters on a word boundary and closed with an ellipsis; as it is when it fits."""
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
 
 
 def _unit_label(u: Unit, claims: Sequence = (), limit: int = UNBOUND_LABEL_CHARS) -> str:
@@ -5103,7 +5124,7 @@ def _unit_label(u: Unit, claims: Sequence = (), limit: int = UNBOUND_LABEL_CHARS
     is not shown again), else the unit's text; without list markup, cut at ``limit`` characters."""
     standing = [c.text for c in claims if not c.whole_unit and c.verdict in STANDING_VERDICTS and c.text.strip()]
     text = _norm(re.sub(r"^\s*(?:[-*+•]|\d{1,3}[.)])\s+", "", "; ".join(standing) if standing else u.text)).strip(" |")
-    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
+    return _clip_words(text, limit)
 
 
 def _condition_verdicts(votes: Iterable[JudgeRequirement]) -> dict[str, ConditionVerdict]:
@@ -5220,7 +5241,7 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
                 # and one uncertainty line names it (round 21 U2, KTD2, R2); it counts as a missing caveat, never as coverage
                 report.unbound.append(Unbound(unit.index, st["id"], _item_label(st), st.get("value") or "",
                                               phrase or verdict.quote or MSG_CONDITION_LIMIT.format(where=_read_in(cited)), "condition",
-                                              (only[0].id if len(only := report.claims.get(unit.index, [])) == 1 else "")))
+                                              _sole_id(report.claims.get(unit.index, []))))
                 continue
             key = (unit.index, st["source"], _flat_quote(phrase or MSG_CONDITION_LIMIT.format(where=_read_in(cited))))
             pending.setdefault(key, []).append((st, anchor, phrase, _scope_label(source, ws) if several and phrase else ""))
@@ -5255,7 +5276,7 @@ def _item_label(st: dict) -> str:
     """An item named by its own words for the uncertainty line: the first cell of its source row, as a server line names it, else the
     agent's label, else its value; cut at ``UNBOUND_LABEL_CHARS``."""
     text = _norm(st.get("label") or "") or _norm(st.get("value") or "")
-    return text if len(text) <= UNBOUND_LABEL_CHARS else text[:UNBOUND_LABEL_CHARS].rsplit(" ", 1)[0] + "…"
+    return _clip_words(text, UNBOUND_LABEL_CHARS)
 
 
 def _noted_cell(st: dict, source: Source | None, note: str) -> str | None:
@@ -8463,6 +8484,7 @@ def _shown_support(verdicts: dict[int, JudgeVerdict], batch: _Batch, ws: Workspa
     units = {u.index: u for u in batch.units}
     out = dict(verdicts)
     shown = None
+    read = None
     for i, v in verdicts.items():
         named = [s for s in v.supported_by if s not in units[i].ids]
         if v.verdict != "supported" or not named:
@@ -8475,12 +8497,15 @@ def _shown_support(verdicts: dict[int, JudgeVerdict], batch: _Batch, ws: Workspa
         # a source the turn read and returned with text also stands (round 21 R4): a unit with no number (the connector sentence of a list)
         # has no candidate to be shown, and the one the judge named is a source of this turn; it must hold the unit's numbers when it has
         # any, and the unit must cite a source itself. Only a source the turn never saw is refused; the server's checks of the named support still run (``_named_support``)
-        read = returned_text_sources(ws)
-        numbers = numbers_in(_stated_text(units[i]))
-        # only a unit that cites a source of its own: an uncited claim keeps the old rule (no shown source holds it, so it stays unsupported)
-        cites = any(x in ws.sources for x in units[i].ids)
-        turn_read = {s for s in named if cites and s in read and _EVIDENCE_ID.fullmatch(s)
-                     and (not numbers or numbers & _source_terms(ws, s, (_source_parts(ws, s) or ("", "", ""))[1])[0])}
+        turn_read: set[str] = set()
+        if pending := [s for s in named if s not in shown and s not in mine]:  # only a source neither shown nor a candidate needs this
+            if read is None:  # the sources the turn returned with text, worked out once like ``shown``
+                read = returned_text_sources(ws)
+            numbers = numbers_in(_stated_text(units[i]))
+            # only a unit that cites a source of its own: an uncited claim keeps the old rule (no shown source holds it, so it stays unsupported)
+            cites = any(x in ws.sources for x in units[i].ids)
+            turn_read = {s for s in pending if cites and s in read and _EVIDENCE_ID.fullmatch(s)
+                         and (not numbers or numbers & _source_terms(ws, s, (_source_parts(ws, s) or ("", "", ""))[1])[0])}
         wrong = [s for s in named if not (s in shown or s in mine or s in turn_read) or not _EVIDENCE_ID.fullmatch(s)]
         if wrong:
             out[i] = v.model_copy(update={"verdict": "unsupported", "supported_by": [], "reason": (
@@ -9223,11 +9248,13 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 # a unit holding claims that differ: one problem per claim that fails, so each is linked to its claim
                 # by id (R5); the unit stays, marked, until the edit ladder cuts the claim (U4)
                 held = rescues.get(u.index, {})
+                no_calc = not any(i in ws.computations for i in u.ids)  # the unit cites no calculation: the same for every claim of it
                 for r in failing or [None]:
                     keeps = _number_stands(u, r, recs, v.defect, ws)
+                    mine = [r] if r is not None else recs
                     if v.defect == "units":  # the source's own wording of the number, for a repair that drops it (``_source_sentence``)
-                        for x in ([r] if r is not None else recs):
-                            if x.verdict == "partial" and x.kind == "datum" and not any(i in ws.computations for i in u.ids):
+                        for x in mine:
+                            if x.verdict == "partial" and x.kind == "datum" and no_calc:
                                 x.source_sentence = _source_sentence(u, numbers_in(x.text), ws)
                     why = (reasons.get(r.id) if r is not None else None) or v.reason + (
                         f" («{r.text}»)" if r is not None else "")
@@ -10204,6 +10231,9 @@ class SupportScope:
         return flat in self._flat[sid]
 
 
+ROW_MIN = 6  # a quote shorter than this names no row
+
+
 def _rows_covered(place: tuple[str, str], quote: str, covered: list[tuple[str, str, str]]) -> bool:
     """Whether the judge's support ``quote`` is only rows the answer already gives (round 21 G1): every line of it that is not a heading
     holds, or is held by, the quote of an item of the same component that a surviving unit gives, in the same document and appraisal unit.
@@ -10211,12 +10241,11 @@ def _rows_covered(place: tuple[str, str], quote: str, covered: list[tuple[str, s
     part the answer omits and caps nothing. A quote with a line no covered item holds stays evidence of a gap."""
     from app.chat.items import heading_only
 
-    lines = [_flat_span(x) for x in quote.splitlines() if x.strip() and not heading_only(x)]
     mine = [c[2] for c in covered if c[:2] == place and len(c[2]) >= ROW_MIN]
-    return bool(lines) and bool(mine) and all(any(m in x or x in m for m in mine) for x in lines)
-
-
-ROW_MIN = 6  # a quote shorter than this names no row
+    if not mine:
+        return False
+    lines = [_flat_span(x) for x in quote.splitlines() if x.strip() and not heading_only(x)]
+    return bool(lines) and all(any(m in x or x in m for m in mine) for x in lines)
 
 
 def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> dict[str, list[dict]]:
@@ -10277,6 +10306,12 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
 QUOTE_NEW_WORDS = 3
 
 
+@functools.lru_cache(maxsize=256)
+def _asked_forms(asked: str) -> frozenset[str]:
+    """The comparable forms of the content words of the request's own words, kept per text: every quote of a component is compared with them."""
+    return frozenset(f for w in _missing_words(asked) for f in _missing_forms(w))
+
+
 def _holds_value(quote: str, asked: str) -> bool:
     """Whether a passage quoted for a part of the request holds a value of the asked kind (round 21 U9, KTD5): a number, or at least
     ``QUOTE_NEW_WORDS`` content words the request's own words (``asked``: the component and the part the answer omits) do not hold — a
@@ -10284,7 +10319,7 @@ def _holds_value(quote: str, asked: str) -> bool:
     it from there keeps its tools, to read on or search for the value."""
     if numbers_in(quote):
         return True
-    known = {f for w in _missing_words(asked) for f in _missing_forms(w)}
+    known = _asked_forms(asked)
     return sum(1 for w in _missing_words(quote) if not _missing_forms(w) & known) >= QUOTE_NEW_WORDS
 
 

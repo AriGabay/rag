@@ -105,6 +105,7 @@ from app.chat import conditions, scopes
 from app.chat.evidence import OTHER_ITEM, claim_terms
 from app.chat.meaning import _row_cells, after_kind
 from app.chat.verify import (
+    _FINAL_LETTERS,
     ITEM_COVERED,
     ITEM_INCLUDED,
     ITEM_NOT_APPLICABLE,
@@ -410,7 +411,7 @@ def missing_detail(src, quote: str, group: frozenset[str]) -> str:
         if at is not None:
             head = _header_cells(context_of_source(src)[1]) if src is not None else []
             named = f"{head[at]}: {cells[at]}" if len(head) == len(cells) and head[at] else cells[at]
-            return _whole_tokens(" ".join(named.split()), MISSING_DETAIL_CHARS)
+            return _whole_tokens(named, MISSING_DETAIL_CHARS)
     for start, end, forms in number_spans(quote, source=True):
         if group & forms:
             while start > 0 and not quote[start - 1].isspace():
@@ -419,8 +420,8 @@ def missing_detail(src, quote: str, group: frozenset[str]) -> str:
                 end += 1
             left, right = _tokens(quote[:start])[-_WORDS_AROUND:], _tokens(quote[end:])[:_WORDS_AROUND]
             near = " ".join([*left, quote[start:end].strip(), *right])
-            return _whole_tokens(" ".join(re.sub(r"[\[\]]", " ", near).split()), MISSING_DETAIL_CHARS)
-    return _whole_tokens(" ".join(quote.split()), MISSING_DETAIL_CHARS)
+            return _whole_tokens(re.sub(r"[\[\]]", " ", near), MISSING_DETAIL_CHARS)
+    return _whole_tokens(quote, MISSING_DETAIL_CHARS)
 
 
 def _header_cells(body: Sequence[str]) -> list[str]:
@@ -619,7 +620,7 @@ def _clip_row(line: str) -> str:
 
 class _SpanRow(NamedTuple):
     """A table row of a source for ``_cited_spans``: the line, its first cell, its first value cell, the numbers its value cells state and the
-    class of each (``_number_class``)."""
+    class of each (``_number_class``), then a plain class for each number that no matched number holds."""
 
     line: str
     label: str
@@ -687,7 +688,11 @@ def _span_index(src) -> list[_SpanRow | list[_SpanSentence]]:
             if values:
                 blank = _outside_dates(" ".join(values))
                 classes = tuple((frozenset(numbers_in(m.group(0))), _number_class(blank, m.start(), m.end())) for m in _NUMBER.finditer(blank))
-                out.append(_SpanRow(line, cells[0], values[0], frozenset(numbers_in(blank)), classes))
+                numbers = frozenset(numbers_in(blank))
+                covered = {f for forms, _ in classes for f in forms}
+                # a number the row states that no matched number holds (a form only the whole text reads) is a plain number: class ""
+                classes += tuple((frozenset({f}), "") for f in numbers - covered)
+                out.append(_SpanRow(line, cells[0], values[0], numbers, classes))
             continue
         sentences = []
         for sentence in _SENTENCE_END.split(line):
@@ -710,8 +715,7 @@ def _cited_spans(index: Sequence[_SpanRow | list[_SpanSentence]], wanted: Mappin
     sentence that the unit states, in the sentence's order (``value`` is the first); empty for a row."""
     for entry in index:
         if isinstance(entry, _SpanRow):
-            covered = {f for forms, _ in entry.classes for f in forms}
-            if _states([*entry.classes, *((frozenset({f}), "") for f in entry.numbers - covered)], wanted):
+            if _states(entry.classes, wanted):
                 yield _clip_row(entry.line), entry.label, entry.value, ()
             continue
         for sentence in entry:
@@ -754,9 +758,12 @@ def _holds(item: Item, sid: str, ws, flat: str, component: str | None = None) ->
 
 def _related(sentence: str, text: str) -> bool:
     """Whether a source sentence and an answer sentence share a content word (one word's stem opening the other, three letters at least)."""
-    final = str.maketrans("םןץףך", "מנצפכ")  # a stem keeps its letters when a suffix follows ("דגם" / "דגמים")
-    mine, theirs = {w.translate(final) for w in claim_terms(sentence)[1]}, {w.translate(final) for w in claim_terms(text)[1]}
+    # a stem keeps its letters when a suffix follows ("דגם" / "דגמים")
+    mine, theirs = {w.translate(_FINAL_LETTERS) for w in claim_terms(sentence)[1]}, {w.translate(_FINAL_LETTERS) for w in claim_terms(text)[1]}
     return any(a.startswith(b) or b.startswith(a) for a in mine for b in theirs if min(len(a), len(b)) >= 3)
+
+
+_OWN_PLACES = ("quote", "row")  # the places of a condition span that are the item's own quote or its table row, not the context around them
 
 
 def _only_itself(spans: Sequence[Span], flat: str) -> bool:
@@ -765,7 +772,7 @@ def _only_itself(spans: Sequence[Span], flat: str) -> bool:
         return SupportScope.flat(text).strip(" .,;:")
 
     mine = bare(flat)
-    return all(sp.place in ("quote", "row") and mine in bare(sp.text) for sp in spans)
+    return all(sp.place in _OWN_PLACES and mine in bare(sp.text) for sp in spans)
 
 
 def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledger: Ledger) -> list[Item]:
@@ -802,7 +809,7 @@ def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledge
                         or any(_holds(i, sid, ws, flat, component) for i in [*held, *built])):
                     continue
                 spans = condition_spans(src, quote, [i.quote for i in held])
-                own = [sp for sp in spans if sp.place in ("quote", "row")] if hits else []
+                own = [sp for sp in spans if sp.place in _OWN_PLACES] if hits else []
                 if own:
                     # a clause of the item's own sentence limits the figures it holds: the clause of another figure of the sentence (the exclusion
                     # of the commerce area, beside the lot's area) is that figure's. The item's value is the first figure the unit states that
@@ -1180,16 +1187,23 @@ def _dating_dates(quote: str):
     return [p for p in shared_dates.find_all(quote) if not any(a <= p.span[0] and p.span[1] <= b for a, b in asides)]
 
 
+@functools.lru_cache(maxsize=2048)
+def _dates_of(is_source: bool, label: str, value: str, condition: str, quote: str) -> tuple[str, ...]:
+    """``_item_dates`` as a function of the strings it reads (an item's date words are read many times: the ledger asks them of the same
+    item for every sentence)."""
+    if is_source:  # the server's label and condition are clips of the quote: they carry its asides too
+        own = [p for text in (label, value, condition) for p in _dating_dates(text)]
+    else:
+        own = shared_dates.find_all(f"{label} ; {value} ; {condition}")
+    if own:
+        return tuple(dict.fromkeys(p.iso for p in own))
+    quoted = _dating_dates(quote)
+    return (quoted[0].iso,) if len(quoted) == 1 else ()
+
+
 def _item_dates(item: Item) -> list[str]:
     """The dates (ISO) the item has: those in its own words (label, value, condition); when none, the one date of its quote."""
-    if item.origin == ORIGIN_SOURCE:  # the server's label and condition are clips of the quote: they carry its asides too
-        own = [p for text in (item.label, item.value, item.condition) for p in _dating_dates(text)]
-    else:
-        own = shared_dates.find_all(f"{item.label} ; {item.value} ; {item.condition}")
-    if own:
-        return list(dict.fromkeys(p.iso for p in own))
-    quoted = _dating_dates(item.quote)
-    return [quoted[0].iso] if len(quoted) == 1 else []
+    return list(_dates_of(item.origin == ORIGIN_SOURCE, item.label, item.value, item.condition, item.quote))
 
 
 def _signature(item: Item) -> frozenset[str]:
@@ -1323,10 +1337,27 @@ def _ranged(text: str) -> frozenset[str]:
     return frozenset(out)
 
 
-def _stated_dates(quote: str, text: str) -> bool:
-    """Whether ``text`` states every date of ``quote``."""
+def _stray(group: frozenset[str]) -> bool:
+    """Whether a headline value is a bare number of one or two digits ("2", "12"): a count that many rows of a table share."""
+    return any(f.isdigit() and len(f) <= 2 for f in group)
+
+
+def _stated_dates(dates: Sequence[str], text: str) -> bool:
+    """Whether ``text`` states every date of a quote (``dates``: their ISO forms)."""
     stated = [p.iso for p in shared_dates.find_all(text)]
-    return all(any(s.startswith(p.iso) for s in stated) for p in shared_dates.find_all(quote))
+    return all(any(s.startswith(d) for s in stated) for d in dates)
+
+
+@functools.lru_cache(maxsize=2048)
+def _figures_plan(quote: str) -> tuple[tuple[frozenset[str], ...], tuple[str, ...]] | None:
+    """What ``figures_stated`` asks of a quote, a function of the quote alone (kept per quote: the same quote is checked against every
+    sentence): its headline values and the ISO forms of its dates; None when its figures are too few to tell it from another passage
+    (no date, fewer than three values, fewer than two that are no bare small number)."""
+    groups = headline(quote, quote)
+    dates = tuple(p.iso for p in shared_dates.find_all(quote))
+    if not (dates or len(groups) >= 3 or sum(1 for g in groups if not _stray(g)) >= 2):
+        return None
+    return groups, dates
 
 
 def figures_stated(quote: str, text: str) -> bool | None:
@@ -1335,11 +1366,11 @@ def figures_stated(quote: str, text: str) -> bool | None:
     every figure of the quote (ranges and enumerations expanded to the same set) and every date of it stands in ``text``. A judge's
     quote ("9.75% ... 3.8.2031", "lots 61, 62, 63, 64, 65 ...") is written in the source's words and the answer in its own, so the
     words half of a quote that is its figures says nothing about it."""
-    groups = headline(quote, quote)
-    dated = bool(shared_dates.find_all(quote))
-    if not (dated or len(groups) >= 3 or sum(1 for g in groups if not _stray(g)) >= 2):
+    plan = _figures_plan(quote)
+    if plan is None:
         return None
-    if dated and not _stated_dates(quote, text):
+    groups, dates = plan
+    if dates and not _stated_dates(dates, text):
         return False
     have = _have(text) | _ranged(text)
     return all(g & have for g in groups)
@@ -1417,7 +1448,7 @@ _LIST_NUMBER = re.compile(r"\A\s*(?:[-*+•]\s+)?\d{1,3}[.)]\s")  # the number a
 # a heading's numbering at the start of a text ("4.2 תנאי תשלום", "## 4.2.1 …"): dotted groups, then a word. The number names the section and states
 # no amount - unless a unit, a currency or a duration follows it ("3.5 שנים", "4.5 מ״ר"; round 21 U7, KTD7)
 _SECTION_NUMBER = re.compile(r"\s*(?:#{1,6}\s+|[-*+•]\s+)?(\d{1,3}(?:\.\d{1,3})+)\.?(?=\s+[^\W\d_])")
-_DURATION_AFTER = re.compile(r"\s*(?:שנה|שנים|שנות|חודש|חודשים|ימים|יום|שבוע|שבועות|קומות|חדרים|מ[\"״]ר)")
+_UNIT_NOUN_AFTER = re.compile(r"\s*(?:שנה|שנים|שנות|חודש|חודשים|ימים|יום|שבוע|שבועות|קומות|חדרים|מ[\"״]ר)")
 
 
 def _without_list_number(text: str) -> str:
@@ -1445,7 +1476,7 @@ def _not_headline(text: str, start: int, end: int) -> bool:
         return True
     section = _SECTION_NUMBER.match(text)
     return bool(section and section.start(1) <= start and end <= section.end(1)
-                and not (_QUANTITY_AFTER.match(text, section.end(1)) or _DURATION_AFTER.match(text, section.end(1))))
+                and not (_QUANTITY_AFTER.match(text, section.end(1)) or _UNIT_NOUN_AFTER.match(text, section.end(1))))
 
 
 @functools.lru_cache(maxsize=2048)
@@ -1485,18 +1516,30 @@ def value_tokens(value: str, quote: str) -> tuple[tuple[frozenset[str], ...], tu
     return headline(value, quote), tuple(f for f in fractions_in(value) if f in written)
 
 
+@functools.lru_cache(maxsize=2048)
+def _text_scan(text: str) -> tuple[tuple[tuple[int, int, str], ...], tuple[tuple[int, int, frozenset[str]], ...]]:
+    """What ``token_places`` reads of a text alone: its stated fractions as (start, end, n/m) and the numbers of the text with its dates
+    blanked in place (so the offsets stay the text's own), as ``_numbers_with_scale`` reads them. A function of the text alone, kept per
+    text: the same sentence is placed against every item (round 21 simplification; same values, once per text)."""
+    frac = tuple((m.start(), m.end(), f"{m.group(1)}/{m.group(2)}") for m in _FRACTION.finditer(text))
+    blank = text  # the dates blanked in place, so the offsets stay the text's own
+    for p in sorted(shared_dates.find_all(text), key=lambda x: x.span[0], reverse=True):
+        blank = blank[:p.span[0]] + " " * (p.span[1] - p.span[0]) + blank[p.span[1]:]
+    return frac, tuple(_numbers_with_scale(blank))
+
+
 def token_places(text: str, groups: Sequence[frozenset[str]], fractions: Sequence[str]) -> list[list[tuple[int, int]]]:
     """For each value token of a datum (a headline group, then each fraction), where ``text`` states it, as (start, end) offsets of
     ``text``, in the text's order; an empty list for a token the text does not state. A number inside a stated fraction counts for the
     fraction only."""
-    frac = [(m.start(), m.end(), f"{m.group(1)}/{m.group(2)}") for m in _FRACTION.finditer(text)]
-    inside = lambda a, b: any(fa <= a and b <= fb for fa, fb, _ in frac)  # noqa: E731
-    blank = text  # the dates blanked in place, so the offsets stay the text's own
-    for p in sorted(shared_dates.find_all(text), key=lambda x: x.span[0], reverse=True):
-        blank = blank[:p.span[0]] + " " * (p.span[1] - p.span[0]) + blank[p.span[1]:]
+    frac, numbers = _text_scan(text)
+
+    def inside(a: int, b: int) -> bool:
+        return any(fa <= a and b <= fb for fa, fb, _ in frac)
+
     out: list[list[tuple[int, int]]] = []
     for group in groups:
-        out.append([(a, b) for a, b, forms in _numbers_with_scale(blank) if forms & group and not inside(a, b)])
+        out.append([(a, b) for a, b, forms in numbers if forms & group and not inside(a, b)])
     for f in fractions:
         out.append([(a, b) for a, b, g in frac if g == f])
     return out
@@ -1692,11 +1735,6 @@ class CoverageUnavailable(Exception):
 _DURATION = re.compile(r"(\d{1,2}(?:\.\d+)?)\s*(?:שנה|שנים|שנות|חודש|חודשים|ימים|יום|שבוע|שבועות)(?![א-ת])")
 
 
-def _stray(group: frozenset[str]) -> bool:
-    """Whether a headline value is a bare number of one or two digits ("2", "12"): a count that many rows of a table share."""
-    return any(f.isdigit() and len(f) <= 2 for f in group)
-
-
 def _whole_duration(item: Item, text: str, group: frozenset[str]) -> bool:
     """Whether the item's value writes the number of ``group`` as a duration ("5 שנים") and ``text`` writes the same duration."""
     def durations(source: str) -> set[str]:
@@ -1879,6 +1917,7 @@ _ROW_END = re.compile(r"[\s.,;:!?…]+\Z")
 _ROW_KEY_MIN = 6  # a normalised quote shorter than this names no row
 
 
+@functools.lru_cache(maxsize=2048)
 def _row_key(quote: str) -> str:
     """The row a quote names, whichever way the source or the agent spelled its edges (round 21 U7, KTD7): without a leading list marker
     ("- ", "* ", "2. "), without the brackets (their direction is a drawing matter) and without the marks that close it."""
@@ -2163,7 +2202,10 @@ def _defers(wide: Item, narrow: Item, spans: Mapping[Evidence, Sequence[Span]], 
     that gives the wide item gives it too."""
     if narrow.component != wide.component or not _inside(narrow.evidence, wide.evidence) or not same_datum(narrow, wide):
         return False
-    texts = lambda ev: {SupportScope.flat(sp.text) for sp in spans[ev]}  # noqa: E731
+
+    def texts(ev: Evidence) -> set[str]:
+        return {SupportScope.flat(sp.text) for sp in spans[ev]}
+
     return texts(wide.evidence) <= texts(narrow.evidence) and gave.get(wide.evidence, frozenset()) <= gave.get(narrow.evidence, frozenset())
 
 

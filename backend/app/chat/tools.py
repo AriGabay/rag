@@ -1168,7 +1168,7 @@ def subject_sides(text: str | None, explicit: bool = False) -> list[str]:
     pieces = split.split(text or "")
     if not explicit:
         pieces = [y for x in pieces for y in _repeat_split(x)]
-    parts = [x.strip(f" {_DASHES},.") for x in pieces if x and x.strip(f" {_DASHES},.")]
+    parts = [side for x in pieces if x and (side := x.strip(f" {_DASHES},."))]
     return parts if len(parts) > 1 else ([text.strip()] if text and text.strip() else [])
 
 
@@ -3467,6 +3467,7 @@ def _table_text(st: dict, rows: list, marks: dict[int, str] | None = None, befor
     # same text for the agent and for the verifier, which read ``Source.text``; the stored rows are not changed
     served = stored_tables.serve_structure(st)
     place = {id(r): i for i, r in enumerate(st.get("rows") or [])} if served is not st else {}
+    labels = stored_tables.served_labels(served) if served is not st else None  # the same for every row of the table
     lines = [x for x in [st.get("caption"), *(st.get("title") or []), table_size_line(served)] if x]
     if any(served.get("headers") or []):
         lines.append(" | ".join(served["headers"]))
@@ -3476,9 +3477,9 @@ def _table_text(st: dict, rows: list, marks: dict[int, str] | None = None, befor
         if served is st:
             lines.append(" | ".join(r.get("cells") or []))
         elif id(r) in place:
-            lines.append(stored_tables.render_served_row(served, place[id(r)]))
+            lines.append(stored_tables.render_served_row(served, place[id(r)], labels))
         else:
-            lines.append(stored_tables.render_served_cells(served, list(r.get("cells") or [])))
+            lines.append(stored_tables.render_served_cells(served, list(r.get("cells") or []), labels))
     lines += st.get("notes") or []
     note = _TABLE_SOURCES.get(st.get("source") or "", "")
     return (note + "\n" if note else "") + "\n".join([*before, *lines, *after])

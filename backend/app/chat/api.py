@@ -1234,9 +1234,9 @@ def _diagnostics(outcome: engine.TurnOutcome, payload: dict, removals: _Removals
     # in the resolution's jsonb, served apart by ``get_diagnostics``. A draft may cite a source the final answer dropped, so the
     # documents of every id a draft cites are behind the message too (the draft text is the answer's own words about them)
     drafted = {"drafts": outcome.drafts} if outcome.drafts else {}
-    checked |= {str(loc["document_id"]) for d in outcome.drafts for loc in d["sources"].values() if loc.get("document_id")}
-    checked |= documents_of(leaf for d in outcome.drafts for loc in d["sources"].values() if loc.get("type") == "computation"
-                            for leaf in loc["leaves"])
+    locs = [loc for d in outcome.drafts for loc in d["sources"].values()]
+    checked |= {str(loc["document_id"]) for loc in locs if loc.get("document_id")}
+    checked |= documents_of(leaf for loc in locs if loc.get("type") == "computation" for leaf in loc["leaves"])
     return {"rounds": outcome.rounds, "removed": removed,
             "resolution": (resolution or {}) | {"timing": timing} | registrations | trace | item_ledger | drafted,
             "document_ids": _answer_documents(payload) | found | checked,
