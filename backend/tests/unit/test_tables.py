@@ -339,6 +339,105 @@ def test_the_count_by_class_separates_reversed_drawn_boxless_and_hebrew_tables()
     assert counts == {"reversed_stored": 2, "drawn_stored": 1, "no_boxes": 2, "hebrew": 1, "other": 1}
 
 
+# --- round 22 U4: one serve decision from the structure and the Hebrew context of its pages (KTD4, R7) --------------------------------
+#
+# Ingestion stored a Latin table on a Hebrew page for right-to-left reading; serving it as "reversed" read it the other way. The
+# decision now takes the page context the loader attaches (``PAGE_HEBREW``), and a cell-box backfill cannot change it when the
+# context and the cell cue already decide. Every table here is invented.
+
+def _with_page(st: dict, hebrew: bool | None) -> dict:
+    return st if hebrew is None else {**st, "page_hebrew": hebrew}  # what the loader attaches (``reader.with_page_context``)
+
+
+def _without_boxes(st: dict) -> dict:
+    return {**{k: v for k, v in st.items() if k != "header_boxes"},
+            "rows": [{k: v for k, v in r.items() if k != "cell_boxes"} for r in st["rows"]]}
+
+
+def _with_boxes(st: dict, xs: list[float]) -> dict:
+    return {**st, "rows": [{**r, "cell_boxes": [_box(x) for x in xs]} for r in st["rows"]]}
+
+
+def test_a_latin_table_on_a_hebrew_page_follows_the_ingestion_direction():
+    from app.extraction import tables
+
+    # the page has Hebrew: ingestion read the table for right-to-left reading and stored it that way, so it is served as stored
+    on_hebrew_page = _with_page(REVERSED, True)
+    assert tables.column_order(on_hebrew_page) is None and tables.serve_structure(on_hebrew_page) is on_hebrew_page
+    # a page with no Hebrew, or a page not known: the cue holds and the boxes descend, as before
+    assert tables.column_order(_with_page(REVERSED, False)) == [3, 2, 1, 0]
+    assert tables.column_order(REVERSED) == [3, 2, 1, 0]
+
+
+def test_a_hebrew_table_with_descending_boxes_stays_as_stored_whatever_the_page_says():
+    from app.extraction import tables
+
+    for hebrew in (None, False, True):
+        assert tables.column_order(_with_page(HEBREW, hebrew)) is None
+    one_hebrew_cell = _stored([["Annual", "Q2 2024", "Q1 2024", "פריט"], ["300", "200", "100", "הכנסה"]], [300, 220, 140, 60])
+    assert tables.column_order(_with_page(one_hebrew_cell, False)) is None
+
+
+@pytest.mark.parametrize("st,hebrew", [(REVERSED, True), (DRAWN, True), (HEBREW, False), (NUMBERS_ONLY, False), (NUMBERS_ONLY, True)],
+                         ids=["latin_on_hebrew_page", "drawn_on_hebrew_page", "hebrew_cells", "no_cue", "no_cue_hebrew_page"])
+def test_backfilling_cell_boxes_does_not_change_the_decision_when_the_context_and_the_cue_decide(st, hebrew):
+    from app.extraction import tables
+
+    base = _with_page(st, hebrew)
+    decided = tables.column_order(base)
+    for variant in (_without_boxes(base), _with_boxes(base, [300, 220, 140, 60][:len(base["rows"][0]["cells"])]),
+                    _with_boxes(base, [60, 140, 220, 300][:len(base["rows"][0]["cells"])])):
+        assert tables.column_order(variant) == decided
+        assert tables.serve_direction(variant).inferred is False
+
+
+def test_a_table_the_boxes_alone_decide_is_marked_inferred_and_keeps_todays_stored_boxes_rule():
+    from app.extraction import tables
+
+    assert tables.serve_direction(REVERSED) == tables.Direction(True, "boxes", True)
+    assert tables.serve_direction(DRAWN) == tables.Direction(False, "boxes", True)
+    assert tables.serve_direction(NO_BOXES) == tables.Direction(False, "unknown", True)
+    assert tables.serve_direction(_with_page(REVERSED, True)) == tables.Direction(False, "page", False)
+    assert tables.serve_direction(HEBREW) == tables.Direction(False, "cells", False)
+    assert tables.serve_direction(NUMBERS_ONLY) == tables.Direction(False, "cue", False)
+    served = tables.serve_structure(REVERSED)
+    assert served["direction"] == {"reversed": True, "basis": "boxes", "inferred": True}
+
+
+def test_the_pages_whose_text_gives_a_tables_context_are_the_pages_of_its_rows_and_only_for_a_table_it_can_change():
+    from app.extraction import tables
+
+    two_pages = {**REVERSED, "rows": [{**REVERSED["rows"][0], "page": 4}, {**REVERSED["rows"][1], "page": 5}]}
+    assert tables.context_pages(two_pages) == [4, 5]
+    assert tables.context_pages(HEBREW) == [] and tables.context_pages(_with_page(REVERSED, False)) == []
+    assert tables.context_pages(tables.serve_structure(REVERSED)) == []
+
+
+def test_measurements_and_dates_read_a_cell_by_the_stored_column_the_serve_decision_names():
+    """The readers of the stored structure that do not serve it (a date of a header's column, a measurement's re-anchoring row) index a
+    cell by its stored column; the serve decision keeps that column as the identity of every served position (``columns``)."""
+    from app.chat import dates
+    from app.extraction import tables
+    from app.measurements.store import _find_row
+
+    # a Hebrew valuation table in logical order: stored column 0 is the rightmost; it is served as stored whatever its page says
+    hebrew = {"headers": ["מועד קובע", "שווי"], "units": [], "caption": "ריכוז", "title": [], "notes": [],
+              "rows": [{"page": 1, "cells": ["15/04/2025", "9,000"], "cell_boxes": [_box(300), _box(60)]}]}
+    for page in (None, False, True):
+        st = _with_page(hebrew, page)
+        assert tables.serve_structure(st) is st
+        assert [d.iso for d, _ in dates._table_dates(st["headers"], st["rows"])] == ["2025-04-15"]
+    # a Latin table served reversed: the served position names the stored column the measurement row is found in
+    served = tables.serve_structure(REVERSED)
+    for position, label in enumerate(["Item", "Q1 2024", "Q2 2024", "Annual"]):
+        stored = tables.stored_column(served, position)
+        assert served["rows"][0]["cells"][position] == label == REVERSED["rows"][0]["cells"][stored]
+        assert served["rows"][1]["cells"][position] == REVERSED["rows"][1]["cells"][stored]
+    old = {"caption": "", "headers": [], "row": REVERSED["rows"][1]["cells"]}
+    found = _find_row([(0, REVERSED)], old, ["200"], {})
+    assert found is not None and found[1] == 1 and found[3][tables.stored_column(served, 2)] == "200"  # the cell «200» is Q2 2024
+
+
 # --- round 22 U3: a table continues across a page on structural evidence, never on shape alone (KTD3, R6, R9) -----------------------
 #
 # Three values: "continues" (a repeated header and nothing between the parts), "separate" (a heading or paragraph that is no page

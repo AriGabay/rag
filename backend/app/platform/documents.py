@@ -22,6 +22,7 @@ from app.chat import reader
 from app.config import get_settings
 from app.db import TenantContext, bump_data_version, tenant_tx
 from app.deps import FORBIDDEN, NOT_FOUND, get_ctx, parse_uuid, require_admin
+from app.extraction import tables as stored_tables
 from app.extraction.base import PageGeometry
 from app.extraction.geometry import POSITIONS_VERSION, geometry_box
 from app.extraction.render import (  # noqa: F401 - the view's scales
@@ -595,8 +596,13 @@ def get_blocks(document_id: str, version_id: str, start: int | None = Query(None
              "content_hash": r.content_hash, "original_text": r.original_text}
         if r.table_index is not None and r.table_index in tables:
             st = tables[r.table_index] or {}
-            b["table"] = {k: st.get(k) for k in ("headers", "caption", "title", "notes", "source", "media")} | {
-                "rows": [x.get("cells") for x in st.get("rows") or []]}
+            # the table as the agent read it (round 22 U4, KTD4, R7): a table stored in reversed cell order is shown in the order it
+            # is drawn, by the one serve decision every path uses; ``columns`` names the stored column of each shown one, which is
+            # what a citation's column index (``anchor.column``) counts
+            served = stored_tables.serve_structure(st)
+            b["table"] = {k: served.get(k) for k in ("headers", "caption", "title", "notes", "source", "media")} | {
+                "rows": [x.get("cells") for x in served.get("rows") or []], "columns": served.get("columns")}
+            b["text"] = stored_tables.serve_text(st, r.text or "")
         if r.media and r.media.rsplit(".", 1)[-1].lower() in _MEDIA_TYPES:
             b["media_url"] = f"/api/documents/{document_id}/versions/{version_id}/media/{quote(r.media)}"
         if v.mime_type == PDF_MIME and r.page:

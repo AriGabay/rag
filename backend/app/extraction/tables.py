@@ -337,7 +337,8 @@ def _append(table: TableResult, body: list[list[str]], boxes: list[list | None],
 # approval); the order is recovered at serve time from what the stored data itself shows. All three must hold for a table to be
 # served reversed: its stored cell boxes run from right to left, it holds no Hebrew letter, and the left-to-right cue holds on the
 # table read in the order it is drawn. A table with no boxes, with ascending boxes, with a Hebrew letter or with no cue is served
-# as stored. A served table keeps, for each column, the stored column it came from (``columns``): the stored index is what a cell's
+# as stored. Round 22 U4 (KTD4): Hebrew on the table's pages (``PAGE_HEBREW``) also means as stored, as ingestion read the table, and
+# when the page context and the cue decide the boxes are not asked (``serve_direction``). A served table keeps, for each column, the stored column it came from (``columns``): the stored index is what a cell's
 # value, its box and the datum's identity are looked up by.
 
 _LETTER = re.compile(r"[^\W\d_]")
@@ -371,21 +372,60 @@ def _texts(st: dict) -> Iterator[str]:
             yield c or ""
 
 
-def stored_reversed(st: dict | None) -> bool:
-    """Whether a stored table is a left-to-right table stored in reversed cell order (KTD6): its stored cell boxes descend, no
-    cell or header holds a Hebrew letter, and the left-to-right cue holds on the table read in the order it is drawn (the stored
-    order reversed). Read from the stored structure alone; the page's own text is not at hand, so a table of a page with Hebrew
-    and none in its cells is judged by its boxes and its cue alone."""
+PAGE_HEBREW = "page_hebrew"  # the page context a loader attaches to a structure it reads (``context_pages`` names the pages it is read from)
+
+
+class Direction(NamedTuple):
+    """How a stored table is served (round 22 U4, KTD4): ``reversed`` (its stored columns run right to left and are served in the order
+    they are drawn), ``basis`` (what decided it: ``cells`` a Hebrew letter in the table, ``page`` Hebrew on the table's pages, ``cue`` no
+    left-to-right cue, ``boxes`` the stored cell boxes, ``unknown`` no box says), and ``inferred`` (the boxes or nothing decided it, not
+    the page context and the cell cue)."""
+
+    reversed: bool
+    basis: str
+    inferred: bool
+
+
+def context_pages(st: dict | None) -> list[int]:
+    """The pages a stored table's Hebrew context is taken from (round 22 U4): the pages of its rows, else its own page. Empty for a
+    table the context cannot change (a structure already served, one that holds a Hebrew letter: both are decided without it) and for
+    one that already carries it."""
+    if not st or st.get("columns") is not None or PAGE_HEBREW in st or any(has_hebrew(c) for c in _texts(st)):
+        return []
+    pages = sorted({r["page"] for r in st.get("rows") or [] if isinstance(r, dict) and isinstance(r.get("page"), int)})
+    return pages or ([st["page"]] if isinstance(st.get("page"), int) else [])
+
+
+def serve_direction(st: dict | None) -> Direction:
+    """The one decision of how a stored table is served (round 22 U4, KTD4, R7): a pure function of the stored structure and the Hebrew
+    context of its pages (``PAGE_HEBREW``: whether a page of its rows holds a Hebrew letter, as the stored page text shows; absent when
+    the structure was read without it). Every path that shows a cell (search, read, take_value, the citation and the source viewer)
+    asks this function, so a cell has one identity whatever path reads it.
+
+    Ingestion stored a table reversed unless ``reads_left_to_right`` held for it with the context of its page. So: a Hebrew letter in the
+    table, or Hebrew on its page, means it was stored for right-to-left reading and is served as stored, whatever its boxes show (a box
+    backfill cannot change it); a table with no left-to-right cue (read in the order it is drawn) was stored reversed by every reader
+    and is served as stored. What is left (no Hebrew anywhere, the cue holds) is a table the round-19 reading stored reversed or a
+    later one stored in the order it is drawn: only its stored cell boxes tell, and the direction is then inferred."""
     if not st or st.get("columns") is not None:  # a structure already served
-        return False
+        return Direction(False, "served", False)
     if any(has_hebrew(c) for c in _texts(st)):
-        return False
+        return Direction(False, "cells", False)
+    if st.get(PAGE_HEBREW):
+        return Direction(False, "page", False)
     rows = st.get("rows") or []
-    if _boxes_descend([st.get("header_boxes"), *(r.get("cell_boxes") for r in rows)]) is not True:
-        return False
     headers = st.get("headers") or []
     grid = ([headers[::-1]] if any(headers) else []) + [list(r.get("cells") or [])[::-1] for r in rows]
-    return reads_left_to_right(grid, False)
+    if not reads_left_to_right(grid, False):
+        return Direction(False, "cue", False)
+    boxes = _boxes_descend([st.get("header_boxes"), *(r.get("cell_boxes") for r in rows)])
+    return Direction(boxes is True, "unknown" if boxes is None else "boxes", True)
+
+
+def stored_reversed(st: dict | None) -> bool:
+    """Whether a stored table is a left-to-right table stored in reversed cell order and served in the order it is drawn
+    (``serve_direction``)."""
+    return serve_direction(st).reversed
 
 
 def _width_of(st: dict) -> int:
@@ -611,6 +651,7 @@ def _served(key: _ById) -> dict:
     units = st.get("units") or []
     out = dict(st)
     out["columns"] = order
+    out["direction"] = serve_direction(st)._asdict()  # why it is served reversed, and whether that is inferred (round 22 U4)
     out["headers"] = serve_cells(order, headers, fixed=False) if any(headers) else []
     out["units"] = _pick(units, order, None) if units else []
     if st.get("header_boxes"):

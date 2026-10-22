@@ -195,18 +195,44 @@ def section_path_of(conn: Connection, version_id: UUID, block_index: int) -> tup
     return tuple(row.section_path or ()) if row else ()
 
 
+HEBREW_LETTER_SQL = "[א-ת]"
+
+
+def with_page_context(conn: Connection, version_id: UUID, structures: dict[int, dict]) -> dict[int, dict]:
+    """``structures`` (by table index) each carrying the Hebrew context of its pages (round 22 U4, KTD4): ``tables.PAGE_HEBREW`` is true
+    when a page of its rows holds a Hebrew letter in the stored page text (``pages.text``), which is what ingestion read when it decided
+    the table's direction. One query for all the tables given, made only for a table the context can change
+    (``tables.context_pages``); a structure the pages do not tell about is returned as it is, and nothing stored is changed."""
+    from app.extraction import tables as stored_tables
+
+    wanted = {i: pages for i, st in structures.items() if (pages := stored_tables.context_pages(st))}
+    if not wanted:
+        return structures
+    found = {r.page_no: bool(r.hebrew) for r in conn.execute(text(
+        "SELECT page_no, text ~ :letter AS hebrew FROM pages WHERE version_id = :v AND page_no = ANY(:p)"),
+        {"v": version_id, "letter": HEBREW_LETTER_SQL, "p": sorted(set().union(*wanted.values()))})}
+    out = dict(structures)
+    for i, pages in wanted.items():
+        known = [found[p] for p in pages if p in found]
+        if known:
+            out[i] = {**structures[i], stored_tables.PAGE_HEBREW: any(known)}
+    return out
+
+
 def table_structure(conn: Connection, version_id: UUID, table_index: int) -> dict | None:
     row = conn.execute(text("SELECT structure FROM extracted_tables WHERE version_id = :v AND table_index = :t"),
                        {"v": version_id, "t": table_index}).first()
-    return (row.structure or {}) if row else None
+    if not row:
+        return None
+    return with_page_context(conn, version_id, {table_index: row.structure or {}})[table_index]
 
 
 def tables_of(conn: Connection, version_id: UUID, indexes: Collection[int] | None = None) -> dict[int, dict]:
-    """A version's tables by index (only those of ``indexes`` when given)."""
-    return {r.table_index: (r.structure or {}) for r in conn.execute(text(
+    """A version's tables by index (only those of ``indexes`` when given), each with the Hebrew context of its pages (``with_page_context``)."""
+    return with_page_context(conn, version_id, {r.table_index: (r.structure or {}) for r in conn.execute(text(
         "SELECT table_index, structure FROM extracted_tables WHERE version_id = :v"
         + (" AND table_index = ANY(:t)" if indexes is not None else "") + " ORDER BY table_index"),
-        {"v": version_id, "t": list(indexes) if indexes is not None else None})}
+        {"v": version_id, "t": list(indexes) if indexes is not None else None})})
 
 
 def table_block(conn: Connection, version_id: UUID, table_index: int):

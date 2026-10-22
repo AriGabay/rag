@@ -225,6 +225,7 @@ from app.chat.timing import StageClock
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
 from app.extraction import tables as stored_tables
+from app.extraction.chunking import render_row
 from app.measurements.extract import (
     EXTRACTION_VERSION,
     PERIOD_LABELS,
@@ -6662,6 +6663,61 @@ def _row_quote_locator(sid: str, st: dict, loc: dict) -> dict:
     return {"row_number": i + 1, "column_number": ci + 1, "number": loc["number"]}
 
 
+def _cell_forms(label: str, unit, cell: str, column: int) -> list[str]:
+    """How a table cell is written in the text a source shows: the cell alone, and after its column label as a row chunk or a
+    served row renders it (``render_row``: ``label: cell``, the unit after the label when the label lacks it, ``עמודה N`` for a
+    column with no label)."""
+    name = label or f"עמודה {column + 1}"
+    forms = [cell, f"{name}: {cell}"]
+    if unit and f"({unit})" not in name:
+        forms.append(f"{name} ({unit}): {cell}")
+    return forms
+
+
+def _quote_cell_locator(src: Source, full: str, st: dict, loc: dict) -> dict | None:
+    """The cell locator of a quote of a table source that holds exactly one cell of its table (round 22 U4, KTD4, R7): the cell
+    whose number is the quote's number and whose text, alone or after its column label as the source shows it, holds the quote — in the
+    rows the source shows (the one row of a table-row hit). It is then taken as that cell, so its anchor carries the table, the row and
+    the stored column, and the table's scale, unit and notes apply, as for a cell taken by row and column. None (the quote is taken as
+    a quote) when the number is not in the quote, no cell or several cells hold it, or the quote is also written outside the table's rows
+    of this source (a note, a caption): then the quote does not say which cell it is."""
+    wanted = _parse_number(loc.get("number") or "")
+    shaped = _loose(loc.get("quote"))
+    if wanted is None or len(shaped) < 3 or meaning._flat(loc["quote"]) not in meaning._flat(full) \
+            or not any(n[3] == abs(wanted[1]) for n in _numbers_of(meaning._norm(loc["quote"]))):
+        return None
+    sst = stored_tables.serve_structure(st)
+    labels = stored_tables.served_labels(sst)[0] if sst is not st else list(st.get("headers") or [])
+    units = list(sst.get("units") or [])
+    stored_labels, stored_units = list(st.get("headers") or []), list(st.get("units") or [])
+    whole = _loose(full)
+    rest = full
+    found: list[tuple[int, int]] = []
+    for i, row in enumerate(sst.get("rows") or []):
+        if src.row_index is not None and i != src.row_index:
+            continue
+        cells = list(row.get("cells") or [])
+        stored_row = list((st.get("rows") or [])[i].get("cells") or []) if i < len(st.get("rows") or []) else cells
+        lines = [" | ".join(cells), render_row(stored_labels, stored_row, stored_units or None)]
+        if sst is not st:
+            lines.append(stored_tables.render_served_row(sst, i, (labels, None)))
+        lines = [ln for ln in dict.fromkeys(lines) if ln and _loose(ln) and _loose(ln) in whole]
+        if not lines:
+            continue
+        for ln in lines:
+            rest = rest.replace(ln, "")
+        for ci, cell in enumerate(cells):
+            label = labels[ci] if ci < len(labels) else ""
+            unit = units[ci] if ci < len(units) else None
+            if any(n[3] == abs(wanted[1]) for n in _numbers_of(meaning._norm(cell))) \
+                    and any(shaped in _loose(f) for f in _cell_forms(label, unit, cell, ci)):
+                found.append((i, ci))
+    if len(found) != 1 or shaped in _loose(rest):
+        return None
+    i, ci = found[0]
+    return {"row_number": i + 1, "column_number": ci + 1, "number": loc["number"]}
+
+
 MSG_QUOTE_AMBIGUOUS = ("הציטוט מופיע ב-{sid} יותר מפעם אחת, ובמקומות שונים כתוב בו מספר אחר: צטט ציטוט ארוך יותר, "
                        "שמופיע במקור פעם אחת בלבד ושהמספר כתוב בו במלואו")
 
@@ -7341,6 +7397,12 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             if st is None:
                 raise ToolError("הטבלה לא נמצאה בקריאה הנוכחית של המסמך")
             loc, cell = _row_quote_locator(sid, st, loc), True
+        elif not cell and not vision and src.table_index is not None and loc.get("quote"):
+            # a quote of a table source that holds one cell of its table is that cell, with its table, row and stored column (round 22 U4, KTD4)
+            st, _ = _table_at(ws, conn, src.version_id, src.table_index)
+            resolved = _quote_cell_locator(src, full, st, loc) if st is not None else None
+            if resolved is not None:
+                loc, cell = resolved, True
         rows: list = []
         if cell and vision:
             taken = _take_vision_cell(ws, src, full, loc, _governing_note(ws, conn, src.version_id, src.block_start))

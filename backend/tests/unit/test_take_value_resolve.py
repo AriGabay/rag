@@ -481,6 +481,69 @@ def test_a_table_served_as_stored_keeps_the_stored_column_and_no_shown_column():
     assert taken["written"] == "300"
 
 
+# --- round 22 U4: a quote of a table cell is that cell, with its table, row and stored column (KTD4, R7) -------------------------
+
+def test_a_quote_of_a_served_cell_of_a_reversed_table_anchors_to_that_cell_with_its_column_identity(monkeypatch):
+    reversed_, _ = _reversed_store()
+    d = _workspace(monkeypatch, reversed_)
+    _take(d, _loc(quote="Q1 2024: 100", number="100"))  # the quote as the served table shows the cell (no pipe)
+    v = d.ws.values["V1"]
+    assert v.locator["row_number"] == 2 and v.locator["column"] == "Q1 2024"
+    assert v.locator["column_number"] == 3 and v.locator["column_shown"] == 2  # the stored column and the one shown
+    anchor = d.ws.anchors["V1"]
+    assert (anchor["table_index"], anchor["row"], anchor["column"]) == (0, 1, 2)  # the stored cell: its box is looked up by it
+    assert reversed_["rows"][1]["cells"][anchor["column"]] == "100"
+
+
+def test_each_served_cell_of_a_reversed_table_anchors_to_its_own_stored_column(monkeypatch):
+    reversed_, _ = _reversed_store()
+    for quote, number, column in (("Q2 2024: 200", "200", 1), ("Annual: 300", "300", 0), ("Q1 2024: 100", "100", 2)):
+        d = _workspace(monkeypatch, reversed_)
+        _take(d, _loc(quote=quote, number=number))
+        assert (d.ws.anchors["V1"]["row"], d.ws.anchors["V1"]["column"]) == (1, column)
+        assert reversed_["rows"][1]["cells"][column] == number
+
+
+def test_a_quote_of_a_cell_of_a_table_served_as_stored_is_that_cell_too(monkeypatch):
+    _, drawn = _reversed_store()
+    d = _workspace(monkeypatch, drawn)
+    _take(d, _loc(quote="200", number="200"))
+    v = d.ws.values["V1"]
+    assert (d.ws.anchors["V1"]["table_index"], d.ws.anchors["V1"]["row"], d.ws.anchors["V1"]["column"]) == (0, 1, 2)
+    assert v.locator["row_number"] == 2 and v.locator["column_number"] == 3 and "column_shown" not in v.locator
+
+
+def _source_of(table: dict, row_index: int | None = None) -> T.Source:
+    full = T._table_text(table, table["rows"])
+    return T.Source(sid="S1", document_id=VERSION.document_id, version_id=VERSION.version_id, title="t", section=None, location="",
+                    kind="table", text=full, block_start=0, block_end=0, reading_id="r", status="complete", table_index=0,
+                    row_index=row_index)
+
+
+def test_a_quote_that_fits_several_cells_or_is_written_in_a_note_is_not_forced_into_a_cell():
+    twice = _table(["Item", "Q1", "Q2"], [["Rent", "100", "100"], ["Fees", "20", "30"]], notes=["* amounts as of 2024"])
+    src = _source_of(twice)
+    assert T._quote_cell_locator(src, src.text, twice, {"quote": "100", "number": "100"}) is None  # two cells hold it
+    src.text = "Item | Q1 | Q2\nItem: Rent | Q1: 100 | Q2: 100\nItem: Fees | Q1: 20 | Q2: 30"  # a read that shows the cells with their labels
+    assert T._quote_cell_locator(src, src.text, twice, {"quote": "Q1: 100", "number": "100"}) == \
+        {"row_number": 1, "column_number": 2, "number": "100"}
+    assert T._quote_cell_locator(src, src.text, twice, {"quote": "Q9: 100", "number": "100"}) is None  # not in the source
+    noted = _table(["Item", "Q1"], [["Rent", "2024"]], notes=["* amounts as of 2024"])
+    src = _source_of(noted)
+    src.text += "\nItem: Rent | Q1: 2024"
+    assert T._quote_cell_locator(src, src.text, noted, {"quote": "2024", "number": "2024"}) is None  # the note writes it too
+    assert T._quote_cell_locator(src, src.text, noted, {"quote": "amounts as of 2024", "number": "2024"}) is None
+    assert T._quote_cell_locator(src, src.text, noted, {"quote": "Q1: 2024", "number": "2024"})["column_number"] == 2
+
+
+def test_a_row_chunk_hit_limits_the_cells_a_quote_can_be_to_its_own_row():
+    table = _table(["Item", "Q1"], [["Rent", "100"], ["Fees", "100"]])
+    src = _source_of(table, row_index=1)
+    src.text = "Item: Fees | Q1: 100"
+    assert T._quote_cell_locator(src, src.text, table, {"quote": "Q1: 100", "number": "100"}) == \
+        {"row_number": 2, "column_number": 2, "number": "100"}
+
+
 # --- round 22 U3: a stored table whose rows span pages applies its caption scale to a later page only on evidence (KTD3, R9) -----
 
 def _two_page_table(caption="להלן טבלת הוצאות (באלפי ₪)") -> dict:

@@ -416,3 +416,36 @@ def test_the_answer_documents_include_the_documents_behind_the_components_table_
     assert _answer_documents(base | {"time": {"breakdown": blocks}}) == {"d1", "d4", "d5"}
     assert _answer_documents(base | {"time": {"breakdown": []}}) == {"d1"}
     assert _answer_documents(base | {"time": {"timeline": []}}) == {"d1"}, "an older message has no breakdown"
+
+
+# --- round 22 U4: the citation reads a cell's row and column by the labels the agent was shown (KTD4, R7, AE2) -------------------
+
+def _reversed_with_header_row() -> dict:
+    from tests.unit.test_tables import REVERSED
+
+    return REVERSED
+
+
+def test_ae2_the_viewer_row_and_column_of_a_cell_of_a_reversed_table_match_the_agents_labels():
+    reversed_ = _reversed_with_header_row()  # stored [Annual, Q2 2024, Q1 2024, Item]; drawn Item | Q1 2024 | Q2 2024 | Annual
+    snap = A.snapshot(stub(kind="cell", block_start=1, block_end=1, table_index=0, row=1, column=2),  # Revenue / Q1 2024, stored column 2
+                      reading(tables={0: reversed_}, pages=[page(1)]), "r1")
+    t = snap["table"]
+    assert (t["row_label"], t["column_header"]) == ("Revenue", "Q1 2024")  # not the stored first cell «300»
+    assert (t["row_number"], t["column_number"]) == (2, 2)  # the column as shown to the agent
+    assert t["direction"] == {"reversed": True, "basis": "boxes", "inferred": True}
+    assert snap["precision"] == "cell" and snap["pages"][0]["rects"] == [frac(reversed_["rows"][1]["cell_boxes"][2])]
+
+
+def test_a_reversed_table_with_its_own_headers_gives_the_served_header_of_the_stored_column():
+    reversed_ = {**_reversed_with_header_row(), "headers": ["Annual", "Q2 2024", "Q1 2024", "Item"]}
+    reversed_["rows"] = reversed_["rows"][1:]
+    snap = A.snapshot(stub(kind="cell", block_start=1, block_end=1, table_index=0, row=0, column=1), reading(tables={0: reversed_}), "r1")
+    t = snap["table"]
+    assert (t["row_label"], t["column_header"], t["column_number"]) == ("Revenue", "Q2 2024", 3)
+
+
+def test_a_table_the_page_context_serves_as_stored_keeps_its_stored_labels_in_the_citation():
+    on_hebrew_page = {**_reversed_with_header_row(), "page_hebrew": True}
+    snap = A.snapshot(stub(kind="cell", block_start=1, block_end=1, table_index=0, row=1, column=2), reading(tables={0: on_hebrew_page}), "r1")
+    assert snap["table"]["row_label"] == "300" and "direction" not in snap["table"]  # as stored, as ingestion read it

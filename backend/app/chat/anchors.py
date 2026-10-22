@@ -66,6 +66,7 @@ from app.answering.numread import NUMBER, _span_end, read_separators
 from app.chat import datum, reader
 from app.chat.meaning import _norm, units_attested
 from app.chat.slots import clip
+from app.extraction import tables as stored_tables
 from app.extraction.base import PageGeometry
 from app.extraction.geometry import Span, geometry_box
 
@@ -520,9 +521,20 @@ def _table_ctx(reading: Reading, ti: int, row: int | None, column: int | None) -
     if st is None:
         return None
     rows = st.get("rows") or []
-    headers = st.get("headers") or []
     cells = (rows[row].get("cells") or []) if row is not None and 0 <= row < len(rows) else []
+    headers = st.get("headers") or []
     col = column if column is not None and (0 <= column < max(len(headers), len(cells))) else None
+    # the labels are the ones the agent was shown (round 22 U4, KTD4, R7): a table served in the order it is drawn gives its row label
+    # and column header from the served structure, by the stored column the anchor names; the units and the header boxes stay
+    # looked up by that stored column
+    served = stored_tables.serve_structure(st)
+    labels, shown = headers, cells
+    if served is not st:
+        labels = served.get("headers") or []
+        if not any(labels):
+            labels = stored_tables.served_labels(served)[0]
+        shown = (served["rows"][row].get("cells") or []) if cells else []
+    at = stored_tables.served_position(served, col) if col is not None else None
     units = st.get("units") or []
     notes = [n for n in st.get("notes") or [] if n]
     unit = units[col] if col is not None and col < len(units) and units[col] else None
@@ -538,10 +550,11 @@ def _table_ctx(reading: Reading, ti: int, row: int | None, column: int | None) -
         if rects:
             header = {"page": page_no, "rects": [_union(rects)]}
     title = st.get("caption") or next((t for t in st.get("title") or [] if t), None)
-    return {"table_index": ti, "title": title, "row_label": (cells[0] or None) if cells else None,
+    return {"table_index": ti, "title": title, "row_label": (shown[0] or None) if shown else None,
             "row_number": row + 1 if cells else None,
-            "column_header": (headers[col] or None) if col is not None and col < len(headers) else None,
-            "column_number": col + 1 if col is not None else None, "unit_note": unit, "source": st.get("source"),
+            "column_header": (labels[at] or None) if at is not None and at < len(labels) else None,
+            "column_number": at + 1 if at is not None else None, "unit_note": unit, "source": st.get("source"),
+            **({"direction": served["direction"]} if served is not st else {}),
             "header": header,
             "notes": [{"text": n} | ({"page": page_no} if reading.is_pdf and page_no else {})
                       for n in notes[:MAX_NOTES]]}
