@@ -457,12 +457,13 @@ def _row_conditions(row: str, body: Sequence[str], flat: str) -> Iterable[tuple[
     yield from (("row", c) for c in conditions.material_clauses(sentence))
 
 
-def condition_spans(src, quote: str, elsewhere: Sequence[str] = ()) -> list[Span]:
+def condition_spans(src, quote: str, elsewhere: Sequence[str] = (), value: str = "") -> list[Span]:
     """The condition spans of the item whose quote is ``quote`` in ``src``, from its own context only: an operator clause of the
     quote, the clauses and note of its row (or its sentence), the headings that name a method, a status, a component or a time, and
     the paragraphs and notes attributed to its table (``TablePart.attributed``: a paragraph that is not attributed is no condition
     of its values). Each span once, in that order. ``elsewhere``: the quotes of the other items of the turn: a note whose mark one of
-    them carries and the item's own quote and row do not is the note of that item (round 20 U9, F2)."""
+    them carries and the item's own quote and row do not is the note of that item (round 20 U9, F2). ``value``: the item's value; a quote that
+    holds it and another amount gives the item only the operator clauses of its own part (``_foreign_part``: round 21 full measurement)."""
     parts, body = context_of_source(src)
     flat = SupportScope.flat(quote)
     out: list[Span] = []
@@ -477,7 +478,8 @@ def condition_spans(src, quote: str, elsewhere: Sequence[str] = ()) -> list[Span
     row = _row_of(body, flat)
     if row is None or "|" not in row:  # a table row is read cell by cell below: its placeholder cells say nothing
         for clause in conditions.material_clauses(quote):
-            add("quote", clause)
+            if not _foreign_part(quote, clause, value):
+                add("quote", clause)
     if row is not None:
         for place, text in _row_conditions(row, body, flat):
             add(place, text)
@@ -492,18 +494,55 @@ def condition_spans(src, quote: str, elsewhere: Sequence[str] = ()) -> list[Span
     return out
 
 
+# the places a quote of several amounts breaks into the part of each: a comma that joins no digits, a semicolon, and the words that open another part
+_PART_BREAK = re.compile(r"(?<!\d),(?!\d)|;|(?<![א-ת])(?:דהיינו|כלומר|ואילו)(?![א-ת])")
+
+
+def _foreign_part(quote: str, clause: str, value: str) -> bool:
+    """Whether the operator clause ``clause`` of a quote that holds the item's ``value`` and another amount limits only the other amount (round 21
+    full measurement: «… 3.250 דונם בבעלות צד אחר והוא אינו מהווה חלק מנשוא חוות הדעת, דהיינו סה"כ … 40.100 דונם»: the exclusion is the 3.250 part's,
+    not the total's). The quote is cut into parts at a comma, a semicolon and «דהיינו», «כלומר», «ואילו»; a part that holds an amount other than the
+    value and not the value is foreign. The clause is foreign when it has an operator in some part and every part with an operator is foreign. No
+    value, a quote with one amount or none of the value, and a clause with no part of its own are never foreign (the clause is the item's, as before)."""
+    if not value or not (tokens := value_tokens(value, quote)) or not any(tokens):
+        return False
+    mine = [place for places in token_places(quote, *tokens) for place in places]
+    if not mine:
+        return False
+    _, numbers = _text_scan(quote)
+    others = [(a, b) for a, b, _ in numbers if not _not_headline(quote, a, b) and not any(x <= a and b <= y for x, y in mine)]
+    start = quote.find(clause)
+    if not others or start < 0:
+        return False
+    end, cuts = start + len(clause), [0, *(m.end() for m in _PART_BREAK.finditer(quote)), len(quote)]
+    held = False
+    for a, b in zip(cuts, cuts[1:], strict=False):
+        if b <= start or a >= end:
+            continue
+        part = quote[max(a, start):min(b, end)]
+        if not conditions.material_clauses(part):
+            continue
+        held = True
+        if not any(a <= x and y <= b for x, y in others) or any(a <= x and y <= b for x, y in mine):
+            return False  # an operator of the part that holds the value, or of a part with no other amount: the item's
+    return held
+
+
 def _note_of_row(note: str, body: Sequence[str], row: str | None, quote: str = "", elsewhere: Sequence[str] = ()) -> bool:
     """Whether a note beside a table limits the item whose row is ``row`` (round 20 U3, KTD3, R10, AE7; round 20 U9, F2): a note that opens
     with a mark («*», «**», «(1)», «(***)») belongs to the cells that carry the same mark, so it is no condition of a row that carries none
     of them; a mark in a header cell belongs to every row. A mark that the quote of another item (``elsewhere``) carries, and the item's own
     quote and row do not, is the mark of that item's row, even in another table: the note is no condition of this item. A note without a
-    mark, a mark nobody carries, and an item that is no table row keep the note."""
+    mark and a mark nobody carries keep the note for a table row. Round 21 full measurement: a marked note belongs to what carries its
+    mark, never to a prose item whose own quote does not carry it, whether or not a row of this source text carries the mark."""
     mark = scopes.note_mark(note)
     if not mark:
         return True
     elsewhere_holds = any(mark in scopes.marks_of(q) for q in elsewhere)
     if row is None or "|" not in row:
-        return mark in scopes.marks_of(quote) or not elsewhere_holds
+        # round 21 full measurement: a marked note belongs to what carries its mark, so a prose item whose own quote does not carry it never
+        # takes it (the mark may stand on a row of another chunk or source that this text does not hold: it is still not this item's)
+        return mark in scopes.marks_of(quote)
     rows, held = _rows_marked(tuple(body), mark)
     if held is None:  # no cell of the table carries it: another item's note only when the table carries no mark of its own
         return mark in scopes.marks_of(quote) or not elsewhere_holds or _marked_table(tuple(body))
@@ -808,7 +847,7 @@ def source_items(units: Sequence[Unit], ws, components: Sequence[Mapping], ledge
                 if (made >= ROWS_PER_UNIT or scope.source_problem(sid, flat) or scope.place_problem(src)
                         or any(_holds(i, sid, ws, flat, component) for i in [*held, *built])):
                     continue
-                spans = condition_spans(src, quote, [i.quote for i in held])
+                spans = condition_spans(src, quote, [i.quote for i in held], value)
                 own = [sp for sp in spans if sp.place in _OWN_PLACES] if hits else []
                 if own:
                     # a clause of the item's own sentence limits the figures it holds: the clause of another figure of the sentence (the exclusion
@@ -1082,7 +1121,7 @@ def candidates(units: Sequence[Unit], ws, ledger: Ledger, components: Sequence[M
         for n in found[:CANDIDATES_PER_SOURCE]:
             raw = raws[n]
             offered.append(Candidate(ledger.candidate_id(evidence_key(document_id, unit_id, sid, flats[n])), sid, raw.quote, raw.label, raw.value,
-                                     " ; ".join(sp.text for sp in condition_spans(src, raw.quote)), " ".join(raw.own.split()),
+                                     " ; ".join(sp.text for sp in condition_spans(src, raw.quote, value=raw.value)), " ".join(raw.own.split()),
                                      raw.kind, document_id, unit_id))
         if len(found) > CANDIDATES_PER_SOURCE:
             left_out[sid] = len(found) - CANDIDATES_PER_SOURCE
@@ -1164,6 +1203,23 @@ def _attributed(item: Item, unit: Unit, ws) -> bool:
                 v = ws.values.get(leaf)
                 if v is not None and v.source_id == item.source and _same_place(home, _value_place(v)):
                     return True
+    return False
+
+
+def _cites_source(item: Item, unit: Unit, ws) -> bool:
+    """Whether the unit cites the item's own source itself (round 21 full measurement): the S# (or its re-read), a value V# registered from it, or a
+    calculation C# one of whose leaves is such a value. Narrower than ``_attributed``, which also takes another passage of the item's document and
+    unit that holds its quote or value: a sentence that cites only that passage gives the same figure from another source."""
+    for cid in unit.ids:
+        if cid in ws.sources:
+            if _same_source(ws, cid, item.source):
+                return True
+        elif cid in ws.values:
+            if _same_source(ws, ws.values[cid].source_id, item.source):
+                return True
+        elif cid in ws.computations:
+            if any((v := ws.values.get(leaf)) is not None and _same_source(ws, v.source_id, item.source) for leaf in _leaves(ws, cid)):
+                return True
     return False
 
 
@@ -1839,7 +1895,8 @@ def _giving_parts(item: Item, block: Block, ws=None) -> list[Unit]:
     all of them for an item asked by its words, or when no sentence states a value of its own. Round 20 U3 (KTD3, R10): among several that
     state it, the ones whose OWN citations include the item's source (``_attributed``) — a sentence that only shares the figure with the item
     through the citations of the block it stands in (it speaks of two appraisals, and cites the other's value) is not the one the item's
-    condition is read against or written into; when none does, all of them, as before."""
+    condition is read against or written into; when none does, all of them, as before. Round 21 full measurement: among those, the ones that cite
+    the item's own source itself (``_cites_source``) when some do."""
     if len(block.parts) == 1:
         return list(block.parts)
     if parsed := shared_dates.parse(item.value):
@@ -1854,8 +1911,8 @@ def _giving_parts(item: Item, block: Block, ws=None) -> list[Unit]:
         mine = []
     chosen = mine or list(block.parts)
     if ws is not None and len(chosen) > 1:
-        own = [u for u in chosen if _attributed(item, u, ws)]
-        return own or chosen
+        own = [u for u in chosen if _attributed(item, u, ws)] or chosen
+        return [u for u in own if _cites_source(item, u, ws)] or own  # round 21 full measurement: the sentence that cites the item's own source
     return chosen
 
 
@@ -1881,6 +1938,9 @@ def _coverage_all(item: Item, blocks: Sequence[Block], ws, shared: bool, leads: 
     giving = [b for b, c in checks if not c.why]
     if giving:
         parts = [(b, _giving_parts(item, b, ws)) for b in giving]
+        # round 21 full measurement: when a block that gives the item cites its own source, the blocks that give it only by another source's citation
+        # (the same figure in another passage) are not the sentence the item and its condition note go to; no block cites it: the first one, as before
+        parts = [(b, mine) for b, mine in parts if any(_cites_source(item, u, ws) for u in mine)] or parts
         indexes = frozenset(u.index for _, mine in parts for u in mine)
         return (Coverage(True, parts[0][1][0].index, ""),
                 Giving(indexes, tuple(b.unit for b, _ in parts if len(b.parts) > 1)))
@@ -2230,7 +2290,7 @@ _RANK = {conditions.KEPT: 0, conditions.UNDECIDED: 1, conditions.MISSING: 2, con
 
 def _spans_of(ws, item: Item, elsewhere: Sequence[str] = ()) -> list[Span]:
     src = ws.sources.get(item.source)
-    return condition_spans(src, item.quote, elsewhere) if src is not None else []
+    return condition_spans(src, item.quote, elsewhere, item.value) if src is not None else []
 
 
 def _own_text(ws, item: Item, elsewhere: Sequence[str] = ()) -> str:

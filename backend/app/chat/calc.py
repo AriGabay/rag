@@ -668,7 +668,7 @@ class _Eval:
     def additive(self, op: str, a: Operand, b: Operand) -> Operand:
         self._additive_checks([a, b], op)
         if a.subject and b.subject and not (
-                op == "+" and a.role == "component" and b.role == "component") and _subjects_differ(a, b, self.contexts):
+                op == "+" and a.role == "component" and b.role == "component") and _subjects_differ(a, b, self.contexts, op):
             self.need(f"נושא: «{a.subject}» מול «{b.subject}»")
         (va, vb), scale = self.same_scale([a, b])
         value = va + vb if op == "+" else va - vb
@@ -891,21 +891,22 @@ def _subject_designators(subject: str) -> frozenset[str]:
         any(ch.isdigit() for ch in w) or (len(w) == 1 and w.isalpha())))
 
 
-def _subjects_differ(a: Operand, b: Operand, allowed: list[frozenset[str]] | None = None) -> bool:
+def _subjects_differ(a: Operand, b: Operand, allowed: list[frozenset[str]] | None = None, op: str = "-") -> bool:
     """Whether two operands that are added or subtracted name different scopes, decided by evidence first (round 21 packet A, Q5): when every
     input of both lies in an appraisal context the sources locate (``Leaf.context``), the same context is no mismatch whatever strings the
     model wrote for the two subjects, and disjoint contexts are one as before; when either is unknown the model's own strings decide, as before
     (``same_subject``). A value of an appendix or a comparables part has no subject context (``Value.operand``), so it is never located and the
     strings decide, as before. Round 21 review: a context is an appraisal, not a plot, lot, building or unit, so inside one context two subjects
     that each carry a designator ("מגרש 1" and "מגרש 2", "מגרש א" and "מגרש ב", ``_subject_designators``) and carry different ones are
-    still decided by the strings; two wordings of one property ("שווי מגרש 1 כיום", "שווי מגרש 1 בשומה הקודמת"), or a subject with no
-    designator, stay no mismatch."""
+    still decided by the strings when one is subtracted from the other (a difference between two plots is no difference of one property); a
+    sum of the units of one appraisal ("דירה 4 בקומה 5" and "דירה 4 בקומה 6") is a total of that appraisal and stays no mismatch, and so do two
+    wordings of one property ("שווי מגרש 1 כיום", "שווי מגרש 1 בשומה הקודמת") and a subject with no designator."""
     ca = {lf.context[0] for lf in a.leaves if lf.context is not None}
     cb = {lf.context[0] for lf in b.leaves if lf.context is not None}
     if ca and cb and all(lf.context is not None for lf in (*a.leaves, *b.leaves)):
         if ca == cb:
             da, db = _subject_designators(a.subject), _subject_designators(b.subject)
-            if not (da and db and da != db):
+            if op != "-" or not (da and db and da != db):
                 return False
         elif ca.isdisjoint(cb):
             # two appraisals are two properties, unless the request compares exactly these (``_check_contexts`` governs the combination)

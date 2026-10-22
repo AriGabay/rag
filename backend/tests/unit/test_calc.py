@@ -923,9 +923,13 @@ def test_a21_q5_review_two_plots_of_one_appraisal_context_are_a_mix_of_subjects(
     one = _valuation("V1", "9000000", "שווי מגרש 1", context=A_CONTEXT)
     two = _valuation("V2", "7000000", "שווי מגרש 2", context=A_CONTEXT)
     with pytest.raises(CalcError):
-        run("V1 + V2", ops(one, two))
-    out = run("V1 + V2", ops(one, two), "סכום שני המגרשים של אותה שומה")
+        run("V1 - V2", ops(one, two))
+    out = run("V1 - V2", ops(one, two), "הפרש בין שני המגרשים של אותה שומה")
     assert out.conditional and any("נושא" in c for c in out.conditional)
+    # a sum of the plots or units of one appraisal is its total: no subject mix (the sum of apartments on two floors of one building)
+    assert run("V1 + V2", ops(one, two)).value == Decimal("16000000")
+    floors = (_valuation("V3", "2750000", "דירה 4 חדרים בקומה 5", context=A_CONTEXT), _valuation("V4", "2750000", "דירה 4 חדרים בקומה 6", context=A_CONTEXT))
+    assert run("V3 + V4", ops(*floors)).value == Decimal("5500000") and not run("V3 + V4", ops(*floors)).conditional
 
 
 @pytest.mark.parametrize("left, right", [("מגרש א", "מגרש ב"), ("בניין 3", "בניין 4"), ("שווי מגרש A", "שווי מגרש B")])

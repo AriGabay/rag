@@ -2377,3 +2377,81 @@ def test_g2c_an_item_with_no_date_of_its_own_is_told_apart_by_the_one_date_of_it
     out = {o["id"]: o for o in ledger.outcomes(_units("שיעור של 9.75% ב-3.8.2031 [S1]."), ws)}
     assert out[ledger.items[second.key].id]["state"] == "covered"
     assert out[ledger.items[first.key].id]["state"] == "omitted"
+
+
+# --- round 21 full measurement: a condition goes to the item it belongs to, not to a neighbour (note by mark, clause by amount, sentence by source) ---
+
+LEASE_ROW = "הפחתה בגין מגבלה (***) | 120,000"
+LEASE_NOTE = "(***) המגבלה חלה רק על החלק המוחכר"
+LEASE_PROSE = "הקונה יביא בחשבון גם הכנסות מניהול"
+LEASE_SOURCE = "\n".join(["הטבלה: 2 שורות", "סעיף | סכום", LEASE_ROW, "ניכוי אחר | 30,000", LEASE_NOTE, LEASE_PROSE])
+
+
+def test_r21_full_a_marked_note_belongs_to_the_table_row_that_carries_its_mark_and_not_to_a_prose_sentence_of_the_source():
+    ws = _ws(LEASE_SOURCE)
+    src = ws.sources["S1"]
+    assert [(s.place, s.text) for s in items.condition_spans(src, LEASE_ROW)] == [("paragraph", LEASE_NOTE)]  # the marked row keeps it
+    assert all(LEASE_NOTE not in s.text for s in items.condition_spans(src, LEASE_PROSE))  # the prose sentence of the same source does not
+    _, body = items.context_of_source(src)
+    assert not items._note_of_row(LEASE_NOTE, body, LEASE_PROSE, LEASE_PROSE) and items._note_of_row(LEASE_NOTE, body, LEASE_ROW, LEASE_ROW)
+    assert items._note_of_row(LEASE_NOTE, body, LEASE_PROSE, "הקונה יביא בחשבון (***)")  # a mark the quote carries stays the item's
+    assert items._note_of_row("המגבלה חלה רק על החלק המוחכר", body, LEASE_PROSE, LEASE_PROSE)  # a note without a mark stays
+
+
+def test_r21_full_a_marked_note_is_no_condition_of_a_prose_item_even_when_no_row_of_this_text_carries_its_mark():
+    # the row that carries «(***)» may stand in another chunk or source: the note is still not the prose sentence's
+    unmarked = _ws("\n".join(["הטבלה: 2 שורות", "סעיף | סכום", "הפחתה בגין מגבלה | 120,000", "ניכוי אחר | 30,000", LEASE_NOTE, LEASE_PROSE]))
+    assert all(LEASE_NOTE not in s.text for s in items.condition_spans(unmarked.sources["S1"], LEASE_PROSE))
+
+
+CLAUSE_QUOTE = 'חלק ממגרש 7 בשטח של כ-3.250 דונם בבעלות צד אחר והוא אינו מהווה חלק מנשוא חוות הדעת, דהיינו סה"כ השטח נשוא חוות הדעת הינו 40.100 דונם'
+CLAUSE_OF_PART = "והוא אינו מהווה חלק מנשוא חוות הדעת"
+
+
+def _quote_clauses(quote: str, value: str = "") -> list[str]:
+    ws = _ws(quote, kind="paragraph")
+    return [s.text for s in items.condition_spans(ws.sources["S1"], quote, value=value) if s.place == "quote"]
+
+
+def test_r21_full_the_clause_of_another_amount_of_a_multi_amount_quote_is_not_the_condition_of_this_amounts_item():
+    assert not any(CLAUSE_OF_PART in c for c in _quote_clauses(CLAUSE_QUOTE, "40.100"))
+    assert any(CLAUSE_OF_PART in c for c in _quote_clauses(CLAUSE_QUOTE, "3.250"))  # the item of the amount it qualifies keeps it
+    assert any(CLAUSE_OF_PART in c for c in _quote_clauses(CLAUSE_QUOTE))  # no value: as before
+
+
+def test_r21_full_a_one_amount_quote_and_a_clause_in_the_values_own_part_keep_their_condition_clauses():
+    one = "השטח הוא 40.100 דונם, והוא אינו כולל את שטח הדרך"
+    assert _quote_clauses(one, "40.100") == [one] == _quote_clauses(one)
+    own = "חלק ממגרש 7 בשטח של כ-3.250 דונם, דהיינו סה\"כ השטח נשוא חוות הדעת הינו 40.100 דונם והוא אינו כולל את שטח הדרך"
+    assert _quote_clauses(own, "40.100") == [own]  # the clause stands in the segment of 40.100
+    assert _quote_clauses(own, "3.250") == []  # the operator stands in the segment of 40.100 only: it is no condition of the 3.250 part
+
+
+OWN_SOURCE = 'בתא שטח 12 סך הזכויות למסחר לא יעלה על 4,200 מ"ר'
+OTHER_SOURCE = 'בטופס האכלוס צוין היקף מסחרי של 4,200 מ"ר'
+OTHER_SENTENCE = 'בטופס האכלוס צוין היקף מסחרי של 4,200 מ"ר [S1].'
+OWN_SENTENCE = 'התכנית מגבילה את שטח המסחר ל-4,200 מ"ר [S2].'
+
+
+def _own_source_ws() -> Workspace:
+    return _ws(OTHER_SOURCE + ".", OWN_SOURCE + ".", same_file=True, kind="paragraph")
+
+
+def _limit_item() -> items.Item:
+    return _item(label="שטח המסחר", source="S2", quote=OWN_SOURCE, value="4,200")
+
+
+@pytest.mark.parametrize("answer", [f"{OTHER_SENTENCE}\n\n{OWN_SENTENCE}", f"{OTHER_SENTENCE} {OWN_SENTENCE}", f"{OWN_SENTENCE}\n\n{OTHER_SENTENCE}"])
+def test_r21_full_the_item_is_given_by_the_sentence_that_cites_its_own_source_when_another_sentence_states_the_value_from_another_source(answer):
+    ws = _own_source_ws()
+    units = _units(answer)
+    mine = next(u for u in units if "S2" in u.ids)
+    got = _condition(ws, answer, _limit_item())
+    assert got["state"] == "covered" and got["covered_by"] == mine.index and got["condition_unit"] == mine.index, got
+
+
+def test_r21_full_the_item_stays_given_by_the_other_sources_sentence_when_no_sentence_cites_its_own_source():
+    ws = _own_source_ws()
+    answer = f"{OTHER_SENTENCE}\n\nהאישור המסחרי הוא 4,200 מ\"ר [S1]."
+    got = _condition(ws, answer, _limit_item())
+    assert got["state"] == "covered" and got["covered_by"] == 0 and got["condition_unit"] == 0, got
