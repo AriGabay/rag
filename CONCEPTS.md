@@ -124,6 +124,12 @@ A component with an item that is neither given nor stated with a reason is not c
 
 An item's condition (a negation, "only", an exception, "subject to", a status, a method, or a limit in time or to a component, as its own source states it) is part of its meaning: an item given without it is not given in full, even when it is the only item of its kind. A missing condition is completed from the source or stated next to the value as written there, and is never a reason to remove the value. Besides the items the agent lists, the ledger holds items the server takes from the structure of the sources the answer cites (other rows of a cited table, other members of a list, other value-bearing sentences of a cited passage), but only those the request is shown to ask for. A note is an item's condition only when it is the item's own: a note marked with a sign belongs to the row or cell that carries that sign, never to a row of another table or another item.
 
+### Server addition
+
+Any text the server, not the model, writes into an answer: a qualifier such as a period, unit or basis, a condition note, a scope note, a "partly verified" mark, a cut marker, a removal note, or a read-and-not-used line. Each one names the datum it belongs to and is written at that datum's own place in the answer, so it can be checked like the model's own words.
+
+When no single datum and place can be decided from evidence, nothing is written inline. The datum stays, and one uncertainty line names what could not be bound. The last number in a sentence, nearness of words, a number that also appears in the source, or one member of a list is never evidence of where an addition belongs. A note says what actually happened to its claim, and a read-and-not-used line is written only when the final answer really leaves the item out: different wording is not an omission.
+
 ### Identity card
 
 What an appraisal unit says about its own subject, read once at ingestion from the unit's opening (its first pages) and kept for every unit of a file that holds several appraisals. A card holds only fields about the subject property: its name, address and city, block and parcel, property type, and the dates the opening writes as labelled text. Each field is stored together with a verbatim quote of the unit's blocks, and a field whose quote is not in those blocks is discarded, never the whole card.
