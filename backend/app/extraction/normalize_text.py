@@ -144,6 +144,17 @@ def negation_form(word: str, *, ambiguous: bool = True, prepositional: bool = Tr
     return next((word[len(p):] for p in _NEGATION_PREFIXES if word.startswith(p) and listed(word[len(p):], False)), None)
 
 
+# the copular negation «X אינו <noun>» ("X is not a <noun>": a classification) in its genders and numbers (round 22 post-review): one family. It is
+# no existential absence ("there is no <noun>": «אין», «לא נמצא», «ללא») and, as a negation, one negation whatever its inflection.
+COPULAR_NEGATIONS = frozenset("אינו אינה אינם אינן איננו איננה".split())
+
+
+def negation_family(form: str) -> str:
+    """The key of a negation form (``negation_form``) as a negation: the copular forms («אינה», «אינם», «איננו»...) are all «אינו»; any other
+    form is its own family («לא», «אין», «טרם»)."""
+    return "אינו" if form in COPULAR_NEGATIONS else form
+
+
 def is_negation(word: str, *, ambiguous: bool = True, prepositional: bool = True) -> bool:
     """Whether a normalized word is a negation, bare or after a conjunction/relative prefix (``negation_form``)."""
     return negation_form(word, ambiguous=ambiguous, prepositional=prepositional) is not None
@@ -226,7 +237,8 @@ def _absence_words(words: list[str], figure_from: int | None = None) -> bool:
             return True
         governed = _first_content_word(after)
         figure_first = figure_from is not None and i >= figure_from and negation_form(w, ambiguous=False, prepositional=False) is None
-        if governed is not None and is_word(_INFO_NOUN, governed) and not figure_first:  # "אין בהם נתון", "ללא פירוט" (not "50,000 ₪ ללא פירוט")
+        copular = negation_form(w, ambiguous=False) in COPULAR_NEGATIONS  # "אינה נתון השוואה" classifies; it does not say a datum is missing
+        if governed is not None and is_word(_INFO_NOUN, governed) and not figure_first and not copular:  # "אין בהם נתון", "ללא פירוט" (not "50,000 ₪ ללא פירוט")
             return True
         for j, x in enumerate(after[:2]):  # "אינו מופיע בשומה", "לא קיים מידע"
             rest = after[j + 1:j + 5]
@@ -308,13 +320,14 @@ def _negation_reach(text: str) -> list[tuple[int, int, str]]:
 def negated_spans(text: str, ignore: frozenset[str] = frozenset()) -> list[tuple[int, int]]:
     """The spans of ``text`` that a negation governs (``_negation_reach``): «אינם 1,200 ₪», «לא 1,500»; the words before the negation are not
     governed by it. ``ignore``: negation forms that are not counted (the negations of an item's own quote: they are its datum's)."""
-    return [(a, b) for a, b, form in _negation_reach(text) if form not in ignore]
+    return [(a, b) for a, b, form in _negation_reach(text) if negation_family(form) not in ignore]
 
 
 def negations_in(text: str) -> frozenset[str]:
     """The clause negations ``text`` writes, each without its prefix («שאינם» is «אינם»). What an item's own quote negates is its datum: the
-    same negation in the answer's clause is the datum's, not a negation of the item."""
-    return frozenset(form for _, _, form in _negation_reach(text))
+    same negation in the answer's clause is the datum's, not a negation of the item. The copular forms are one negation (``negation_family``):
+    «אינו» in the quote and «אינה» in the answer are the same one; ``negated_spans`` compares the family."""
+    return frozenset(negation_family(form) for _, _, form in _negation_reach(text))
 
 
 def holds_absence(text: str) -> bool:

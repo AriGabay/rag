@@ -7,6 +7,8 @@ the turn has no requirements at all, so a datum never gets two statements. Synth
 
 from __future__ import annotations
 
+import pytest
+
 from app.chat import coverage
 from app.chat.engine import FinalAnswer, Requested
 from app.chat.tools import Workspace
@@ -301,3 +303,28 @@ def test_a_figure_before_a_prepositional_negation_keeps_its_clause_positive_and_
         assert nt.states_absence(text) or nt.absence_spans(text), text
     assert nt.states_absence("הוצאות תחזוקה ללא פירוט נוסף")
     assert nt.absence_clause("הוצאות 50,000 ₪ אין בהן נתון")
+
+
+# --- round 22 post-review: a copular negation classifies, it does not say the datum is missing ----------------------------------------
+#
+# «X אינה נתון השוואה» is "X is not a comparison datum" (a classification, a fact the document states); «אין נתון», «לא נמצא נתון» and
+# «אינו ידוע» say the datum is missing. The copular family (אינו אינה אינם אינן איננו איננה) directly governing an information noun is no absence.
+
+@pytest.mark.parametrize("noun", ["נתון", "מידע", "פרט", "נתון השוואה"])
+@pytest.mark.parametrize("neg", ["אינו", "אינה", "אינם", "אינן", "איננו", "איננה", "שאינו", "שאינה"])
+def test_a_copular_negation_before_an_information_noun_is_a_classification_not_an_absence(neg, noun):
+    from app.extraction import normalize_text as nt
+
+    text = f"אי־הגשת הצעות {neg} {noun}"
+    assert not nt.absence_clause(text) and not nt.holds_absence(text) and not nt.states_absence(text)
+
+
+@pytest.mark.parametrize("text", [
+    "אין נתון השוואה", "אין בהם נתון", "לא נמצא נתון השוואה", "לא קיים מידע על המכרז", "ללא פירוט", "חסר פירוט בדוח",
+    "הדוח אינו מציין נתון השוואה", "מועד הסיום אינו ידוע", "הסכום אינו מצוין", "הנתונים אינם מפורטים", "אינו מופיע בשומה",
+    "המסמך אינו מתייחס לנתון", "לא ניתן לקבוע נתון",
+])
+def test_existential_absence_words_and_participles_of_knowing_stay_absence(text):
+    from app.extraction import normalize_text as nt
+
+    assert nt.absence_clause(text) and nt.holds_absence(text)

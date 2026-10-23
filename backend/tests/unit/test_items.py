@@ -2615,6 +2615,42 @@ def test_shape_1_the_negations_an_items_own_quote_writes_are_its_datum_not_a_neg
     assert _paragraph_item(quote, answer, label="הצעות במכרז", value=value) == ["covered"]
 
 
+# round 22 post-review: the datum's own copular negation is one negation whatever its gender or number: «אינו» in the quote, «אינה» in the answer.
+COPULAR_QUOTE = "העובדה כי לא הוגשו הצעות במכרז אינו מהווה נתון השוואה"
+
+
+@pytest.mark.parametrize("neg", ["אינו", "אינה", "אינם", "אינן", "איננו", "איננה", "שאינה"])
+def test_post_review_the_copular_negation_family_is_one_negation_of_the_datum(neg):
+    from app.extraction import normalize_text as nt
+
+    assert nt.negations_in(f"הדבר {neg} נתון השוואה") == nt.negations_in("הדבר אינו נתון השוואה")
+    own = items._own_negation((COPULAR_QUOTE,))[0]
+    text = f"אי־הגשת הצעות {neg} נתון השוואה"
+    assert items.positive_text(text, frozenset(), False, own).split() == text.split()  # nothing of the clause is blanked
+    assert items.positive_text(text).split() != text.split()  # protection: without the item's own negation it is a negated clause
+
+
+def test_post_review_la_and_ein_stay_their_own_families():
+    from app.extraction import normalize_text as nt
+
+    assert len({nt.negations_in(t) for t in ("הדבר אינו נתון", "הדבר לא נתון", "אין נתון")}) == 3
+
+
+@pytest.mark.parametrize("answer", [
+    "ההכרעה קובעת שאי־הגשת הצעות אינה נתון השוואה [S1].",
+    "ההכרעה קובעת שאי־הגשת הצעות איננה נתון השוואה [S1].",
+    "ההכרעה קובעת שהצעות במכרז אינן נתון השוואה [S1].",
+])
+def test_post_review_an_answer_repeating_the_datums_negation_with_another_inflection_states_it(answer):
+    assert _paragraph_item(COPULAR_QUOTE, answer, label="הצעות במכרז", value="") == ["covered"]
+
+
+def test_post_review_protection_an_answer_that_really_negates_the_item_is_not_stated():
+    # «אין» and an absence statement are other families than the quote's «לא»/«אינו»: they still negate the item (as before this change)
+    assert _paragraph_item(COPULAR_QUOTE, "אין בהצעות במכרז נתון השוואה [S1].", label="הצעות במכרז") == ["omitted"]
+    assert _paragraph_item(COPULAR_QUOTE, "לא נמצא נתון השוואה בהצעות במכרז [S1].", label="הצעות במכרז") == ["omitted"]
+
+
 @pytest.mark.parametrize("value", ["", "20% מהתמורה", "לא יאוחר מארבעה חודשים", "20%; 4 חודשים"])
 def test_shape_2_a_limit_expression_is_no_negation_and_a_count_in_words_is_the_digit(value):
     quote = "סך של 20% מהתמורה, לא יאוחר מארבעה חודשים לאחר התחלת הבניה"

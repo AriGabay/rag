@@ -4416,3 +4416,26 @@ def test_a_plan_code_is_no_designator_so_the_part_naming_it_by_its_number_is_sta
         assert o["limitation"] is None and o["stated"] is False, (answer, o)
     _, _, _, o = _end_case("מועד הסיום לפי תכנית ג/4521 לא נמצא [S1].", "מועד סיום לפי תכנית 4521", question=question)
     assert _kept_open(o), o
+
+
+# --- round 22 post-review: the datum's own copular negation, written with another inflection by the answer, is stated (no false gap line) ----
+
+COPULAR_QUOTE = "העובדה כי לא הוגשו הצעות במכרז אינו מהווה נתון השוואה"
+
+
+def _copular_gap_lines(answer_text: str) -> tuple[list[str], list]:
+    ws = _u7_file("הכרעת השומה", COPULAR_QUOTE)
+    raw = [_adj_item("הצעות במכרז", COPULAR_QUOTE, "")]
+    r, turn, answer, _ = _ledger_check(ws, answer_text, raw)
+    final, _ = _finish(ws, answer, r, turn)
+    return _lines_not_used(final.answer_markdown), r.item_gaps
+
+
+def test_post_review_an_answer_stating_the_datums_own_copular_negation_in_another_gender_gets_no_read_and_not_used_line():
+    lines, gaps = _copular_gap_lines("ההכרעה קובעת שאי־הגשת הצעות אינה נתון השוואה [S2].")
+    assert lines == [] and gaps == []
+
+
+def test_post_review_protection_an_answer_that_says_the_datum_is_absent_keeps_its_gap_line():
+    lines, gaps = _copular_gap_lines("לא נמצא נתון השוואה בהצעות במכרז [S2].")
+    assert len(lines) == 1 and len(gaps) == 1
