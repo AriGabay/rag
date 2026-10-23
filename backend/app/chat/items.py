@@ -1998,7 +1998,7 @@ def _line_numbers(line: str, ref: RowRef) -> frozenset[str]:
     """The numbers the cells of a table row write after its label that are no part of the datum's own value (a year, a floor, a stage, another
     column's figure): they tell two rows of one value apart like words do."""
     groups = headline(ref.value, ref.quote)
-    own = frozenset().union(*groups) if groups else frozenset()
+    own = frozenset().union(*groups)
     cells = _row_cells(line) if "|" in line else []
     return frozenset(n for c in cells[1:] for n in numbers_in(_outside_dates(c))) - own
 
@@ -2035,14 +2035,11 @@ def rival_rows(ref: RowRef, ws, ids: Sequence[str] = ()) -> list[_SpanRow]:
     return out
 
 
-_ONE_LETTER_PREFIXES = "ובהלמכש"
-
-
 def _clause_words(text: str, lead: str = "") -> frozenset[str]:
     """The words of a clause and its lead, and of each three-letter word the word without its prefix letter ("הגג" -> "גג"): a short name of a
     row ("גג", "דק") is a word of the row, and the content-word reader keeps the prefix of a word that short."""
     have = _words(text) | _words(lead)
-    return have | {w[1:] for w in have if len(w) == 3 and w[0] in _ONE_LETTER_PREFIXES}
+    return have | {w[1:] for w in have if len(w) == 3 and w[0] in _PREFIX_LETTERS}
 
 
 def _dates_in(text: str) -> frozenset[str]:
@@ -2087,10 +2084,10 @@ def row_status(ref: RowRef, text: str, ws, ids: Sequence[str] = (), lead: str = 
     line = _own_line(ref, ws) or ref.quote
     names = _row_names(ref, line)
     rival_names = {r.line: _line_names(r.line) for r in rivals}
-    own_words = frozenset().union(*(_words(t) for t in names)) if names else frozenset()
-    own_des = frozenset().union(*(designators(t) for t in names)) if names else frozenset()
+    own_words = frozenset().union(*(_words(t) for t in names))
+    own_des = frozenset().union(*(designators(t) for t in names))
     groups = headline(ref.value, ref.quote)
-    own_nums = _line_numbers(line, ref) | (frozenset(numbers_in(_outside_dates(" ".join(names)))) - (frozenset().union(*groups) if groups else frozenset()))
+    own_nums = _line_numbers(line, ref) | (frozenset(numbers_in(_outside_dates(" ".join(names)))) - frozenset().union(*groups))
     rival_nums_of = {r.line: _line_numbers(r.line, ref) for r in rivals}
     rival_words = frozenset().union(*(_words(t) for ts in rival_names.values() for t in ts))
     rival_des = frozenset().union(*(designators(t) for ts in rival_names.values() for t in ts))

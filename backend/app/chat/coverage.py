@@ -1279,13 +1279,14 @@ def _unbound_dropped(ws: Workspace, report, dropped: Sequence[tuple[object, str]
     from app.chat.verify import Unbound
 
     for span, text in dropped:
-        got = report.applies_for(span.addition, span.datum, span.claim_ids[0] if span.claim_ids else "")
+        claim = span.claim_ids[0] if span.claim_ids else ""
+        got = report.applies_for(span.addition, span.datum, claim)
         datum = span.datum.split(",")[0] if span.datum else ""
         label = (got.label if got is not None else "") or (ws.values[datum].label if datum in ws.values else "") or datum or "הערך"
         detail = (got.detail if got is not None else "") or " ".join(text.strip(" ()").split())
         unit = next((i for i, recs in report.claims.items() if any(r.id in span.claim_ids for r in recs)), -1)
         kind = "scope" if span.addition == "scope" else "condition"
-        report.unbound.append(Unbound(unit, datum, label, got.value if got is not None else "", detail, kind, span.claim_ids[0] if span.claim_ids else ""))
+        report.unbound.append(Unbound(unit, datum, label, got.value if got is not None else "", detail, kind, claim))
 
 
 def _datum_tokens(ws: Workspace, states: dict, datum: str) -> tuple[tuple, tuple]:

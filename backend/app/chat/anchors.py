@@ -530,9 +530,7 @@ def _table_ctx(reading: Reading, ti: int, row: int | None, column: int | None) -
     served = stored_tables.serve_structure(st)
     labels, shown = headers, cells
     if served is not st:
-        labels = served.get("headers") or []
-        if not any(labels):
-            labels = stored_tables.served_labels(served)[0]
+        labels = stored_tables.served_labels(served)[0]
         shown = (served["rows"][row].get("cells") or []) if cells else []
     at = stored_tables.served_position(served, col) if col is not None else None
     units = st.get("units") or []

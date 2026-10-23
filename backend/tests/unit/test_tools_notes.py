@@ -165,7 +165,7 @@ def test_the_quote_path_and_the_cell_path_give_the_same_scale_for_the_same_cell(
     cell = T._cell_of(src, passage, {"row_number": MARKED_ROW + 1, "column_number": 2, "number": "1020"}, st, 0)
     assert cell["scale"] == 1000
     quote = T._take_quote(src, passage, {"quote": "מחיר (₪): 1020 (*)", "number": "1020"}, None, None,
-                          notes=T._notes_of_rows(st, [MARKED_ROW]))
+                          table_notes=T._notes_of_rows(st, [MARKED_ROW]))
     assert quote["scale"] == cell["scale"] == 1000 and quote["units"] == cell["units"] == {"ILS"}
 
 
@@ -183,9 +183,9 @@ def test_the_cell_path_reads_the_notes_of_its_row_only():
 def test_a_paragraph_quote_takes_no_table_notes():
     ws = _ws(_thousands_table())
     paragraph = SimpleNamespace(sid="S1", version_id=VID, table_index=None, row_index=None, kind="text", text="העלות הכוללת היא 1,020 ₪.")
-    assert T._quote_table_notes(ws, None, paragraph, paragraph.text, {"quote": "העלות הכוללת היא 1,020 ₪"}) == []
+    assert T._quote_table_notes(ws, None, paragraph, {"quote": "העלות הכוללת היא 1,020 ₪"}) == []
     got = T._take_quote(paragraph, paragraph.text, {"quote": "העלות הכוללת היא 1,020 ₪", "number": "1,020"}, None, None,
-                        notes=T._quote_table_notes(ws, None, paragraph, paragraph.text, {"quote": "העלות הכוללת היא 1,020 ₪"}))
+                        table_notes=T._quote_table_notes(ws, None, paragraph, {"quote": "העלות הכוללת היא 1,020 ₪"}))
     assert got["scale"] == 1
 
 
@@ -194,15 +194,15 @@ def test_a_table_quote_reads_the_notes_of_the_rows_that_hold_it_from_the_stored_
     ws = _ws(t)
     hit, passage = _row_hit(t, MARKED_ROW)
     src = SimpleNamespace(sid="S1", version_id=VID, table_index=0, row_index=MARKED_ROW, kind="table_row")
-    assert T._quote_table_notes(ws, None, src, passage, {"quote": "מחיר (₪): 1020 (*)"}) == [STAR]
+    assert T._quote_table_notes(ws, None, src, {"quote": "מחיר (₪): 1020 (*)"}) == [STAR]
     other_hit, other_passage = _row_hit(t, 30)
     other = SimpleNamespace(sid="S2", version_id=VID, table_index=0, row_index=30, kind="table_row")
-    assert T._quote_table_notes(ws, None, other, other_passage, {"quote": "מחיר (₪): 1030"}) == []
+    assert T._quote_table_notes(ws, None, other, {"quote": "מחיר (₪): 1030"}) == []
     # a table chunk: the rows the quote is in decide, and a quote that is in no unique row takes only what it carries itself
     group_hit, group = _group_hit(t, MARKED_ROW)
     chunk = SimpleNamespace(sid="S3", version_id=VID, table_index=0, row_index=None, kind="table")
-    assert T._quote_table_notes(ws, None, chunk, group, {"quote": "דירה 20 | 1020 (*)"}) == [STAR]
-    assert T._quote_table_notes(ws, None, chunk, group, {"quote": "דירה 21 | 1021"}) == []
+    assert T._quote_table_notes(ws, None, chunk, {"quote": "דירה 20 | 1020 (*)"}) == [STAR]
+    assert T._quote_table_notes(ws, None, chunk, {"quote": "דירה 21 | 1021"}) == []
 
 
 # --- the consumers without the database: condition spans and the scope reading ----------------------------------------------------------

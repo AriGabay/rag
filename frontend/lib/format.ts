@@ -1,7 +1,7 @@
 // Display formatting. Decimal strings are formatted directly (Intl accepts exact numeric strings),
 // so no float arithmetic touches money or area. Nothing here aggregates values.
 
-import type { ChatStandard, ChatUnit } from "./chatTypes";
+import type { ChatStandard, ChatUnit, ValueProvenance } from "./chatTypes";
 import type {
   AbstentionKind,
   ClaimKind,
@@ -555,7 +555,7 @@ const DEFINING_ATTRIBUTE_LABEL: Record<string, string> = { kind: "סוג הער�
  * Empty when the value is not marked. */
 export function valueUncertaintyNote(
   value:
-    | { certainty?: string | null; provenance?: Record<string, string> | null; stated?: Record<string, string> | null }
+    | { certainty?: string | null; provenance?: ValueProvenance | null; stated?: Record<string, string> | null }
     | null
     | undefined,
 ): string {

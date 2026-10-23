@@ -346,7 +346,12 @@ def _phrase(toks: list[_Tok], text: str, i: int) -> tuple[int, int]:
     v, j = _group(toks, text, i)
     if j < len(toks) and toks[j].kind in ("thousand", "thousands") and (j == i or _joins(text, toks, j)):
         t = toks[j]
-        total = (2000 if not v else 0) if t.value == 2000 else (v or 1) * 1000 if t.kind == "thousand" else v * 1000
+        if t.value == 2000:
+            total = 2000 if not v else 0
+        elif t.kind == "thousand":
+            total = (v or 1) * 1000
+        else:
+            total = v * 1000
         if total:
             rest, k = _group(toks, text, j + 1) if _joins(text, toks, j + 1) else (0, j + 1)
             return total + rest, k

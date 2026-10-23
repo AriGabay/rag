@@ -36,6 +36,8 @@ from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
+from app.extraction.normalize_text import _FINALS
+
 VERSION = 2
 MAX_LISTS = 3
 LIST_AGE = 3  # an answer's lists are carried while it is one of the last three answers (the last six messages)
@@ -321,7 +323,6 @@ def ordinal_numbers(message: str, length: int) -> set[int]:
 
 # --- which list a message names, and which item of it -------------------------------------------------------------------------
 
-_FINALS = str.maketrans("םןףץך", "מנפצכ")
 # the prefix letters Hebrew puts before a word, in their order ("ובה", "שב", "מה"): at most one of each kind, so that "בשומה" is "שומה" and
 # never "ומה"
 _PREFIX = re.compile(r"^ו?ש?[בלמכ]?ה?")

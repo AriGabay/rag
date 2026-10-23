@@ -156,8 +156,6 @@ def is_negation(word: str, *, ambiguous: bool = True, prepositional: bool = True
 # a fact the document states about an absence ("אין בדירה גינה", "השמאי מציין שאין גינה"): a negation that governs a word of stating, finding,
 # computing, determining or knowing, or an information noun ("לא נמסר", "אין בהם נתון", "לא ניתן לקבוע", "ללא פירוט").
 _FINALS = str.maketrans("ךםןףץ", "כמנפצ")
-_WORD_PREFIXES = "והבלמשכ"
-_HEB_TOKEN = re.compile(r"[א-ת][א-ת״׳]*")
 
 
 def _medial(words: str) -> frozenset[str]:
@@ -192,7 +190,7 @@ def _forms(word: str) -> set[str]:
     word = word.translate(_FINALS)
     out = {word}
     for k in (1, 2):
-        if len(word) - k >= 3 and all(ch in _WORD_PREFIXES for ch in word[:k]):
+        if len(word) - k >= 3 and all(ch in _PREFIXES for ch in word[:k]):
             out.add(word[k:])
     return out
 
@@ -235,7 +233,7 @@ def _absence_words(words: list[str]) -> bool:
 
 
 def _tokens(text: str) -> list[str]:
-    return _HEB_TOKEN.findall(base_normalize(text))
+    return _HEB_WORD.findall(base_normalize(text))
 
 
 # A clause: the text between two clause ends. A clause end is a full stop (not inside a number, a date or the abbreviation "מ.ע.מ."), a

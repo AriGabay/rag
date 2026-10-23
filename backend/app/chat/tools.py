@@ -1358,6 +1358,11 @@ def _table_at(ws: Workspace, conn: Connection, version_id, table_index: int) -> 
     return found
 
 
+def _row_line(r: dict) -> str:
+    """The cells of a stored row on one line, joined by « | »."""
+    return " | ".join(str(c) for c in r.get("cells") or [])
+
+
 def _notes_of_rows(st: dict | None, rows: Iterable[int] | None) -> list[str]:
     """The notes of a stored table (``structure.notes``) that govern the rows ``rows`` (indexes into ``structure.rows``; None or none: the rows are
     not known), by their scope (round 22 U5, KTD5, R8): a note that opens with a mark («*», «(1)», «(***)») belongs to the rows that carry the mark,
@@ -1367,7 +1372,7 @@ def _notes_of_rows(st: dict | None, rows: Iterable[int] | None) -> list[str]:
     notes = [str(n) for n in (st or {}).get("notes") or [] if n]
     if not notes:
         return []
-    body = [" | ".join(str(c) for c in r.get("cells") or []) for r in st.get("rows") or []]
+    body = [_row_line(r) for r in st.get("rows") or []]
     header = [str(h) for h in st.get("headers") or []]
     held = set(rows) if rows is not None else set()
     out: list[str] = []
@@ -1400,7 +1405,7 @@ def _hit_notes(ws: Workspace, conn: Connection | None, h: dict, passage: str, ha
         rows = [int(h["row_index"])] if h.get("row_index") is not None else None
     else:
         lines = {ln.strip() for ln in passage.split("\n")}
-        rows = [i for i, r in enumerate(st.get("rows") or []) if (line := " | ".join(str(c) for c in r.get("cells") or []).strip()) and line in lines]
+        rows = [i for i, r in enumerate(st.get("rows") or []) if (line := _row_line(r).strip()) and line in lines]
     shown = meaning._flat(passage)
     held = [n for n in _notes_of_rows(st, rows) if meaning._flat(n) not in shown]
     if not held:
@@ -1411,7 +1416,7 @@ def _hit_notes(ws: Workspace, conn: Connection | None, h: dict, passage: str, ha
     return held, f"[לטבלה יש הערות: {' '.join(marks)}" + (f"; לקריאתן: read(table={handle})" if handle else "") + "]"
 
 
-def _quote_table_notes(ws: Workspace, conn: Connection | None, src: Source, full: str, loc: dict) -> list[str]:
+def _quote_table_notes(ws: Workspace, conn: Connection | None, src: Source, loc: dict) -> list[str]:
     """The notes of the table of ``src`` that govern the quote ``loc['quote']`` of it, read from the stored structure (round 22 U5, KTD5, R8): the row of a
     row chunk, else the rows whose line holds the quote, else (the quote is in no unique row) the notes whose mark the quote carries itself and those
     that govern every row. [] for a source that is no table (a paragraph quote gets no table notes)."""
@@ -1424,7 +1429,7 @@ def _quote_table_notes(ws: Workspace, conn: Connection | None, src: Source, full
     if src.row_index is not None:
         return _notes_of_rows(st, [src.row_index])
     shaped = _loose(quote)
-    rows = [i for i, r in enumerate(st.get("rows") or []) if shaped and shaped in _loose(" | ".join(str(c) for c in r.get("cells") or []))]
+    rows = [i for i, r in enumerate(st.get("rows") or []) if shaped and shaped in _loose(_row_line(r))]
     if len(rows) == 1:
         return _notes_of_rows(st, rows)
     whole, carried = _notes_of_rows(st, None), scopes.marks_of(quote)
@@ -3235,7 +3240,7 @@ def _rows_in_scope(chunk: str, rows: list[dict], groups: list[dict], keep: set[i
     if not rows or not groups:
         return chunk
     context_of = {n: g["context"] for g in groups for n in range(g["first"], g["last"] + 1)}
-    cells = [" | ".join(str(c) for c in (r.get("cells") or [])) for r in rows]
+    cells = [_row_line(r) for r in rows]
     lines, at, kept, tagged, dropped = chunk.split("\n"), 0, [], 0, 0
     for line in lines:
         found = next((i for i in range(at, len(cells)) if cells[i] == line), None)
@@ -6867,7 +6872,7 @@ def _quote_cell_locator(src: Source, full: str, st: dict, loc: dict) -> dict | N
         lines = [" | ".join(cells), render_row(stored_labels, stored_row, stored_units or None)]
         if sst is not st:
             lines.append(stored_tables.render_served_row(sst, i, (labels, None)))
-        lines = [ln for ln in dict.fromkeys(lines) if ln and _loose(ln) and _loose(ln) in whole]
+        lines = [ln for ln in dict.fromkeys(lines) if ln and (key := _loose(ln)) and key in whole]
         if not lines:
             continue
         for ln in lines:
@@ -6900,13 +6905,13 @@ def _block_sentence(blocks: Iterable[tuple] | None, anchor: dict, quote: str) ->
 
 
 def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = None,
-                governing: Callable[[int], str | _ScaleNote] | None = None, notes: Iterable[str] = ()) -> dict:
+                governing: Callable[[int], str | _ScaleNote] | None = None, table_notes: Iterable[str] = ()) -> dict:
     """The number inside an exact quote of the source: the quote must occur in the source's full text, and the
     number inside the quote. ``blocks``: the source's blocks (``(block_index, text, page)``), where the quote is
     located within the cited range only (KTD4): one occurrence records its block and word span; several that write
     the same number record the blocks holding them (block precision); several that write different numbers are
     refused, asking for a longer quote. Never the first occurrence. ``governing``: the scale note that governs a
-    block from a block above it (``calc.governing_note``), for the block the number is in. ``notes``: the notes of the table the quote is of that govern
+    block from a block above it (``calc.governing_note``), for the block the number is in. ``table_notes``: the notes of the table the quote is of that govern
     its row and that the source's text lacks (``_quote_table_notes``, round 22 U5): read as the cell path reads them, for the scale, the unit and the VAT."""
     if not loc.get("number"):
         raise ToolError("ציטוט (quote) דורש גם את המספר כפי שנכתב בו (number)")
@@ -6953,7 +6958,7 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
     # the scale the source states it in (R14): its own scale word, else a note of the quote, else of its line, else
     # of the heading-like line above that governs its block ("ממצאי הבדיקה באלפי ₪" over one figure per paragraph)
     held = _value_blocks(anchor)
-    table_notes = [str(n) for n in notes if n]
+    table_notes = [str(n) for n in table_notes if n]
     note_text = meaning._norm(" ".join(table_notes))
     notes = [governing(b) for b in sorted(held)] if governing is not None and held else [""]
     # a duration, count, coefficient, area or rate takes neither the currency nor the scale of a heading
@@ -7406,7 +7411,7 @@ def _value_report(ws: Workspace, value: calc.Value, said: Attribution | None, no
     # only the kind and the unit lower the certainty (round 13 U5, KTD6), and only when the source does not confirm them (stated differently,
     # or supported by nothing; round 22 U9, KTD8); any other attribute the model asserted is reported as not stated, which neither lowers it
     # nor enters a comparison or a calculation
-    defining = [k for k in value.unconfirmed()]
+    defining = value.unconfirmed()
     other = [names[k] for k in asserted if k not in calc.DEFINING_ATTRIBUTES]
     if defining:
         sure = "נמוכה יותר — " + "; ".join(attribute_clauses(ws, value.vid, defining))
@@ -7632,7 +7637,7 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
                                              src.block_end if src.block_end is not None else src.block_start)
                 blocks = [(r.block_index, r.text or "", r.page) for r in rows]
             taken = _take_quote(src, full, loc, blocks, lambda b: _governing_note(ws, conn, src.version_id, b),
-                                notes=_quote_table_notes(ws, conn, src, full, loc))
+                                table_notes=_quote_table_notes(ws, conn, src, loc))
             at = _value_blocks(taken.get("anchor") or {})
         reading_id = src.reading_id or v.reading_id
         # the number's place, from the anchor ``take`` located (no read): a value already registered there answers this call

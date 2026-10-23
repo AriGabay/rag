@@ -1467,22 +1467,25 @@ function CalculationsSection({ answer, onCite }: { answer: ChatAnswer; onCite: (
         <div className="calc-group" data-testid="calc-document-data">
           <h4>נתונים מהמסמכים</h4>
           <ul>
-            {values.map((v) => (
-              <li key={v.id}>
-                <button type="button" className="source-link" onClick={() => onCite(v.id)}>
-                  {v.id}
-                </button>{" "}
-                {v.label}: <bdi>{v.value_text}</bdi>
-                {[v.unit_label, PERIOD[v.period], VAT[v.vat], v.area_basis ? `בסיס שטח: ${v.area_basis}` : ""]
-                  .filter(Boolean)
-                  .map((x) => ` · ${x}`)
-                  .join("")}
-                {" — "}
-                {v.title}, {v.locator.row ? `שורה «${v.locator.row}», עמודה «${v.locator.column}»` : v.location}
-                {valueUncertaintyNote(v) && ` · ${valueUncertaintyNote(v)}`}{" "}
-                <ValueStatusBadge status={valueStatusOf(answer, v)} />
-              </li>
-            ))}
+            {values.map((v) => {
+              const uncertainty = valueUncertaintyNote(v);
+              return (
+                <li key={v.id}>
+                  <button type="button" className="source-link" onClick={() => onCite(v.id)}>
+                    {v.id}
+                  </button>{" "}
+                  {v.label}: <bdi>{v.value_text}</bdi>
+                  {[v.unit_label, PERIOD[v.period], VAT[v.vat], v.area_basis ? `בסיס שטח: ${v.area_basis}` : ""]
+                    .filter(Boolean)
+                    .map((x) => ` · ${x}`)
+                    .join("")}
+                  {" — "}
+                  {v.title}, {v.locator.row ? `שורה «${v.locator.row}», עמודה «${v.locator.column}»` : v.location}
+                  {uncertainty && ` · ${uncertainty}`}{" "}
+                  <ValueStatusBadge status={valueStatusOf(answer, v)} />
+                </li>
+              );
+            })}
           </ul>
         </div>
       )}

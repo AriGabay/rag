@@ -126,7 +126,7 @@ from app.chat import contexts, coverage, entities, resolve, timeframe
 from app.chat import intent as intent_mod
 from app.chat import request as request_analysis
 from app.chat import tools as T
-from app.chat.compose import ServerSpan, text_digest
+from app.chat.compose import CITATION, ServerSpan, text_digest
 from app.chat.final_check import FinalCheckError, finalize
 from app.chat.items import Ledger as ItemLedger
 from app.chat.rereader import ContextReader
@@ -639,7 +639,7 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None, bin
         for m in inp.history:
             who = "משתמש" if m.role == "user" else "עוזר"
             # an earlier answer's [S3] named a passage of that turn; here it would name another one
-            content = re.sub(r"\s*\[[SMCPVA]\d+(?:\s*[,،;]\s*[SMCPVA]\d+)*\]", "", m.content)
+            content = CITATION.sub("", m.content)
             # an earlier answer is context, not a source (its datum is in the focus): its opening is enough
             limit = HISTORY_USER_CHARS if m.role == "user" else HISTORY_ANSWER_CHARS
             line = f"{who}: {prompt_text(content[:limit] + ('…' if len(content) > limit else ''))}"

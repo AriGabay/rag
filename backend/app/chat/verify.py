@@ -1117,6 +1117,7 @@ def _supported_claim(r: ClaimRecord) -> str:
     return claim if re.search(r"\w", claim) else ""
 
 
+@functools.lru_cache(maxsize=2048)
 def _vat_basis(claim: str) -> frozenset[str]:
     """The VAT statuses ``claim`` states for its numbers (``excluded`` / ``included``), read by the one VAT reader (``_vat_phrases``, round 22
     U13); empty when it states none. A clause saying the text does not state the VAT («לא צוין אם כולל מע״מ») states none."""
@@ -4438,10 +4439,14 @@ def _vat_phrases(text: str, skip_absence: bool):
         clause = text[start:end]
         numbers = list(_NUM_AT.finditer(clause))
         nums = [(n.start(), _value_forms(clause, n)) for n in numbers if _vat_bearing(clause, n)]
-        silent = absence_spans(clause) if skip_absence else []  # the absence clauses of it: a phrase inside one gives nothing (round 22 U6)
+        silent = None  # the absence clauses of it: a phrase inside one gives nothing (round 22 U6); read when a phrase first has a polarity
         for v in _VAT.finditer(clause):
             polarity = _vat_polarity(v)
-            if not polarity or any(a <= v.start() < b for a, b in silent):
+            if not polarity:
+                continue
+            if silent is None:
+                silent = absence_spans(clause) if skip_absence else []
+            if any(a <= v.start() < b for a, b in silent):
                 continue
             before = [forms for pos, forms in nums if pos < v.start()]
             opened = _open_parenthesis(clause, v.start())
@@ -5305,7 +5310,7 @@ def _addition_verdict(ws: Workspace, st: dict, row, answer: str | None) -> Appli
     return Applies("", "judge" if answer else "structure", why="the sentence does not say which row it states")
 
 
-def _plan_additions(report: VerifyReport, ws: Workspace, states: Sequence[dict], units: Sequence[Unit]) -> list[AdditionAsk]:
+def _plan_additions(ws: Workspace, states: Sequence[dict], units: Sequence[Unit]) -> list[AdditionAsk]:
     """The condition notes the server may write next to a datum whose row the sentence does not decide (round 22 U8, KTD7; R14): for each covered
     item whose condition the sentence leaves out or the call is asked to decide, the questions for the ones structure leaves open - one per
     addition, to be asked inside the requirements call that already runs, next to the plan of the qualifier edits and before the judge batches."""
@@ -7602,7 +7607,6 @@ COUNT_MIN, COUNT_MAX = 2, 99  # the counts the channel derives: a small count of
 _GENERIC_KIND_WORDS = frozenset({
     "טבלה", "טבלת", "לוח", "סיכום", "פירוט", "נתונים", "נתון", "שורה", "שורות", "עמודה", "פריט", "פריטים", "תיאור", "הערה", "הערות", "סכום",
     "סכומים", "מספר", "רשימה", "רשימת", "ערך", "ערכים", "שם", "סוג", "פרט", "כללי", "דוח", "סעיף", "סעיפים", "ראשון", "שני", "שלישי"})
-_TOTAL_ROW = re.compile(r"סה[\"״']?כ|סך\s*ה?כו?ל|סיכום|(?<![A-Za-z])total(?![A-Za-z])", re.I)
 _COUNT_DIGITS = re.compile(r"(?<![\d.,/%])(?<!\d-)(\d{1,2})(?![\d.,/%])[ \t]+([א-ת][א-ת\"״׳']*)")
 _HEBREW_WORD = re.compile(r"[א-ת]{2,}")
 _FIRST_HEBREW_WORD = re.compile(r"[ \t]+([א-ת][א-ת\"״׳']*)")
@@ -7639,6 +7643,7 @@ def _table_enumeration(src) -> _Enumeration | None:
     """The data rows of a table source as an enumeration: one table read whole (not in parts), the rows after its header (the rows before
     the first one that holds a digit), a total row not counted, and the stated size of the table (``הטבלה: N שורות``) the one the rows
     show. Its kind: the header of the row-label column, the word every row label starts with, and the nouns of the lines around the table."""
+    from app.chat.calc import TOTAL_WORDS
     from app.chat.tools import table_row_count
 
     if src.kind != "table" or src.table_part or src.partial_document:
@@ -7665,7 +7670,7 @@ def _table_enumeration(src) -> _Enumeration | None:
     stated = table_row_count(text)
     if stated is not None and stated != len(data):
         return None
-    counted = [r for r in data if not (r and _TOTAL_ROW.search(r[0]))]
+    counted = [r for r in data if not (r and TOTAL_WORDS.search(r[0]))]
     column = next((c for c in (0, 1) if all(c < len(r) and re.search(r"[א-ת]", r[c]) for r in counted)), None)
     kinds: set[str] = set()
     if column is not None:
@@ -9560,7 +9565,7 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         coverage.items = report.item_listing({u.index for u in stand}, texts, states=states)
         # round 22 U8 (KTD7; R14): the condition notes whose datum the sentence does not decide by its row are asked inside the requirements call that
         # runs below, one question each, next to the plan of the qualifier edits and before the judge batches
-        report.additions = _plan_additions(report, ws, states, [report._as_edited(u) for u in stand])
+        report.additions = _plan_additions(ws, states, [report._as_edited(u) for u in stand])
         coverage.additions = [a.listing() for a in report.additions]
     # a missing qualifier does not keep the unit from the judge: it is annotated only if the unit is supported
     for u in units:

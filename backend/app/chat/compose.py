@@ -123,7 +123,7 @@ NOTES_OVERFLOW = "(ועוד {n} הערות מערכת לא הוצגו)"
 WHOLE_ANSWER_LABEL = "התשובה כולה"
 REPLACEMENT_STAND_IN = "(העוזר לא הצליח לבסס תשובה בתור זה)"
 ONLY_NOTES_STAND_IN = "(בתור זה העוזר מסר רק הערות מערכת)"
-_CITATION = re.compile(r"\s*\[[SMCPVA]\d+(?:\s*[,،;]\s*[SMCPVA]\d+)*\]")
+CITATION = re.compile(r"\s*\[[SMCPVA]\d+(?:\s*[,،;]\s*[SMCPVA]\d+)*\]")
 _SENTENCE_END = re.compile(r"[.;!?]\s+|\n")
 
 
@@ -136,7 +136,7 @@ def stand_in(spans) -> str:
 
 def _note_text(raw: str) -> str:
     """The server text of a span as a note: no citations, markup, blockquote marks or enclosing brackets, on one line."""
-    t = _CITATION.sub("", raw)
+    t = CITATION.sub("", raw)
     t = re.sub(r"(?m)^\s*>+\s*", "", t).replace("**", "").replace("*", "")
     t = " ".join(t.split())
     while len(t) > 1 and t[0] == "(" and t[-1] == ")" and "(" not in t[1:-1]:
@@ -157,7 +157,7 @@ def _nearby_words(markdown: str, at: int, ranges: list[tuple[int, int]]) -> str:
         kept.append(markdown[pos:max(pos, min(a, at))])
         pos = max(pos, min(b, at))
     kept.append(markdown[pos:at])
-    before = " ".join(_CITATION.sub("", "".join(kept)).split())
+    before = " ".join(CITATION.sub("", "".join(kept)).split())
     if not before:
         return WHOLE_ANSWER_LABEL
     clause = _SENTENCE_END.split(before + " ")[-1] or before
