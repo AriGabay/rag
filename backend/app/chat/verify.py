@@ -318,7 +318,9 @@ JUDGE_FIRST_CALL_MIN_SECONDS = 40
 # 21 (round 20 U3, KTD3): the header of a passage of a file holding several reports also shows the names the document gives its unit
 # (``_names_head``), and the ownership line carries the scope facts (a datum written under another plan, parcel or contract) and the
 # same-property fact (the question's name is a name of the unit its address labels); rule (34) reads them.
-JUDGE_VERSION = 21
+# 22 (round 22 U8, KTD7): the requirements call may carry ``<additions>`` (a condition the server is about to write beside a datum, its ``<clause>``,
+# ``<row>`` and ``<other_rows>``) and a requirement answers each with ``applies`` (``applies``, ``not_applies`` or ``unknown``).
+JUDGE_VERSION = 22
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check

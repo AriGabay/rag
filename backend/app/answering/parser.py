@@ -24,20 +24,23 @@ _FOLLOWUP = re.compile(r"^\s*(ו?מה\s+(לגבי|עם|ב)|ו?ב-?\s*(19|20)\d{2
 _NEIGHBORHOOD_PHRASE = re.compile(r"(?:ב|ל|מ)?שכונת\s+((?:[א-ת״׳\"'-]+\s?){1,3})")
 _CITY_PHRASE = re.compile(r"(?:ב|ל|מ)?עיר\s+((?:[א-ת״׳\"'-]+\s?){1,3})")
 
-TRANSACTION_WORDS = ("עסקה", "עסקאות", "עסקת", "נמכר", "נמכרה", "נמכרו", "מכירה", "מכירות", "מחירי עסקאות")
-VALUE_WORDS = ("שווי", "שומה", "שומות", "הוערך", "הוערכו", "הערכת")
-ASKING_WORDS = ("מבוקש", "מחיר מבוקש", "מחירים מבוקשים")
+TRANSACTION_WORDS = ("עסקה", "עסקאות", "עסקת", "עסקתו", "עסקתה", "נמכר", "נמכרה", "נמכרו", "נמכרים", "נמכרות", "מכירה", "מכירות", "מחירי עסקאות")
+# round 22 U1 follow-up: "שווי" with a possessive or plural ending ("שוויו", "שוויה", "שוויים", "שווים", "שוויי") matched before the whole-word
+# match (a substring of the word); the prefixed forms ("בשווי", "השווי") are matched by the prefix letters
+VALUE_FORMS = ("שווי", "שוויו", "שוויה", "שוויים", "שווים", "שוויי")
+VALUE_WORDS = (*VALUE_FORMS, "שומה", "שומות", "הוערך", "הוערכו", "הערכת")
+ASKING_WORDS = ("מבוקש", "מבוקשת", "מבוקשים", "מבוקשות", "מחיר מבוקש", "מחירים מבוקשים")
 ADJUSTED_WORDS = ("מתואם", "מתואמים", "לאחר התאמות")
 # round 22 U1: every list below is matched as whole words (Hebrew prefix letters allowed), so an inflection is listed.
-PRICE_WORDS = ("מחיר", "מחירי", "מחירים")
-AVERAGE_WORDS = ("ממוצע", "ממוצעת", "ממוצעים")
-WEIGHTED_WORDS = ("משוקלל", "משוקללת", "משוקללים")
+PRICE_WORDS = ("מחיר", "מחירי", "מחירים", "מחירו", "מחירה", "מחירם")
+AVERAGE_WORDS = ("ממוצע", "ממוצעת", "ממוצעים", "ממוצעו", "ממוצעה")
+WEIGHTED_WORDS = ("משוקלל", "משוקללת", "משוקללים", "משוקללו")
 MEDIAN_WORDS = ("חציון", "חציוני", "חציונית")
 VAT_INCLUDED_WORDS = ("כולל מע״מ", "כולל מעמ")
 VAT_EXCLUDED_WORDS = ("לא כולל מע״מ", "לא כולל מעמ")
 PER_SQM_WORDS = ("למ״ר",)
 CALC_WORDS = ("למ״ר", "למטר", *AVERAGE_WORDS, *MEDIAN_WORDS, *WEIGHTED_WORDS, "כמה עסקאות", "מספר העסקאות",
-              *PRICE_WORDS, "שווי")
+              *PRICE_WORDS, *VALUE_FORMS)
 EXPLAIN_WORDS = ("למה", "מדוע", "שיקול", "שיקולי", "השיקולים", "הסבר", "נימוק", "נימוקי", "מה נכתב", "מה נאמר",
                  "איך השמאי", "מה השמאי", "הוזכר", "הוזכרו", "התייחס")
 LOOKUP_WORDS = ("באיזה מסמך", "באיזו שומה", "באילו שומות", "באילו מסמכים", "איפה מופיע", "מצא את", "איזה מסמך",

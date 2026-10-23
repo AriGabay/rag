@@ -1,6 +1,8 @@
 """History keeps meaning (round 22 U11, KTD10, R19, R22, R5; AE5): an earlier answer reaches the next turn as its prose without the server's
 words, and, beside it, the meaning the server added as labelled system notes built from the stored registry. Synthetic text only."""
 
+# ruff: noqa: F811 - the tests take the imported ``offline`` fixture by name, as the round-20 and round-21 sequences do
+
 from __future__ import annotations
 
 import re
@@ -11,6 +13,13 @@ from app.chat.api import _history_message, _history_notes, _history_text
 from app.chat.compose import SERVER_SPANS_FIELD, ServerSpan
 from app.chat.tools import Workspace
 from app.chat.verify import verify_answer
+from tests.support.scripted_agent import ScriptedAgent, final
+from tests.unit.test_final_check import (  # noqa: F401 - the fixture, taken by name
+    SEARCH,
+    Judge,
+    _turn,
+    offline,
+)
 from tests.unit.test_verify_units import _answer, _judge
 
 BASE = "השווי הוא 100 ₪"
@@ -165,6 +174,7 @@ def test_an_old_row_without_a_registry_passes_unchanged_and_no_note_is_derived_f
 
 
 def test_a_later_claim_that_cites_nothing_is_not_supported_by_a_note():
+    """The unit-level view (kept): verification grounds a claim in the turn's sources, and the workspace holds none of history."""
     notes = _history_notes(_conditioned())
     assert notes  # the earlier answer's condition is in the next turn's history ...
     ws = Workspace(ctx=None)  # ... but a turn's evidence is its sources: history is not one
@@ -172,3 +182,53 @@ def test_a_later_claim_that_cites_nothing_is_not_supported_by_a_note():
     answer = _answer("השווי הוא 100 ₪, בכפוף להשלמת הפיתוח.")
     report = verify_answer(_judge(lambda t: "supported"), answer, ws, "מה השווי?", [])
     assert report.counts()["removed"] == 1, report.counts()  # no source states it: the note does not
+
+
+# the engine boundary (round 22 follow-up): a whole offline turn whose history carries the note
+SOURCE_WITHOUT = "תא שטח 1: השווי הוא 100 ₪. הנכס פנוי."
+SOURCE_WITH = "תא שטח 1: השווי הוא 100 ₪, בכפוף להשלמת הפיתוח. הנכס פנוי."
+CLAIM = "השווי הוא 100 ₪, בכפוף להשלמת הפיתוח"
+
+
+def _evidence_judge():
+    """A judge that is honest about evidence only: a unit is supported when every word of its condition is in a ``<source>`` of the call
+    it was shown (the evidence of the call), whatever the history, the question or any note said."""
+
+    def rule(text, input, n):
+        evidence = " ".join(re.findall(r"<source[^>]*>(.*?)</source>", input, re.S))
+        return "supported" if "בכפוף להשלמת הפיתוח" not in text or "בכפוף להשלמת הפיתוח" in evidence else \
+            {"verdict": "unsupported", "failure": "absent_from_source"}
+
+    return Judge(rule)
+
+
+def _noted_history() -> list[engine.HistoryMessage]:
+    history = _history(_conditioned())
+    assert any("בכפוף להשלמת הפיתוח" in n for m in history for n in m.notes)  # the note is really in the turn's history
+    return history
+
+
+def test_a_condition_repeated_by_the_final_answer_is_removed_when_no_source_holds_it_though_the_history_note_does(offline):
+    offline.texts = [SOURCE_WITHOUT]
+    judge = _evidence_judge()
+    held: list = []
+    offline.setup = held.append  # the turn's workspace, to see its sources afterwards
+    answer = f"{CLAIM}.\nהנכס פנוי [S1]."
+    agent = ScriptedAgent([SEARCH, final(answer), final(answer), final(answer)], judge=judge)
+    out = _turn(agent, "מה השווי?", history=_noted_history())
+    md = out.answer.answer_markdown
+    assert "בכפוף להשלמת הפיתוח" not in md and "הנכס פנוי" in md, md  # the uncited condition is not kept ...
+    assert out.report.removals(), out.report.counts()  # ... it was removed by the check, not left to the note
+    # ... and no note text is a source or evidence of any judge call
+    assert [s.text for s in held[0].sources.values()] == [SOURCE_WITHOUT]
+    assert judge.inputs and all("הערת מערכת" not in i for i in judge.inputs)
+    assert all("בכפוף להשלמת הפיתוח" not in " ".join(re.findall(r"<source[^>]*>(.*?)</source>", i, re.S)) for i in judge.inputs)
+
+
+def test_the_same_turn_keeps_the_condition_when_a_source_states_it(offline):
+    """The negative control of the test above: the turn, the history, the note and the answer are the same; only the source differs."""
+    offline.texts = [SOURCE_WITH]
+    judge = _evidence_judge()
+    answer = f"{CLAIM} [S1].\nהנכס פנוי [S1]."
+    out = _turn(ScriptedAgent([SEARCH, final(answer), final(answer), final(answer)], judge=judge), "מה השווי?", history=_noted_history())
+    assert "בכפוף להשלמת הפיתוח" in out.answer.answer_markdown and not out.report.removals(), out.answer.answer_markdown

@@ -3,6 +3,7 @@
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 from app.answering.conditions import QueryConditions
@@ -224,6 +225,27 @@ def test_intent_and_data_kind_words_are_whole_words():
     assert _conds("מחיר עסקאות חציוני").aggregation == "median"
     assert _conds("מחיר עסקאות חציון ב-2024").aggregation == "median"
     assert _conds("מחיר עסקאות משוקלל ב-2024").aggregation == "weighted"
+
+
+@pytest.mark.parametrize("form", ["שוויו", "שוויה", "שוויים", "שווים", "שוויי", "השווי", "בשווי", "לשווי", "משווי", "ושווי", "כשווי"])
+def test_the_value_word_keeps_its_inflected_and_prefixed_forms_as_before_the_whole_word_match(form):
+    """Round 22 U1 follow-up: «שווי» with a possessive or plural ending or a prefix letter read as the value word before U1 (a substring test),
+    so a question holding it is still a calculation (compared with the parser at the base of round 22, d581463)."""
+    assert _conds("מה שווי נכסים בשומות ברמת גן 2024").intent == "calculation"
+    assert _conds(f"מה {form} נכסים בשומות ברמת גן 2024").intent == "calculation", form
+    assert _conds(f"מה {form} הנכס").intent == "calculation", form
+    assert _conds(f"{form} שומות ברמת גן 2023").intent == "calculation", form
+
+
+@pytest.mark.parametrize("form", ["מחירו", "מחירה", "מחירם", "ממוצעו", "משוקללו"])
+def test_price_and_aggregate_words_keep_their_possessive_forms_as_before_the_whole_word_match(form):
+    """Round 22 U1 follow-up: the possessive forms of the price and aggregate words read as calculation words before U1 (a substring
+    test) and still do."""
+    assert _conds(f"מה {form} של עסקאות ברמת גן 2024").intent == "calculation", form
+
+
+def test_the_value_word_is_still_a_whole_word():
+    assert _conds("מה שוויון הזדמנויות").intent == "explanation"  # «שוויון» (equality) is no inflection of the value word
 
 
 def test_date_field_words_are_whole_words():

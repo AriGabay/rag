@@ -108,3 +108,49 @@ def test_with_a_separation_the_later_cell_is_scaled_unconfirmed_and_a_calculatio
     assert "V1" not in ws.uncertain_values and "4. פירוט עלויות נוספות" in ws.uncertain_values["V2"]
     out = json.loads(T.tool_calculate(ws, "V1 + V2", "סך הוצאות"))
     assert out["conditional"] is True
+
+
+# --- the link between two parts is stored (round 22 follow-up: ``structure.candidate_of`` of persist) ---------------------------------
+
+PART_HEADERS = ["כתובת", "גוש/חלקה", "תאריך עסקה", "סוג נכס", "חדרים", "שטח (מ״ר)", "סוג שטח", "מחיר (₪)", "מחיר למ״ר (₪)"]  # a header row the reader knows
+
+
+def _part_row(i: int) -> list[str]:
+    return [f"רחוב {i}", f"6160/{i}/1", "01/01/2024", "דירה", "4", "90", "נטו", f"2,{i:03d},000", "25,000"]
+
+
+def _stored_links(office, pieces: list) -> list[tuple[int, dict]]:
+    """Assemble ``pieces`` as the walker does, persist the reading and return each stored table's ``(table_index, structure)``."""
+    from app.extraction.base import ExtractionResult
+    from app.extraction.tables import assemble_tables
+    from app.platform import pipeline
+
+    doc, ver = make_document(office, office.default_group_id, TITLE, sha="c" * 64)
+    result = ExtractionResult(page_count=3, pages=[], tables=assemble_tables(pieces), chunks=[])
+    info = pipeline.VersionInfo(ver, doc, "k", "application/pdf", None)
+    with tenant_tx(office.system) as conn:
+        pipeline.persist_extraction(conn, info, result)
+        rows = conn.execute(text("SELECT table_index, structure FROM extracted_tables WHERE version_id = :v ORDER BY table_index"),
+                            {"v": ver}).all()
+    return [(r.table_index, r.structure) for r in rows]
+
+
+def test_an_undecided_headerless_later_part_is_stored_linked_to_the_earlier_and_the_first_part_has_no_link(office):
+    from app.extraction.tables import RawTable
+
+    stored = _stored_links(office, [RawTable(page=1, rows=[PART_HEADERS, _part_row(1)]),
+                                    RawTable(page=2, rows=[_part_row(2)])])
+    assert [i for i, _ in stored] == [0, 1]
+    assert "candidate_of" not in stored[0][1]  # the first part continues nothing
+    assert stored[1][1]["candidate_of"] == 0 and stored[1][1]["headers"] == []  # the later one may continue table 0, and is its own part
+    with tenant_tx(office.system) as conn:
+        assert conn.execute(text("SELECT table_index FROM extracted_tables WHERE structure->>'candidate_of' IS NOT NULL")).scalars().all() == [1]
+
+
+def test_a_part_that_repeats_the_header_continues_the_table_and_stores_no_link(office):
+    from app.extraction.tables import RawTable
+
+    stored = _stored_links(office, [RawTable(page=1, rows=[PART_HEADERS, _part_row(1)]),
+                                    RawTable(page=2, rows=[PART_HEADERS, _part_row(2)])])
+    assert len(stored) == 1 and "candidate_of" not in stored[0][1]  # one table, both pages' rows, no link between parts
+    assert [r["page"] for r in stored[0][1]["rows"]] == [1, 2] and stored[0][1]["headers"] == PART_HEADERS

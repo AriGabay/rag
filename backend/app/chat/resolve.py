@@ -693,8 +693,12 @@ def _note_two_lists(out: Request, settled: intent_mod.Intent, candidates: list[d
                     decisions: dict) -> None:
     """An ordinal that names an item of the previous answer's list and also fits the candidates of a clarification or
     a listing of documents the previous turn offered has two substantive readings (round 10 KTD6). Since round 15 U6 (KTD1,
-    R2) the server does not ask: the model gets both readings as a hint and decides, asking only when the ambiguity is
-    material. A listing that names the same thing as the item is one reading."""
+    R2) the server does not ask about THIS pair (an item of a list against a clarification's candidates or a documents listing): the model
+    gets both readings as a hint and decides, asking only when the ambiguity is material. A listing that names the same thing as the item is
+    one reading. The other ambiguity - a bare ordinal that fits two LISTS of the previous answers ("השני" over the plots and the payments) - is
+    the server's own question since round 22 U12 (KTD14, plan R20/AE6): ``slots.bind`` returns ``Binding(kind="ask")`` and ``settle`` makes
+    it the one clarification that names both lists (``Request.server_clarify``); the question stores no pending ordinal, so a reply is a
+    new message that names the list and its place."""
     if settled.bound != "item":
         return
     n, rivals = settled.item, []
