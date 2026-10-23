@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 STAGES = ("locate", "read", "compute", "compose", "verify", "final")
@@ -55,6 +55,7 @@ class StageClock:
     searches_memoized: int = 0
     not_checked: dict[str, int] = field(default_factory=dict)
     reads: dict[str, dict] = field(default_factory=dict)
+    read_docs: dict[str, set] = field(default_factory=dict)  # round 22 U7: the documents each read target names (never in the summary)
     tables_served: set = field(default_factory=set)
     multi_page: set = field(default_factory=set)
 
@@ -102,11 +103,13 @@ class StageClock:
         self.not_checked[cause] = self.not_checked.get(cause, 0) + 1
 
     def note_read(self, target: str, tool: str, *, attempted: bool, completed: bool = False, failed_with: str | None = None,
-                  budget_skipped: bool = False) -> None:
+                  budget_skipped: bool = False, documents: Iterable[str] = ()) -> None:
         """The state of one read target (R18): ``attempted`` — the server ran the read; ``completed`` — it returned without
         failing; ``failed_with`` — the refusal key or exception name of a read that failed (or ``time_limit``, a read the
         reading time stopped); ``budget_skipped`` — the tool budget stopped the call before it ran. Later calls on the same
-        target add to it: ``completed`` and ``budget_skipped`` stay once set, ``failed_with`` is cleared by a completed read."""
+        target add to it: ``completed`` and ``budget_skipped`` stay once set, ``failed_with`` is cleared by a completed read.
+        ``documents`` (round 22 U7): the documents the call named (the handles it gave, resolved by the caller), kept apart from the
+        record: ``Workspace.failed_reads`` finds the reads of a document through them."""
         st = self.reads.get(target)
         if st is None:
             if len(self.reads) >= READ_TARGETS_KEPT:
@@ -118,6 +121,8 @@ class StageClock:
         st["completed"] = st["completed"] or completed
         st["budget_skipped"] = st["budget_skipped"] or budget_skipped
         st["failed_with"] = None if st["completed"] else failed_with or st["failed_with"]
+        if documents:
+            self.read_docs.setdefault(target, set()).update(str(d) for d in documents)
 
     def note_table(self, key: tuple, spans_pages: bool) -> None:
         """A stored table served (``key``: its version and index; once per table); ``spans_pages``: its rows are on more than

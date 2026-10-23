@@ -808,6 +808,10 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
     outside = [sid for sid in ev["checks"] if sid in ws.sources and not _inside_unit(ws, sid, signal)]
     if partly_stated:
         return out | {"reason": None}
+    # a read of one of its documents (any document of the turn, when the judge tied none) broke for a technical reason and was not completed since
+    # (round 22 U7, R18, R11): no search can say the datum is not in a region that read opened - the line says the check did not complete
+    if ws.failed_reads(documents):
+        return out | {"reason": "tool_failure"}
     if out["searched"] and len(outside) < len(ev["checks"]):
         return out | {"reason": "not_located", "variant": "searched"}
     return out | {"reason": "not_located", "searched": False}

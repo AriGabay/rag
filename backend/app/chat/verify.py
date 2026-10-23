@@ -243,6 +243,7 @@ from app.providers.llm import (
     LLMProvider,
     Purpose,
     call_structured,
+    deadline_left,
     for_purpose,
     has_time,
     prompt_attr,
@@ -280,6 +281,14 @@ JUDGE_CALL_CHARS = 30_000  # evidence per judge call; more units go to further c
 JUDGE_MAX_UNITS = 40  # units per judge call (the verdicts must fit the output)
 VERIFY_ALLOWANCE_SECONDS = 60  # verification may run this long past the turn's deadline
 RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures worth one more call
+# Round 22 U7 (KTD13, F2): the slice of the verification deadline kept for a judge batch's one retry. A judge call is cut to what its
+# deadline leaves, so a first call that hung to the end of a late deadline left the retry no time and a fully supported answer was
+# withheld as "not checked: timeout". The first call is cut to ``deadline - JUDGE_RETRY_RESERVE_SECONDS`` (``first_call_deadline``),
+# so a first call that fails by timeout leaves the retry that much; with less time than the reserve plus
+# ``JUDGE_FIRST_CALL_MIN_SECONDS`` there is no room for two usable windows and the one call keeps all of it. A roomy deadline (the
+# first call ends at its purpose's timeout well before the reserve) is not changed.
+JUDGE_RETRY_RESERVE_SECONDS = 20
+JUDGE_FIRST_CALL_MIN_SECONDS = 15
 # The judge contract's version (round 8 KTD7): part of every verdict key, bumped whenever the policy, the schema or what
 # a call renders changes what a verdict means, so a verdict of an older contract is never reused (cached readings are
 # versioned). 6 (round 10 U9, KTD14): the evidence header of a standard carries its kind, limits and wording, and the policy
@@ -1108,17 +1117,10 @@ def _supported_claim(r: ClaimRecord) -> str:
     return claim if re.search(r"\w", claim) else ""
 
 
-# the words that state the VAT basis of a number ("ללא מע״מ", "כולל מע״מ"): a partly verified number a repair round keeps must keep them, or
-# it changes its basis without saying so (round 21 U9, R10: a number whose VAT basis differs is kept only with its basis stated)
-VAT_BASIS_WORDS = frozenset("מעמ כולל כוללת כוללים כוללות ללא לא אינו אינה אינם אינן בלי".split())
-
-
-def _vat_basis(claim: str) -> str:
-    """The words of ``claim`` that state its VAT basis (``VAT_BASIS_WORDS``) when it states one; "" when it does not mention VAT."""
-    words = qualifier_words(claim)
-    if not any(_missing_forms(w) & {"מעמ"} for w in words):
-        return ""
-    return " ".join(w for w in words if _missing_forms(w) & VAT_BASIS_WORDS)
+def _vat_basis(claim: str) -> frozenset[str]:
+    """The VAT statuses ``claim`` states for its numbers (``excluded`` / ``included``), read by the one VAT reader (``_vat_phrases``, round 22
+    U13); empty when it states none. A clause saying the text does not state the VAT («לא צוין אם כולל מע״מ») states none."""
+    return frozenset(polarity for _, polarity, _, _ in _vat_phrases(claim, True))
 
 
 def _covers_any(covers: list[set[str]], claim: str, heading: str, numeric: bool) -> bool:
@@ -1143,13 +1145,11 @@ def _covers_any(covers: list[set[str]], claim: str, heading: str, numeric: bool)
     return any(covers_it(c) for c in covers)
 
 
-_VAT_PHRASE = re.compile(r"(?<![א-ת])(?:ללא|בלי|לא\s+כולל|אינו\s+כולל|כולל|לפני|אחרי|בתוספת)\s+מע[\"״”]?מ(?![א-ת])")
-
-
 def _vat_phrase(source: str) -> str:
-    """The words of ``source`` that state a VAT basis ("ללא מע״מ", "כולל מע״מ"), as written; "" when it states none."""
-    m = _VAT_PHRASE.search(source or "")
-    return m.group(0) if m else ""
+    """The first VAT phrase of ``source`` that states a basis («ללא מע״מ», «אינם כוללים מע״מ», «+מע״מ», «אחרי מע״מ»), as written; "" when it
+    states none. The one VAT reader (``_vat_phrases``) finds it, so a form the verification reads is a form that is written back."""
+    text = _unwrap_vat_lines(source or "")
+    return next((text[a:b].strip() for _, _, a, b in _vat_phrases(text, False)), "")
 
 
 def _basis_insertion(units: list[Unit], numbers: set[str], source: str) -> tuple[int, str] | None:
@@ -1166,11 +1166,11 @@ def _basis_insertion(units: list[Unit], numbers: set[str], source: str) -> tuple
     return None if at is None else (at, " " + phrase)
 
 
-def _keeps_basis(covers: list[set[str]], claim: str) -> bool:
-    """Whether a unit of a repair's answer (``covers``) holds the VAT basis words of ``claim`` (``_vat_basis``); true for a claim that
-    states no VAT basis."""
+def _keeps_basis(units: list[Unit], chains: dict[int, str], claim: str) -> bool:
+    """Whether a unit of a repair's answer (``units``, with the heading chain above each, ``chains``) states the VAT status of ``claim``
+    (``_vat_basis``): the same status (a number «לפני מע״מ» is not kept by «כולל מע״מ»); true for a claim that states none."""
     basis = _vat_basis(claim)
-    return not basis or _covers_any(covers, basis, "", True)
+    return not basis or any(basis <= _vat_basis(f"{u.text}\n{chains[u.index]}") for u in units)
 
 
 def _word_forms(text: str) -> set[str]:
@@ -2263,7 +2263,7 @@ class VerifyReport:
         basis alone (round 21 U9, KTD5): the part the judge doubted is what a repair may fix, and the number is never the repair's to
         drop."""
         shown = numbers_in(text)
-        _, _, covers = _cover_forms(text)
+        units_now, chains_now, covers = _cover_forms(text)
         cited = set(ids_in(text))
         units = {u.index: u for u in self.units}
         lost = []
@@ -2278,7 +2278,7 @@ class VerifyReport:
                     continue  # a statement of an absence is not protected
                 needed = numbers_in(claim)
                 if number_only:
-                    if not needed <= shown or not _keeps_basis(covers, r.source_sentence or claim):
+                    if not needed <= shown or not _keeps_basis(units_now, chains_now, r.source_sentence or claim):
                         lost.append((u, r))
                     continue
                 if (needed and not needed <= shown) or (sources and not sources & cited) or not _covers_any(
@@ -2323,7 +2323,7 @@ class VerifyReport:
             claim, number_only = self._protected(r)
             needed = numbers_in(claim)
             if number_only:
-                if needed <= shown and _keeps_basis(covers, r.source_sentence or claim):
+                if needed <= shown and _keeps_basis(new_units, chains, r.source_sentence or claim):
                     continue  # its number is there, with its basis
                 if needed <= shown and (place := _basis_insertion(new_units, needed, r.source_sentence or claim)) is not None:
                     bound.append((u, r, place))
@@ -4306,15 +4306,18 @@ def _all_numbers(ws: Workspace) -> set[str]:
     return nums
 
 
-_VAT = re.compile(r"(?P<neg>ללא|לא\s+כולל|לא\s+כוללים|אינו\s+כולל|אינם\s+כוללים|אינה\s+כוללת|לפני|בתוספת|\+)?\s*"
-                  r"(?:כולל\s+)?" + VAT_TERM)
+# THE VAT reader (round 22 U13, KTD11): every written form of a VAT basis, with its status (``_vat_polarity``): excluded - ללא, בלי, לא כולל(ים), אינו/אינם
+# כולל(ים), אינה כוללת, לפני, בתוספת, «+»; included - כולל, אחרי. The attachment of a phrase to its number (``_vat_phrases``), the basis a repair
+# keeps (``_vat_basis``) and writes back (``_vat_phrase``) and the phrases the meaning check lists (``meaning.vat_words``) all read it.
+_VAT = re.compile(r"(?P<neg>ללא|בלי|לא\s+כולל|לא\s+כוללים|אינו\s+כולל|אינם\s+כוללים|אינה\s+כוללת|לפני|בתוספת|\+)?\s*"
+                  r"(?:(?:כולל|אחרי)\s+)?" + VAT_TERM)
 _CLAUSE_END = meaning._CLAUSE_END
 # round 13: PDF text wraps lines mid-sentence, and a line break between the negation (or inclusion) word and the rest of
 # a VAT phrase ("... ₪ לא\nכולל מע״מ") ended the clause there, so the phrase lost its "לא" and its number and was read as
 # "included" for the whole source. The break inside such a phrase is read as a space (the same length, so offsets into the
 # text stay valid); a break anywhere else still ends the clause (table rows).
-_VAT_LINE_WRAP = re.compile(r"(?<![א-ת])((?:ללא|לא|אינו|אינם|אינה|כולל|כוללים|כוללת|בתוספת|לפני)[ \t]*)\n([ \t]*)"
-                            r"(?=(?:(?:כולל|כוללים|כוללת)\s+)?" + VAT_TERM + ")")
+_VAT_LINE_WRAP = re.compile(r"(?<![א-ת])((?:ללא|בלי|לא|אינו|אינם|אינה|כולל|כוללים|כוללת|בתוספת|לפני|אחרי)[ \t]*)\n([ \t]*)"
+                            r"(?=(?:(?:כולל|כוללים|כוללת|אחרי)\s+)?" + VAT_TERM + ")")
 
 
 def _unwrap_vat_lines(text: str) -> str:
@@ -4420,7 +4423,7 @@ def _value_forms(text: str, m: re.Match) -> set[str]:
 
 def _vat_polarity(m: re.Match) -> str:
     text = m.group(0)
-    return "excluded" if m.group("neg") else ("included" if "כולל" in text else "")
+    return "excluded" if m.group("neg") else ("included" if "כולל" in text or "אחרי" in text else "")
 
 
 def _vat_phrases(text: str, skip_absence: bool):
@@ -8888,6 +8891,16 @@ def _pack(units: list[Unit], ws: Workspace, expanded: dict[str, list[tuple[str, 
     return out
 
 
+def first_call_deadline(deadline: float | None) -> float | None:
+    """The deadline of a judge batch's FIRST call (round 22 U7, KTD13, F2): ``deadline`` less the retry's reserve
+    (``JUDGE_RETRY_RESERVE_SECONDS``), so a first call that times out leaves its one retry a usable window. ``deadline`` itself when there
+    is none, or when the time left cannot give the first call ``JUDGE_FIRST_CALL_MIN_SECONDS`` and keep the reserve."""
+    left = deadline_left(deadline)
+    if deadline is None or left is None or left - JUDGE_RETRY_RESERVE_SECONDS < JUDGE_FIRST_CALL_MIN_SECONDS:
+        return deadline
+    return deadline - JUDGE_RETRY_RESERVE_SECONDS
+
+
 def judge(provider: LLMProvider, batch: _Batch, rendered: str, usage: list[dict], deadline: float | None = None,
           coverage: _Coverage | None = None, *, policy: str = "", label: str = "verify"
           ) -> tuple[dict[int, JudgeVerdict], str, list[JudgeRequirement]]:
@@ -8920,13 +8933,15 @@ def _judge_batch(provider: LLMProvider, batch: _Batch, ws: Workspace, usage: lis
                  ) -> tuple[dict[int, JudgeVerdict], list[JudgeRequirement]]:
     """One batch to verdicts (and requirement scores): a call that timed out, was rate-limited or came back invalid is
     made once more; a truncated (``incomplete``) reply is split in half instead of resent. Raises
-    ``VerificationUnavailable`` when the judge cannot answer. ``label``: the calls' usage purpose (``judge``);
-    ``policy``: more rules for these calls."""
+    ``VerificationUnavailable`` when the judge cannot answer. The first call ends ``JUDGE_RETRY_RESERVE_SECONDS`` before the deadline
+    (``first_call_deadline``), so its one retry has a usable window when the first one timed out late (round 22 U7, KTD13, F2).
+    ``label``: the calls' usage purpose (``judge``); ``policy``: more rules for these calls."""
     if coverage is not None:
         # the sources a requirement may name as support (round 16 U1; follow-up): any source returned to the agent with text
         coverage.readable = returned_text_sources(ws)
     rendered = _render_batch(batch, ws, coverage)
-    got, status, scores = judge(provider, batch, rendered, usage, deadline, coverage, label=label, policy=policy)
+    got, status, scores = judge(provider, batch, rendered, usage, first_call_deadline(deadline), coverage, label=label,
+                                policy=policy)
     if status == "incomplete" and len(batch.units) > 1:
         half = len(batch.units) // 2
         first, p1 = _judge_batch(provider, _Batch(batch.units[:half], batch.narrow, batch.removed,
@@ -9432,7 +9447,8 @@ def _reread(provider: LLMProvider, report: VerifyReport, verdicts: dict[int, Jud
         return
     batch.units = [units[i] for i in dict.fromkeys(u.index for u, *_ in expanded)]
     rendered = _render_batch(batch, ws)
-    got, status, _ = judge(provider, batch, rendered, usage, deadline, policy=JUDGE_REREAD_POLICY, label="verify_reread")
+    got, status, _ = judge(provider, batch, rendered, usage, first_call_deadline(deadline), policy=JUDGE_REREAD_POLICY,
+                           label="verify_reread")
     if status in RETRYABLE:
         got, status, _ = judge(provider, batch, rendered, usage, deadline, policy=JUDGE_REREAD_POLICY,
                                label="verify_reread")

@@ -307,6 +307,14 @@ REREADS_PER_VALUE = 2  # focused re-reads of an unclear value's region per turn 
 LEVELS = ("located", "retrieved", "read", "verified")
 NOT_REACHED = "not_reached"  # a document of the set the turn never touched
 READ_TO_END = "end"  # a read target read from its beginning to its end (``Workspace.read_progress``)
+# The state of a read target (round 22 U7, R18, R11; ``Workspace.read_state``): the only state that may produce absence wording is a
+# completed read - and only for the region it read, of a datum that read did not hold ("completed with no finding", decided by the consumer)
+READ_COMPLETED = "completed"  # read to its end, no unread region
+READ_PARTIAL = "partial"  # read in part: ``ReadState.unread`` says how (``clipped``: stopped before its end; ``unread``: a region the document's reading left unread)
+READ_FAILED = "failed"  # the read broke for a technical reason: the tool raised, or a vision reading failed
+READ_BUDGET_SKIPPED = "budget_skipped"  # the tool budget or the reading time stopped the call before it ran
+READ_REFUSED = "refused"  # the server refused the call (a bad handle, a missing table): the request's fault, no region was read
+TECHNICAL_READ_FAILURES = frozenset({"tool_failed", "read_failed"})  # the ``failed_with`` keys of a read that broke (not a refusal)
 TOOL_BUDGET = "tool_budget"  # ``Workspace.limits_hit``: the turn's tool-output budget is spent
 TIME_LIMIT = "time_limit"  # ``Workspace.limits_hit``: the turn's reading time is up (``inspect``, or the loop's clock)
 STEP_LIMIT = "step_limit"  # ``Workspace.limits_hit``: the turn took the most steps it may (``engine``)
@@ -320,6 +328,19 @@ def read_chars() -> int:
 def table_rows() -> int:
     """The rows in a part of a table (KTD12)."""
     return get_settings().chat_table_rows
+
+
+class ReadState(NamedTuple):
+    """The state of one read target (``Workspace.read_state``): ``state`` - one of ``READ_COMPLETED``, ``READ_PARTIAL``, ``READ_FAILED``,
+    ``READ_BUDGET_SKIPPED``, ``READ_REFUSED`` - and, for a partial read, ``unread``: ``clipped`` or ``unread``."""
+
+    state: str
+    unread: str = ""
+
+    @property
+    def may_state_absence(self) -> bool:
+        """Only a completed read may say a datum is not in the region it read (R18); a failed, skipped, refused or partial one says what it was."""
+        return self.state == READ_COMPLETED
 
 
 class ToolError(Exception):
@@ -752,6 +773,35 @@ class Workspace:
         """Whether a target was read to its end with no unread region (None: never read as a target)."""
         st = self.reads.get(target) if target is not None else None
         return None if st is None else st["to"] == READ_TO_END and not st["unread"]
+
+    def read_state(self, target) -> ReadState | None:
+        """The state of a read target (round 22 U7, R18): a section, table or page range (the tuple ``read_progress`` keeps) is completed or
+        partial (``unread`` says how); a call's locator (the string ``_read_target`` writes on the stage clock, U0) is completed, failed,
+        budget-skipped or refused. None for a target never read. The two records are the ones that already existed; this reads them together."""
+        if isinstance(target, str):
+            st = self.clock.reads.get(target)
+            if st is None:
+                return None
+            if st["completed"]:
+                return ReadState(READ_COMPLETED)
+            if st["budget_skipped"] or st["failed_with"] == TIME_LIMIT:
+                return ReadState(READ_BUDGET_SKIPPED)
+            return ReadState(READ_FAILED if st["failed_with"] in TECHNICAL_READ_FAILURES else READ_REFUSED)
+        st = self.reads.get(target) if target is not None else None
+        if st is None:
+            return None
+        if st["to"] == READ_TO_END and not st["unread"]:
+            return ReadState(READ_COMPLETED)
+        return ReadState(READ_PARTIAL, "unread" if st["to"] == READ_TO_END else "clipped")
+
+    def failed_reads(self, documents: Iterable[str] | None = None) -> list[str]:
+        """The call locators of the turn whose read broke for a technical reason and was not completed since, those that named one of
+        ``documents`` (every one when None or empty): a document with such a read was not searched in the region that read opens, so no
+        line may say the datum is not in it (round 22 U7, R18)."""
+        wanted = {str(d) for d in documents or ()}
+        return [t for t in self.clock.reads
+                if (state := self.read_state(t)) is not None and state.state == READ_FAILED
+                and (not wanted or wanted & self.clock.read_docs.get(t, set()))]
 
     def note_readings(self, conn: Connection, version_ids) -> None:
         """Pin the reading ids of versions the turn is reading, in the transaction that reads them."""
@@ -5475,7 +5525,7 @@ def _vision_read(ws: Workspace, spot: _Spot):
         shot = render_region(get_storage().get(spot.v.storage_key), spot.page, crop,
                              scale=regions.READ_DPI / 72, max_side=VISION_MAX_SIDE)
     except RenderError:
-        raise ToolError(MSG_INSPECT_RENDER.format(what=spot.what)) from None
+        raise ToolError(MSG_INSPECT_RENDER.format(what=spot.what), key="read_failed") from None
     png = shot.png
     # where a pixel of the crop is on the page: the crop is already in the rendered frame, so an OCR box found in it
     # is mapped back with these alone (``anchors.page_box``), never through ``display_box_of`` again (KTD6)
@@ -5488,7 +5538,7 @@ def _vision_read(ws: Workspace, spot: _Spot):
         reading = transcribe(vision, png, deadline=ws.read_until, evidence=True, ocr_boxes=ocr,
                              layer_words=_in_pixels(layer, frame))
     except VisionCallFailed as exc:
-        raise ToolError(MSG_INSPECT_FAILED.format(what=spot.what, status=exc.status)) from None
+        raise ToolError(MSG_INSPECT_FAILED.format(what=spot.what, status=exc.status), key="read_failed") from None
     reading.ocr["frame"] = frame
     with tenant_tx(ws.ctx) as conn:
         v = reader.version(conn, spot.v.version_id)  # access may have changed while the model read
@@ -8796,13 +8846,28 @@ def _read_target(name: str, args: dict) -> str:
     return _clip(f"{name}:" + ",".join(parts), 120)
 
 
+def _documents_of(ws: Workspace, args) -> set[str]:
+    """The documents a call names through the handles it gives (``D1``, ``§3``, ``T2``, ``K1``, ``R4`` of ``ws.handles``), anywhere in its
+    arguments (round 22 U7): what ``Workspace.failed_reads`` finds a read by. Handles only; a locator that names none gives no document."""
+    found: set[str] = set()
+    if isinstance(args, dict):
+        for v in args.values():
+            found |= _documents_of(ws, v)
+    elif isinstance(args, (list, tuple)):
+        for v in args:
+            found |= _documents_of(ws, v)
+    elif isinstance(args, str) and (h := ws.handles.get(args)) is not None and h.get("document_id"):
+        found.add(str(h["document_id"]))
+    return found
+
+
 def _note_read(ws: Workspace, name: str, args: dict, **state) -> None:
     """Record the state of a reading call's target on the stage clock (round 22 U0, R18): attempted, completed, failed with,
     skipped for the tool budget. Diagnostics only: nothing a tool returns or decides reads it, and it never raises."""
     if name not in READ_TARGET_TOOLS:
         return
     try:
-        ws.clock.note_read(_read_target(name, args), name, **state)
+        ws.clock.note_read(_read_target(name, args), name, documents=_documents_of(ws, args), **state)
     except Exception:  # noqa: BLE001 - a measurement must never fail a tool call
         logger.debug("read state not recorded", exc_info=True)
 

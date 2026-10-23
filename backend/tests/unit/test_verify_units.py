@@ -3033,3 +3033,56 @@ def test_u10_the_answers_own_list_confirms_a_count_only_of_the_kind_its_items_sh
 def test_u10_a_sum_over_a_count_in_words_with_no_enumeration_is_not_removed():
     ws = _ws("הסכום מחבר את שווי הדירות.")
     assert _count_check(ws, "שני החישובים מותנים: הסכום מחבר שמונה שוויי דירות [S1].")[1] == []
+
+
+# --- round 22 U13 (KTD11, R2): one VAT reader ------------------------------------------------------------------------------
+#
+# Two readers of a VAT phrase decided the same written form differently: the attachment reader (``vat_attachments``, ``_VAT``) and the
+# repair guard's basis reader (``_vat_phrase`` / ``_vat_basis``). A basis the guard did not read was not kept, restored or compared; one
+# it read only as «מע״מ» let «לפני מע״מ» pass for «כולל מע״מ». There is one reader now (``_vat_phrases``); every form either read is read.
+
+VAT_FORMS = [("ללא מע״מ", "excluded"), ("לא כולל מע״מ", "excluded"), ("אינו כולל מע״מ", "excluded"), ("אינם כוללים מע״מ", "excluded"),
+             ("אינה כוללת מע״מ", "excluded"), ("לא כוללים מע״מ", "excluded"), ("לפני מע״מ", "excluded"), ("בתוספת מע״מ", "excluded"),
+             ("+מע״מ", "excluded"), ("בלי מע״מ", "excluded"), ("כולל מע״מ", "included"), ("אחרי מע״מ", "included")]
+
+
+@pytest.mark.parametrize(("form", "polarity"), VAT_FORMS)
+def test_u13_every_written_form_of_a_vat_basis_is_read_by_the_one_reader(form, polarity):
+    pairs, general = verify.vat_attachments(f"המחיר הוא 55 ₪ {form}.")
+    assert {p for _, p in pairs} == {polarity} and general == set()
+    assert verify._vat_phrase(f"המחיר הוא 55 ₪ {form}.") == form  # the phrase as written, for the basis written back at a number
+
+
+def test_u13_a_negation_that_says_the_text_does_not_state_the_vat_gives_no_basis():
+    assert verify.vat_attachments("לא צוין אם הסכום 55 ₪ כולל מע״מ", skip_absence=True) == (set(), set())
+    assert verify._vat_basis("לא צוין אם הסכום 55 ₪ כולל מע״מ") == frozenset()
+    assert verify._vat_basis("המחיר הוא 55 ₪") == frozenset()  # no VAT mentioned: no basis to keep
+
+
+def _basis_judge():
+    from tests.unit.test_verify_cache import _fixed, _partial_judge
+
+    return _fixed(_partial_judge("units", number="55"))
+
+
+def _basis_report(source_sentence: str):
+    from tests.unit.test_verify_cache import _answer as answer
+
+    return verify_answer(_basis_judge(), answer("המחיר הוא 55 ₪ [S1]."), _ws(f"דוח: {source_sentence} הנכס פנוי."), "?", [])
+
+
+@pytest.mark.parametrize(("basis", "changed"), [("לפני מע״מ", "כולל מע״מ"), ("כולל מע״מ", "לפני מע״מ"), ("ללא מע״מ", "כולל מע״מ"),
+                                                ("בתוספת מע״מ", "כולל מע״מ"), ("+מע״מ", "כולל מע״מ")])
+def test_u13_a_repair_that_changes_the_vat_basis_of_a_partly_verified_number_loses_it(basis, changed):
+    report = _basis_report(f"המחיר הוא 55 ₪ {basis}.")
+    assert report.lost_supported(f"המחיר הוא 55 ₪ {basis} [S1].\nהנכס פנוי [S1].") == []  # the same basis: nothing lost
+    assert len(report.lost_supported(f"המחיר הוא 55 ₪ {changed} [S1].\nהנכס פנוי [S1].")) == 1  # another basis is not the number's own
+    assert len(report.lost_supported("המחיר הוא 55 ₪ [S1].\nהנכס פנוי [S1].")) == 1  # none at all
+
+
+@pytest.mark.parametrize("basis", ["+מע״מ", "אינם כוללים מע״מ", "בלי מע״מ", "אחרי מע״מ", "לפני מע״מ"])
+def test_u13_a_basis_is_written_back_at_the_number_in_every_form_it_is_read(basis):
+    report = _basis_report(f"המחיר הוא 55 ₪ {basis}.")
+    repaired = "המחיר הוא 55 ₪ [S1].\nהנכס פנוי [S1]."
+    merged, back = report.restore_lost(repaired, report.lost_supported(repaired))
+    assert len(back) == 1 and merged == f"המחיר הוא 55 ₪ {basis} [S1].\nהנכס פנוי [S1]." and merged.count("55") == 1
