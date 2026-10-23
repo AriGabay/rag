@@ -1174,6 +1174,9 @@ def compose_components(ws: Workspace, answer: FinalAnswer, report,
     report.gaps = groups
     lines = [g["text"] for g in groups]
     doc = edited.doc
+    # round 22 U8 (KTD7; R13, R14): an addition that does not apply to its datum, or has no verdict, is not written inline and the uncertainty line below
+    # names it: the stored verdicts are read before the lines are composed
+    audit_server_spans(ws, report, doc, applies_only=True)
     if note := report.conditional_note():  # one caveat per calculation, after the body and before the gaps (R23)
         doc.tidy_blank_lines()
         doc.append(("\n\n" if doc.text else "") + note, "conditional_note")
@@ -1204,16 +1207,34 @@ def compose_components(ws: Workspace, answer: FinalAnswer, report,
     return edited, outcomes
 
 
-def audit_server_spans(ws: Workspace, report, doc) -> int:
+def audit_server_spans(ws: Workspace, report, doc, *, applies_only: bool = False) -> int:
     """The audit of the server's additions inside the answer (round 21 U6, KTD4; R1): an addition (a qualifier, a scope note, a citation or a
     partial mark) whose datum is no longer in the text at its anchor is dropped, and one whose datum's place changed follows it
     (``Doc.audit``). A step of ``compose_components``, a pure function of the report and the text as the editors left them, so the final
     check's passes and the closing recomposition run it from the same state. The datum's text is the draft range of the claims the addition
     is registered with (``ServerSpan.claim_ids``); an addition that names only a datum is read by that datum's value tokens (a V# by its
     written form, a ledger item by its headline forms and fractions) and, for an item with no figure, by the claims of the sentence that
-    gives it. What cannot be read is left alone. No judge call. Returns the number of additions dropped or moved."""
-    if not any(s.kind in AUDITED_KINDS and (s.claim_ids or s.datum) for s in doc.spans()):
+    gives it. What cannot be read is left alone. No judge call. Returns the number of additions dropped or moved.
+
+    Round 22 U8 (KTD7; R13, R14): a meaning-changing addition (a condition, a scope, a conditional tag: ``ServerSpan.addition``) is also read against the
+    verdict stored in the report of whether it applies to its datum (``VerifyReport.applies_for``), as data. One that does not apply, or has no
+    verdict, is dropped, and the datum is recorded in ``report.unbound`` for the uncertainty line. ``applies_only``: that check alone, run before
+    the lines of the answer are composed so that the uncertainty line names what it dropped."""
+    dropped: list[tuple[object, str]] = []
+
+    def applies(span) -> bool:
+        got = report.applies_for(span.addition, span.datum, span.claim_ids[0] if span.claim_ids else "")
+        if got is not None and got.verdict == "applies":
+            return True
+        dropped.append((span, doc.text[span.start:span.end]))
+        return False
+
+    if not any(s.kind in AUDITED_KINDS and (s.claim_ids or s.datum or s.addition) for s in doc.spans()):
         return 0  # no addition names a claim or a datum: nothing to compare, nothing to read
+    if applies_only:
+        changed = doc.audit(lambda span: None, applies=applies)
+        _unbound_dropped(ws, report, dropped)
+        return changed
     ranges = {r.id: (r.start, r.end) for records in report.claims.values() for r in records}
     states: dict[str, dict] = {}
     loaded = False
@@ -1242,7 +1263,25 @@ def audit_server_spans(ws: Workspace, report, doc) -> int:
             return held
         return of_datum(span) if span.datum else None
 
-    return doc.audit(datum_ranges)
+    changed = doc.audit(datum_ranges, applies=applies)
+    _unbound_dropped(ws, report, dropped)
+    return changed
+
+
+def _unbound_dropped(ws: Workspace, report, dropped: Sequence[tuple[object, str]]) -> None:
+    """The data whose meaning-changing addition the audit dropped for want of a verdict that it applies, recorded for the uncertainty line (once
+    each: ``VerifyReport.unbound_data`` keeps the first of a datum and a detail). Its words are those the verdict recorded, else the datum's, else
+    the addition's own text."""
+    from app.chat.verify import Unbound
+
+    for span, text in dropped:
+        got = report.applies_for(span.addition, span.datum, span.claim_ids[0] if span.claim_ids else "")
+        datum = span.datum.split(",")[0] if span.datum else ""
+        label = (got.label if got is not None else "") or (ws.values[datum].label if datum in ws.values else "") or datum or "הערך"
+        detail = (got.detail if got is not None else "") or " ".join(text.strip(" ()").split())
+        unit = next((i for i, recs in report.claims.items() if any(r.id in span.claim_ids for r in recs)), -1)
+        kind = "scope" if span.addition == "scope" else "condition"
+        report.unbound.append(Unbound(unit, datum, label, got.value if got is not None else "", detail, kind, span.claim_ids[0] if span.claim_ids else ""))
 
 
 def _datum_tokens(ws: Workspace, states: dict, datum: str) -> tuple[tuple, tuple]:

@@ -225,6 +225,7 @@ class ServerSpan:
     ordinal: int = 0
     claim_ids: tuple[str, ...] = ()
     datum: str = ""
+    addition: str = ""  # round 22 U8: the kind of meaning-changing addition it is (``ADDITION_KINDS``); "" for any other span
 
     def as_dict(self) -> dict:
         out = {"start": self.start, "end": self.end, "kind": self.kind}
@@ -234,15 +235,23 @@ class ServerSpan:
             out["claim_ids"] = list(self.claim_ids)
         if self.datum:
             out["datum"] = self.datum
+        if self.addition:
+            out["addition"] = self.addition
         return out
 
 
 DATUM_PREFIX = "@"  # in a ``ref`` tuple: the entry that names the datum (an item id, a V#, a C#) rather than a claim
+ADDITION_PREFIX = "+"  # in a ``ref`` tuple: the entry that names the kind of the meaning-changing addition (round 22 U8, KTD7)
+# the additions that change how a datum is read - a condition the source states, a scope, the tag of a conditional calculation: each is written inline
+# only when it applies to the datum it stands next to (``Doc.audit``'s ``applies``; ``VerifyReport.applies``)
+ADDITION_KINDS = ("condition", "scope", "conditional")
 
 
-def ref_of(claim_ids=(), datum: str = "") -> tuple[str, ...]:
-    """The ``ref`` of a server addition (``Doc.splice``): the claims it is about, then the datum it is bound to (``DATUM_PREFIX``)."""
-    return (*dict.fromkeys(c for c in claim_ids if c), *((DATUM_PREFIX + datum,) if datum else ()))
+def ref_of(claim_ids=(), datum: str = "", addition: str = "") -> tuple[str, ...]:
+    """The ``ref`` of a server addition (``Doc.splice``): the claims it is about, then the datum it is bound to (``DATUM_PREFIX``) and the kind
+    of addition it is (``ADDITION_PREFIX``)."""
+    return (*dict.fromkeys(c for c in claim_ids if c), *((DATUM_PREFIX + datum,) if datum else ()),
+            *((ADDITION_PREFIX + addition,) if addition else ()))
 
 
 class Doc:
@@ -330,7 +339,7 @@ class Doc:
                 if o >= 0 and (self.text[i].isalnum() if letters else not self.text[i].isspace())
                 and any(a <= o < b for a, b in ranges)]
 
-    def audit(self, datum_ranges, kinds: tuple[str, ...] = AUDITED_KINDS) -> int:
+    def audit(self, datum_ranges, kinds: tuple[str, ...] = AUDITED_KINDS, applies=None) -> int:
         """The audit of the server's additions inside the answer (round 21 U6, KTD4; R1): each addition of ``kinds`` that names a datum is
         dropped when the datum's text is no longer in the answer, and follows it when the datum's place changed; the rest are left as they are.
         ``datum_ranges(span)``: the datum's text as draft ranges (model-text coordinates), or None when the caller cannot tell (the addition
@@ -338,10 +347,14 @@ class Doc:
         still right before it; when that character is still in the text but something else stands between, it is moved to follow it; when
         the character went (a cut took the end of the datum's clause) it follows the last character of the datum's text before it, and when
         nothing of the datum's text is left before it, it goes. Deterministic, no judge call; a second run changes nothing. Returns the
-        number of additions dropped or moved."""
+        number of additions dropped or moved.
+
+        Round 22 U8 (KTD7; R13, R14): ``applies(span)`` is the stored verdict of whether a meaning-changing addition (a span with an ``addition``
+        kind) applies to its datum, read as data: False — it does not apply, or no verdict was recorded — drops the addition wherever it stands;
+        anything else leaves it to the position audit above."""
         changed = 0
         for _ in range(len(self._kind) + 1):  # one change at a time on the text as it stands; each makes its span settled
-            action = self._next_audit(datum_ranges, kinds)
+            action = self._next_audit(datum_ranges, kinds, applies)
             if action is None:
                 break
             span, ref, anchor_at = action
@@ -353,10 +366,12 @@ class Doc:
             changed += 1
         return changed
 
-    def _next_audit(self, datum_ranges, kinds):
+    def _next_audit(self, datum_ranges, kinds, applies=None):
         pos = None  # the position of each draft character in the text, built when a span needs it
         for span, ref in self.refs():
             tag = self._tag[span.start]
+            if applies is not None and span.addition and span.kind in kinds and applies(span) is False:
+                return span, ref, None  # an addition that does not apply to its datum (or has no verdict) is not written inline
             if span.kind not in kinds or not (span.claim_ids or span.datum) or self._anchor.get(tag, -1) < 0:
                 continue
             here = self._origin_before(span.start)
@@ -391,13 +406,14 @@ class Doc:
                 j += 1
             if tag:
                 kind, ref = self._kind[tag], self._ref[tag]
-                claims = tuple(x for x in ref if not x.startswith(DATUM_PREFIX))
+                claims = tuple(x for x in ref if not x.startswith((DATUM_PREFIX, ADDITION_PREFIX)))
                 datum = next((x[len(DATUM_PREFIX):] for x in ref if x.startswith(DATUM_PREFIX)), "")
+                addition = next((x[len(ADDITION_PREFIX):] for x in ref if x.startswith(ADDITION_PREFIX)), "")
                 if kind == "partial_mark":  # the mark's place among the marks of the text, and the claims it covers
                     marks += 1
-                    out.append((ServerSpan(i, j, kind, marks, claims, datum), ref))
+                    out.append((ServerSpan(i, j, kind, marks, claims, datum, addition), ref))
                 else:
-                    out.append((ServerSpan(i, j, kind, 0, claims, datum), ref))
+                    out.append((ServerSpan(i, j, kind, 0, claims, datum, addition), ref))
             i = j
         return out
 

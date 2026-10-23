@@ -1088,8 +1088,11 @@ def test_items_shared_by_value_count_only_the_fills_alive_in_the_latest_version(
     earlier = items.Ledger()
     _declared(ws, "ההתאמה למיקום היא 5% [S1].", earlier, place, floor, components=COMPONENTS, version=1)
     _declared(ws, "ההתאמה לגיל הבניין היא 2% [S1].", earlier, _raw(), components=COMPONENTS, version=2)
-    alone = {o["quote"]: o for o in earlier.outcomes(stated, ws)}
+    alone = {o["quote"]: o for o in earlier.outcomes(_units("ההתאמה למיקום היא 5%, וההתאמה לקומה היא 5% [S1]."), ws)}
     assert alone["מיקום | 5%"]["state"] == alone["קומה | 5%"]["state"] == "covered"
+    # round 22 U8 (KTD7): a sentence that names neither row gives neither, whether or not the fills are twins: two rows of the cited passage hold 5%
+    generic = {o["quote"]: o for o in earlier.outcomes(stated, ws)}
+    assert generic["מיקום | 5%"]["state"] == generic["קומה | 5%"]["state"] == "omitted"
 
 
 def test_a_wider_quote_of_the_same_row_is_one_fill_with_the_narrower_one_and_never_a_twin_that_makes_the_row_share_its_value():

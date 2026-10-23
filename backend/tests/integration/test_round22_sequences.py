@@ -28,6 +28,8 @@ from tests.integration.test_round18_sequences import DOCUMENT_OF, ingest_pdf, le
 from tests.integration.test_round20_sequences import FOOTNOTE, GROUP_A_ROW, GROUP_B_ROW, LOTS, lot_item
 from tests.integration.test_search import add_chunks
 from tests.support.scripted_agent import ScriptedAgent, call, component, final
+from tests.unit.test_final_check import SEARCH, Judge, offline  # noqa: F401 - the fixture, taken by name
+from tests.unit.test_final_check import _turn as engine_turn
 
 pytestmark = pytest.mark.db
 
@@ -166,3 +168,48 @@ def test_a_summary_built_by_an_older_builder_is_rebuilt_with_the_superseded_one_
         agent.steps += _public_turn(summaries.public)
         assert send(client, cid, f"שאלה נוספת {i}")["status"] == "done"
     assert _summary_row(summaries, cid).summary_meta["superseded"]["text"] == old_text
+
+
+# --- U8: row-level attribution and the applies-to-datum check, over the whole turn (KTD7; R12-R14; AE3) -------------------------------------------
+#
+# Round 22 U8. The offline engine (a scripted model and judge over synthetic passages, no database): the agent declares the row of one property and
+# the answer states the equal value of another. The condition of the first row never lands next to the second row's figure, in either order of the
+# search results, and it lands next to the first row's own.
+
+U8_NOTE = "הזכויות חלות רק על פי תכנית מאושרת"
+U8_HEAD = "סוג שטח | שטח (מ״ר) | הערה"
+U8_NORTH, U8_SOUTH = "שטח קרקע צפונית", "שטח קרקע דרומית"
+U8_ASK = "שטח הקרקע הצפונית"
+U8_QUESTION = "מה שטח הקרקע הצפונית?"
+U8_NORTH_ITEM = {"component": U8_ASK, "label": U8_NORTH, "source": "S1", "quote": f"{U8_NORTH} | 1,200", "value": "1,200", "condition": "",
+                 "state": "included", "reason": ""}
+U8_TABLE = "\n".join([U8_HEAD, f"{U8_NORTH} | 1,200 | {U8_NOTE}", f"{U8_SOUTH} | 1,200 | ללא הערה"])
+
+
+def _u8_turn(offline, answer: str, texts: list[str], item: dict):
+    offline.texts = texts
+    judge = Judge(lambda t, i, n: "supported", asks={U8_ASK: "שטח"})
+    return engine_turn(ScriptedAgent([SEARCH, *[final(answer, items=[item]) for _ in range(3)]], judge=judge, request=[component(U8_ASK)]), U8_QUESTION)
+
+
+def test_ae3_the_condition_of_one_row_is_not_written_next_to_the_equal_value_of_another_row_over_a_whole_turn(offline):
+    out = _u8_turn(offline, "שטח הקרקע הדרומית הוא 1,200 מ״ר [S1].", [U8_TABLE], U8_NORTH_ITEM)
+    md = out.answer.answer_markdown
+    assert U8_NOTE not in md.split("\n\n")[0], md  # the sentence is about the south row: no condition of the north row beside its figure
+    assert not [s for s in out.server_spans if s.kind == "qualifier"], out.server_spans
+    out = _u8_turn(offline, "שטח הקרקע הצפונית הוא 1,200 מ״ר [S1].", [U8_TABLE], U8_NORTH_ITEM)
+    md = out.answer.answer_markdown
+    assert f"1,200 מ״ר (התנאי לפי המקור: {U8_NOTE}) [S1]" in md, md
+    (note,) = [s for s in out.server_spans if s.kind == "qualifier"]
+    assert note.datum.startswith("I") and note.addition == "condition", note
+
+
+def test_the_order_the_search_returned_the_passages_in_does_not_move_a_condition_between_properties(offline):
+    north_table = "\n".join([U8_HEAD, f"{U8_NORTH} | 1,200 | {U8_NOTE}"])
+    south_table = "\n".join([U8_HEAD, f"{U8_SOUTH} | 1,200 | ללא הערה"])
+    for texts, north_sid, south_sid in (([north_table, south_table], "S1", "S2"), ([south_table, north_table], "S2", "S1")):
+        item = U8_NORTH_ITEM | {"source": north_sid}
+        out = _u8_turn(offline, f"שטח הקרקע הדרומית הוא 1,200 מ״ר [{south_sid}].", texts, item)
+        assert U8_NOTE not in out.answer.answer_markdown.split("\n\n")[0], (texts, out.answer.answer_markdown)
+        out = _u8_turn(offline, f"שטח הקרקע הצפונית הוא 1,200 מ״ר [{north_sid}].", texts, item)
+        assert f"1,200 מ״ר (התנאי לפי המקור: {U8_NOTE}) [{north_sid}]" in out.answer.answer_markdown, (texts, out.answer.answer_markdown)

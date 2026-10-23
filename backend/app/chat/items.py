@@ -85,7 +85,13 @@ as the source writes them; ``omitted`` — no headline value in a block that cit
 the words of its value, label or quote, in the block); or ``unchecked`` — the check itself failed or an input is missing, which is its own
 state and wording, never "omitted". A declared ``not_verifiable`` / ``not_applicable`` fill passes the same check: a block that states it
 covers it, and no line is written. ``Ledger.outcomes`` is that function over the ledger; ``VerifyReport.decision`` is its value over the units
-that stand, computed at every compose pass, and the body's caps, the gap paragraph and the item lines are all read from it."""
+that stand, computed at every compose pass, and the body's caps, the gap paragraph and the item lines are all read from it.
+
+Round 22 U8 (KTD7; R12-R14) attributes an item to a sentence at the level of its ROW. Another row of the cited passage that holds the item's value
+is a rival (``rival_rows``); with one, a clause gives the item only when it names the item's row (``row_status``: a value of that row it cites, the
+designators, the numbers, the dates or the words of one of its names - label, condition, cells - that no rival row has), decided by structure and
+reused by the server's additions (``verify._addition_verdict``). A clause that names a rival row gives the item no condition, one that names no row
+gives it none while two rows hold the value, and a sentence that merges two rows gives the condition of one of them once, with the row it belongs to."""
 
 from __future__ import annotations
 
@@ -130,6 +136,7 @@ from app.chat.verify import (
     request_word_forms,
     shared_request_words,
     shares_request_word,
+    source_context,
     unit_referent,
 )
 from app.extraction.normalize_text import (
@@ -726,8 +733,12 @@ def _unwrapped(lines: Sequence[str]) -> list[str]:
 def _span_index(src) -> list[_SpanRow | list[_SpanSentence]]:
     """The body of a source parsed once for ``_cited_spans``, line by line (a wrapped sentence is one line, ``_unwrapped``): a table row (two
     cells or more) with a value cell that holds a digit, else the sentences of a passage line. A row without a digit in its value cells has no entry."""
+    return _span_index_of(context_of_source(src)[1])
+
+
+def _span_index_of(body: Sequence[str]) -> list[_SpanRow | list[_SpanSentence]]:
     out: list[_SpanRow | list[_SpanSentence]] = []
-    for line in _unwrapped(context_of_source(src)[1]):
+    for line in _unwrapped(body):
         cells = _row_cells(line) if "|" in line else []
         if len(cells) >= 2:
             values = [c for c in cells[1:] if re.search(r"\d", c)]
@@ -1922,6 +1933,214 @@ class CoverageUnavailable(Exception):
 _DURATION = re.compile(r"(\d{1,2}(?:\.\d+)?)\s*(?:שנה|שנים|שנות|חודש|חודשים|ימים|יום|שבוע|שבועות)(?![א-ת])")
 
 
+# --- row-level attribution (round 22 U8, KTD7; R13, R14) ---------------------------------------------------------------------------------
+
+ROW_NAMED = "named"  # the clause states the datum's own row: its distinguishing label words or designators, or it cites a value of that row
+ROW_OTHER = "other"  # it states another row of the cited passage that holds the same value (its words, its designators, its value) and not the datum's
+ROW_UNNAMED = "unnamed"  # another row holds the value and the clause names no row
+ROW_ALONE = "alone"  # no other row of the cited passages holds the value: the value itself names its row
+ROW_INDISTINCT = "indistinct"  # another row holds the value and nothing in the labels or the designators tells the two rows apart: structure cannot decide
+ROW_GIVES = (ROW_NAMED, ROW_ALONE, ROW_INDISTINCT)  # the statuses under which a clause gives the datum (the last, undecided, is asked of the judge where a note depends on it)
+
+
+class RowRef(NamedTuple):
+    """A datum as the row it stands in: the agent's ``label`` and ``condition``, the ``quote`` (the row as read), the ``value`` and the ``source`` (S#)
+    of the row."""
+
+    label: str
+    quote: str
+    value: str
+    source: str
+    condition: str = ""
+
+
+class Row(NamedTuple):
+    """What a clause says of a datum's row (``row_status``): its status and, when it names the datum's row, the labels of the other rows it names
+    too (a clause that merges two rows: a note about one of them names it)."""
+
+    status: str
+    with_rows: tuple[str, ...] = ()
+
+
+def row_ref(item: Item) -> RowRef:
+    return RowRef(item.label, item.quote, item.value, item.source, item.condition)
+
+
+@functools.lru_cache(maxsize=256)
+def _body_rows(text: str, tabular: bool) -> tuple[_SpanRow, ...]:
+    """The table rows of a source body that state a number (``_span_index``'s rows), kept per text."""
+    return tuple(e for e in _span_index_of(source_context(text, tabular)[1]) if isinstance(e, _SpanRow))
+
+
+def _line_names(line: str) -> tuple[str, ...]:
+    """The cells of a table row that carry words of its own: its first cell (the label) and every other cell with no digit (a note, a status)."""
+    cells = _row_cells(line) if "|" in line else []
+    if len(cells) < 2:
+        return ()
+    return tuple(" ".join(c.split()) for i, c in enumerate(cells) if c.strip() and (i == 0 or not re.search(r"\d", c)))
+
+
+def _own_line(ref: RowRef, ws) -> str:
+    """The line of the datum's passage that holds its quote: the row it stands in ("" when the passage or the line is not known)."""
+    src = ws.sources.get(ref.source)
+    row = _row_of(context_of_source(src)[1], SupportScope.flat(ref.quote)) if src is not None and ref.quote else None
+    return row or ""
+
+
+def _row_names(ref: RowRef, line: str) -> tuple[str, ...]:
+    """The texts that name a datum's row: the cells of the row it stands in with words of their own (as its source writes them), and the
+    agent's label and condition."""
+    out = [*_line_names(line), *(" ".join(t.split()) for t in (ref.label, ref.condition) if t.strip())]
+    return tuple(dict.fromkeys(t for t in out if t))
+
+
+def _line_numbers(line: str, ref: RowRef) -> frozenset[str]:
+    """The numbers the cells of a table row write after its label that are no part of the datum's own value (a year, a floor, a stage, another
+    column's figure): they tell two rows of one value apart like words do."""
+    groups = headline(ref.value, ref.quote)
+    own = frozenset().union(*groups) if groups else frozenset()
+    cells = _row_cells(line) if "|" in line else []
+    return frozenset(n for c in cells[1:] for n in numbers_in(_outside_dates(c))) - own
+
+
+def _row_sources(ref: RowRef, ws, ids: Sequence[str]) -> list[str]:
+    """The passages whose rows can hold the datum's value for a clause that cites ``ids``: the datum's own source and the cited passages (a cited
+    value's passage too) of its document and appraisal unit."""
+    home = _place(ws, ref.source)
+    out = [ref.source]
+    for cid in ids:
+        sid = ws.values[cid].source_id if cid in ws.values else cid
+        if sid in ws.sources and sid not in out and (home is None or ((p := _place(ws, sid)) is not None and _same_place(home, p))):
+            out.append(sid)
+    return out
+
+
+def rival_rows(ref: RowRef, ws, ids: Sequence[str] = ()) -> list[_SpanRow]:
+    """The table rows of the datum's passage and of the passages a clause cites that hold the datum's value and are not the datum's own row."""
+    groups = headline(ref.value, ref.quote)
+    if not groups:
+        return []
+    own = SupportScope.flat(ref.quote)
+    out: list[_SpanRow] = []
+    for sid in _row_sources(ref, ws, ids):
+        src = ws.sources.get(sid)
+        if src is None:
+            continue
+        for row in _body_rows(src.text or "", _is_tabular(src)):
+            flat = _flat_span(row.line)
+            if own and (own in flat or flat in own):
+                continue
+            if all(g & row.numbers for g in groups):
+                out.append(row)
+    return out
+
+
+_ONE_LETTER_PREFIXES = "ובהלמכש"
+
+
+def _clause_words(text: str, lead: str = "") -> frozenset[str]:
+    """The words of a clause and its lead, and of each three-letter word the word without its prefix letter ("הגג" -> "גג"): a short name of a
+    row ("גג", "דק") is a word of the row, and the content-word reader keeps the prefix of a word that short."""
+    have = _words(text) | _words(lead)
+    return have | {w[1:] for w in have if len(w) == 3 and w[0] in _ONE_LETTER_PREFIXES}
+
+
+def _dates_in(text: str) -> frozenset[str]:
+    return frozenset(p.iso for p in shared_dates.find_all(text))
+
+
+def _dates_stated(wanted: frozenset[str], have: frozenset[str]) -> bool:
+    return bool(wanted) and all(any(h.startswith(w) for h in have) for w in wanted)
+
+
+def _half_hit(texts: Sequence[str], against: frozenset[str], have: frozenset[str]) -> bool:
+    """Whether ``have`` (the clause's words) states at least half (rounded up) of the words of one of ``texts`` that ``against`` (the other row's
+    words) does not write: the words that tell this row from the other."""
+    for text in texts:
+        distinct = [g for g in _word_groups(text) if not g & against]
+        if distinct and sum(1 for g in distinct if g & have) >= (len(distinct) + 1) // 2:
+            return True
+    return False
+
+
+def row_status(ref: RowRef, text: str, ws, ids: Sequence[str] = (), lead: str = "") -> Row:
+    """What the clause ``text`` (its citations ``ids``, the ``lead`` above it) says of the row ``ref`` (KTD7, R14): decided by structure.
+
+    Another row of the cited passages that holds the same value is a rival. With none, the value names its row (``ROW_ALONE``). Otherwise the
+    clause names the datum's row when it cites a value (V#) of that row, writes the designators, the numbers or at least half of the words of one
+    of its names (``_row_names``: its label, its condition, the cells of its row) that no rival row writes, or all of its label with nothing the
+    rival row adds; it names another row when it writes what only a rival row has or cites a rival row's value. A clause that names none is
+    ``ROW_UNNAMED``. When the two rows are the same in words, designators and numbers nothing tells them apart: ``ROW_INDISTINCT``."""
+    rivals = rival_rows(ref, ws, ids)
+    if not rivals:
+        return Row(ROW_ALONE)
+    own_flat = SupportScope.flat(ref.quote)
+    cited_other = False
+    for cid in ids:
+        v = ws.values.get(cid)
+        if v is None or not (v.quote or "").strip():
+            continue
+        flat = _flat_span(v.quote)
+        if _same_source(ws, v.source_id, ref.source) and own_flat and (own_flat in flat or flat in own_flat):
+            return Row(ROW_NAMED)
+        cited_other = cited_other or any(flat in _flat_span(r.line) or _flat_span(r.line) in flat for r in rivals)
+    line = _own_line(ref, ws) or ref.quote
+    names = _row_names(ref, line)
+    rival_names = {r.line: _line_names(r.line) for r in rivals}
+    own_words = frozenset().union(*(_words(t) for t in names)) if names else frozenset()
+    own_des = frozenset().union(*(designators(t) for t in names)) if names else frozenset()
+    groups = headline(ref.value, ref.quote)
+    own_nums = _line_numbers(line, ref) | (frozenset(numbers_in(_outside_dates(" ".join(names)))) - (frozenset().union(*groups) if groups else frozenset()))
+    rival_nums_of = {r.line: _line_numbers(r.line, ref) for r in rivals}
+    rival_words = frozenset().union(*(_words(t) for ts in rival_names.values() for t in ts))
+    rival_des = frozenset().union(*(designators(t) for ts in rival_names.values() for t in ts))
+    rival_nums = frozenset().union(*rival_nums_of.values())
+    have = _clause_words(text, lead)
+    written = designators(text) | designators(lead)
+    nums = frozenset(numbers_in(_outside_dates(f"{text} {lead}")))
+    stated = _dates_in(f"{text} {lead}")
+    own_dates = _dates_in(f"{ref.quote} {' '.join(names)}")
+    rival_dates = {r.line: _dates_in(r.line) for r in rivals}
+    distinct_des, distinct_nums = own_des - rival_des, own_nums - rival_nums
+    distinct_dates = own_dates - frozenset().union(*rival_dates.values())
+    own_hit = (_half_hit(names, rival_words, have) or (bool(distinct_des) and distinct_des <= written)
+               or (bool(distinct_nums) and distinct_nums <= nums) or _dates_stated(distinct_dates, stated))
+    named_rows = tuple(dict.fromkeys(
+        " ".join(r.label.split()) for r in rivals
+        if _half_hit(rival_names[r.line], own_words, have) or ((designators(r.label) - own_des) & written)
+        or ((rival_nums_of[r.line] - own_nums) & nums) or _dates_stated(rival_dates[r.line] - own_dates, stated)))
+    if own_hit:
+        return Row(ROW_NAMED, named_rows)
+    if _foreign(own_des, written) or named_rows or cited_other:
+        return Row(ROW_OTHER, named_rows)
+    distinct_words = [g for t in names for g in _word_groups(t) if not g & rival_words]
+    rival_adds = any([g for t in rival_names[r.line] for g in _word_groups(t) if not g & own_words] or (designators(r.label) - own_des)
+                     or (rival_nums_of[r.line] - own_nums) or (rival_dates[r.line] - own_dates) for r in rivals)
+    if not (distinct_words or distinct_des or distinct_nums or distinct_dates or rival_adds):
+        return Row(ROW_INDISTINCT)  # the two rows are the same in words, designators, numbers and dates
+    label = _word_groups(ref.label) or _word_groups(names[0] if names else "")
+    if not (distinct_words or distinct_des or distinct_nums or distinct_dates) and label and all(g & have for g in label):
+        return Row(ROW_NAMED)  # the clause writes all of its label, and the rival row only adds to it
+    return Row(ROW_UNNAMED)
+
+
+def item_of_state(st: Mapping) -> Item:
+    """The ledger item an item state (``Ledger.outcomes``) was made from, as far as the row and the positive reading need it."""
+    return Item(component=st.get("component") or "", label=st.get("label") or "", source=st.get("source") or "", quote=st.get("quote") or "",
+                value=st.get("value") or "", condition=st.get("condition") or "", origin=st.get("origin") or ORIGIN_AGENT,
+                document_id=st.get("document_id") or "", unit_id=st.get("unit_id"))
+
+
+def clause_row(ref: RowRef, unit: Unit, ws, block: Unit | None = None, lead: str = "", text: str | None = None) -> Row:
+    """The row a sentence ``unit`` says (``row_status``) with the block it stands in as the second reading: a sentence that names no row of
+    its own ("שטחה 300 מ״ר" after the sentence that names the plot) takes the row its block names; a sentence that names another row never does.
+    ``text``: the unit's words as they state the datum (``_positive``), else its own."""
+    own = row_status(ref, unit.text if text is None else text, ws, unit.ids, lead)
+    if own.status in (ROW_OTHER, ROW_NAMED, ROW_ALONE) or block is None or block.text == unit.text:
+        return own
+    return row_status(ref, block.text if text is None else text + " " + block.text, ws, block.ids, lead)
+
+
 def _whole_duration(item: Item, text: str, group: frozenset[str]) -> bool:
     """Whether the item's value writes the number of ``group`` as a duration ("5 שנים") and ``text`` writes the same duration."""
     def durations(source: str) -> set[str]:
@@ -2019,10 +2238,14 @@ def _check_block(item: Item, block: Block, ws, shared: bool, rivals: frozenset[s
         return _Check("date_not_stated")
     if shared and not _tells_apart(item, words, rivals, rival_dates):
         return _Check("condition_not_stated")
-    return verdict
+    # another row of the cited passage holds the value: the block gives the item only when it names the item's own row (round 22 U8, KTD7)
+    row = row_status(row_ref(item), text, ws, unit.ids, lead).status
+    if row == ROW_UNNAMED:
+        return _Check("condition_not_stated")
+    return _Check("not_attributed") if row == ROW_OTHER else verdict
 
 
-def _giving_parts(item: Item, block: Block, ws=None) -> list[Unit]:
+def _giving_parts(item: Item, block: Block, ws=None, lead: str = "") -> list[Unit]:
     """The sentences of a block that give the item: those that state one of its headline values (its date, for an item whose value is a date);
     all of them for an item asked by its words, or when no sentence states a value of its own. Round 20 U3 (KTD3, R10): among several that
     state it, the ones whose OWN citations include the item's source (``_attributed``) — a sentence that only shares the figure with the item
@@ -2043,6 +2266,10 @@ def _giving_parts(item: Item, block: Block, ws=None) -> list[Unit]:
         mine = []
     chosen = mine or list(block.parts)
     if ws is not None and len(chosen) > 1:
+        # round 22 U8 (KTD7): among them, the sentences whose clause names the item's row (its own words, or the block's when it names none of its
+        # own); a sentence that states the figure of another row is not the one the item and its condition are read against
+        ref = row_ref(item)
+        chosen = [u for u in chosen if clause_row(ref, u, ws, block.unit, lead, _positive(item, u.text)).status in ROW_GIVES] or chosen
         own = [u for u in chosen if _attributed(item, u, ws)] or chosen
         return [u for u in own if _cites_source(item, u, ws)] or own  # round 21 full measurement: the sentence that cites the item's own source
     return chosen
@@ -2069,7 +2296,7 @@ def _coverage_all(item: Item, blocks: Sequence[Block], ws, shared: bool, leads: 
               for b in blocks]
     giving = [b for b, c in checks if not c.why]
     if giving:
-        parts = [(b, _giving_parts(item, b, ws)) for b in giving]
+        parts = [(b, _giving_parts(item, b, ws, leads.get(b.unit.index, ""))) for b in giving]
         # round 21 full measurement: when a block that gives the item cites its own source, the blocks that give it only by another source's citation
         # (the same figure in another passage) are not the sentence the item and its condition note go to; no block cites it: the first one, as before
         parts = [(b, mine) for b, mine in parts if any(_cites_source(item, u, ws) for u in mine)] or parts

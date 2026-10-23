@@ -545,6 +545,11 @@ JUDGE_REQUIREMENTS_POLICY = (
     "שמקורו בפריט אחר (hint=\"other_item:I#\"; quote — מילה במילה מתוך ה-span של הפריט האחר). תנאי שהיחידה אומרת באותה משמעות "
     "הוא kept גם כשהמילים שונות. hint=\"contradicted\" הוא חשד של השרת בלבד: אשר אותו רק אם היחידה באמת אומרת את ההפך. החזר רשומה "
     "רק לפריט שמסומן check, ולכל היותר אחת לפריט; כשאינך בטוח אל תחזיר רשומה. תנאי חסר או שגוי אינו סיבה להסיר את הערך.\n"
+    "תוספות: כשמופיע <additions>, כל <addition id=\"A#\"> היא הערת תנאי שהשרת עומד לכתוב ליד הנתון שמשפט התשובה (<clause>) נותן. "
+    "<row> היא השורה של הנתון במקור ו-<other_rows> הן שורות אחרות של אותו קטע שמחזיקות אותו ערך. לכל תוספת החזר ב-applies של הדרישה "
+    "הראשונה רשומה {addition: A#, outcome}: applies — המשפט נותן את הנתון של השורה <row>, וההערה שלו; not_applies — המשפט נותן את "
+    "הערך של אחת השורות האחרות; unknown — המשפט אינו אומר על איזו שורה הוא מדבר. כשאינך בטוח החזר unknown או אל תחזיר רשומה: "
+    "תוספת שלא הוכרע שהיא חלה על הנתון אינה נכתבת ליד הערך.\n"
     "מועמדים: כשמופיע <candidates>, הוא מפרט שורות של טבלה, חברי רשימה ומשפטים מהמקורות שנקראו (K#, source, label ו-value כפי "
     "שהמקור כותב אותם) שהתשובה אינה נותנת, בקרבת מה שהתשובה והפנקס נשענים עליו; <more> — כמה מועמדים נוספים לא הוצגו. מועמד "
     "שדרישה של הבקשה מבקשת — פריט מאותו סוג שהיא מבקשת, בנושא ובנכס שנשאלו — החזר ב-candidates של אותה דרישה {candidate: K#, "
@@ -572,6 +577,7 @@ SUPPORT_PER_REQUIREMENT = 6  # a requirement names at most this many support quo
 ITEMS_PER_COMPONENT = 12
 ITEM_QUOTE_CHARS = 160
 ITEM_SPAN_CHARS = 240  # round 18 U5: the most of a condition span the ledger block shows an asked item
+ADDITION_RIVALS = 3  # round 22 U8: the other rows of a passage that hold the datum's value, at most this many shown with an addition question
 SPAN_CHARS = 160  # a condition span this short is compact: the server may write it next to the value (``_condition_span``)
 REQ_DATA_FOUND = ("חלק של הבקשה שהתשובה לא נתנה במלואו: «{text}». הנתונים שלו כבר נמצאו בתור הזה ({ids}): השלם "
                   "אותו בתשובה מהם, וחשב ב-calculate אם הוא דורש חישוב")
@@ -884,6 +890,14 @@ class ConditionVerdict(_Strict):
     quote: str = ""
 
 
+class AppliesVerdict(_Strict):
+    """The judge's answer to one addition question (``<addition>``, round 22 U8, KTD7): ``applies`` - the text is a condition of the datum the clause
+    states; ``not_applies`` - it belongs to another row of the passage; ``unknown`` - the clause does not say which row it is about."""
+
+    addition: str
+    outcome: Literal["applies", "not_applies", "unknown"]
+
+
 class CandidateAssignment(_Strict):
     """The judge's reading of one candidate (round 18 U6, KTD2): the requirement it sits under asks for the candidate ``candidate``
     (K#), and ``words`` are the request words it answers — a short noun phrase of the request or the requirement that the candidate's
@@ -924,6 +938,9 @@ class JudgeRequirement(_Strict):
     # the condition outcome of each ledger item the call asked (``<item_ledger>`` items with ``check``), kept per vote and only when
     # its quote stands in the right span (``_Coverage.valid_conditions``, round 18 U5). Empty by default, so an older reply stays valid.
     conditions: list[ConditionVerdict] = Field(default_factory=list)
+    # the answers to the additions (``<additions>``) the call asked whether they apply to the datum their clause states; kept per vote and only
+    # for an addition this call asked (``_Coverage.valid_applies``, round 22 U8). Empty by default, so an older reply stays valid.
+    applies: list[AppliesVerdict] = Field(default_factory=list)
     # the candidates (``<candidates>``) this requirement asks for, each with the request words it answers; kept per vote and only when
     # the words stand in the requirement or request and in the candidate's own text (``_Coverage.valid_candidates``, round 18 U6).
     candidates: list[CandidateAssignment] = Field(default_factory=list)
@@ -1853,9 +1870,19 @@ class Problem:
         if self.failure_kind is None:
             self.failure_kind = KIND_FAILURES.get(self.kind)
 
+    @property
+    def addition(self) -> str:
+        """The kind of meaning-changing addition (``compose.ADDITION_KINDS``) the note written for this problem is: a condition, a scope or the
+        tag of a conditional calculation; "" for any other problem (round 22 U8, KTD7)."""
+        if self.conditional:
+            return "conditional"
+        if self.check in CONDITION_CHECKS:
+            return "condition"
+        return "scope" if self.check in SCOPE_CHECKS else ""
+
     def ref(self) -> tuple[str, ...]:
-        """What a server span written for this problem is registered with (``compose.ref_of``): its claim and its datum."""
-        return ref_of([self.claim_id], self.datum)
+        """What a server span written for this problem is registered with (``compose.ref_of``): its claim, its datum and the kind of addition."""
+        return ref_of([self.claim_id], self.datum, self.addition)
 
     def unstated_written(self) -> list[str]:
         """The ``unstated`` numbers as the unit writes them (a few, in order of appearance)."""
@@ -1977,6 +2004,49 @@ class Unbound:
     claim_id: str = ""
 
 
+APPLIES, NOT_APPLIES = "applies", "not_applies"  # the verdict of whether an addition applies to its datum (``Applies``); "" — not decided
+
+
+@dataclass(frozen=True)
+class Applies:
+    """The recorded verdict of whether a meaning-changing server addition applies to the datum it stands next to (round 22 U8, KTD7; R13, R14):
+    ``verdict`` — ``applies``, ``not_applies`` or "" (undecided: nothing was recorded by structure and the judge did not say); ``by`` — ``structure``
+    (the row of the cited value, the row's label or designators, the V# subject, the place of the condition) or ``judge`` (the answer to the
+    addition's question in the requirements call); ``named``: the row label a note carries when its clause merges several rows. ``label``,
+    ``value``, ``detail`` and ``unit``: the datum in its own words and what was not placed, for the uncertainty line when the addition is not
+    written inline."""
+
+    verdict: str
+    by: str = "structure"
+    why: str = ""
+    named: str = ""
+    label: str = ""
+    value: str = ""
+    detail: str = ""
+    unit: int = -1
+
+
+@dataclass(frozen=True)
+class AdditionAsk:
+    """One question of the requirements call (round 22 U8, KTD7): whether ``text`` (the condition a server note would carry) applies to the datum
+    the clause states, when structure could not tell which of the rows that hold the same value the clause is about. ``id``: A#, the call's name for
+    it; ``datum``: the ledger item id; ``unit``: the sentence that gives the datum; ``row``: the datum's own row, ``rivals``: the other rows of the
+    passage that hold its value."""
+
+    id: str
+    kind: str
+    datum: str
+    unit: int
+    text: str
+    clause: str
+    row: str
+    rivals: tuple[str, ...] = ()
+
+    def listing(self) -> dict:
+        return {"id": self.id, "kind": self.kind, "datum": self.datum, "unit": self.unit, "text": self.text, "clause": self.clause,
+                "row": self.row, "rivals": list(self.rivals)}
+
+
 @dataclass
 class VerifyReport:
     units: list[Unit]
@@ -2047,6 +2117,20 @@ class VerifyReport:
     partial_marks: list[tuple[int, tuple[str, ...]]] = field(default_factory=list)
     # the data a condition or a scope could not be bound to (round 21 U2): nothing is written inline for them, ``uncertainty_line`` states them
     unbound: list[Unbound] = field(default_factory=list)
+    # round 22 U8 (KTD7; R13, R14): the verdict of whether each meaning-changing addition applies to its datum, by (addition kind, datum, anchor claim
+    # id) - the audit and the composition read it as data and make no judge call (``applies_for``) - and the questions the requirements call was
+    # asked for the additions structure could not decide
+    applies: dict[tuple[str, str, str], Applies] = field(default_factory=dict)
+    additions: list[AdditionAsk] = field(default_factory=list)
+
+    def applies_for(self, kind: str, datum: str, claim: str = "") -> Applies | None:
+        """The recorded verdict for an addition of ``kind`` about ``datum`` (a comma-joined list of data is one note about several): the verdict of
+        its anchor claim, else the verdict recorded for the datum whatever its claim. None: nothing was recorded."""
+        found = [self.applies.get((kind, d, claim)) or self.applies.get((kind, d, "")) for d in (datum.split(",") if datum else [""])]
+        found = [f for f in found if f is not None]
+        if not found:
+            return None
+        return next((f for f in found if f.verdict == APPLIES), found[0])
 
     @property
     def ok(self) -> bool:
@@ -2603,14 +2687,15 @@ class VerifyReport:
         raw = "".join(kept)
         return dataclasses.replace(u, raw=raw, text=_IDS.sub("", raw).strip(), ids=[*ids_in(raw), *attached])
 
-    def item_listing(self, kept: set[int] | None = None, texts: dict[str, str] | None = None, *, ask: bool = True) -> list[dict]:
+    def item_listing(self, kept: set[int] | None = None, texts: dict[str, str] | None = None, *, ask: bool = True,
+                     states: list[dict] | None = None) -> list[dict]:
         """The ledger as the requirements call is shown it (``_Coverage.items``): each item's id, component, origin, label, source, quote,
         value, condition and state (and the reason of a declared one). Round 18 U5: also its condition check (``check``: "" when
         the server decided it or there is none, else what the call is asked: ``undecided`` or ``hint``; ``ask=False``, the final
         check, asks nothing), the unit that gives it (``unit``), the ``hint`` kinds and ``foreign`` items, and its condition spans
         (``spans``, in full: the server checks a judge's quote against them). ``texts``: see ``item_states``."""
         out = []
-        for s in self.item_states(kept, texts):
+        for s in states if states is not None else self.item_states(kept, texts):
             row = {k: s[k] for k in ("id", "component", "origin", "candidate", "label", "source", "quote", "value", "condition", "state",
                                      "reason")}
             row["state"] = ITEM_INCLUDED if row["state"] == ITEM_UNCHECKED else row["state"]  # the judge is told no state of its own
@@ -3130,7 +3215,8 @@ class VerifyReport:
                     # row, by its number) — none when the unit already says its result is conditional, and one per
                     # place however many calculations
                     if (at, p.unit.index) not in tagged and not _SAYS_CONDITIONAL.search(p.unit.text):
-                        note_once(at, f" ({CONDITIONAL_TAG})", "qualifier", p.ref() or ref_of(self._claim_ids(p.unit.index), p.cite or ""))
+                        note_once(at, f" ({CONDITIONAL_TAG})", "qualifier",
+                                  ref_of([p.claim_id] if p.claim_id else self._claim_ids(p.unit.index), p.datum or p.cite or "", p.addition))
                         tagged.add((at, p.unit.index))
                     continue
                 cite = f" [{p.cite}]" if p.uncited else ""
@@ -5069,6 +5155,7 @@ def scope_outcome(u: Unit, phrase: str, ws: Workspace, text: str | None = None, 
         # (round 21 U2, KTD1; orchestrator decision)
         claim = _sole_id(live)
         first = sources[0][0]
+        _note_applies(report, "scope", "", claim, u, claims, "the scope is the claim's own: every amount of it rests on the cited evidence")
         if all(x == "ok" for x in standing):
             return True, Problem(u, MSG_SCOPE_FOUND.format(sid=first, phrase=scope), kind="missing_qualifier", annotation=scope, cite=first,
                                  defect="scope", check=SCOPE_CHECK, claim_id=claim, clause_anchor=True)
@@ -5085,12 +5172,20 @@ def scope_outcome(u: Unit, phrase: str, ws: Workspace, text: str | None = None, 
     datum = next((i for i in dict.fromkeys(u.ids) if i in ws.values), "")
     claim = _claim_id_at(u, at, claims)
     first = sources[0][0]
+    _note_applies(report, "scope", datum, claim, u, claims, "the sentence cites the value the scope is about")
     if all(x == "ok" for x in standing):
         return True, Problem(u, MSG_SCOPE_FOUND.format(sid=first, phrase=scope), kind="missing_qualifier", number=number, at=at,
                              annotation=scope, cite=first, defect="scope", check=SCOPE_CHECK, datum=datum, claim_id=claim)
     return True, Problem(u, MSG_SCOPE_UNVERIFIED.format(sid=", ".join(k for k, _ in sources)), kind="missing_qualifier",
                          number=number, at=at, annotation=_scope_limit_note(standing).format(where=_read_in(sources)), defect="scope",
                          check=SCOPE_LIMIT_CHECK, datum=datum, claim_id=claim)
+
+
+def _note_applies(report: VerifyReport | None, kind: str, datum: str, claim: str, u: Unit, claims: Sequence, why: str) -> None:
+    """Record, for the audit, that a scope note applies to its datum by structure (round 22 U8, KTD7): the datum is the V# the sentence cites at the
+    figure it anchors, or the claim itself when every amount of it rests on the cited evidence."""
+    if report is not None:
+        report.applies[(kind, datum, claim)] = Applies(APPLIES, "structure", why=why, label=_unit_label(u, claims), unit=u.index)
 
 
 def _uniform_scope(u: Unit, sources: Sequence[tuple[str, Source]], standing: Sequence[str], claims: Sequence) -> bool:
@@ -5157,6 +5252,93 @@ def _condition_span(spans: list[str], quote: str) -> str:
     return next((t for t in (holding, quote.strip()) if t and len(_norm(t)) <= SPAN_CHARS), "")
 
 
+def _addition_context(units: Sequence[Unit]) -> tuple[dict[int, Unit], dict[int, str]]:
+    """For each sentence of the answer (by index) the block it stands in, and the text above it that names or dates it (``items._leads``): what
+    a clause that names no row of its own takes its row from (round 22 U8, KTD7)."""
+    from app.chat import items as ledger
+
+    model = ledger.model_units(units)
+    return {p.index: b.unit for b in ledger.blocks_of(model) for p in b.parts}, ledger._leads(model)
+
+
+def _addition_clause(unit: Unit, st: dict, states: Sequence[dict], source: Source | None) -> str:
+    """The clause that states the datum of the item ``st`` in the sentence ``unit``: the whole row of a table row, else the clause around the
+    datum's own figure (``_item_anchor``), else the sentence."""
+    if unit.table_span is not None:
+        return unit.text
+    from app.chat import conditions  # conditions reads this module
+
+    anchor = _item_anchor(unit, st, states, "", source)
+    return conditions.clause_at(unit.text, anchor[1]) if anchor is not None and anchor[0] else unit.text
+
+
+def _row_of_addition(ws: Workspace, st: dict, unit: Unit, states: Sequence[dict], context: tuple[dict[int, Unit], dict[int, str]]):
+    """What the clause that states the datum of the item ``st`` says of its row (``items.row_status``), and the clause."""
+    from app.chat import items as ledger
+
+    blocks, leads = context
+    item = ledger.item_of_state(st)
+    clause = _addition_clause(unit, st, states, ws.sources.get(st["source"]))
+    narrowed = dataclasses.replace(unit, text=clause)
+    row = ledger.clause_row(ledger.row_ref(item), narrowed, ws, blocks.get(unit.index), leads.get(unit.index, ""), ledger._positive(item, clause))
+    return row, clause
+
+
+def _addition_verdict(ws: Workspace, st: dict, row, answer: str | None) -> Applies:
+    """Whether a condition note about the item ``st`` applies to the clause that states it, from what the clause says of the item's row (decided
+    by structure) and, for what structure leaves open (``ROW_UNNAMED``, ``ROW_INDISTINCT``), the judge's stored answer to the addition's question
+    (``answer``: ``applies``, ``not_applies``, ``unknown`` or None - it was not asked, or the call did not answer)."""
+    from app.chat import items as ledger
+
+    if row.status in (ledger.ROW_NAMED, ledger.ROW_ALONE):
+        named = ""
+        if row.with_rows:  # the clause merges several rows: the note says which one it is about
+            named = ledger.source_name(ws.sources.get(st["source"]), st["quote"])
+        return Applies(APPLIES, "structure", named=named)
+    if row.status == ledger.ROW_OTHER:
+        return Applies(NOT_APPLIES, "structure", why="the sentence states another row of the passage")
+    if answer in (APPLIES, NOT_APPLIES):
+        return Applies(answer, "judge")
+    return Applies("", "judge" if answer else "structure", why="the sentence does not say which row it states")
+
+
+def _plan_additions(report: VerifyReport, ws: Workspace, states: Sequence[dict], units: Sequence[Unit]) -> list[AdditionAsk]:
+    """The condition notes the server may write next to a datum whose row the sentence does not decide (round 22 U8, KTD7; R14): for each covered
+    item whose condition the sentence leaves out or the call is asked to decide, the questions for the ones structure leaves open - one per
+    addition, to be asked inside the requirements call that already runs, next to the plan of the qualifier edits and before the judge batches."""
+    from app.chat import items as ledger
+
+    by_index = {u.index: u for u in units}
+    context = _addition_context(units)
+    asks: list[AdditionAsk] = []
+    for st in states:
+        if st["state"] != ITEM_COVERED or st["condition_check"] not in (DECIDED_MISSING, *ASKED_CHECKS):
+            continue
+        unit = by_index.get(st["condition_unit"])
+        if unit is None:
+            continue
+        row, clause = _row_of_addition(ws, st, unit, states, context)
+        if row.status not in (ledger.ROW_UNNAMED, ledger.ROW_INDISTINCT):
+            continue
+        text = st.get("condition_quote") or " ; ".join(x["text"] for x in st["condition_spans"])
+        ref = ledger.row_ref(ledger.item_of_state(st))
+        rivals = tuple(" ".join(r.line.split()) for r in ledger.rival_rows(ref, ws, unit.ids)[:ADDITION_RIVALS])
+        asks.append(AdditionAsk(f"A{len(asks) + 1}", "condition", st["id"], unit.index, _norm(text)[:ITEM_SPAN_CHARS], clause,
+                                " ".join((ledger._own_line(ref, ws) or st["quote"]).split()), rivals))
+    return asks
+
+
+def _addition_answers(votes: Iterable[JudgeRequirement]) -> dict[str, str]:
+    """The judge's answers to the addition questions over every call, by A#: the most careful one of them (not_applies, then unknown, then applies)."""
+    rank = {NOT_APPLIES: 0, "unknown": 1, APPLIES: 2}
+    out: dict[str, str] = {}
+    for v in votes:
+        for a in v.applies:
+            if a.addition not in out or rank[a.outcome] < rank[out[a.addition]]:
+                out[a.addition] = a.outcome
+    return out
+
+
 def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequirement]) -> None:
     """What the server does with the condition of each covered item whose check the requirements call decided (round 18 U5, KTD1;
     R1-R4). Only a CONFIRMED contradiction can remove a statement; an undecided or hinted item the judge did not decide, and
@@ -5178,12 +5360,15 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
     units = {u.index: u for u in report.units}
     removed = report.removed_units()
     states = report.item_states()
+    answers = _addition_answers(votes)  # the judge's answers to the questions of the additions structure could not decide (round 22 U8)
+    asked = {(a.kind, a.datum, a.unit): a.id for a in report.additions}
+    context = _addition_context([report._as_edited(u) for u in report.units]) if report.item_ledger is not None else ({}, {})
     by_id: dict[str, dict] = {}
     for x in states:
         by_id.setdefault(x["id"], x)
     # the notes to write, by (unit, source, flat condition): the same condition missing from several items of one sentence is ONE note
     # (round 20 U9, F2), placed after the last of the data it is about (round 21 U2)
-    pending: dict[tuple[int, str, str], list[tuple[dict, tuple[str, int], str, str]]] = {}
+    pending: dict[tuple[int, str, str], list[tuple[dict, tuple[str, int], str, str, Applies]]] = {}
     for st in states:
         verdict = said.get(st["id"])
         unit = units.get(st["condition_unit"])
@@ -5241,6 +5426,19 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
                 phrase = conditions.without_echo(phrase, conditions.clause_at(unit.text, at) if anchor[0] else unit.text)
                 if not phrase:
                     continue
+            if source is not None and anchor is not None:
+                # round 22 U8 (KTD7; R13, R14): a note is written only next to the datum it applies to - decided by the row the clause states, and
+                # for what structure leaves open by the judge's stored answer. One that does not apply, or was not decided, is not written inline and
+                # no repair is asked for it; the uncertainty line names it
+                row, _ = _row_of_addition(ws, st, unit, states, context)
+                fits = _addition_verdict(ws, st, row, answers.get(asked.get(("condition", st["id"], unit.index), "")))
+                detail = phrase or verdict.quote or MSG_CONDITION_LIMIT.format(where=_read_in([(st["source"], source)]))
+                record = dataclasses.replace(fits, label=_item_label(st), value=st.get("value") or "", detail=detail, unit=unit.index)
+                if record.verdict != APPLIES:
+                    report.applies[("condition", st["id"], "")] = record
+                    report.unbound.append(Unbound(unit.index, st["id"], record.label, record.value, detail, "condition",
+                                                  _sole_id(report.claims.get(unit.index, []))))
+                    continue
             report.problems.append(Problem(Unit(-1, "", "", []), REQ_CONDITION_FOUND.format(
                 name=name, where=f"{st['source']} «{prompt_text(verdict.quote)}»"), kind="requirement",
                 component=st["component"], check=CONDITION_FOUND_CHECK))
@@ -5255,14 +5453,16 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
                                               _sole_id(report.claims.get(unit.index, []))))
                 continue
             key = (unit.index, st["source"], _flat_quote(phrase or MSG_CONDITION_LIMIT.format(where=_read_in(cited))))
-            pending.setdefault(key, []).append((st, anchor, phrase, _scope_label(source, ws) if several and phrase else ""))
+            pending.setdefault(key, []).append((st, anchor, phrase, record.named or (_scope_label(source, ws) if several and phrase else ""), record))
     for (index, sid, _), group in pending.items():
         unit = units[index]
-        st, (number, at), phrase, named = max(group, key=lambda g: g[1][1] if g[1][0] else len(unit.text) + 1)
+        st, (number, at), phrase, named, _ = max(group, key=lambda g: g[1][1] if g[1][0] else len(unit.text) + 1)
         source = ws.sources[sid]
         cited = [(sid, source)]
         datum = ",".join(x[0]["id"] for x in group)
         claim = _claim_id_at(unit, at, report.claims.get(unit.index, [])) if number else ""
+        for member in group:  # each datum of the note applies to its clause: recorded for the audit (the composition reads it as data)
+            report.applies[("condition", member[0]["id"], claim)] = member[4]
         common = dict(number=number or None, at=at if number else None, datum=datum, claim_id=claim, clause_anchor=not number)
         if phrase:
             report.problems.append(Problem(unit, MSG_CONDITION_FOUND.format(sid=sid, phrase=phrase), kind="missing_qualifier",
@@ -8230,6 +8430,7 @@ class _Coverage:
     candidates: list[dict] = field(default_factory=list)
     candidates_left: dict[str, int] = field(default_factory=dict)
     candidate_sources_left: int = 0
+    additions: list[dict] = field(default_factory=list)  # round 22 U8 (KTD7): the additions structure could not place (``AdditionAsk.listing``)
     question: str = ""  # the user's own question: its words, with the request's and the component's subject, ground a missing part (round 20 U5)
 
     def component_texts(self) -> list[str]:
@@ -8255,6 +8456,8 @@ class _Coverage:
                 + "\n</derive_requirements>"
         if ledger := _item_ledger_block(self.items):
             out += "\n" + ledger
+        if asked := _additions_block(self.additions):
+            out += "\n" + asked
         if offered := _candidates_block(self.candidates, self.candidates_left, self.candidate_sources_left):
             out += "\n" + offered
         if passages:
@@ -8284,6 +8487,7 @@ class _Coverage:
                                      "related": [x for x in dict.fromkeys(r.related) if x in self.known],
                                      "missing": missing, "support": self.valid_support(r, trace),
                                      "conditions": self.valid_conditions(r, indexes, trace),
+                                     "applies": self.valid_applies(r, indexes),
                                      "candidates": self.valid_candidates(r, texts, trace)})
             v._trace = trace.as_dict(missing, r.missing)
             v._stamp = {"call_units": sorted(indexes)}
@@ -8349,6 +8553,17 @@ class _Coverage:
                                      "accepted": why is None, "why": why or ""})
             if why is None:
                 out[c.item.strip()] = ConditionVerdict(item=c.item.strip(), outcome=c.outcome, quote=c.quote.strip())
+        return list(out.values())
+
+    def valid_applies(self, r: JudgeRequirement, indexes: set[int]) -> list[AppliesVerdict]:
+        """The addition answers a vote keeps (round 22 U8, KTD7): only for an addition this call asked whose sentence the call showed, each addition
+        once. An answer for anything else is dropped, and the addition stays undecided: nothing is written inline for it."""
+        asked = {a["id"]: a for a in self.additions}
+        out: dict[str, AppliesVerdict] = {}
+        for a in r.applies:
+            key = a.addition.strip()
+            if key in asked and asked[key]["unit"] in indexes and key not in out:
+                out[key] = AppliesVerdict(addition=key, outcome=a.outcome)
         return list(out.values())
 
     def valid_candidates(self, r: JudgeRequirement, texts: dict[str, str], trace: _VoteTrace | None = None
@@ -8437,6 +8652,20 @@ def _item_ledger_block(items: list[dict]) -> str:
             lines.append(f'<more count="{len(mine) - len(shown)}"/>')
         blocks.append(f'<component id="{prompt_attr(cid)}">\n' + "\n".join(lines) + "\n</component>")
     return "<item_ledger>\n" + "\n".join(blocks) + "\n</item_ledger>" if blocks else ""
+
+
+def _additions_block(additions: list[dict]) -> str:
+    """The ``<additions>`` block of a requirements call (round 22 U8, KTD7): one ``<addition>`` for each condition note the server would write next
+    to a datum whose row structure could not tell from the other rows of its passage that hold the same value - its id, the datum, the sentence
+    that gives it, the clause, the datum's own row, the other rows and the text of the note. Empty when there is none: a turn with no undecided
+    addition is shown exactly what it was."""
+    lines = []
+    for a in additions:
+        others = "".join(f"<other_rows>{prompt_text(r[:ITEM_QUOTE_CHARS])}</other_rows>" for r in a["rivals"][:ADDITION_RIVALS])
+        lines.append(f'<addition id="{prompt_attr(a["id"])}" kind="{prompt_attr(a["kind"])}" datum="{prompt_attr(a["datum"])}" unit="{a["unit"]}">'
+                     f'<clause>{prompt_text(a["clause"][:ITEM_QUOTE_CHARS])}</clause><row>{prompt_text(a["row"][:ITEM_QUOTE_CHARS])}</row>'
+                     f'{others}<text>{prompt_text(a["text"][:ITEM_SPAN_CHARS])}</text></addition>')
+    return "<additions>\n" + "\n".join(lines) + "\n</additions>" if lines else ""
 
 
 def _candidates_block(candidates: list[dict], left_out: dict[str, int], sources_left: int = 0) -> str:
@@ -9310,7 +9539,13 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         report.candidate_offer = offer.record()
         coverage.candidates, coverage.candidates_left = [c.listing() for c in offer.candidates], dict(offer.left_out)
         coverage.candidate_sources_left = offer.sources_left
-        coverage.items = report.item_listing({u.index for u in stand}, {r["id"]: r["text"] for r in requirements.items})
+        texts = {r["id"]: r["text"] for r in requirements.items}
+        states = report.item_states({u.index for u in stand}, texts)
+        coverage.items = report.item_listing({u.index for u in stand}, texts, states=states)
+        # round 22 U8 (KTD7; R14): the condition notes whose datum the sentence does not decide by its row are asked inside the requirements call that
+        # runs below, one question each, next to the plan of the qualifier edits and before the judge batches
+        report.additions = _plan_additions(report, ws, states, [report._as_edited(u) for u in stand])
+        coverage.additions = [a.listing() for a in report.additions]
     # a missing qualifier does not keep the unit from the judge: it is annotated only if the unit is supported
     for u in units:
         if u.index in failed:
@@ -9332,6 +9567,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
         # a result of a conditional calculation: the server writes that it is conditional next to it (the judge
         # reads the unit with it), so an unhedged sentence is shown as conditional, never lost and never certain
         for cid, number, note in conditional_notes(u, ws):
+            # the sentence cites the calculation (or is bound to it): the tag is about its own result (round 22 U8, KTD7)
+            report.applies[("conditional", cid, "")] = Applies(APPLIES, "structure", why="the sentence states the calculation's result")
             report.problems.append(Problem(u, CONDITIONAL_UNSTATED.format(cid=cid, why=note), kind="missing_qualifier",
                                            number=number, annotation=note, cite=cid, conditional=True,
                                            named=conditional_qualifier(ws.computations[cid], True, ws),
@@ -9374,7 +9611,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                      coverage.workspace if coverage else "", request or question,
                      tuple(r["id"] for r in requirements.items) if requirements is not None else (),
                      tuple((i["id"], i["state"], i["check"], i["unit"]) for i in coverage.items) if coverage else (),
-                     tuple(c["id"] for c in coverage.candidates) if coverage else ())
+                     tuple(c["id"] for c in coverage.candidates) if coverage else (),
+                     tuple((a["id"], a["datum"], a["unit"]) for a in coverage.additions) if coverage else ())
     # a lead-in before list items is structure (round 13 U10, KTD12, R15): the judge is not asked, it is recorded as navigation,
     # and its numbers are read by the deterministic checks above like any unit's
     for u in to_judge:
