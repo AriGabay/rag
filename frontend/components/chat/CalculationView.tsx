@@ -9,7 +9,7 @@ import type {
   ViewerNav,
   ViewerTarget,
 } from "@/lib/chatTypes";
-import { VALUE_STATUS, valueStatusText } from "@/lib/format";
+import { VALUE_STATUS, valueStatusText, valueUncertaintyNote } from "@/lib/format";
 import { assumptionText, citedTarget } from "./cited";
 import { resultText } from "./Message";
 import { useInitialFocus } from "./SourceViewer";
@@ -48,7 +48,6 @@ const VAT_BASIS: Record<string, string> = {
   excluded: "כל סכומי הכסף שבחישוב אינם כוללים מע״מ",
 };
 const VAT_MIXED = "לא צוין בסיס מע״מ אחיד לסכומים שבחישוב";
-const MODEL_ASSERTED = "חלק ממשמעות הערך (יחידה, תקופה או מע״מ) נקבע ולא נמצא במקור";
 const NOT_CONDITIONAL = "התוצאה אינה מותנית";
 const MESSAGE_MISSING = "ההודעה אינה מוצגת כרגע בשיחה (ייתכן שהיא בין ההודעות הקודמות שלא נטענו).";
 const NO_PLACE = "למקור הזה אין מיקום שאפשר לפתוח";
@@ -92,6 +91,8 @@ interface InputRow {
   label: string;
   shown: string;
   input: ChatComputationInput | null;
+  /** The honest note for a value input whose kind or unit its source does not confirm ("" when it is not marked). */
+  uncertainty: string;
   /** A document input's place (null: it has none the viewer can open). */
   target: ViewerTarget | null;
   assumption: ChatAssumption | null;
@@ -135,7 +136,12 @@ function inputRows(answer: ChatAnswer, c: ChatComputation): InputRow[] {
     } else if (kind === "computation" && computation) {
       shown = resultText(computation);
     }
-    return { id, kind, label, shown, input, target, assumption, computation };
+    const uncertainty = valueUncertaintyNote({
+      certainty: input?.certainty ?? value?.certainty,
+      provenance: input?.provenance ?? value?.provenance,
+      stated: input?.stated ?? value?.stated,
+    });
+    return { id, kind, label, shown, input, uncertainty, target, assumption, computation };
   });
 }
 
@@ -426,10 +432,10 @@ export function CalculationView({
                       ({valueStatusText(r.target.valueStatus)})
                     </span>
                   )}
-                  {r.input?.certainty === "model_asserted" && (
+                  {r.uncertainty && (
                     <span className="calc-asserted" data-testid="calc-model-asserted">
                       {" · "}
-                      {MODEL_ASSERTED}
+                      {r.uncertainty}
                     </span>
                   )}
                 </li>

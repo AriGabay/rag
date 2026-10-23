@@ -546,3 +546,27 @@ export function contentActionsText(counts: Partial<Record<ChangeAction, number>>
 export function plainClaimText(text: string): string {
   return text.replace(/\*\*|__|`/g, "");
 }
+
+const DEFINING_ATTRIBUTE_LABEL: Record<string, string> = { kind: "סוג הערך", unit: "יחידת הערך" };
+
+/** The honest note for a value the server marks "model_asserted": only its kind or its unit is unconfirmed by the source, never
+ * the period, the VAT or the area basis. Per unconfirmed attribute: the source states another one (with its own words when it
+ * has them), or nothing supports it. An answer stored before provenance carried this has only the certainty: a general note.
+ * Empty when the value is not marked. */
+export function valueUncertaintyNote(
+  value:
+    | { certainty?: string | null; provenance?: Record<string, string> | null; stated?: Record<string, string> | null }
+    | null
+    | undefined,
+): string {
+  if (value?.certainty !== "model_asserted") return "";
+  const parts: string[] = [];
+  for (const attr of ["kind", "unit"]) {
+    const label = DEFINING_ATTRIBUTE_LABEL[attr];
+    const state = value.provenance?.[attr];
+    const words = value.stated?.[attr]?.trim();
+    if (state === "stated_different") parts.push(words ? `${label} במקור: «${words}»` : `המקור מציין ${attr === "kind" ? "סוג אחר" : "יחידה אחרת"} לערך`);
+    else if (state === "model_asserted") parts.push(`${label} לא אושר${attr === "kind" ? "" : "ה"} במקור`);
+  }
+  return parts.length ? parts.join(" · ") : "משמעות הערך לא אושרה במלואה במקור";
+}

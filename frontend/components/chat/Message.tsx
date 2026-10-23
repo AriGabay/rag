@@ -47,6 +47,7 @@ import {
   rowChangeAction,
   unitLabel,
   valueStatusText,
+  valueUncertaintyNote,
 } from "@/lib/format";
 import { type CitationTarget, Markdown, citationOrder, plainAnswer } from "./Markdown";
 import { assumptionText, citedSource, citedTarget, standardChipTitle, valueStatusOf } from "./cited";
@@ -1380,7 +1381,8 @@ export function resultText(c: ChatComputation): string {
   return `${d.value} ${c.unit}`.trim();
 }
 
-function InputLine({ input, onCite }: { input: ChatComputationInput; onCite: (id: string) => void }) {
+function InputLine({ input, value, onCite }: { input: ChatComputationInput; value?: ChatValue; onCite: (id: string) => void }) {
+  const note = input.kind === "value" ? valueUncertaintyNote({ certainty: input.certainty, provenance: input.provenance ?? value?.provenance, stated: input.stated ?? value?.stated }) : "";
   const shown = input.value_text ?? input.display ?? "";
   // every input opens: a document input its place, an assumption the user's words, a calculation its breakdown
   const link = (
@@ -1399,7 +1401,7 @@ function InputLine({ input, onCite }: { input: ChatComputationInput; onCite: (id
     <li>
       {link}{" "}
       {input.label}: <bdi>{shown}</bdi>
-      {input.kind === "value" && input.certainty === "model_asserted" && " · חלק ממשמעות הערך נקבע ולא נמצא במקור"}
+      {note && ` · ${note}`}
     </li>
   );
 }
@@ -1437,7 +1439,7 @@ function CalculationsSection({ answer, onCite }: { answer: ChatAnswer; onCite: (
                 {c.inputs
                   .filter((x): x is ChatComputationInput => typeof x !== "string")
                   .map((x) => (
-                    <InputLine key={x.id} input={x} onCite={onCite} />
+                    <InputLine key={x.id} input={x} value={values.find((v) => v.id === x.id)} onCite={onCite} />
                   ))}
               </ul>
               {c.conditional && (
@@ -1477,7 +1479,7 @@ function CalculationsSection({ answer, onCite }: { answer: ChatAnswer; onCite: (
                   .join("")}
                 {" — "}
                 {v.title}, {v.locator.row ? `שורה «${v.locator.row}», עמודה «${v.locator.column}»` : v.location}
-                {v.certainty === "model_asserted" && " · חלק ממשמעות הערך נקבע ולא נמצא במקור"}{" "}
+                {valueUncertaintyNote(v) && ` · ${valueUncertaintyNote(v)}`}{" "}
                 <ValueStatusBadge status={valueStatusOf(answer, v)} />
               </li>
             ))}

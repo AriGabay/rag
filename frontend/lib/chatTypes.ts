@@ -227,6 +227,11 @@ export interface ChatMeasurement {
   anchor?: ChatAnchor | null;
 }
 
+/** How a value's source stands to one of its attributes: "source" (it states it), "model_asserted" (nothing supports it),
+ * "not_stated"; for the defining attributes `kind` and `unit` also "stated_different" (the source states another one) and
+ * "silent" (the source says nothing against it, so it is not unconfirmed). */
+export type ValueProvenance = Record<string, "source" | "model_asserted" | "not_stated" | "stated_different" | "silent">;
+
 /** An input of a calculation: a value verified in a source (V#), a user assumption (A#), a stored measurement (M#)
  * or an earlier calculation (C#), with its full value. */
 export interface ChatComputationInput {
@@ -239,6 +244,10 @@ export interface ChatComputationInput {
   /** For a value: the passage it was verified in. */
   source_id?: string;
   certainty?: "verified" | "model_asserted" | "uncertain_reading";
+  /** For a value: how its source stands to each attribute, and the source's own words for a kind or unit it states differently
+   * (absent here today: the matching `ChatValue` of the answer carries them). */
+  provenance?: ValueProvenance;
+  stated?: Record<string, string>;
   /** For an assumption: the user's words. */
   quote?: string;
 }
@@ -339,7 +348,9 @@ export interface ChatValue {
   area_basis: string;
   subject: string;
   role: string;
-  provenance: Record<string, "source" | "model_asserted" | "not_stated">;
+  provenance: ValueProvenance;
+  /** The source's own words for a kind or unit it states differently from the registered one (`stated.kind`), when it does. */
+  stated?: Record<string, string> | null;
   /** "uncertain_reading": its own region was read uncertainly and no re-read confirmed it. */
   certainty: "verified" | "model_asserted" | "uncertain_reading";
   /** Who stated it and its standing, as the cited text says (absent on older answers). */
