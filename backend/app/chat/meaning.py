@@ -77,6 +77,7 @@ from app.extraction.normalize_text import absence_spans as _absence_clauses
 from app.measurements.extract import (
     _MONTH_WORDS,
     _YEAR_WORDS,
+    MONEY_KINDS,
     PERIOD_ADJECTIVE_ENDINGS,
     PERIOD_ADJECTIVES,
     PERIOD_LABELS,
@@ -578,7 +579,7 @@ def _only(q: Qualifiers, kind: str, keep: bool = True) -> Qualifiers:
                       {k: dict(v) for k, v in q.parts.items() if (k == kind) == keep})
 
 
-def absence_spans(text: str) -> list[tuple[int, int]]:
+def qualifier_absence_spans(text: str) -> list[tuple[int, int]]:
     """The spans of the clauses of ``text`` (split as ``attached`` splits them, then by clause) that state something is not stated: a clause says the source
     does not state / show something ("לא צוין אם הסכום כולל מע״מ", "אינו מופיע"), so it claims no basis, period or VAT for the numbers it names
     and no number-meaning check applies to it (round 9 U12; the reader of absence is ``normalize_text.absence_clause``, round 22 U6)."""
@@ -779,11 +780,10 @@ def _period_lines(lines: list[str], is_row: list[bool]):
 
     def scoped(notes, context: str) -> Qualifiers:
         q = Qualifiers()
-        money_kinds = {"value", "price", "rent", "management_fee", "cost", "income", "profit", "levy"}
         recurring = {"rent", "management_fee", "income"}
-        row_kinds = {k for k in money_kinds if kind_attested(k, context)}
+        row_kinds = {k for k in MONEY_KINDS if kind_attested(k, context)}
         for note, quals in notes:
-            kinds = {k for k in money_kinds if kind_attested(k, note)}
+            kinds = {k for k in MONEY_KINDS if kind_attested(k, note)}
             if not kinds or not row_kinds or kinds & row_kinds or kinds & recurring and row_kinds & recurring:
                 q.merge(quals)
         return q
@@ -1223,7 +1223,6 @@ def units_attested(context: str) -> set[str]:
     return set()
 
 
-MONEY_KINDS = ("value", "price", "rent", "management_fee", "cost", "income", "profit", "levy")
 # a label's number ("טבלה מספר 4", "מס' 7") counts nothing
 _LABEL_NUMBER = re.compile(r"(?:מספר|מס['\"]?)\s*\d+")
 
@@ -1689,7 +1688,7 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
     words = _content_words(text)
     problems: list[MeaningProblem] = []
     in_unit, _ = attached(text)
-    absent = absence_spans(text)
+    absent = qualifier_absence_spans(text)
     for forms, pos, claimed in in_unit:
         if not forms:
             continue

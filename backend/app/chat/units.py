@@ -97,6 +97,7 @@ from sqlalchemy import Connection, text
 from app.chat import contexts
 from app.extraction import hebrew
 from app.extraction.normalize_text import base_normalize
+from app.extraction.tables import furniture_pages_needed
 from app.platform.source_kinds import APPRAISALS_SQL
 from app.professional.sections import flight, landed
 
@@ -193,8 +194,6 @@ LAYOUT_TOP_TOLERANCE = 6.0  # points: tops of two title blocks that "repeat" a l
 LAYOUT_HEIGHT_TOLERANCE = 1.5  # points: their line heights
 RUN_MAX = 8  # blocks of a title run
 FRONT_MATTER_PAGES_MAX = 4  # a part before the first appraisal longer than this is a document, not a cover
-FURNITURE_MIN_PAGES = 3
-FURNITURE_SHARE = 0.5  # a text on this share of the pages (and at least FURNITURE_MIN_PAGES) is a running header
 TOC_PAGES = 4  # pages after the TOC heading read for entries
 TOC_TABLE_PAGES = 15  # tables on these first pages bring their text (a TOC set as a table)
 TABLE_DOMINANT = 0.5
@@ -1248,7 +1247,7 @@ def derive(blocks: Iterable, pages: Iterable = (), version_id: str = "", furnitu
         if r.page is not None and r.kind in _TEXT_KINDS and _text(r) and getattr(r, "table_index", None) is None:
             per_text[_norm(_text(r))].add(r.page)
     pages_seen = len({r.page for r in rows if r.page is not None})
-    need = max(FURNITURE_MIN_PAGES, math.ceil(FURNITURE_SHARE * pages_seen))
+    need = furniture_pages_needed(pages_seen)  # a text on this share of the pages (and at least the minimum) is a running header
     furniture = frozenset(t for t, ps in per_text.items() if t and len(ps) >= need)
     c = _Ctx(rows, body, furniture, frozenset(furniture_images), _running_lines(pages))
     for i, r in enumerate(rows):

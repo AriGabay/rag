@@ -2724,3 +2724,13 @@ def test_u5_a_paragraph_source_takes_no_table_notes_into_its_condition_spans():
     ws = _u5_ws("text", "מחיר הדירה הוא 1,020,000 ₪ (*)", [U5_LEASE_NOTE], table_index=None)
     assert items.condition_spans(ws.sources["S1"], "מחיר הדירה הוא 1,020,000 ₪ (*)", value="1020000") == []
     assert all(U5_LEASE_NOTE not in s.text for s in items.condition_spans(ws.sources["S1"], "מחיר הדירה הוא 1,020,000 ₪"))
+
+
+def test_round22_review_7_a_figure_before_a_prepositional_negation_stays_positive_in_positive_text():
+    text = "הוצאות תחזוקה 50,000 ₪ ללא פירוט נוסף. דמי ניהול 500 ₪ ללא ציון תאריך."
+    assert items.positive_text(text) == text
+    assert "50,000" in items.positive_text("הוצאות 50,000 ₪ (ללא פירוט)")  # the parenthesised variant, as before
+    blanked = items.positive_text("ללא פירוט נוסף")
+    assert not blanked.strip()  # the absence clause alone is still blanked
+    beside = items.positive_text("הוצאות התחזוקה ללא פירוט נוסף. הארנונה 1,200 ₪.")
+    assert "1,200" in beside and "פירוט" not in beside

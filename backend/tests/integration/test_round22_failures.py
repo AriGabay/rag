@@ -27,7 +27,7 @@ from app.providers.llm import CallStatus, StructuredResult
 from tests.support.scripted_provider import ScriptedProvider
 
 PURPOSE_TIMEOUT = 45.0  # ``llm_timeout_verify_seconds``
-NEEDED = 12.0  # a judge call given less than this many seconds does not finish
+NEEDED = 18.0  # a judge call given less than this many seconds does not finish (the retry must be able to fit the reserve, 20s)
 SOURCE = "סיכום: השווי למ\"ר הוא 9,500 ₪. דמי השכירות הם 55 ₪ למ\"ר לחודש."
 MARKDOWN = "השווי למ\"ר הוא 9,500 ₪ [S1].\nדמי השכירות הם 55 ₪ למ\"ר לחודש [S1]."
 
@@ -86,9 +86,10 @@ def _check(provider: TimingProvider, clock: Clock, left: float) -> tuple[verify.
 
 
 def test_f2_a_late_judge_batch_that_times_out_still_gets_its_retry_inside_the_reserved_slice(clock):
-    # the agent loop left 50 seconds of the verification window; the first call hangs to its timeout
+    # the agent loop left 61 seconds of the verification window (just above the reserve plus JUDGE_FIRST_CALL_MIN_SECONDS, so the reserve
+    # applies); the first call hangs to its timeout: without the reserve it would take 45s and leave the retry 16s, under NEEDED
     p = TimingProvider(clock, lambda n, input: n == 1)
-    report, ws = _check(p, clock, 50)
+    report, ws = _check(p, clock, 61)
     assert len(p.windows) == 2, p.windows  # the first call and its one retry
     assert p.windows[1] >= NEEDED, f"the retry was given {p.windows[1]}s: starved ({p.windows})"
     assert report.removals() == []  # the claims stand: a fully supported answer is not lost
@@ -97,11 +98,21 @@ def test_f2_a_late_judge_batch_that_times_out_still_gets_its_retry_inside_the_re
 
 def test_the_first_call_is_cut_so_the_retry_keeps_the_reserve_and_a_roomy_deadline_is_unchanged(clock):
     p = TimingProvider(clock, lambda n, input: n == 1)
-    _check(p, clock, 50)
-    assert p.windows[0] == pytest.approx(50 - verify.JUDGE_RETRY_RESERVE_SECONDS, abs=1)
+    _check(p, clock, 61)
+    assert p.windows[0] == pytest.approx(61 - verify.JUDGE_RETRY_RESERVE_SECONDS, abs=1)
     roomy = TimingProvider(clock, lambda n, input: n == 1)
     _check(roomy, clock, 300)
     assert roomy.windows[0] == PURPOSE_TIMEOUT  # nothing is cut when the deadline leaves room for both calls
+
+
+def test_a_deadline_that_cannot_give_the_first_call_the_p99_of_healthy_calls_and_keep_the_reserve_does_not_cut_the_first_call(clock):
+    # round 22 review U7: healthy judge calls take up to ~44s (measured p99 40s), so with 35-60s left a cut to left-20s would time out a call that
+    # would have finished; the one call keeps all of the time, as before round 22
+    assert verify.JUDGE_FIRST_CALL_MIN_SECONDS >= 40
+    p = TimingProvider(clock)
+    report, _ = _check(p, clock, 50)
+    assert p.windows == [pytest.approx(PURPOSE_TIMEOUT, abs=1)]  # min(its purpose's timeout, the 50s left): not cut to 30s
+    assert report.removals() == []
 
 
 def test_too_little_time_for_two_windows_gives_the_one_call_everything(clock):
@@ -114,7 +125,7 @@ def test_too_little_time_for_two_windows_gives_the_one_call_everything(clock):
 def test_a_claim_still_unchecked_after_the_retry_is_withheld_recorded_with_its_cause_and_shown_as_not_checked(clock, monkeypatch):
     monkeypatch.setattr(verify, "JUDGE_MAX_UNITS", 1)  # two batches: the first answers, the second times out twice
     p = TimingProvider(clock, lambda n, input: "דמי השכירות" in input.split("<unit", 2)[-1])
-    report, ws = _check(p, clock, 50)
+    report, ws = _check(p, clock, 61)
     assert len(p.windows) == 3
     removed = report.removals()
     assert [r.cause for r in removed] == ["check_failed"]  # fail closed: the unchecked claim is not kept

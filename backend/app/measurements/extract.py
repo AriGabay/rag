@@ -65,6 +65,9 @@ UNIT_LABELS = {"ILS": "₪", "ILS_per_sqm": "₪ למ״ר", "sqm": "מ״ר", "du
                "units": "יחידות",
                "years": "שנים", "months": "חודשים", "ratio": "", "other": ""}
 PERIOD_LABELS = {"month": "לחודש", "year": "לשנה", "one_time": "חד-פעמי", "none": "", "unknown": "תקופה לא צוינה"}
+# the kinds that state an amount of money, defined once (round 22 review #8): chat/calc.py (kind-to-unit family) and chat/meaning.py (kind
+# attestation, scoped qualifiers) both import it
+MONEY_KINDS = ("value", "price", "rent", "management_fee", "cost", "income", "profit", "levy")
 VAT_LABELS = {"included": "כולל מע״מ", "excluded": "ללא מע״מ", "unknown": "מע״מ לא צוין", "not_applicable": ""}
 
 # every written form of the VAT (round 13): "מע״מ" / "מע"מ" / "מע''מ", the dotted "מ.ע.מ", "מעמ" and "מס ערך מוסף", with a

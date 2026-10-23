@@ -736,3 +736,18 @@ def test_the_period_a_turn_ran_under_is_stored_with_its_property_and_kept_when_t
     nothing = slots.carry(None, intent="property", property=PROPERTY, params=PARAMS, period=out["period"], message_id="m-2")
     again = api._context(_outcome(), _payload(None), nothing, "m-3")  # no datum found, nowhere moved: the property and its period stay
     assert again["property"] == PROPERTY and again["period"] == out["period"]
+
+
+def test_round22_review_2_a_function_word_never_names_a_list_and_a_kind_is_never_prefix_stripped():
+    appraisals = a_list(["שומה א", "שומה ב", "שומה ג"], "השומות", kind="שומה", mid="m-1", n=1)
+    payments = a_list(["תשלום 1", "תשלום 2"], "תשלומים", kind="תשלום", mid="m-1", n=2)
+    # "ומה" opens most follow-ups; it is the function word "and what", not the stem of the kind "שומה"
+    assert slots.bind("ומה לגבי השני?", [appraisals, payments], item=2).kind == "ask"
+    assert slots._forms("שומה", base=True) == {"שומה", "שומ"}
+    # a message that names the noun, bare or prefixed, still binds to it
+    for message in ["ומה לגבי השומה השנייה?", "ומה בשומה השנייה?", "ולשומה השנייה?"]:
+        got = slots.bind(message, [appraisals, payments], item=2)
+        assert got.kind == "item" and got.list_id == "m-1#1", message
+    for message in ["ומה לגבי התשלום השני?", "מה בתשלום השני?", "ולתשלומים, השני?", "והתשלום השני"]:
+        got = slots.bind(message, [appraisals, payments], item=2)
+        assert got.kind == "item" and got.list_id == "m-1#2", message

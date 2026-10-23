@@ -253,6 +253,82 @@ def test_an_answer_for_a_question_the_call_did_not_ask_is_dropped():
     assert verify.JudgeCoverageOutput.model_validate({"verdicts": [], "requirements": [{"id": "N1", "status": "full"}]}).requirements[0].applies == []
 
 
+# --- round 22 review #1: an addition answer belongs to the call that asked it (A# is renumbered every verification round) ---------------------
+
+NORTH_SENTENCE, SOUTH_SENTENCE = "שטח הקרקע הצפונית הוא 300 מ״ר [S2].", "שטח הקרקע הדרומית הוא 300 מ״ר [S2]."
+NOTE_SOUTH = "השטח כפוף להיתר בנייה בתוקף"
+TWO_NOTES = [HEADER, f"{NORTH} | 300 | {NOTE}", f"{SOUTH} | 300 | {NOTE_SOUTH}"]
+NORTH_STATED = f"שטח הקרקע הצפונית הוא 300 מ״ר, {NOTE} [S2]."  # the repair writes the north row's condition itself: no addition is asked for it
+
+
+def _two_row_round(markdown: str, cache, ledger, turn, ws, seen: list, first_answers: dict[str, str]):
+    """One verification round of the two-row answer (the south sentence is cited by the FIRST requirement, so the addition answers travel on the vote
+    that a later round carries when only the north sentence changed). ``first_answers``: the answers of the call, by A#."""
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        seen.append(input)
+        units = {int(i): t for i, t in re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S)}
+        south = [i for i, t in units.items() if "הדרומית" in t]
+        north = [i for i, t in units.items() if "הצפונית" in t]
+        out = {"verdicts": [{"index": i, "verdict": "supported", "reason": "בדיקה"} for i in units]}
+        if "<requirements>" in input:
+            asked = re.findall(r'<addition id="(A\d+)"', input)
+            replies = [{"addition": a, "outcome": first_answers[a]} for a in asked if a in first_answers]
+            ids = re.findall(r'<requirement id="(N[\d.]+)"', input)
+            out["requirements"] = [C._req("", "full", south if i == "N1" else north, id=i) | ({"applies": replies} if n == 0 else {})
+                                   for n, i in enumerate(ids)]
+        return out
+
+    p.on(verify.Purpose.VERIFY, respond, repeat=True)
+    answer = C._answer(markdown).model_copy(update={"items": [_item(), _item(SOUTH, component="N2")]})
+    return verify_answer(p, answer, ws, "?", [], requirements=turn, ledger=ledger, cache=cache), answer
+
+
+def test_a_renumbered_plan_never_reads_the_answer_of_a_different_addition_from_a_carried_vote(undecided):
+    ws = C._plan_file(*TWO_NOTES)
+    turn = C._turn({"id": "1", "text": "שטח הקרקע הצפונית"}, {"id": "2", "text": "שטח הקרקע הדרומית"})
+    cache, ledger, seen = verify.VerdictCache(), items.Ledger(), []
+    # round 1: A1 = the north row's note (applies), A2 = the south row's (not_applies)
+    first, _ = _two_row_round(f"{NORTH_SENTENCE}\n\n{SOUTH_SENTENCE}", cache, ledger, turn, ws, seen,
+                              {"A1": "applies", "A2": "not_applies"})
+    assert [(a.id, a.datum) for a in first.additions] == [("A1", "I1"), ("A2", "I2")], first.additions
+    # round 2: the repair wrote the north row's condition itself, so the plan is A1 = the south row's note; the call shows only the changed
+    # sentence and does not answer; the vote of the south-cited requirement is carried from round 1 with its answers
+    markdown = f"{NORTH_STATED}\n\n{SOUTH_SENTENCE}"
+    second, answer = _two_row_round(markdown, cache, ledger, turn, ws, seen, {})
+    assert [(a.id, a.datum) for a in second.additions] == [("A1", "I2")], second.additions
+    assert second.reused >= 1  # the south sentence's verdict and the vote resting on it were carried
+    edited, _ = coverage.compose_components(ws, answer, second, turn)
+    south_sentence = [p for p in edited.doc.text.split("\n\n") if "הדרומית" in p][0]
+    assert NOTE_SOUTH not in south_sentence, edited.doc.text  # the judge ruled the south note out in round 1: never written beside the south row now
+    assert [s.datum for s in _notes(edited.doc)] != ["I2"]
+
+
+def test_an_addition_answer_is_read_by_what_it_was_asked_about_not_by_its_position():
+    stale = verify.JudgeRequirement(status="full", applies=[verify.AppliesVerdict(addition="A1", outcome="applies"),
+                                                            verify.AppliesVerdict(addition="A2", outcome="not_applies")])
+    stale._asked = {"A1": ("condition", "I1", 5), "A2": ("condition", "I2", 8)}
+    fresh = verify.JudgeRequirement(status="full", applies=[verify.AppliesVerdict(addition="A1", outcome="applies")])
+    fresh._asked = {"A1": ("condition", "I2", 8)}  # this round's A1 is the old A2's addition
+    unknown = verify.JudgeRequirement(status="full", applies=[verify.AppliesVerdict(addition="A1", outcome="applies")])  # a vote that knows nothing of what it asked
+    assert verify._addition_answers([stale]) == {("condition", "I1", 5): "applies", ("condition", "I2", 8): "not_applies"}
+    assert verify._addition_answers([fresh]) == {("condition", "I2", 8): "applies"}  # the positive control: a fresh answer is read for its own addition
+    assert verify._addition_answers([unknown]) == {}
+    assert verify._addition_answers([stale, fresh])[("condition", "I2", 8)] == "not_applies"  # two answers to one addition: the careful one
+
+
+def test_a_vote_the_cache_reuses_for_moved_units_keeps_no_addition_answer():
+    cache = verify.VerdictCache()
+    vote = verify.JudgeRequirement(id="N1", status="full", units=[1], applies=[verify.AppliesVerdict(addition="A1", outcome="applies")])
+    vote._asked = {"A1": ("condition", "I1", 1)}
+    cache.verdicts["k1"] = verify.JudgeVerdict(index=0, verdict="supported", reason="x")
+    cache.last = verify._Round(["k0", "k1"], [vote], ())
+    unit = type("U", (), {"index": 0})()
+    _, carried, _ = cache.reuse([unit], [unit], {0: "k1"})
+    assert [v.units for v in carried] == [[0]] and carried[0].applies == [] and carried[0]._asked is None
+
+
 def test_a_decided_addition_asks_nothing_so_the_requirements_call_is_what_it_was():
     seen: list[str] = []
     _compose(SENTENCE, judge=_addition_judge(lambda a, i: "applies", seen))

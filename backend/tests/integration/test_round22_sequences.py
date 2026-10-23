@@ -138,7 +138,13 @@ def _summary_row(office, cid: str):
 def test_a_summary_built_by_an_older_builder_is_rebuilt_with_the_superseded_one_kept(client, summaries, monkeypatch):
     steps = [s for _ in range(4) for s in _public_turn(summaries.public)]
     agent = ScriptedAgent(steps)
-    agent.on(Purpose.SUMMARY, lambda instructions, input: {"summary": input[-3000:]}, repeat=True)
+    prompts: list[str] = []
+
+    def summarize(instructions, input):
+        prompts.append(input)
+        return {"summary": input[-3000:]}
+
+    agent.on(Purpose.SUMMARY, summarize, repeat=True)
     cloud(monkeypatch, summaries, agent)
     login(client, "emp@example.test")
     cid = new_conversation(client)
@@ -155,9 +161,13 @@ def test_a_summary_built_by_an_older_builder_is_rebuilt_with_the_superseded_one_
                      {"s": old_text, "m": json.dumps(old_meta), "c": cid})
         before = conn.execute(text("SELECT count(*) FROM messages WHERE conversation_id = :c"), {"c": cid}).scalar_one()
     agent.steps += _public_turn(summaries.public)
+    prompts.clear()
     assert send(client, cid, "שאלה מספר 5")["status"] == "done"
     after = _summary_row(summaries, cid)
-    assert old_text not in after.summary and after.summary_meta["builder_version"] == chat_api.SUMMARY_VERSION
+    # round 22 review #3: the re-fold of a still-usable old summary gets the old text as the previous summary (not "אין"), so what it carried from
+    # earlier messages is not lost
+    assert len(prompts) == 1 and prompts[0].startswith("סיכום קודם:\n" + old_text), prompts
+    assert after.summary_meta["builder_version"] == chat_api.SUMMARY_VERSION
     assert after.summary_meta["superseded"]["text"] == old_text
     assert after.summary_meta["superseded"]["meta"]["summary_sha256"] == old_meta["summary_sha256"]
     with tenant_tx(summaries.system) as conn:

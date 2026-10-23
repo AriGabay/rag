@@ -208,7 +208,7 @@ def test_an_absence_clause_is_found_by_its_span_and_a_positive_clause_beside_it_
     from app.chat import meaning
 
     text = "הסכום לא צוין אם הוא כולל מע״מ; דמי הניהול הם 1,200 ₪ ללא מע״מ."
-    spans = meaning.absence_spans(text)
+    spans = meaning.qualifier_absence_spans(text)
     assert [text[a:b].strip() for a, b in spans] == ["הסכום לא צוין אם הוא כולל מע״מ"]
 
 
@@ -275,4 +275,29 @@ def test_a_vat_phrase_is_ignored_only_inside_the_absence_clause_not_in_the_claus
     assert forms("הדוח אינו מתייחס לכך, והשכר 5,000 ₪ ללא מע״מ") == {"excluded"}
     assert forms("הסכום טרם נקבע, והוא 5,000 ₪ כולל מע״מ") == {"included"}
     text = "הדוח אינו מתייחס לכך, והשכר 5,000 ₪ ללא מע״מ."
-    assert [text[a:b] for a, b in meaning.absence_spans(text)] == ["הדוח אינו מתייחס לכך"]
+    assert [text[a:b] for a, b in meaning.qualifier_absence_spans(text)] == ["הדוח אינו מתייחס לכך"]
+
+
+# --- round 22 review fixes (#6, #7) ----------------------------------------------------------------------------------------------------
+
+def test_missing_counts_as_absence_only_when_it_predicates_an_information_or_document_noun():
+    from app.extraction import normalize_text as nt
+
+    for text in ["הנתון חסר", "חסר פירוט על השטח", "חסרים נתונים על הקומה", "חסר מידע לגבי מועד הסיום", "הפירוט חסר בשומה", "חסרה התייחסות לשטח"]:
+        assert nt.absence_clause(text) and nt.states_absence(text), text
+    for text in ["המחסן חסר היתר בנייה", "הדירה חסרה מעלית", "הבניין חסר חניה", "החדר חסר חלון", "חסרות מדרגות בכניסה"]:
+        assert not nt.absence_clause(text) and not nt.states_absence(text), text
+        assert nt.absence_spans(text) == [], text
+
+
+def test_a_figure_before_a_prepositional_negation_keeps_its_clause_positive_and_the_bare_negation_still_reads_as_absence():
+    from app.extraction import normalize_text as nt
+
+    for text in ["הוצאות תחזוקה 50,000 ₪ ללא פירוט נוסף", "דמי ניהול 500 ₪ ללא ציון תאריך", "ארנונה 1,200 ₪ בלי פירוט"]:
+        assert not nt.absence_clause(text) and not nt.states_absence(text), text
+        assert nt.absence_spans(text) == [], text
+    for text in ["ללא פירוט", "הוצאות התחזוקה ללא פירוט נוסף", "אין בהם נתון ישיר על הגודל", "הוצאות 50,000 ₪ (ללא פירוט)",
+                 "הסכום 50,000 ₪ אינו מופיע בשומה", "ללא פירוט נוסף על 50,000 ₪"]:
+        assert nt.states_absence(text) or nt.absence_spans(text), text
+    assert nt.states_absence("הוצאות תחזוקה ללא פירוט נוסף")
+    assert nt.absence_clause("הוצאות 50,000 ₪ אין בהן נתון")

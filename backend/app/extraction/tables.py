@@ -484,13 +484,20 @@ def spans_pages(st: dict | None) -> bool:
 # --- page furniture, and a stored table that spans pages (round 22 U3, KTD3, R9) ---------------------------------------------------
 #
 # Page furniture is a normalized line (digits and punctuation dropped) that recurs at the same place on a large share of the pages: a
-# running header never separates two table pieces. The same idea as ``app.chat.units`` (``FURNITURE_SHARE``: a text on half of the pages,
-# and at least ``FURNITURE_MIN_PAGES``), written here because the extraction layer does not import the chat layer; it adds the place
-# (the top of the line, within ``FURNITURE_TOP_TOLERANCE`` points) so a heading that repeats at other places stays a heading.
+# running header never separates two table pieces. The threshold (``FURNITURE_SHARE``: a text on half of the pages, and at least
+# ``FURNITURE_MIN_PAGES``) is defined once, here in the lower layer, and ``app.chat.units`` imports it (round 22 review #11); this reader
+# adds the place (the top of the line, within ``FURNITURE_TOP_TOLERANCE`` points) so a heading that repeats at other places stays a heading.
 
 FURNITURE_MIN_PAGES = 3
 FURNITURE_SHARE = 0.5
 FURNITURE_TOP_TOLERANCE = 6.0
+
+
+def furniture_pages_needed(total: int) -> int:
+    """The pages a text must be on, of ``total`` pages, to be page furniture (a running header)."""
+    return max(FURNITURE_MIN_PAGES, math.ceil(FURNITURE_SHARE * total))
+
+
 _NON_WORD = re.compile(r"[\W\d_]+")
 
 
@@ -529,7 +536,7 @@ def furniture_of(entries: Iterable[tuple[int, float | None, str]], pages_total: 
         if key:
             groups.setdefault(key, []).append((page, top))
     total = pages_total if pages_total is not None else len({p for g in groups.values() for p, _ in g})
-    need = max(FURNITURE_MIN_PAGES, math.ceil(FURNITURE_SHARE * total))
+    need = furniture_pages_needed(total)
     places: dict[str, tuple[float | None, ...]] = {}
     for key, group in groups.items():
         if len({p for p, _ in group}) < need:

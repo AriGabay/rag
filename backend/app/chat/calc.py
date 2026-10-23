@@ -73,7 +73,7 @@ from uuid import UUID
 from app.answering.numread import read_separators
 from app.chat import datum
 from app.chat.contexts import context_subject
-from app.measurements.extract import PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
+from app.measurements.extract import MONEY_KINDS, PERIOD_LABELS, UNIT_LABELS, VAT_LABELS
 
 MAX_EXPRESSION = 4000  # characters (an aggregate may name a few hundred measurements)
 MAX_TOKENS = 1000
@@ -1172,14 +1172,13 @@ DEFINING_ATTRIBUTES = ("kind", "unit")
 #   model_asserted    nothing supports it where it matters: no unit is stated, or the kind does not go with the unit
 # A stored V# from before the round has only "source" and "model_asserted"; both keep their meaning.
 UNCONFIRMED = ("stated_different", "model_asserted")  # the states that make a computation conditional when the operation reads them
-_MONEY_KINDS = frozenset({"value", "price", "rent", "management_fee", "cost", "income", "profit", "levy"})
 # the kinds that go with each unit: an amount is in ₪, a per-area amount in ₪ per m², a rate in %; "other" goes with any
-_KIND_UNITS = {**dict.fromkeys(_MONEY_KINDS, {"ILS"}), **dict.fromkeys(PER_AREA_BASE, {"ILS_per_sqm"}),
+_KIND_UNITS = {**dict.fromkeys(MONEY_KINDS, {"ILS"}), **dict.fromkeys(PER_AREA_BASE, {"ILS_per_sqm"}),
                "area": {"sqm", "dunam"}, "rights_area": {"sqm", "dunam"}, "rate": {"percent", "ratio"},
                "coefficient": {"ratio", "percent"}, "count": {"units"}, "duration": {"years", "months"}}
 _UNIT_FAMILY = {"ILS": "money", "ILS_per_sqm": "money", "sqm": "area", "dunam": "area", "percent": "percent", "ratio": "ratio",
                 "units": "count", "years": "time", "months": "time"}
-_KIND_FAMILY = {**dict.fromkeys(_MONEY_KINDS, "money"), "area": "area", "rights_area": "area", "rate": "percent",
+_KIND_FAMILY = {**dict.fromkeys(MONEY_KINDS, "money"), "area": "area", "rights_area": "area", "rate": "percent",
                 "coefficient": "ratio", "count": "count", "duration": "time"}
 
 

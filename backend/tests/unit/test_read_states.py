@@ -40,13 +40,12 @@ def _key(**target) -> str:
 
 # --- the state of a target ---------------------------------------------------------------------------------------------------
 
-def test_a_section_read_to_its_end_is_completed_and_may_state_absence():
+def test_a_section_read_to_its_end_is_completed():
     ws = Workspace(ctx=None)
     target = ("section", "doc", "תיאור הנכס")
     ws.reads[target] = {"to": READ_TO_END, "unread": False, "document_id": "doc"}
     state = ws.read_state(target)
     assert (state.state, state.unread) == (T.READ_COMPLETED, "")
-    assert state.may_state_absence
 
 
 def test_a_section_read_in_part_is_partial_and_names_the_unread_region():
@@ -56,7 +55,6 @@ def test_a_section_read_in_part_is_partial_and_names_the_unread_region():
     ws.reads[unread] = {"to": READ_TO_END, "unread": True, "document_id": "doc"}
     assert (ws.read_state(clipped).state, ws.read_state(clipped).unread) == (T.READ_PARTIAL, "clipped")
     assert (ws.read_state(unread).state, ws.read_state(unread).unread) == (T.READ_PARTIAL, "unread")
-    assert not ws.read_state(clipped).may_state_absence and not ws.read_state(unread).may_state_absence
 
 
 def test_a_call_that_broke_is_failed_and_one_the_budget_stopped_is_budget_skipped(monkeypatch):
@@ -64,7 +62,7 @@ def test_a_call_that_broke_is_failed_and_one_the_budget_stopped_is_budget_skippe
     _handlers(monkeypatch, read=RuntimeError("boom"))
     _call(ws, section="§1")
     failed = ws.read_state(_key(section="§1"))
-    assert failed.state == T.READ_FAILED and not failed.may_state_absence
+    assert failed.state == T.READ_FAILED
     ws.tool_budget = 10
     _handlers(monkeypatch, read="טקסט ארוך מהתקציב של הסבב")
     _call(ws, section="§2")  # reads, and spends the budget
@@ -72,7 +70,7 @@ def test_a_call_that_broke_is_failed_and_one_the_budget_stopped_is_budget_skippe
     out = _call(ws, section="§3")
     assert out.startswith("<not_read")
     skipped = ws.read_state(_key(section="§3"))
-    assert skipped.state == T.READ_BUDGET_SKIPPED and not skipped.may_state_absence
+    assert skipped.state == T.READ_BUDGET_SKIPPED
 
 
 def test_a_failed_read_that_is_read_again_is_completed():
@@ -117,6 +115,25 @@ def test_the_documents_of_a_failed_read_are_found_through_the_handles_the_call_n
     assert ws.failed_reads(None) == [_key(document="D1", section="§1")]
 
 
+def test_the_documents_of_a_failed_read_of_a_source_id_are_found_through_the_source(monkeypatch):
+    # round 22 review #5: ``read(source=S1)`` names a source (not a handle); its document is the source's, a listing has none
+    ws = _ws()
+    doc = str(ws.sources["S1"].document_id)
+    _handlers(monkeypatch, read=RuntimeError("boom"))
+    _call(ws, source="S1")
+    assert ws.failed_reads([doc]) == [_key(source="S1")]
+    assert ws.failed_reads([str(uuid.uuid4())]) == []
+
+
+def test_a_failed_read_whose_document_cannot_be_resolved_fails_every_document(monkeypatch):
+    ws = _ws()
+    doc = str(ws.sources["S1"].document_id)
+    _handlers(monkeypatch, read=RuntimeError("boom"))
+    _call(ws, source="S99")  # names nothing the workspace knows
+    assert ws.failed_reads([doc]) == [_key(source="S99")]
+    assert ws.failed_reads([str(uuid.uuid4())]) == [_key(source="S99")]
+
+
 # --- absence wording follows the state --------------------------------------------------------------------------------------
 
 def _fail_read_of(ws: Workspace, monkeypatch, **target) -> str:
@@ -157,6 +174,16 @@ def test_a_failed_read_of_the_documents_the_component_is_tied_to_says_failed(mon
     ws = _ws()
     claim = _claim(ws)
     _fail_read_of(ws, monkeypatch, section="§1")
+    _, outcomes, gap = _missing_with(ws, TurnRequirements(), [], requested=[claim])
+    assert outcomes[1]["limitation"] == "tool_failure"
+    assert "לא נמצא" not in gap and "לא מופיע" not in gap
+
+
+def test_a_crashed_read_of_a_source_id_blocks_the_absence_wording_for_its_document(monkeypatch):
+    ws = _ws()
+    claim = _claim(ws)
+    _handlers(monkeypatch, read=RuntimeError("boom"))
+    _call(ws, source="S1")
     _, outcomes, gap = _missing_with(ws, TurnRequirements(), [], requested=[claim])
     assert outcomes[1]["limitation"] == "tool_failure"
     assert "לא נמצא" not in gap and "לא מופיע" not in gap

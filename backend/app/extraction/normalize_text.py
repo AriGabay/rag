@@ -155,11 +155,11 @@ def is_negation(word: str, *, ambiguous: bool = True, prepositional: bool = True
 # ``compose.is_absence_claim``, ``verify._NEGATIONS``); this is the one that replaced them. A claim that says the datum is missing, as opposed to
 # a fact the document states about an absence ("אין בדירה גינה", "השמאי מציין שאין גינה"): a negation that governs a word of stating, finding,
 # computing, determining or knowing, or an information noun ("לא נמסר", "אין בהם נתון", "לא ניתן לקבוע", "ללא פירוט").
-_FINALS = str.maketrans("ךםןףץ", "כמנפצ")
+FINALS = str.maketrans("ךםןףץ", "כמנפצ")
 
 
 def _medial(words: str) -> frozenset[str]:
-    return frozenset(w.translate(_FINALS) for w in words.split())
+    return frozenset(w.translate(FINALS) for w in words.split())
 
 
 # verbs that, right after a negation, say the datum is missing: not stated / mentioned / written / detailed / known / found / shown /
@@ -179,15 +179,15 @@ _APPEARING = re.compile(r"(?:מופיע|הופיע|נמצא|נכתב|כתוב|מ
 # verbs of existing or being given: absence only when an information noun follows ("לא קיים מידע")
 _GIVEN = re.compile(r"(?:קיימ|ניתנ)" + _INFLECTION)
 _INFO_NOUN = re.compile(r"מידע|נתונ|נתונימ|פירוט|פרטימ|התייחסות|אזכור|ציונ|תיעוד|אינדיקציה")
-_DOC_NOUN = re.compile(r"(?:מסמכ|קטע|מקור|טקסט|דוח)\w*|ראיות|ראיה|ראייה|שומה|שומות|שומת")
+DOC_NOUN = re.compile(r"(?:מסמכ|קטע|מקור|טקסט|דוח)\w*|ראיות|ראיה|ראייה|שומה|שומות|שומת")
 _KNOWING = re.compile(r"לקבוע|לדעת|לזהות|למצוא|להסיק|לאתר|לחשב|לברר")
 _POSSIBLE = re.compile(r"ניתנ|אפשר|אפשרות|דרכ")
 _QUANTIFIERS = frozenset({"כל", "שום", "כלל"})
 
 
-def _forms(word: str) -> set[str]:
+def word_forms(word: str) -> set[str]:
     """A word with final letters unified, and without one or two leading prefix letters (three letters stay)."""
-    word = word.translate(_FINALS)
+    word = word.translate(FINALS)
     out = {word}
     for k in (1, 2):
         if len(word) - k >= 3 and all(ch in _PREFIXES for ch in word[:k]):
@@ -195,45 +195,46 @@ def _forms(word: str) -> set[str]:
     return out
 
 
-def _is(pattern: re.Pattern, word: str) -> bool:
-    return any(pattern.fullmatch(f) for f in _forms(word))
+def is_word(pattern: re.Pattern, word: str) -> bool:
+    return any(pattern.fullmatch(f) for f in word_forms(word))
 
 
 def _first_content_word(words: list[str]) -> str | None:
     """The first word that is not a short function word ("בהם", "את"), a quantifier ("כל") or a document word ("במסמכים"): what a negation
     governs in "אין בהם נתון" or "אין במסמכי הראיות כל מידע"."""
-    return next((w for w in words if not (len(w) <= 3 or w in _QUANTIFIERS or _is(_DOC_NOUN, w))), None)
+    return next((w for w in words if not (len(w) <= 3 or w in _QUANTIFIERS or is_word(DOC_NOUN, w))), None)
 
 
-def _absence_words(words: list[str]) -> bool:
+def _absence_words(words: list[str], figure_from: int | None = None) -> bool:
+    """Whether the words of one clause say a datum is missing. ``figure_from``: the index of the first word that stands after a figure of the
+    clause (``absence_clause``): a preposition of negation after a figure negates the noun it governs, not the figure ("50,000 ₪ ללא פירוט")."""
     for i, w in enumerate(words):
-        if w.translate(_FINALS) in _MISSING_WORDS:
-            return True
-        if w == "אי" and words[i + 1:i + 2] == ["אפשר"] and len(words) > i + 2 and _is(_KNOWING, words[i + 2]):
+        if w.translate(FINALS) in _MISSING_WORDS:  # a datum called missing (round 22 review #6): "הנתון חסר", "חסר פירוט" - not a feature of the property
+            if any(is_word(_INFO_NOUN, x) or is_word(DOC_NOUN, x) for x in (*words[max(i - 2, 0):i], *words[i + 1:i + 4])):
+                return True
+            continue
+        if w == "אי" and words[i + 1:i + 2] == ["אפשר"] and len(words) > i + 2 and is_word(_KNOWING, words[i + 2]):
             return True
         if not is_negation(w, ambiguous=False):
             continue
         after = words[i + 1:i + 6]
-        if after and after[0].translate(_FINALS) in _STATED_VERBS:  # "לא נמצא", "אינו מופיע", "לא נקבע"
+        if after and after[0].translate(FINALS) in _STATED_VERBS:  # "לא נמצא", "אינו מופיע", "לא נקבע"
             return True
-        if any(_is(_STATING, x) for x in after[:2]):  # "לא נמסר", "אינם מפרטים"
+        if any(is_word(_STATING, x) for x in after[:2]):  # "לא נמסר", "אינם מפרטים"
             return True
-        if len(after) >= 2 and _is(_POSSIBLE, after[0]) and _is(_KNOWING, after[1]):  # "לא ניתן לקבוע", "אין אפשרות לחשב"
+        if len(after) >= 2 and is_word(_POSSIBLE, after[0]) and is_word(_KNOWING, after[1]):  # "לא ניתן לקבוע", "אין אפשרות לחשב"
             return True
         governed = _first_content_word(after)
-        if governed is not None and _is(_INFO_NOUN, governed):  # "אין בהם נתון", "ללא פירוט"
+        figure_first = figure_from is not None and i >= figure_from and negation_form(w, ambiguous=False, prepositional=False) is None
+        if governed is not None and is_word(_INFO_NOUN, governed) and not figure_first:  # "אין בהם נתון", "ללא פירוט" (not "50,000 ₪ ללא פירוט")
             return True
         for j, x in enumerate(after[:2]):  # "אינו מופיע בשומה", "לא קיים מידע"
             rest = after[j + 1:j + 5]
-            if _is(_APPEARING, x) and any(_is(_DOC_NOUN, y) or _is(_INFO_NOUN, y) for y in rest):
+            if is_word(_APPEARING, x) and any(is_word(DOC_NOUN, y) or is_word(_INFO_NOUN, y) for y in rest):
                 return True
-            if _is(_GIVEN, x) and any(_is(_INFO_NOUN, y) for y in rest):
+            if is_word(_GIVEN, x) and any(is_word(_INFO_NOUN, y) for y in rest):
                 return True
     return False
-
-
-def _tokens(text: str) -> list[str]:
-    return _HEB_WORD.findall(base_normalize(text))
 
 
 # A clause: the text between two clause ends. A clause end is a full stop (not inside a number, a date or the abbreviation "מ.ע.מ."), a
@@ -264,7 +265,11 @@ def absence_spans(text: str) -> list[tuple[int, int]]:
 
 def absence_clause(clause: str) -> bool:
     """Whether one clause says a datum is not stated, found, computed or determined: the reader of absence, over its words."""
-    return _absence_words(_tokens(clause))
+    norm = base_normalize(clause)
+    figure = re.search(r"\d", norm)
+    words = list(_HEB_WORD.finditer(norm))
+    figure_from = next((k for k, m in enumerate(words) if figure and m.start() > figure.start()), None)
+    return _absence_words([m.group() for m in words], figure_from)
 
 
 def states_absence(text: str) -> bool:

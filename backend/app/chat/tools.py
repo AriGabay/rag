@@ -308,7 +308,9 @@ LEVELS = ("located", "retrieved", "read", "verified")
 NOT_REACHED = "not_reached"  # a document of the set the turn never touched
 READ_TO_END = "end"  # a read target read from its beginning to its end (``Workspace.read_progress``)
 # The state of a read target (round 22 U7, R18, R11; ``Workspace.read_state``): the only state that may produce absence wording is a
-# completed read - and only for the region it read, of a datum that read did not hold ("completed with no finding", decided by the consumer)
+# completed read - and only for the region it read, of a datum that read did not hold ("completed with no finding", decided by the consumer).
+# The one gate is ``coverage.reason_of`` through ``Workspace.failed_reads`` (a read that broke for a technical reason blocks the wording);
+# a partial read is told apart by ``document_read_in_part`` / ``region_not_read`` (``Workspace.activity``), not by this state
 READ_COMPLETED = "completed"  # read to its end, no unread region
 READ_PARTIAL = "partial"  # read in part: ``ReadState.unread`` says how (``clipped``: stopped before its end; ``unread``: a region the document's reading left unread)
 READ_FAILED = "failed"  # the read broke for a technical reason: the tool raised, or a vision reading failed
@@ -336,11 +338,6 @@ class ReadState(NamedTuple):
 
     state: str
     unread: str = ""
-
-    @property
-    def may_state_absence(self) -> bool:
-        """Only a completed read may say a datum is not in the region it read (R18); a failed, skipped, refused or partial one says what it was."""
-        return self.state == READ_COMPLETED
 
 
 class ToolError(Exception):
@@ -797,11 +794,12 @@ class Workspace:
     def failed_reads(self, documents: Iterable[str] | None = None) -> list[str]:
         """The call locators of the turn whose read broke for a technical reason and was not completed since, those that named one of
         ``documents`` (every one when None or empty): a document with such a read was not searched in the region that read opens, so no
-        line may say the datum is not in it (round 22 U7, R18)."""
+        line may say the datum is not in it (round 22 U7, R18). A failed read whose document could not be resolved (it named no handle or
+        source the workspace knows) counts for every document: it is not known which one it left unsearched (round 22 review #5)."""
         wanted = {str(d) for d in documents or ()}
         return [t for t in self.clock.reads
                 if (state := self.read_state(t)) is not None and state.state == READ_FAILED
-                and (not wanted or wanted & self.clock.read_docs.get(t, set()))]
+                and (not wanted or not (docs := self.clock.read_docs.get(t)) or wanted & docs)]
 
     def note_readings(self, conn: Connection, version_ids) -> None:
         """Pin the reading ids of versions the turn is reading, in the transaction that reads them."""
@@ -8853,7 +8851,8 @@ def _read_target(name: str, args: dict) -> str:
 
 def _documents_of(ws: Workspace, args) -> set[str]:
     """The documents a call names through the handles it gives (``D1``, ``§3``, ``T2``, ``K1``, ``R4`` of ``ws.handles``), anywhere in its
-    arguments (round 22 U7): what ``Workspace.failed_reads`` finds a read by. Handles only; a locator that names none gives no document."""
+    arguments (round 22 U7): what ``Workspace.failed_reads`` finds a read by. A handle names its document; so does a source id (``S3``, a
+    ``read(source=...)`` locator; a listing has no document, round 22 review #5). A locator that names none gives no document."""
     found: set[str] = set()
     if isinstance(args, dict):
         for v in args.values():
@@ -8863,6 +8862,8 @@ def _documents_of(ws: Workspace, args) -> set[str]:
             found |= _documents_of(ws, v)
     elif isinstance(args, str) and (h := ws.handles.get(args)) is not None and h.get("document_id"):
         found.add(str(h["document_id"]))
+    elif isinstance(args, str) and (src := ws.sources.get(args)) is not None and src.document_id is not None:
+        found.add(str(src.document_id))
     return found
 
 

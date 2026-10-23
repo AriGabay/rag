@@ -288,7 +288,10 @@ RETRYABLE = ("timeout", "rate_limited", "invalid", "error")  # judge failures wo
 # ``JUDGE_FIRST_CALL_MIN_SECONDS`` there is no room for two usable windows and the one call keeps all of it. A roomy deadline (the
 # first call ends at its purpose's timeout well before the reserve) is not changed.
 JUDGE_RETRY_RESERVE_SECONDS = 20
-JUDGE_FIRST_CALL_MIN_SECONDS = 15
+# Measured on 485 real judge ("verify") calls: p50 20s, p90 31s, p99 40s, max 44.5s for the calls that succeeded. A first call is cut (and its
+# retry slice reserved) only when it can still get the p99 of healthy calls; with less left the one call gets everything, as before round 22,
+# so a healthy 25-45s call is never timed out by a cut to left-20s (round 22 review U7).
+JUDGE_FIRST_CALL_MIN_SECONDS = 40
 # The judge contract's version (round 8 KTD7): part of every verdict key, bumped whenever the policy, the schema or what
 # a call renders changes what a verdict means, so a verdict of an older contract is never reused (cached readings are
 # versioned). 6 (round 10 U9, KTD14): the evidence header of a standard carries its kind, limits and wording, and the policy
@@ -961,6 +964,10 @@ class JudgeRequirement(_Strict):
     # ``items``: signatures, ``ids``: the passages and related ids behind ``passages``) and whether this round's call made it
     # (``origin`` ``fresh``) or an earlier round did (``carried``, with the version it was cast on). None: a hand-built vote
     _stamp: dict | None = PrivateAttr(default=None)
+    # never in the provider's schema (round 22 review #1): what each kept addition answer was asked about, ``{A#: (kind, datum, unit)}``, written when
+    # the vote is admitted (``_Coverage.accept``). A# is the position in ONE call's plan and is renumbered every verification, so an answer is read by
+    # what it was asked about, never by its A#. None: a hand-built vote, or one whose answers a later round did not carry
+    _asked: dict[str, tuple[str, str, int]] | None = PrivateAttr(default=None)
 
 
 class JudgeCoverageOutput(JudgeOutput):
@@ -1459,8 +1466,12 @@ class VerdictCache:
             elif not refs or any(i not in moved for i in refs):
                 refused.append((v, RESCORED))  # scored again by this verification's calls
             else:
+                # its addition answers are dropped (round 22 review #1): they were asked in the last round's plan (A# and unit indexes numbered
+                # there), and the units moved; this round's call asks its own
                 carried.append(v.model_copy(update={"units": [moved[i] for i in refs],
-                                                    "absent": [moved[i] for i in v.absent if i in moved]}))
+                                                    "absent": [moved[i] for i in v.absent if i in moved],
+                                                    "applies": []}))
+                carried[-1]._asked = None
         return {i: self.verdicts[keys[i]].model_copy(update={"index": i}) for i in candidates}, carried, refused
 
 
@@ -5336,14 +5347,18 @@ def _plan_additions(ws: Workspace, states: Sequence[dict], units: Sequence[Unit]
     return asks
 
 
-def _addition_answers(votes: Iterable[JudgeRequirement]) -> dict[str, str]:
-    """The judge's answers to the addition questions over every call, by A#: the most careful one of them (not_applies, then unknown, then applies)."""
+def _addition_answers(votes: Iterable[JudgeRequirement]) -> dict[tuple[str, str, int], str]:
+    """The judge's answers to the addition questions over every call, by what each was asked about, ``(kind, datum, unit)``: the most careful one
+    of them (not_applies, then unknown, then applies). An answer belongs to the call that asked it: its A# is that call's position in its plan and
+    names a different addition in the next round, so a vote that does not know what its answers were asked about (``_asked``) gives none
+    (round 22 review #1)."""
     rank = {NOT_APPLIES: 0, "unknown": 1, APPLIES: 2}
-    out: dict[str, str] = {}
+    out: dict[tuple[str, str, int], str] = {}
     for v in votes:
         for a in v.applies:
-            if a.addition not in out or rank[a.outcome] < rank[out[a.addition]]:
-                out[a.addition] = a.outcome
+            what = (v._asked or {}).get(a.addition)
+            if what is not None and (what not in out or rank[a.outcome] < rank[out[what]]):
+                out[what] = a.outcome
     return out
 
 
@@ -5369,7 +5384,6 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
     removed = report.removed_units()
     states = report.item_states()
     answers = _addition_answers(votes)  # the judge's answers to the questions of the additions structure could not decide (round 22 U8)
-    asked = {(a.kind, a.datum, a.unit): a.id for a in report.additions}
     context = _addition_context([report._as_edited(u) for u in report.units]) if report.item_ledger is not None else ({}, {})
     by_id: dict[str, dict] = {}
     for x in states:
@@ -5439,7 +5453,7 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
                 # for what structure leaves open by the judge's stored answer. One that does not apply, or was not decided, is not written inline and
                 # no repair is asked for it; the uncertainty line names it
                 row, _ = _row_of_addition(ws, st, unit, states, context)
-                fits = _addition_verdict(ws, st, row, answers.get(asked.get(("condition", st["id"], unit.index), "")))
+                fits = _addition_verdict(ws, st, row, answers.get(("condition", st["id"], unit.index)))
                 detail = phrase or verdict.quote or MSG_CONDITION_LIMIT.format(where=_read_in([(st["source"], source)]))
                 record = dataclasses.replace(fits, label=_item_label(st), value=st.get("value") or "", detail=detail, unit=unit.index)
                 if record.verdict != APPLIES:
@@ -5800,7 +5814,7 @@ def _qualifier_edits(u: Unit, ws: Workspace, question: str, blocking: list, vat:
     found: list[tuple[int, int, str, str]] = []
     if blocking:
         entries, _ = meaning.attached(text)
-        absent = meaning.absence_spans(text)
+        absent = meaning.qualifier_absence_spans(text)
         for problem in blocking:
             spans = _silent_qualifier_spans(u, ws, text, entries, problem, absent)
             if spans is None:
@@ -8497,6 +8511,7 @@ class _Coverage:
                                      "conditions": self.valid_conditions(r, indexes, trace),
                                      "applies": self.valid_applies(r, indexes),
                                      "candidates": self.valid_candidates(r, texts, trace)})
+            v._asked = self.asked_of(v.applies)
             v._trace = trace.as_dict(missing, r.missing)
             v._stamp = {"call_units": sorted(indexes)}
             out.append(v)
@@ -8563,9 +8578,17 @@ class _Coverage:
                 out[c.item.strip()] = ConditionVerdict(item=c.item.strip(), outcome=c.outcome, quote=c.quote.strip())
         return list(out.values())
 
+    def asked_of(self, applies: Iterable[AppliesVerdict]) -> dict[str, tuple[str, str, int]]:
+        """What each kept addition answer was asked about, ``{A#: (kind, datum, unit)}`` of THIS call's plan (round 22 review #1): stored with the vote,
+        so the answer is read by that and never by its A#, which the next round's plan numbers again."""
+        asked = {a["id"]: a for a in self.additions}
+        return {a.addition: (asked[a.addition]["kind"], asked[a.addition]["datum"], asked[a.addition]["unit"])
+                for a in applies if a.addition in asked}
+
     def valid_applies(self, r: JudgeRequirement, indexes: set[int]) -> list[AppliesVerdict]:
         """The addition answers a vote keeps (round 22 U8, KTD7): only for an addition this call asked whose sentence the call showed, each addition
-        once. An answer for anything else is dropped, and the addition stays undecided: nothing is written inline for it."""
+        once. An answer for anything else is dropped, and the addition stays undecided: nothing is written inline for it. An answer belongs to the call
+        that asked it: a vote a later round reuses for other units keeps none (``VerdictCache.reuse``), and ``asked_of`` records what each was about."""
         asked = {a["id"]: a for a in self.additions}
         out: dict[str, AppliesVerdict] = {}
         for a in r.applies:

@@ -51,14 +51,14 @@ from app.answering.verify import (
 )
 from app.db import TenantContext
 from app.extraction.normalize_text import (
-    _DOC_NOUN,
-    _FINALS,
+    DOC_NOUN,
+    FINALS,
     STOPWORDS,
-    _forms,
-    _is,
     base_normalize,
     inflection_variants,
+    is_word,
     states_absence,
+    word_forms,
 )
 from app.providers.llm import (
     SYSTEM_POLICY,
@@ -486,10 +486,10 @@ def _content_words(text: str, exclude: set[str] = frozenset()) -> set[str]:
     none of ``exclude``), singular and plural alike, for telling whether two texts speak of the same thing."""
     out: set[str] = set()
     for w in _LATIN_OR_HEBREW_WORD.findall(base_normalize(text)):
-        if len(w) < 3 or w in STOPWORDS or _is(_DOC_NOUN, w):
+        if len(w) < 3 or w in STOPWORDS or is_word(DOC_NOUN, w):
             continue
-        forms = _forms(w)
-        forms |= {v.translate(_FINALS) for f in list(forms) for v in inflection_variants(f)}
+        forms = word_forms(w)
+        forms |= {v.translate(FINALS) for f in list(forms) for v in inflection_variants(f)}
         if not forms & exclude:
             out |= forms
     return out

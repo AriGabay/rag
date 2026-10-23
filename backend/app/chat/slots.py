@@ -36,7 +36,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
-from app.extraction.normalize_text import _FINALS
+from app.extraction.normalize_text import FINALS
 
 VERSION = 2
 MAX_LISTS = 3
@@ -323,26 +323,33 @@ def ordinal_numbers(message: str, length: int) -> set[int]:
 
 # --- which list a message names, and which item of it -------------------------------------------------------------------------
 
-# the prefix letters Hebrew puts before a word, in their order ("ובה", "שב", "מה"): at most one of each kind, so that "בשומה" is "שומה" and
-# never "ומה"
-_PREFIX = re.compile(r"^ו?ש?[בלמכ]?ה?")
+# the prefix letters Hebrew puts before a word, in their order ("ובה", "שב", "מה"): at most one of each kind
+_PREFIX = re.compile(r"ו?ש?[בלמכ]?ה?")
 # the words that introduce a number without naming what it counts ("מספר 3", "פריט 3"): the noun is the word before them
 _NUMBER_LABELS = {"מס", "מספר", "פריט", "אפשרות", "שורה"}
+# the function words of a follow-up ("ומה לגבי השני"): never the noun that names a list (round 22 review #2)
+_FUNCTION_WORDS = frozenset({"מה", "ומה", "זה", "אז", "עוד", "לגבי", "את"})
 
 
-def _forms(word: str) -> set[str]:
-    """A word's forms for matching a noun to a list ("התשלומים" and "תשלום" share one): final letters unified, the prefix letters removed,
-    and the plural or feminine ending removed; forms of fewer than three letters are none."""
-    w = re.sub(r"[^א-תa-z0-9]", "", (word or "").lower()).translate(_FINALS)
+def _forms(word: str, base: bool = False) -> set[str]:
+    """A word's forms for matching a noun to a list ("התשלומים" and "תשלום" share one): final letters unified, the prefix letters removed
+    (every cut the prefix grammar allows: "ושומה" is also "שומה"), and the plural or feminine ending removed; forms of fewer than three letters
+    are none. ``base``: the word is a base noun (a list's kind), which takes no prefix letters of its own: "שומה" is never "ומה"."""
+    w = re.sub(r"[^א-תa-z0-9]", "", (word or "").lower()).translate(FINALS)
     stems = {w}
-    cut = _PREFIX.match(w).end()
-    if cut and len(w) - cut >= 3:
-        stems.add(w[cut:])
+    if not base:
+        stems |= {w[k:] for k in range(1, len(w)) if _PREFIX.fullmatch(w[:k]) and len(w) - k >= 3}
     for stem in list(stems):
         for suffix in ("ימ", "ות", "ה", "ת"):
             if stem.endswith(suffix) and len(stem) - len(suffix) >= 3:
                 stems.add(stem[:-len(suffix)])
     return {x for x in stems if len(x) >= 3}
+
+
+def _message_forms(word: str) -> set[str]:
+    """The forms of a word of the user's message (``_forms``, with the prefix letters it may carry); none for a function word."""
+    w = re.sub(r"[^א-תa-z0-9]", "", (word or "").lower())
+    return set() if w in _FUNCTION_WORDS or (w[:1] == "ו" and w[1:] in _FUNCTION_WORDS) else _forms(w)
 
 
 def _total(entry: dict) -> int:
@@ -367,13 +374,13 @@ def _named(message: str, lists: list[dict], spans: list[tuple[int, int, int]]) -
         while before and before[-1][1].strip("'׳\"״.") in _NUMBER_LABELS:
             before.pop()
         if before:  # the word right before the ordinal is the noun it counts ("התשלום" of "התשלום השני")
-            strong |= _forms(before[-1][1])
+            strong |= _message_forms(before[-1][1])
     weak: set[str] = set()
     for _, word in tokens:
-        weak |= _forms(word)
+        weak |= _message_forms(word)
 
     def kind_forms(entry: dict) -> set[str]:
-        return _forms(entry.get("kind") or "")
+        return _forms(entry.get("kind") or "", base=True)
 
     def title_forms(entry: dict) -> set[str]:
         out: set[str] = set()

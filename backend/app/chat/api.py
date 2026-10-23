@@ -1502,7 +1502,9 @@ def _maybe_summarize(ctx: TenantContext, conversation_id: UUID, message_id: UUID
     Only what the user may see now goes in: an assistant message whose answer draws on a document that is no
     longer visible is left out (the user's own messages stay — they are the user's words). The summary records
     the documents behind the folded answers, the permission scope and data version, and the last message folded.
-    A summary that is no longer usable (or never recorded this) is rebuilt from scratch, without its old text."""
+    A summary that is no longer usable (or never recorded this) is rebuilt from scratch, without its old text. A summary that is still usable
+    but was written by an older builder is re-folded from the last ``SUMMARY_REBUILD_MAX`` messages (their conditions, now kept) ON TOP of its
+    old text: what the old rolling summary carried from earlier messages is not lost (round 22 review #3)."""
     from app.providers.llm import Purpose, for_purpose, prompt_text
 
     with tenant_tx(ctx) as conn:
@@ -1517,6 +1519,7 @@ def _maybe_summarize(ctx: TenantContext, conversation_id: UUID, message_id: UUID
         # a summary an older builder wrote is rebuilt even when it is still usable (its conditions were already cut from it)
         stale = bool(conv.summary) and usable and (conv.summary_meta or {}).get("builder_version") != SUMMARY_VERSION
         rebuild = bool(conv.summary) and (stale or not usable)
+        scratch = bool(conv.summary) and not usable  # only an unusable summary loses its text
         if upto <= 0:
             return
         if not rebuild and (upto <= conv.summary_message_count or upto - conv.summary_message_count < SUMMARY_EVERY):
@@ -1527,13 +1530,15 @@ def _maybe_summarize(ctx: TenantContext, conversation_id: UUID, message_id: UUID
                             {"c": conversation_id, "o": start, "n": upto - start}).all()
         visible = _visible_documents(conn, rows)
         rows = [r for r in rows if not (r.role == "assistant" and _hidden(r, visible))]
-        docs = set() if rebuild else set((conv.summary_meta or {}).get("document_ids") or [])
+        docs = set() if scratch else set((conv.summary_meta or {}).get("document_ids") or [])
         for r in rows:
             if r.role == "assistant":
                 docs |= _answer_documents(r.answer)
         dv = current_data_version(conn)
-    previous = "אין" if rebuild or not conv.summary else prompt_text(conv.summary)
-    body = ("סיכום קודם:\n" + previous + "\n\nהודעות נוספות:\n"
+    previous = "אין" if scratch or not conv.summary else prompt_text(conv.summary)
+    # a version-triggered re-fold shows messages the old summary may already hold: only what it lacks (the system notes) is to be added
+    more = "הודעות נוספות (חלקן כבר בסיכום הקודם; הוסף רק את מה שחסר בו, כולל הערות מערכת):" if stale else "הודעות נוספות:"
+    body = ("סיכום קודם:\n" + previous + "\n\n" + more + "\n"
             + "\n".join("\n".join([f"{'משתמש' if r.role == 'user' else 'עוזר'}: {prompt_text(_history_text(r)[:1500])}",
                                   *(f"  {n}" for n in _history_notes(r))]) for r in rows))
     summarizer = for_purpose(provider, Purpose.SUMMARY)
