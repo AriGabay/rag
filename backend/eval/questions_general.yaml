@@ -1,0 +1,967 @@
+# General question set (U12, KTD16): held-out topics and attributes that appear nowhere in backend/app.
+#
+# Written BEFORE any prompt tuning (plan U12 execution note). Do not edit an item's question or expected
+# outcome after seeing results; add a new item instead.
+#
+# Truth: every expected value, page and coverage list below is derived from the `general_facts` section of
+# tests/fixtures/ground_truth.yaml (documents H1..H8, H4v2 in tests/fixtures/general/, group G3 "ידע כללי",
+# visible to admin-a and dana, never to yossi or office B). Items marked `truth: records` (AE3, AE5) instead
+# take their numbers from eval/truth.py like eval/questions.yaml. `facts:` lists the general_facts ids an
+# expected value is computed from; tests/unit/test_fixtures_ground_truth.py recomputes every `result` from
+# them. D* ids are the original fixtures (ground_truth.yaml `documents`); their mentions of these topics are
+# listed in general_facts.existing_mentions. H4 is superseded by H4v2 and never counts as a current document.
+#
+# Item fields: id, category, held_out (the item's topic/attribute word, listed in `terms`; no test forbids
+# professional terms in backend/app), user (default admin-a@demo.test),
+# cloud (on | off, default on), turns (one or more; a multi-turn item is one conversation).
+#
+# How each expectation is scored (wording is never scored):
+#   task_type        exact match of the turn's validated plan task type
+#                    (locate | answer | compare | compute | compute_explain | clarify | abstain).
+#   tool             when given, the plan's main tool (search | extract_and_compute | compute_records | compare |
+#                    show_sources | explain_previous).
+#   relation         when given, the turn relation (new_question | follow_up | answer_to_clarification |
+#                    topic_change | meta_sources | ...); `cleared` / `kept` name state keys that must be cleared
+#                    or kept after the turn.
+#   outcome          answer       a content answer; every `sources.all_of` entry is cited (doc + physical page;
+#                                 page null = DOCX, any page) and every other cited source is in all_of or
+#                                 `sources.also_valid`. Each `values` entry is stated as a claim cited to its doc.
+#                    computation  a computed figure: `result.value` equals the answer's figure as a Decimal in the
+#                                 canonical unit (ROUND_HALF_UP to 0.01 for means), `result.n` equals the number
+#                                 of observations, each value in `values` is cited at its page, and the coverage
+#                                 reports `coverage.values_found` values; every doc in `not_stated_includes` is
+#                                 reported as not stating the datum (or not yet extracted), never as a value.
+#                                 Superseded versions (H4) never count. No price clarification may appear.
+#                    comparison   both `sides` are cited and labeled (by version for version_diff items); with
+#                                 `incomplete: true` the answer must say the comparison is incomplete and name the
+#                                 side without evidence instead of comparing.
+#                    abstain      no figure in the answer; `abstention_kind` matches (or one of
+#                                 `abstention_kind_any_of`): not_found | not_stated | not_extracted_or_verified |
+#                                 insufficient_permission_scope. `limited_mode: true` = labeled limited mode (cloud off).
+#                    clarification  the system asks about `clarify_key` and shows no figure.
+#   conflict         true: both conflicting statements are shown with their sources; neither is silently chosen.
+#   forbid           other_group | other_office: no cited source may come from documents outside the user's scope.
+#   no_price_clarification  true: no transaction-price / appraised-value clarification may be raised.
+#   settled          (computation turns) what a correct system reports under the settled extraction decisions
+#                    (KTD8 steps 4-5, KTD9, R15) when that differs from what the documents state: `result`,
+#                    `values` and `coverage` inside it replace the ones above for scoring, and
+#                    `coverage.awaiting_review` names the documents that must be reported as awaiting review
+#                    (never used, never "not stated"). `result.facts` / `coverage` outside it keep the document
+#                    truth, recomputed by tests/unit/test_fixtures_ground_truth.py. `basis` cites the decision.
+#
+# Scorer details (eval/general.py; every change since the first runs is listed with its requirement in
+# docs/evaluation/scorer-changes.md): numbers are whole tokens or Hebrew number words and must sit next to
+# the attribute's own words, not another attribute's; boolean / "none" values need the right polarity; a locate
+# answer (no claims) states a value in its cited snippet; `also_valid` pages count for the page of a value; with
+# an `audit` block in the answer, coverage is checked per document; a meta turn (show_sources) is scored on
+# re-showing the previous turn's sources. Since questions_holdout_v2.yaml exists, this file is the REGRESSION set.
+
+items:
+  # --- explicit text facts -------------------------------------------------------------------------------
+  - id: GQ01
+    category: explicit_text_fact
+    held_out: true
+    terms: [ממ״ד]
+    turns:
+      - ask: "מה שטח הממ״ד בדירה ברחוב האירוסים 12 ברמת גן?"
+        expect:
+          task_type: answer
+          outcome: answer
+          no_price_clarification: true
+          sources: {all_of: [{doc: H1, page: 1}]}
+          values: [{fact: H1-F01, value: "12", unit: m2}]
+  - id: GQ02
+    category: explicit_text_fact
+    held_out: true
+    terms: [חניה]
+    turns:
+      - ask: "כמה מקומות חניה צמודים לדירה בשינקין 18 בגבעתיים?"
+        expect:
+          task_type: answer
+          outcome: answer
+          note: the current version is H4v2; H4 states the same value
+          sources: {all_of: [{doc: H4v2, page: 1}], also_valid: [{doc: H4, page: 1}]}
+          values: [{fact: H4v2-F07, value: 1, unit: count}]
+  - id: GQ03
+    category: explicit_text_fact
+    held_out: true
+    terms: [גובה התקרה]
+    turns:
+      - ask: "מה גובה התקרה בדירה ברחוב בן יהודה 140 בתל אביב?"
+        expect:
+          task_type: answer
+          outcome: answer
+          note: only the 2022 appraisal (H6) states it; the 2023 appraisal (H7) of the same unit does not
+          sources: {all_of: [{doc: H6, page: 1}], also_valid: [{doc: H7, page: null}]}
+          values: [{fact: H6-F04, value: "3.05", unit: m}]
+  - id: GQ04
+    category: explicit_text_fact
+    held_out: true
+    terms: [שופץ]
+    turns:
+      - ask: "באיזו שנה שופץ המטבח בדירה ברחוב המעגל 7?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: H2, page: 1}]}
+          values: [{fact: H2-F09, value: "2022: kitchen"}]
+  - id: GQ05
+    category: explicit_text_fact
+    held_out: true
+    terms: [ייעוד]
+    turns:
+      - ask: "מה ייעוד המגרש בשומה של רחוב המאבק 25 בגבעתיים?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: H5, page: 2}]}
+          values: [{fact: H5-F12, value: "מגורים א׳"}]
+  - id: GQ06
+    category: explicit_text_fact
+    held_out: true
+    terms: [חצר]
+    turns:
+      - ask: "האם לדירה בהירדן 30 צמודה חצר, ומה שטחה?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: H8, page: 1}]}
+          values: [{fact: H8-F04, value: "85", unit: m2}]
+  - id: GQ07
+    category: explicit_text_fact
+    held_out: true
+    terms: [ממד]
+    note: spelling without gershayim; the document writes ממ"ד with ASCII quotes
+    turns:
+      - ask: "מה שטח הממד בדירה בשינקין 18?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: H4v2, page: 1}], also_valid: [{doc: H4, page: 1}]}
+          values: [{fact: H4v2-F04, value: "11", unit: m2}]
+
+  # --- table data ----------------------------------------------------------------------------------------
+  - id: GQ08
+    category: table_datum
+    held_out: true
+    terms: [מרחב מוגן]
+    turns:
+      - ask: "מה שטח המרחב המוגן לפי טבלת נתוני היחידה בשומה של המעגל 7?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: H2, page: 1}]}
+          values: [{fact: H2-F01, value: "9.5", unit: m2}]
+  - id: GQ09
+    category: table_datum
+    held_out: true
+    terms: [מעליות]
+    turns:
+      - ask: "כמה מעליות יש בבניין ברחוב האירוסים 12?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: H1, page: 2}]}
+          values: [{fact: H1-F10, value: 2, unit: count}]
+  - id: GQ10
+    category: table_datum
+    held_out: true
+    terms: [שנת בנייה]
+    turns:
+      - ask: "מה שנת הבנייה של הבניין ברחוב המאבק 25 לפי טבלת מאפייני הנכס?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: H5, page: 2}]}
+          values: [{fact: H5-F09, value: 1968, unit: year}]
+  - id: GQ11
+    category: table_datum
+    held_out: true
+    terms: [מחסן]
+    turns:
+      - ask: "האם לדירה ברחוב המאבק 25 יש מחסן?"
+        expect:
+          task_type: answer
+          outcome: answer
+          note: the table states "אין" (no storage); a stated absence is an answer, not an abstention
+          sources: {all_of: [{doc: H5, page: 2}]}
+          values: [{fact: H5-F11, value: false}]
+
+  # --- locate --------------------------------------------------------------------------------------------
+  - id: GQ12
+    category: locate
+    held_out: true
+    terms: [היתר בנייה]
+    turns:
+      - ask: "אילו שומות מזכירות היתר בנייה?"
+        expect:
+          task_type: locate
+          outcome: answer
+          note: D1/D1v2 say "בין היתר" (among other things) - not a permit, must not be cited
+          sources: {all_of: [{doc: H2, page: 1}, {doc: H5, page: 1}, {doc: H8, page: 1}]}
+          values: [{fact: H2-F06}, {fact: H5-F05}, {fact: H8-F05}]
+  - id: GQ13
+    category: locate
+    held_out: true
+    terms: [ממ"ד]
+    note: ASCII-quote spelling in the question; H3 spells it out (מרחב מוגן דירתי) and D2 is a scanned page
+    turns:
+      - ask: 'באילו מסמכים מוזכר ממ"ד?'
+        expect:
+          task_type: locate
+          outcome: answer
+          sources:
+            all_of: [{doc: H1, page: 1}, {doc: H2, page: 1}, {doc: H4v2, page: 1}, {doc: H5, page: 1}]
+            also_valid: [{doc: H3, page: 1}, {doc: H4, page: 1}, {doc: D2, page: 1}]
+  - id: GQ14
+    category: locate
+    held_out: true
+    terms: [מעלית]
+    turns:
+      - ask: "איפה כתוב שהבניין ברחוב הירדן 30 אינו כולל מעלית?"
+        expect:
+          task_type: locate
+          outcome: answer
+          sources: {all_of: [{doc: H8, page: 1}]}
+          values: [{fact: H8-F03, value: false}]
+  - id: GQ15
+    category: locate
+    held_out: true
+    terms: [ממ״ד]
+    turns:
+      - ask: "באיזו שומה יש טבלה עם עמודה של שטח ממ״ד?"
+        expect:
+          task_type: locate
+          outcome: answer
+          sources: {all_of: [{doc: H2, page: 1}]}
+  - id: GQ16
+    category: locate
+    held_out: true
+    terms: [מקלט]
+    turns:
+      - ask: "באילו שומות מוזכר מקלט משותף?"
+        expect:
+          task_type: locate
+          outcome: answer
+          sources: {all_of: [{doc: H5, page: 1}]}
+
+  # --- explanation ---------------------------------------------------------------------------------------
+  - id: GQ17
+    category: explanation
+    held_out: true
+    terms: [מרפסת]
+    turns:
+      - ask: "למה השמאית הפחיתה מהשווי בגלל סגירת המרפסת בדירה ברחוב המאבק 25?"
+        expect:
+          task_type: answer
+          outcome: answer
+          note: the risk of demolition or regularization of an enclosure built without a permit
+          sources: {all_of: [{doc: H5, page: 2}], also_valid: [{doc: H5, page: 1}]}
+  - id: GQ18
+    category: explanation
+    held_out: true
+    terms: [יתרת זכויות]
+    turns:
+      - ask: "מדוע בשומה של המעגל 7 ייחסו ליתרת זכויות הבנייה תרומה מוגבלת לשווי?"
+        expect:
+          task_type: answer
+          outcome: answer
+          note: the remaining rights belong to all owners in the building
+          sources: {all_of: [{doc: H2, page: 1}]}
+          values: [{fact: H2-F11, value: "60 m2 main area"}]
+
+  # --- comparison ----------------------------------------------------------------------------------------
+  - id: GQ19
+    category: comparison
+    held_out: true
+    terms: [מרפסות]
+    turns:
+      - ask: "השווה את מספר המרפסות ושטחן בין הדירה באירוסים 12 לדירה בשינקין 18"
+        expect:
+          task_type: compare
+          tool: compare
+          outcome: comparison
+          sides:
+            - {doc: H1, page: 1, facts: [H1-F02, H1-F03]}
+            - {doc: H4v2, page: 1, facts: [H4v2-F05, H4v2-F06]}
+          sources: {all_of: [{doc: H1, page: 1}, {doc: H4v2, page: 1}], also_valid: [{doc: H4, page: 1}]}
+  - id: GQ20
+    category: comparison
+    held_out: true
+    terms: [גובה התקרה]
+    note: AE6 second half - only one side has evidence
+    turns:
+      - ask: "השווה את גובה התקרה בין שתי השומות של הדירה בבן יהודה 140"
+        expect:
+          task_type: compare
+          tool: compare
+          outcome: comparison
+          incomplete: true
+          missing_side: H7
+          sides:
+            - {doc: H6, page: 1, facts: [H6-F04]}
+            - {doc: H7, page: null, facts: []}
+          sources: {all_of: [{doc: H6, page: 1}], also_valid: [{doc: H7, page: null}]}
+  - id: GQ21
+    category: comparison
+    held_out: true
+    terms: [שיפוץ]
+    turns:
+      - ask: "מה ההבדל בין השיפוץ שבוצע בדירה בארלוזורוב 88 לבין השיפוץ בדירה ברחוב המעגל 7?"
+        expect:
+          task_type: compare
+          tool: compare
+          outcome: comparison
+          sides:
+            - {doc: H3, page: 1, facts: [H3-F09]}
+            - {doc: H2, page: 1, facts: [H2-F09]}
+          sources: {all_of: [{doc: H3, page: 1}, {doc: H2, page: 1}]}
+
+  # --- version diff --------------------------------------------------------------------------------------
+  - id: GQ22
+    category: version_diff
+    held_out: true
+    terms: [תכנית]
+    note: AE6 verbatim in turn 2, after turn 1 names the document
+    turns:
+      - ask: "מה נכתב בשומה של שינקין 18 בגבעתיים על התכנית לתוספת קומה?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: H4v2, page: 2}]}
+          values: [{fact: H4v2-F09, value: "approved (May 2023)"}, {fact: H4v2-F10, value: "1 additional floor"}]
+      - ask: "אילו הנחות השתנו בין הגרסאות?"
+        expect:
+          task_type: compare
+          tool: compare
+          relation: follow_up
+          outcome: comparison
+          labeled_by_version: true
+          sides:
+            - {doc: H4, page: 2, facts: [H4-F09, H4-F11]}
+            - {doc: H4v2, page: 2, facts: [H4v2-F09, H4v2-F11]}
+          changed: [planning_status, adjustment_rate]
+          sources: {all_of: [{doc: H4, page: 2}, {doc: H4v2, page: 2}]}
+  - id: GQ23
+    category: clarification
+    held_out: false
+    note: AE6 verbatim with no referent; two documents in scope have versions (D1/D1v2 and H4/H4v2)
+    turns:
+      - ask: "אילו הנחות השתנו בין הגרסאות?"
+        expect:
+          task_type: clarify
+          outcome: clarification
+          clarify_key: referent
+  - id: GQ24
+    category: version_diff
+    held_out: false
+    note: no held-out word ("התאמה" occurs in backend/app)
+    turns:
+      - ask: "האם שיעור ההתאמה בגין פוטנציאל התוספת השתנה בין גרסאות השומה של שינקין 18?"
+        expect:
+          task_type: compare
+          tool: compare
+          outcome: comparison
+          labeled_by_version: true
+          sides:
+            - {doc: H4, page: 2, facts: [H4-F11]}
+            - {doc: H4v2, page: 2, facts: [H4v2-F11]}
+          values: [{fact: H4-F11, value: "6", unit: percent}, {fact: H4v2-F11, value: "10", unit: percent}]
+          sources: {all_of: [{doc: H4, page: 2}, {doc: H4v2, page: 2}]}
+  - id: GQ25
+    category: version_diff
+    held_out: true
+    terms: [מצב תכנוני]
+    turns:
+      - ask: "מה השתנה במצב התכנוני בין הגרסה הראשונה לגרסה השנייה של השומה בשינקין 18?"
+        expect:
+          task_type: compare
+          tool: compare
+          outcome: comparison
+          labeled_by_version: true
+          sides:
+            - {doc: H4, page: 2, facts: [H4-F09]}
+            - {doc: H4v2, page: 2, facts: [H4v2-F09]}
+          sources: {all_of: [{doc: H4, page: 2}, {doc: H4v2, page: 2}]}
+
+  # --- conflicts -----------------------------------------------------------------------------------------
+  - id: GQ26
+    category: conflict
+    held_out: true
+    terms: [נבנה]
+    turns:
+      - ask: "באיזו שנה נבנה הבניין ברחוב בן יהודה 140 בתל אביב?"
+        expect:
+          task_type: answer
+          outcome: answer
+          conflict: true
+          sources: {all_of: [{doc: H6, page: 1}, {doc: H7, page: null}]}
+          values: [{fact: H6-F01, value: 1958, unit: year}, {fact: H7-F01, value: 1962, unit: year}]
+  - id: GQ27
+    category: conflict
+    held_out: true
+    terms: [שנת בנייה]
+    turns:
+      - ask: "האם יש סתירה בין השומות לגבי שנת הבנייה של הבניין בבן יהודה 140?"
+        expect:
+          task_type: compare
+          outcome: comparison
+          conflict: true
+          sides:
+            - {doc: H6, page: 1, facts: [H6-F01]}
+            - {doc: H7, page: null, facts: [H7-F01]}
+          sources: {all_of: [{doc: H6, page: 1}, {doc: H7, page: null}]}
+
+  # --- computations --------------------------------------------------------------------------------------
+  - id: GQ28
+    category: computation
+    held_out: true
+    terms: [ממ״ד]
+    note: AE1 verbatim. H3 states 300 x 350 cm (10.5 m2). D2 mentions a safe room without its area.
+    turns:
+      - ask: "מה גודל ממ״ד ממוצע ברמת גן?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          no_price_clarification: true
+          result: {scope: {city: רמת גן}, attribute: safe_room_area, metric: mean, value: "10.67", unit: m2, n: 3,
+                   facts: [H1-F01, H2-F01, H3-F04]}
+          values: [{fact: H1-F01, page: 1}, {fact: H2-F01, page: 1}, {fact: H3-F04, page: 1}]
+          coverage: {values_found: 3, not_stated_includes: [H8], mentioned_without_value: [D2]}
+          settled:
+            basis: "KTD8 step 5 (a conversion with assumptions is needs_review), KTD9 and R15 (facts needing review are
+              excluded and counted): H3 gives only inner dimensions in cm (300 על 350 ס״מ), so its 10.5 m2 waits for
+              review - reported as awaiting review, never used and never 'not stated'"
+            result: {value: "10.75", n: 2, facts: [H1-F01, H2-F01]}
+            values: [{fact: H1-F01, page: 1}, {fact: H2-F01, page: 1}]
+            coverage: {values_found: 2, awaiting_review: [H3]}
+  - id: GQ29
+    category: computation
+    held_out: true
+    terms: [מרפסות]
+    turns:
+      - ask: "מה שטח המרפסות הממוצע בדירות שנישומו בגבעתיים?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          no_price_clarification: true
+          note: per document the total balcony area; H4 (superseded) never counts
+          result: {scope: {city: גבעתיים}, attribute: balcony_area, metric: mean, value: "12.50", unit: m2, n: 2, facts: [H4v2-F06, H5-F04]}
+          values: [{fact: H4v2-F06, page: 1}, {fact: H5-F04, page: 1}]
+          coverage: {values_found: 2}
+          settled:
+            basis: "KTD8 step 5 (several values for the subject in one version are needs_review) and step 4 (the value
+              is parsed from the quote; the server never adds values): H4v2 states two balcony areas (12 and 6 מ״ר) in
+              one sentence, so it waits for review - reported as awaiting review, never used and never 'not stated'"
+            result: {value: "7.00", n: 1, facts: [H5-F04]}
+            values: [{fact: H5-F04, page: 1}]
+            coverage: {values_found: 1, awaiting_review: [H4v2]}
+  - id: GQ30
+    category: computation
+    held_out: true
+    terms: [גובה התקרה]
+    turns:
+      - ask: "מה גובה התקרה הממוצע בכל השומות?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: all, attribute: ceiling_height, metric: mean, value: "2.80", unit: m, n: 4,
+                   facts: [H1-F06, H3-F07, H5-F08, H6-F04]}
+          values: [{fact: H1-F06, page: 1}, {fact: H3-F07, page: 1}, {fact: H5-F08, page: 2}, {fact: H6-F04, page: 1}]
+          coverage: {values_found: 4, not_stated_includes: [H2, H8, H4v2, H7]}
+  - id: GQ31
+    category: computation
+    held_out: true
+    terms: [חניה]
+    turns:
+      - ask: "כמה מקומות חניה צמודים יש בממוצע לדירות שנישומו בגבעתיים?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          no_price_clarification: true
+          result: {scope: {city: גבעתיים}, attribute: parking_spaces, metric: mean, value: "0.50", unit: count, n: 2, facts: [H4v2-F07, H5-F10]}
+          values: [{fact: H4v2-F07, page: 1}, {fact: H5-F10, page: 2}]
+          coverage: {values_found: 2}
+  - id: GQ32
+    category: computation
+    held_out: true
+    terms: [מחסן]
+    turns:
+      - ask: "מה שטח המחסן הממוצע בשומות?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          note: H2 and H5 state there is no storage; D4 and D9 mention a storage room without its area
+          result: {scope: all, attribute: storage_area, metric: mean, value: "5.33", unit: m2, n: 3, facts: [H1-F05, H4v2-F08, H6-F08]}
+          values: [{fact: H1-F05, page: 1}, {fact: H4v2-F08, page: 1}, {fact: H6-F08, page: 1}]
+          coverage: {values_found: 3, not_stated_includes: [H3, H8, H7], stated_absent: [H2, H5],
+                     mentioned_without_value: [D4, D9]}
+  - id: GQ33
+    category: computation
+    held_out: true
+    terms: [נבנה]
+    turns:
+      - ask: "מהו הבניין הוותיק ביותר מבין השומות, ומתי נבנה?"
+        expect:
+          task_type: compute
+          outcome: computation
+          conflict: true
+          note: בן יהודה 140 either way (1958 in H6, 1962 in H7); next is H5 (1968). D10 is an old preserved
+            building with no stated year (coverage), D3 says only "the eighties"
+          result: {scope: all, attribute: year_built, metric: min, value: "1958", unit: year, n: 8,
+                   facts: [H1-F08, H2-F07, H3-F01, H8-F01, H4v2-F01, H5-F09, H6-F01, H7-F01]}
+          values: [{fact: H6-F01, page: 1}, {fact: H7-F01, page: null}]
+          coverage: {values_found: 8}
+  - id: GQ34
+    category: computation
+    held_out: true
+    terms: [נבנה]
+    turns:
+      - ask: "בכמה מהשומות ברמת גן הבניין נבנה אחרי 2010?"
+        expect:
+          task_type: compute
+          outcome: computation
+          note: H2's year is the occupancy year (2015). D9 says only "a relatively new building" (unknown)
+          result: {scope: {city: רמת גן}, attribute: year_built, metric: count, value: "2", unit: count, n: 4, where: "> 2010",
+                   facts: [H1-F08, H2-F07, H3-F01, H8-F01]}
+          values: [{fact: H1-F08, page: 2}, {fact: H2-F07, page: 1}]
+          coverage: {values_found: 4}
+          settled:
+            basis: "KTD8 step 5 and R15 (an uncertain value goes to review): H2 states only the year of occupancy
+              (ואוכלס בשנת 2015); reading it as the build year is an assumption, so it waits for review - reported as
+              awaiting review, never used and never 'not stated'"
+            result: {value: "1", n: 3, facts: [H1-F08, H3-F01, H8-F01]}
+            values: [{fact: H1-F08, page: 2}]
+            coverage: {values_found: 3, awaiting_review: [H2]}
+  - id: GQ35
+    category: computation
+    held_out: true
+    terms: [ממ״דים]
+    turns:
+      - ask: "באילו דירות ברמת גן יש ממ״דים קטנים מ-11 מ״ר?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          no_price_clarification: true
+          result: {scope: {city: רמת גן}, attribute: safe_room_area, metric: count, value: "2", unit: count, n: 3, where: "< 11 m2",
+                   facts: [H1-F01, H2-F01, H3-F04]}
+          values: [{fact: H2-F01, page: 1}, {fact: H3-F04, page: 1}]
+          coverage: {values_found: 3, not_stated_includes: [H8]}
+          settled:
+            basis: "as GQ28 (KTD8 step 5, KTD9, R15): H3's area is an assumed conversion from inner dimensions in cm, so
+              it waits for review; 1 of the 2 observed values (H2 9.5 m2) is below 11 m2"
+            result: {value: "1", n: 2, facts: [H1-F01, H2-F01]}
+            values: [{fact: H2-F01, page: 1}]
+            coverage: {values_found: 2, awaiting_review: [H3]}
+  - id: GQ36
+    category: computation
+    held_out: true
+    terms: [מרפסות]
+    turns:
+      - ask: "כמה מרפסות יש בממוצע לדירה בשומות מגבעתיים?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: {city: גבעתיים}, attribute: balcony_count, metric: mean, value: "1.50", unit: count, n: 2, facts: [H4v2-F05, H5-F03]}
+          values: [{fact: H4v2-F05, page: 1}, {fact: H5-F03, page: 1}]
+          coverage: {values_found: 2}
+          settled:
+            basis: "KTD8 step 4 (code parses the value from the quote): H5 names its one balcony only by a singular noun
+              (מרפסת חזית בשטח 7 מ״ר) with no number or number word, so H5 does not state the count - reported as not
+              stated, never used"
+            result: {value: "2.00", n: 1, facts: [H4v2-F05]}
+            values: [{fact: H4v2-F05, page: 1}]
+            coverage: {values_found: 1, not_stated_includes: [H5]}
+
+  # --- attributes nobody extracted yet ------------------------------------------------------------------
+  - id: GQ37
+    category: unextracted_datum
+    held_out: true
+    terms: [ממ״ד]
+    cloud: "off"
+    note: AE2 verbatim - limited mode, passages only, no number and no price clarification
+    turns:
+      - ask: "מה גודל ממ״ד ממוצע ברמת גן?"
+        expect:
+          task_type: compute
+          outcome: abstain
+          limited_mode: true
+          abstention_kind: not_extracted_or_verified
+          no_price_clarification: true
+          sources: {all_of: [], also_valid: [{doc: H1, page: 1}, {doc: H2, page: 1}, {doc: H3, page: 1}, {doc: D2, page: 1}]}
+  - id: GQ38
+    category: unextracted_datum
+    held_out: true
+    terms: [חצר]
+    turns:
+      - ask: "מה שטח החצר הממוצע בדירות הגן שבתיק?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          note: one observation, so the value is listed
+          result: {scope: {property_type: garden_apartment}, attribute: yard_area, metric: mean, value: "85.00", unit: m2, n: 1, facts: [H8-F04]}
+          values: [{fact: H8-F04, page: 1}]
+          coverage: {values_found: 1}
+  - id: GQ39
+    category: unextracted_datum
+    held_out: true
+    terms: [זכויות בנייה]
+    turns:
+      - ask: "מה היקף יתרת זכויות הבנייה שטרם נוצלו בכל אחת מהשומות?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          note: mixed units (m2 and floors) - values are listed, never summed; H1 states none; D6 mentions unused
+            rights without a quantity
+          result: {scope: all, attribute: unused_rights, metric: values, n: 5, facts: [H1-F12, H2-F11, H4v2-F10, H6-F09, H8-F06]}
+          values: [{fact: H2-F11, page: 1}, {fact: H4v2-F10, page: 2}, {fact: H6-F09, page: 1}, {fact: H8-F06, page: 1},
+                   {fact: H1-F12, page: 2}]
+          coverage: {values_found: 5, not_stated_includes: [H3, H5, H7], mentioned_without_value: [D6]}
+  - id: GQ40
+    category: unextracted_datum
+    held_out: true
+    terms: [שיפוץ]
+    turns:
+      - ask: "בכמה מהשומות מצוין שיפוץ שבוצע בדירה משנת 2020 ואילך?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          note: H5 (2018) is earlier, H1 states no changes; D12 says "renovated" without a year (unknown)
+          result: {scope: all, attribute: renovation, metric: count, value: "3", unit: count, n: 5, where: "year >= 2020",
+                   facts: [H1-F07, H2-F09, H3-F09, H5-F06, H7-F03]}
+          values: [{fact: H2-F09, page: 1}, {fact: H3-F09, page: 1}, {fact: H7-F03, page: null}]
+          coverage: {values_found: 5, not_stated_includes: [H8, H6, H4v2], mentioned_without_value: [D12]}
+
+  # --- missing information -------------------------------------------------------------------------------
+  - id: GQ41
+    category: missing_info
+    held_out: true
+    terms: [גובה התקרה]
+    turns:
+      - ask: "מה גובה התקרה בדירה ברחוב המעגל 7?"
+        expect:
+          task_type: answer
+          outcome: abstain
+          abstention_kind: not_stated
+          sources: {all_of: [], also_valid: [{doc: H2, page: 1}]}
+  - id: GQ42
+    category: missing_info
+    held_out: true
+    terms: [ממ״ד]
+    turns:
+      - ask: "מה שטח הממ״ד בדירה ברחוב הירדן 30?"
+        expect:
+          task_type: answer
+          outcome: abstain
+          abstention_kind: not_stated
+          sources: {all_of: [], also_valid: [{doc: H8, page: 1}]}
+  - id: GQ43
+    category: missing_info
+    held_out: true
+    terms: [בריכה]
+    turns:
+      - ask: "מה נכתב על בריכה בבניין ברחוב שינקין 18?"
+        expect:
+          task_type: answer
+          outcome: abstain
+          abstention_kind_any_of: [not_stated, not_found]
+  - id: GQ44
+    category: missing_info
+    held_out: true
+    terms: [שיפוץ]
+    turns:
+      - ask: "באיזו שנה בוצע שיפוץ בדירה בשינקין 18?"
+        expect:
+          task_type: answer
+          outcome: abstain
+          abstention_kind: not_stated
+  - id: GQ45
+    category: missing_info
+    held_out: true
+    terms: [ממ״ד]
+    user: yossi@demo.test
+    note: isolation - yossi sees only G2 (D4); no held-out source may appear
+    turns:
+      - ask: "מה גודל ממ״ד ממוצע ברמת גן?"
+        expect:
+          outcome: abstain
+          abstention_kind_any_of: [not_found, not_stated, insufficient_permission_scope]
+          forbid: other_group
+          no_price_clarification: true
+  - id: GQ46
+    category: missing_info
+    held_out: true
+    terms: [היתר בנייה]
+    user: admin-b@demo.test
+    note: isolation - office B holds no held-out document
+    turns:
+      - ask: "אילו שומות מזכירות היתר בנייה?"
+        expect:
+          outcome: abstain
+          abstention_kind_any_of: [not_found, insufficient_permission_scope]
+          forbid: other_office
+
+  # --- follow-ups ----------------------------------------------------------------------------------------
+  - id: GQ47
+    category: follow_up
+    held_out: false
+    truth: records
+    note: AE3 verbatim in turn 2; the year changes to 2022 and nothing else; office A has no 2022 Harozim
+      transactions (eval/truth.py), so the computation abstains. Resubmitting turn 2 (same turn id) still gives 2022.
+    turns:
+      - ask: "מה מחיר העסקאות למ״ר בחרוזים שנחתמו ב-2023?"
+        clarify: {area_type: net, property_type: apartment, vat_basis: included}
+        expect:
+          task_type: compute
+          tool: compute_records
+          outcome: computation
+          filters: {data_kind: transaction_price, date_field: transaction_date, year_from: 2023, city: רמת גן, neighborhood: חרוזים, area_type: net}
+      - ask: "ומה לגבי השנה הקודמת?"
+        resubmit_same_turn: true
+        expect:
+          relation: follow_up
+          task_type: compute
+          outcome: abstain
+          abstention_kind: not_found
+          kept: [city, neighborhood, data_kind, date_field, area_type]
+          filters: {data_kind: transaction_price, date_field: transaction_date, year_from: 2022, city: רמת גן, neighborhood: חרוזים, area_type: net}
+  - id: GQ48
+    category: follow_up
+    held_out: true
+    terms: [גובה התקרה]
+    turns:
+      - ask: "מה גובה התקרה הממוצע ברמת גן?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: {city: רמת גן}, attribute: ceiling_height, metric: mean, value: "2.68", unit: m, n: 2, facts: [H1-F06, H3-F07]}
+          values: [{fact: H1-F06, page: 1}, {fact: H3-F07, page: 1}]
+          coverage: {values_found: 2, not_stated_includes: [H2, H8]}
+      - ask: "ומה לגבי גבעתיים?"
+        expect:
+          relation: follow_up
+          task_type: compute
+          outcome: computation
+          kept: [attribute, metric]
+          result: {scope: {city: גבעתיים}, attribute: ceiling_height, metric: mean, value: "2.80", unit: m, n: 1, facts: [H5-F08]}
+          values: [{fact: H5-F08, page: 2}]
+          coverage: {values_found: 1, not_stated_includes: [H4v2]}
+      - ask: "ובתל אביב?"
+        expect:
+          relation: follow_up
+          task_type: compute
+          outcome: computation
+          kept: [attribute, metric]
+          result: {scope: {city: תל אביב-יפו}, attribute: ceiling_height, metric: mean, value: "3.05", unit: m, n: 1, facts: [H6-F04]}
+          values: [{fact: H6-F04, page: 1}]
+          coverage: {values_found: 1, not_stated_includes: [H7]}
+  - id: GQ49
+    category: follow_up
+    held_out: true
+    terms: [מרפסות, היתר בנייה]
+    note: AE4 verbatim in turn 2 - the Givatayim filter and the balcony attribute are cleared
+    turns:
+      - ask: "מה שטחי המרפסות בדירות שנישומו בגבעתיים?"
+        expect:
+          task_type: compute
+          outcome: computation
+          result: {scope: {city: גבעתיים}, attribute: balcony_area, metric: values, n: 2, facts: [H4v2-F06, H5-F04]}
+          values: [{fact: H4v2-F06, page: 1}, {fact: H5-F04, page: 1}]
+          coverage: {values_found: 2}
+          settled:
+            basis: "as GQ29 (KTD8 steps 4-5): H4v2's two balcony areas in one sentence wait for review"
+            result: {n: 1, facts: [H5-F04]}
+            values: [{fact: H5-F04, page: 1}]
+            coverage: {values_found: 1, awaiting_review: [H4v2]}
+      - ask: "עכשיו בנושא אחר: אילו שומות מזכירות היתר בנייה?"
+        expect:
+          relation: topic_change
+          task_type: locate
+          outcome: answer
+          cleared: [city, attribute]
+          sources: {all_of: [{doc: H2, page: 1}, {doc: H5, page: 1}, {doc: H8, page: 1}]}
+  - id: GQ50
+    category: follow_up
+    held_out: true
+    terms: [מעלית]
+    turns:
+      - ask: "באילו שומות כתוב שבבניין אין מעלית?"
+        expect:
+          task_type: locate
+          outcome: answer
+          note: D1v2 (current version of D1) says "היעדר מעלית"
+          sources: {all_of: [{doc: H6, page: 1}, {doc: H8, page: 1}, {doc: D1v2, page: 1}], also_valid: [{doc: D1, page: 1}]}
+      - ask: "תראה לי את המקור"
+        expect:
+          relation: meta_sources
+          tool: show_sources
+          outcome: answer
+          sources: {all_of: [{doc: H6, page: 1}, {doc: H8, page: 1}, {doc: D1v2, page: 1}], also_valid: [{doc: D1, page: 1}]}
+
+  # --- clarifications ------------------------------------------------------------------------------------
+  - id: GQ51
+    category: clarification
+    held_out: false
+    truth: records
+    note: AE5 verbatim in turn 2 - the free-text answer resolves the pending data-kind clarification
+    turns:
+      - ask: "מה המחיר או השווי למ״ר בחרוזים ב-2024?"
+        expect:
+          task_type: clarify
+          outcome: clarification
+          clarify_key: data_kind
+      - ask: "התכוונתי לעסקאות"
+        expect:
+          relation: answer_to_clarification
+          resolved: {data_kind: transaction_price}
+          outcome: computation
+          note: further result-changing clarifications (date_field, area_type, property_type, vat_basis) may
+            follow; data_kind is never asked again
+          allow_further_clarification: [date_field, area_type, property_type, vat_basis]
+  - id: GQ52
+    category: clarification
+    held_out: true
+    terms: [מחסן]
+    note: AE5 second branch - an unrelated new question while the clarification is pending
+    turns:
+      - ask: "מה המחיר או השווי למ״ר בחרוזים ב-2024?"
+        expect:
+          task_type: clarify
+          outcome: clarification
+          clarify_key: data_kind
+      - ask: "מה שטח המחסן בדירה ברחוב האירוסים 12?"
+        expect:
+          relation: new_question
+          task_type: answer
+          outcome: answer
+          pending_kept: true
+          sources: {all_of: [{doc: H1, page: 1}]}
+          values: [{fact: H1-F05, value: "5", unit: m2}]
+  - id: GQ53
+    category: clarification
+    held_out: false
+    note: the attribute is missing; a place alone does not make the question understood
+    turns:
+      - ask: "מה הגודל הממוצע ברמת גן?"
+        expect:
+          task_type: clarify
+          outcome: clarification
+          clarify_key: attribute
+          no_price_clarification: true
+  - id: GQ54
+    category: clarification
+    held_out: false
+    turns:
+      - ask: "השווה בין שתי השומות"
+        expect:
+          task_type: clarify
+          outcome: clarification
+          clarify_key: referent
+
+  # --- new topics ----------------------------------------------------------------------------------------
+  - id: GQ55
+    category: new_topic
+    held_out: true
+    terms: [ממ״ד, ייעוד]
+    turns:
+      - ask: "מה שטח הממ״ד בדירה ברחוב האירוסים 12?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: H1, page: 1}]}
+          values: [{fact: H1-F01, value: "12", unit: m2}]
+      - ask: "עכשיו משהו אחר לגמרי: מה ייעוד המגרש בשומה של ארלוזורוב 88?"
+        expect:
+          relation: topic_change
+          task_type: answer
+          outcome: answer
+          cleared: [attribute]
+          note: H3 page 1 is the report header that names the appraised property (address); citing it beside the
+            zoning sentence is valid (scorer-changes.md S6)
+          sources: {all_of: [{doc: H3, page: 2}], also_valid: [{doc: H3, page: 1}]}
+          values: [{fact: H3-F10, value: "מגורים ב׳"}]
+  - id: GQ56
+    category: new_topic
+    held_out: true
+    terms: [ייעודי]
+    user: dana@demo.test
+    note: dana sees G1 and G3; D3 (G1) mentions a change of designation of the NEIGHBORING plot, not a zoning value
+    turns:
+      - ask: "אילו ייעודי קרקע מופיעים בשומות של רמת גן?"
+        expect:
+          task_type: compute
+          outcome: computation
+          forbid: other_group
+          result: {scope: {city: רמת גן}, attribute: zoning, metric: values, n: 3, facts: [H1-F11, H2-F10, H3-F10]}
+          values: [{fact: H1-F11, page: 2}, {fact: H2-F10, page: 1}, {fact: H3-F10, page: 2}]
+          coverage: {values_found: 3, not_stated_includes: [H8]}
+  - id: GQ57
+    category: new_topic
+    held_out: true
+    terms: [היתר]
+    turns:
+      - ask: "באיזו שומה נסגרה מרפסת בלי היתר?"
+        expect:
+          task_type: locate
+          outcome: answer
+          sources: {all_of: [{doc: H5, page: 1}], also_valid: [{doc: H5, page: 2}]}
+          values: [{fact: H5-F05}]
+  - id: GQ58
+    category: explicit_text_fact
+    held_out: true
+    terms: [תכנית]
+    turns:
+      - ask: "מה מצב התכנית גב/600 לפי הגרסה העדכנית של השומה בשינקין 18?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: H4v2, page: 2}]}
+          values: [{fact: H4v2-F09, value: "approved (May 2023)"}]
+  - id: GQ59
+    category: explicit_text_fact
+    held_out: true
+    terms: [שופצה]
+    turns:
+      - ask: "האם הדירה ברחוב האירוסים 12 שופצה מאז האכלוס?"
+        expect:
+          task_type: answer
+          outcome: answer
+          note: the document states that no changes were made since occupancy - an answer, not an abstention
+          sources: {all_of: [{doc: H1, page: 1}]}
+          values: [{fact: H1-F07, value: "none"}]
+  - id: GQ60
+    category: computation
+    held_out: true
+    terms: [גובה תקרה]
+    turns:
+      - ask: "באילו שומות מופיע גובה תקרה של יותר מ-2.70 מטר?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: all, attribute: ceiling_height, metric: count, value: "3", unit: count, n: 4, where: "> 2.70 m",
+                   facts: [H1-F06, H3-F07, H5-F08, H6-F04]}
+          values: [{fact: H1-F06, page: 1}, {fact: H5-F08, page: 2}, {fact: H6-F04, page: 1}]
+          coverage: {values_found: 4, not_stated_includes: [H2, H8, H4v2, H7]}
+  - id: GQ61
+    category: explicit_text_fact
+    held_out: true
+    terms: [ייעוד]
+    turns:
+      - ask: "מה ייעוד המגרש שעליו בנוי הבניין ברחוב האירוסים 12?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: H1, page: 2}]}
+          values: [{fact: H1-F11, value: "מגורים ג׳"}]

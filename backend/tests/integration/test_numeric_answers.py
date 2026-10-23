@@ -1,12 +1,15 @@
 """Structured question path end to end over HTTP (U8, U11): clarification, SQL, template, cache."""
 
+from decimal import ROUND_HALF_UP, Decimal
+
 import pytest
 from sqlalchemy import text
 
+from app.answering.conditions import QueryConditions
 from app.db import tenant_tx
 from tests.conftest import login
 from tests.factories import make_group, make_office, make_user
-from tests.integration.test_dedup import HEADERS, add_version, publish  # noqa: F401
+from tests.integration.test_dedup import HEADER_TEXT, HEADERS, add_version, publish  # noqa: F401
 
 pytestmark = pytest.mark.db
 
@@ -207,3 +210,100 @@ def test_impossible_filter_range_is_a_clarification_not_an_error(client, office)
     r = client.post("/api/ask", json={"question": "מחיר למ״ר בעסקאות לפי תאריך עסקה בחרוזים",
                                       "filters": {"year_from": 2025, "year_to": 2023}})
     assert r.status_code == 200 and r.json()["answer"]["kind"] == "clarification"
+
+
+# --- U6: structured attributes through compute_records (KTD7) ---------------------------------------
+
+def records(office, column, operation, **conditions):
+    from app.appraisal.query import compute_records
+
+    c = QueryConditions(data_kind="transaction_price", **conditions)
+    with tenant_tx(office.ctx()) as conn:
+        return compute_records(conn, c, column, operation)
+
+
+def test_price_per_sqm_through_compute_records_equals_compute_stats(office):
+    from app.appraisal.query import compute_stats
+
+    cond = {"neighborhood": "חרוזים", "date_field": "transaction_date", "year_from": 2024}
+    with tenant_tx(office.ctx()) as conn:
+        stats = compute_stats(conn, QueryConditions(data_kind="transaction_price", **cond))
+    assert (stats.count, stats.mean, stats.weighted) == (2, Decimal("25000.00"), Decimal("26666.67"))
+    got = {op: records(office, "transactions.price_per_sqm", op, **cond)
+           for op in ("mean", "weighted_mean", "median", "min", "max", "count")}
+    assert got["mean"].value == stats.mean and got["weighted_mean"].value == stats.weighted
+    assert got["median"].value == stats.median
+    assert (got["min"].value, got["max"].value) == (stats.minimum, stats.maximum)
+    assert got["count"].value == stats.count == got["count"].count
+    assert sorted(got["mean"].transaction_ids) == sorted(stats.transaction_ids)
+    assert all(isinstance(r.value, Decimal) for op, r in got.items() if op != "count")
+
+
+AREA_ROWS = [  # (address, block/parcel, date, rooms, area, price)
+    ("הדקל 1", "6200/1", "10/01/2024", "3", "71.5", "1,500,000"),
+    ("הדקל 2", "6200/2", "11/02/2024", "4.5", "98.25", "2,400,000"),
+    ("הדקל 3", "6200/3", "12/03/2023", "5", "120", "3,100,000"),
+    ("הדקל 4", "6200/4", "13/04/2024", "2", "55", "1,200,000"),
+]
+UNVERIFIED = ("הדקל 9", "6200/9", "14/05/2024", "6", "300", "9,000,000")
+
+
+def _rows(items):
+    return [[addr, bp, d, "דירה", rooms, area, "נטו", price, ""] for addr, bp, d, rooms, area, price in items]
+
+
+@pytest.fixture
+def area_office(db):
+    a = make_office(db, "משרד א", "admin-a@example.test")
+    d1, v1 = add_version(a, a.default_group_id, _rows(AREA_ROWS[:3]), "4" * 64)
+    d2, v2 = add_version(a, a.default_group_id, _rows(AREA_ROWS[2:]), "5" * 64)  # הדקל 3 cited twice
+    other = HEADER_TEXT.replace("שכונת העסקאות: חרוזים", "שכונת העסקאות: הבורסה")
+    d3, v3 = add_version(a, a.default_group_id, _rows([("ז׳בוטינסקי 7", "6300/7", "10/01/2024", "3", "400", "9,000,000")]),
+                         "6" * 64, header=other)
+    d4, v4 = add_version(a, a.default_group_id, _rows([UNVERIFIED]), "7" * 64)
+    for d, v in ((d1, v1), (d2, v2), (d3, v3), (d4, v4)):
+        publish(a, d, v)
+    approve_all(a)
+    with tenant_tx(a.system) as conn:
+        conn.execute(text("UPDATE occurrences SET verification_status = 'needs_review' WHERE address = :a"),
+                     {"a": UNVERIFIED[0]})
+        assert conn.execute(text("SELECT count(DISTINCT neighborhood) FROM occurrences")).scalar_one() == 2
+    return a
+
+
+def test_mean_area_over_verified_unique_transactions_equals_ground_truth(area_office):
+    truth = [Decimal(area) for *_, area, _price in AREA_ROWS]  # each address once, unverified excluded
+    expected = (sum(truth) / len(truth)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    r = records(area_office, "transactions.area", "mean", neighborhood="חרוזים")
+    assert (r.count, r.value) == (len(truth), expected)
+    assert isinstance(r.value, Decimal) and len(set(r.transaction_ids)) == r.count
+
+
+def test_count_min_max_range_sum_values_on_structured_attributes(area_office):
+    areas = sorted(Decimal(row[4]) for row in AREA_ROWS)
+    rooms = sorted(Decimal(row[3]) for row in AREA_ROWS)
+    n = "חרוזים"
+    assert records(area_office, "transactions.area", "count", neighborhood=n).value == 4
+    assert records(area_office, "transactions.area", "min", neighborhood=n).value == areas[0]
+    assert records(area_office, "transactions.area", "max", neighborhood=n).value == areas[-1]
+    rng = records(area_office, "transactions.area", "range", neighborhood=n)
+    assert (rng.minimum, rng.maximum, rng.value) == (areas[0], areas[-1], areas[-1] - areas[0])
+    assert records(area_office, "transactions.area", "sum", neighborhood=n).value == sum(areas)
+    assert records(area_office, "transactions.area", "values", neighborhood=n).values == areas
+    # rooms: one value per unique transaction, read from occurrences
+    r = records(area_office, "occurrences.rooms", "values", neighborhood=n)
+    assert r.values == rooms and r.count == 4
+    assert records(area_office, "occurrences.rooms", "median", neighborhood=n).value == Decimal("3.75")
+    y2024 = records(area_office, "transactions.price", "max", neighborhood=n, date_field="transaction_date",
+                    year_from=2024)
+    assert (y2024.count, y2024.value) == (3, Decimal("2400000.00"))
+    everywhere = records(area_office, "transactions.area", "count")
+    assert everywhere.value == 5  # the other neighborhood joins without a neighborhood filter
+
+
+def test_non_whitelisted_column_from_a_plan_is_rejected(area_office):
+    from app.appraisal.query import UnsupportedColumn
+
+    for column in ("users.password_hash", "occurrences.address", "transactions.area) FROM users --"):
+        with pytest.raises(UnsupportedColumn):
+            records(area_office, column, "mean")

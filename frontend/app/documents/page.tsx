@@ -7,8 +7,31 @@ import { B, Dialog, ErrorAlert, Notice, StatusBadge } from "@/components/ui";
 import { UploadPanel, UploadResults } from "@/components/UploadPanel";
 import { api, errorMessage, fileUrl } from "@/lib/api";
 import { useApi, useInterval } from "@/lib/useApi";
-import { formatTimestamp, VERSION_STATUS_LABEL } from "@/lib/format";
-import type { DocumentDetail, DocumentSummary, SearchResult, UploadResult, Version } from "@/lib/types";
+import {
+  BLOCK_KIND_LABEL,
+  DEFAULT_KIND,
+  formatTimestamp,
+  ingestProgressText,
+  KEPT_PREVIOUS_TITLE,
+  keptPreviousText,
+  type KeptPrevious,
+  SOURCE_KIND_LABEL,
+  SOURCE_KINDS,
+  VERSION_STATUS_LABEL,
+} from "@/lib/format";
+import type {
+  DocumentDetail,
+  DocumentSummary,
+  PageCoverage,
+  ProfessionalField,
+  ProfessionalFieldName,
+  ProfessionalInfo,
+  RegionStatus,
+  SearchResult,
+  SourceKind,
+  UploadResult,
+  Version,
+} from "@/lib/types";
 
 const POLL_MS = 3000;
 
@@ -37,16 +60,493 @@ function incompletePages(v: Version): React.ReactNode {
   );
 }
 
-function StatusCell({ v }: { v: Version | null }) {
+const MEASURE_STATE: Record<string, string> = {
+  done: "חולצו",
+  partial: "חולצו חלקית",
+  failed: "החילוץ נכשל",
+  pending: "בתהליך",
+};
+
+const REGION_STATUS: Record<RegionStatus, string> = {
+  unread: "לא נקרא",
+  read_uncertain: "נקרא בקריאה לא ודאית",
+};
+
+/** One page's line in the reading details: its unread or uncertain regions with their reasons, a page that was not
+ * read, and text that was corrected. */
+function PageCoverageItem({ p }: { p: PageCoverage }) {
+  return (
+    <li>
+      <strong>{p.page != null ? <>עמוד <B>{p.page}</B></> : "במסמך (ללא עמודים)"}</strong>
+      {!p.ok && <span> · העמוד לא נקרא</span>}
+      {p.corrected > 0 && (
+        <span>
+          {" "}
+          · טקסט תוקן (<B>{p.corrected}</B>)
+        </span>
+      )}
+      {p.regions.length > 0 && (
+        <ul>
+          {p.regions.map((g, i) => (
+            <li key={g.block ?? `r${i}`}>
+              {BLOCK_KIND_LABEL[g.kind] ?? g.kind} – {REGION_STATUS[g.status] ?? g.status}
+              {g.section && (
+                <span className="muted">
+                  {" "}
+                  (סעיף <bdi>{g.section}</bdi>)
+                </span>
+              )}
+              : <bdi>{g.reason || "לא נרשמה סיבה"}</bdi>
+            </li>
+          ))}
+        </ul>
+      )}
+      {p.more ? (
+        <div className="muted">
+          ועוד <B>{p.more}</B> אזורים בעמוד זה
+        </div>
+      ) : null}
+    </li>
+  );
+}
+
+/** The reading per page, opened on demand with a button (keyboard-operable, its state announced). */
+function ReadingDetails({ coverage }: { coverage: PageCoverage[] }) {
+  const [open, setOpen] = useState(false);
+  const listId = useId();
+  if (coverage.length === 0) return null;
+  return (
+    <div>
+      <button
+        type="button"
+        className="btn-link"
+        aria-expanded={open}
+        aria-controls={listId}
+        onClick={() => setOpen((o) => !o)}
+      >
+        פירוט לפי עמוד
+      </button>
+      <ul id={listId} className="coverage-list" aria-label="פירוט הקריאה לפי עמוד" hidden={!open}>
+        {coverage.map((p) => (
+          <PageCoverageItem key={p.page ?? "document"} p={p} />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** Why the last reprocess of a version kept its current reading (KTD9): the document stays available, nothing waits
+ * for an admin. Read from the version's reading report when the server includes it. */
+function keptPrevious(v: Version): KeptPrevious | null {
+  const r = v.reading as (Version["reading"] & { kept_previous?: KeptPrevious | null }) | undefined;
+  return r?.kept_previous ?? null;
+}
+
+function KeptPreviousNote({ v }: { v: Version }) {
+  const kept = keptPrevious(v);
+  if (!kept) return null;
+  return (
+    <div className="small" role="note" style={{ color: "var(--warn)" }}>
+      <span aria-hidden="true">↺ </span>
+      {KEPT_PREVIOUS_TITLE}: <bdi>{keptPreviousText(kept)}</bdi>
+      {kept.at && (
+        <span className="muted">
+          {" "}
+          (<bdi>{formatTimestamp(kept.at)}</bdi>)
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** What was read: searchable passages and tables, pictures by status, measurements and structured records — each
+ * counted on its own, so zero structured records never reads as "nothing searchable". A partly read version lists,
+ * per page, what was not read and why. */
+function ReadingCell({ v }: { v: Version | null }) {
+  const r = v?.reading;
+  if (!v || !r || v.status === "pending" || v.status === "processing") return <span className="muted">—</span>;
+  const img = r.images;
+  const details = [
+    `${img.read ?? 0} נקראו`,
+    img.read_uncertain ? `${img.read_uncertain} בקריאה לא ודאית` : null,
+    img.unread ? `${img.unread} לא נקראו` : null,
+    img.no_text ? `${img.no_text} ללא טקסט (תצלומים, תשריטים)` : null,
+  ].filter(Boolean);
+  const corrected = r.corrected_blocks ?? 0;
+  return (
+    <div className="small">
+      <div className="row" style={{ gap: 4 }}>
+        {r.partial ? (
+          <span className="badge badge-warn">נקרא חלקית</span>
+        ) : (
+          <span className="badge badge-ok">נקרא במלואו</span>
+        )}
+        {corrected > 0 && (
+          <span className="badge badge-info">
+            טקסט תוקן (<B>{corrected}</B>)
+          </span>
+        )}
+      </div>
+      <div>
+        <B>{r.passages}</B> קטעים · <B>{r.tables}</B> טבלאות
+      </div>
+      {r.images_total > 0 && (
+        <div className="muted">
+          תמונות ({r.images_total}): {details.join(", ")}
+        </div>
+      )}
+      {(r.uncertain_blocks ?? 0) > 0 && (
+        <div className="muted">
+          <B>{r.uncertain_blocks}</B> קטעי טקסט בקריאה לא ודאית (מיפוי גופן פגום)
+        </div>
+      )}
+      {(r.repeated_images ?? 0) > 0 && (
+        <div className="muted">
+          <B>{r.repeated_images}</B> תמונות חוזרות (לוגו, חותמת) נקראו פעם אחת
+        </div>
+      )}
+      <ReadingDetails coverage={r.coverage ?? []} />
+    </div>
+  );
+}
+
+function DataCell({ v }: { v: Version | null }) {
+  const r = v?.reading;
+  if (!v || !r) return <span className="muted">—</span>;
+  return (
+    <div className="small">
+      <div>
+        נתונים כמותיים: <B>{r.measurements}</B>
+        {r.measurements_state && r.measurements_state !== "done" && (
+          <span className="muted"> ({MEASURE_STATE[r.measurements_state] ?? r.measurements_state})</span>
+        )}
+        {!r.measurements_state && <span className="muted"> (טרם חולצו)</span>}
+      </div>
+      <div className="muted">
+        רשומות עסקאות: <B>{v.records_total ?? 0}</B>
+        {v.records_needing_review ? ` (${v.records_needing_review} לבדיקה)` : ""}
+      </div>
+    </div>
+  );
+}
+
+/** The status of a version (R2, R3): while it is read, how far it has got (the stage alone before the pages in the file
+ * are known, "pages read N of M" while pages are read, the stage's name during the steps over the whole document); when
+ * it failed, the reason, with a retry control only for an admin and only when reading the file again can cure it (the
+ * time limit, an old page limit); a pending state while the retry is queued. */
+function StatusCell({ v, docId, onChanged }: { v: Version | null; docId: string; onChanged: () => void }) {
+  const me = useSession();
+  const [busy, setBusy] = useState(false);
+  const [queued, setQueued] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const status = v?.status;
+  // queued only until the version's status changes: a retry that fails again is retriable again
+  const [seen, setSeen] = useState(status);
+  if (seen !== status) {
+    setSeen(status);
+    setQueued(false);
+  }
   if (!v) return <span className="muted">—</span>;
+  const isAdmin = me?.user.role === "admin";
+  const progress = isActive(v) ? ingestProgressText(v.progress) : null;
+
+  async function retry() {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api.retryProcessing(docId);
+      setQueued(res.queued > 0);
+      onChanged();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div>
       <StatusBadge status={v.status} />
+      {progress && (
+        <div className="small muted" aria-live="polite">
+          {progress}
+        </div>
+      )}
       {v.status_reason && (v.status === "failed" || v.status === "needs_review") && (
         <div className="small" style={{ color: v.status === "failed" ? "var(--danger)" : "var(--warn)" }}>
           {v.status_reason}
         </div>
       )}
+      {v.status === "failed" && v.retriable && isAdmin && (
+        <button type="button" className="btn" disabled={busy || queued} onClick={() => void retry()}>
+          {queued ? "העיבוד המחודש ממתין בתור" : "עיבוד מחדש"}
+        </button>
+      )}
+      {error && (
+        <div className="small" role="alert" style={{ color: "var(--danger)" }}>
+          {error}
+        </div>
+      )}
+      <KeptPreviousNote v={v} />
+    </div>
+  );
+}
+
+/** A document without a kind (a response from before round 10) is an appraisal. */
+function kindOf(d: Pick<DocumentSummary, "source_kind">): SourceKind {
+  return d.source_kind ?? DEFAULT_KIND;
+}
+
+function KindBadge({ kind }: { kind: SourceKind }) {
+  return (
+    <span className={`badge ${kind === "appraisal" ? "" : "badge-info"}`} data-testid="kind-badge" data-kind={kind}>
+      {SOURCE_KIND_LABEL[kind]}
+    </span>
+  );
+}
+
+const MSG_PENDING = "הנתונים בחילוץ";
+const MSG_FAILED = "חילוץ הנתונים נכשל";
+const UNKNOWN = "לא ידוע";
+
+const FIELD_LABEL: Record<ProfessionalFieldName, string> = {
+  number: "מספר",
+  title: "שם",
+  edition: "נוסח",
+  published: "תאריך פרסום",
+  effective: "תאריך תחילה",
+  issuer: "גוף מפרסם",
+  scope: "תחולה",
+  amends: "מתייחס ל",
+};
+
+// the rows every listing shows, then the rest of the document's screen
+const CORE_FIELDS: ProfessionalFieldName[] = ["number", "edition", "published", "effective"];
+const MORE_FIELDS: ProfessionalFieldName[] = ["title", "issuer", "scope"];
+
+const RELATION_LABEL: Record<string, string> = {
+  clarifies: "הבהרה",
+  amends: "תיקון",
+  replaces: "מחליף",
+  appendix_of: "נספח",
+};
+
+/** Where a stated value is stated: a button (focusable, Enter or Space, tap) that opens its page and quote, never a
+ * hover-only tooltip. */
+function SourceDisclosure({ label, field }: { label: string; field: ProfessionalField }) {
+  const [open, setOpen] = useState(false);
+  const panelId = useId();
+  if (!field.quote && field.page == null) return null;
+  return (
+    <>
+      <button
+        type="button"
+        className="btn-link small"
+        aria-expanded={open}
+        aria-controls={panelId}
+        aria-label={`מקור ${label}`}
+        onClick={() => setOpen((o) => !o)}
+      >
+        מקור
+      </button>
+      <div id={panelId} className="source-quote small" hidden={!open}>
+        <div>{field.page != null ? <>עמוד <B>{field.page}</B></> : "במסמך (ללא עמודים)"}</div>
+        {field.quote && <q>{field.quote}</q>}
+      </div>
+    </>
+  );
+}
+
+function fieldValue(name: ProfessionalFieldName, f: ProfessionalField): string {
+  if (name !== "amends") return f.value ?? "";
+  const rel = f.relation ? RELATION_LABEL[f.relation] : null;
+  const target = `תקן ${f.standard ?? f.value ?? ""}`.trim();
+  return rel ? `${target} (${rel})` : target;
+}
+
+/** What a standard or a professional document states about itself, with each value's source; the state of its
+ * extraction apart from the values (an unknown value is "לא ידוע" only after a finished extraction), its editions and
+ * its copies. `compact` is the listing's: the number, edition and dates. */
+function ProfessionalSummary({
+  info,
+  compact,
+  onOpen,
+}: {
+  info: ProfessionalInfo;
+  compact?: boolean;
+  onOpen?: (id: string) => void;
+}) {
+  const ready = info.state === "ready";
+  const names = [...CORE_FIELDS, ...(compact ? [] : MORE_FIELDS), "amends" as const];
+  // unknown fields are listed only once the extraction finished; the amended standard only when the document states it
+  const rows = info.profile
+    ? names.filter((n) => {
+        const f = info.profile?.[n];
+        return f?.status === "stated" || (ready && n !== "amends");
+      })
+    : [];
+  const open = (id: string, title: string) =>
+    onOpen ? (
+      <button type="button" className="btn-link" onClick={() => onOpen(id)}>
+        {title}
+      </button>
+    ) : (
+      <bdi>{title}</bdi>
+    );
+  const ed = info.editions;
+  const same = info.duplicates.same_text_as;
+  const copies = info.duplicates.copies;
+  return (
+    <div className="professional small stack" data-testid="professional">
+      {info.state === "pending" && (
+        <div className="muted" role="status" data-testid="professional-pending">
+          {MSG_PENDING}
+        </div>
+      )}
+      {info.state === "failed" && (
+        <div role="alert" style={{ color: "var(--danger)" }} data-testid="professional-failed">
+          {MSG_FAILED}
+        </div>
+      )}
+      {rows.length > 0 && info.profile && (
+        <dl className="kv">
+          {rows.map((n) => {
+            const f = info.profile![n];
+            return (
+              <div key={n} style={{ display: "contents" }} data-testid={`professional-${n}`}>
+                <dt>{FIELD_LABEL[n]}</dt>
+                <dd>
+                  {f.status === "stated" ? (
+                    <>
+                      <bdi>{fieldValue(n, f)}</bdi> <SourceDisclosure label={FIELD_LABEL[n]} field={f} />
+                    </>
+                  ) : (
+                    <span className="muted">{UNKNOWN}</span>
+                  )}
+                </dd>
+              </div>
+            );
+          })}
+        </dl>
+      )}
+      {same && (
+        <div data-testid="professional-same-text">
+          אותו נוסח כמו {open(same.document_id, same.title)}
+        </div>
+      )}
+      {copies.length > 0 && (
+        <div data-testid="professional-copies">
+          עותקים נוספים של אותו נוסח:{" "}
+          {copies.map((c, i) => (
+            <span key={c.document_id}>
+              {i > 0 && ", "}
+              {open(c.document_id, c.title)}
+            </span>
+          ))}
+        </div>
+      )}
+      {ed && ed.editions.length > 1 && (
+        <div data-testid="professional-editions">
+          <strong>
+            נוסחים של תקן <B>{ed.number}</B>
+          </strong>
+          <ul>
+            {ed.editions.map((e) => (
+              <li key={e.document_id}>
+                {e.current ? <strong><bdi>{e.title}</bdi></strong> : open(e.document_id, e.title)}
+                {e.current && " (המסמך הזה)"}
+                {[e.edition, e.effective ? `בתוקף מ-${e.effective}` : null, e.published ? `פורסם ${e.published}` : null]
+                  .filter(Boolean)
+                  .map((x, i) => (
+                    <span key={i} className="muted">
+                      {" · "}
+                      <bdi>{x}</bdi>
+                    </span>
+                  ))}
+              </li>
+            ))}
+          </ul>
+          {!ed.order_known && <div className="muted">סדר הנוסחים לא ידוע: התאריכים שצוינו במסמכים אינם קובעים אותו.</div>}
+        </div>
+      )}
+      {ed && ed.related.length > 0 && (
+        <div data-testid="professional-related">
+          מסמכים הקשורים לתקן:{" "}
+          {ed.related.map((r, i) => (
+            <span key={r.document_id}>
+              {i > 0 && ", "}
+              {open(r.document_id, r.title)}
+              {r.relation && RELATION_LABEL[r.relation] ? ` (${RELATION_LABEL[r.relation]})` : ""}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** An admin changes a document's kind. The confirmation says nothing is deleted or read again; while the change runs
+ * the control is busy; a refusal (the server's reason) is shown here and the badge stays as it was. */
+function KindControl({ doc, onChanged }: { doc: DocumentDetail; onChanged: () => void }) {
+  const current = kindOf(doc);
+  const options = SOURCE_KINDS.filter((k) => k !== current);
+  const [target, setTarget] = useState<SourceKind>(options[0]);
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const selectId = useId();
+
+  async function change() {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.changeKind(doc.id, target);
+      setConfirming(false);
+      onChanged();
+    } catch (err) {
+      setConfirming(false);
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="stack" data-testid="kind-control">
+      <div className="row">
+        <label htmlFor={selectId}>שינוי סוג המסמך:</label>
+        <select
+          id={selectId}
+          className="input"
+          value={target}
+          disabled={busy}
+          onChange={(e) => setTarget(e.target.value as SourceKind)}
+        >
+          {options.map((k) => (
+            <option key={k} value={k}>
+              {SOURCE_KIND_LABEL[k]}
+            </option>
+          ))}
+        </select>
+        <button type="button" className="btn" disabled={busy} onClick={() => { setError(null); setConfirming(true); }}>
+          {busy ? "משנה..." : "שינוי סוג"}
+        </button>
+      </div>
+      <ErrorAlert message={error} />
+      <Dialog open={confirming} title="שינוי סוג המסמך" onClose={() => setConfirming(false)}>
+        <p>
+          סוג המסמך ישונה מ«{SOURCE_KIND_LABEL[current]}» ל«{SOURCE_KIND_LABEL[target]}». לא יימחק דבר והמסמך לא ייקרא
+          מחדש.
+        </p>
+        <div className="row">
+          <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void change()}>
+            {busy ? "משנה..." : "אישור השינוי"}
+          </button>
+          <button type="button" className="btn" disabled={busy} onClick={() => setConfirming(false)}>
+            ביטול
+          </button>
+        </div>
+      </Dialog>
     </div>
   );
 }
@@ -55,13 +555,17 @@ function DocumentPanel({
   id,
   onClose,
   onChanged,
+  onOpenDocument,
 }: {
   id: string;
   onClose: () => void;
   onChanged: () => void;
+  /** Another document the screen names (an edition, a copy). */
+  onOpenDocument: (id: string) => void;
 }) {
   const me = useSession();
   const canUpload = !!me && (me.user.role === "admin" || me.user.can_upload);
+  const isAdmin = me?.user.role === "admin";
   const inputId = useId();
   const versionInput = useRef<HTMLInputElement>(null);
   const fetchDoc = useCallback(() => api.document(id), [id]);
@@ -127,9 +631,12 @@ function DocumentPanel({
             <span>
               נוצר: <B>{formatTimestamp(doc.created_at)}</B>
             </span>
+            <KindBadge kind={kindOf(doc)} />
             {doc.deleted && <span className="badge badge-danger">נמחק</span>}
             {polling && <span className="muted">מתעדכן אוטומטית...</span>}
           </div>
+          {doc.professional && <ProfessionalSummary info={doc.professional} onOpen={onOpenDocument} />}
+          {isAdmin && !doc.deleted && <KindControl key={kindOf(doc)} doc={doc} onChanged={() => { reload(); onChanged(); }} />}
           <div className="table-wrap">
             <table className="table">
               <caption className="visually-hidden">גרסאות המסמך</caption>
@@ -139,8 +646,8 @@ function DocumentPanel({
                   <th scope="col">קובץ</th>
                   <th scope="col">סטטוס</th>
                   <th scope="col">עמודים</th>
-                  <th scope="col">רשומות</th>
-                  <th scope="col">לבדיקה</th>
+                  <th scope="col">קריאה</th>
+                  <th scope="col">נתונים</th>
                   <th scope="col">הועלה</th>
                   <th scope="col">עובד</th>
                 </tr>
@@ -158,17 +665,17 @@ function DocumentPanel({
                       </a>
                     </td>
                     <td>
-                      <StatusCell v={v} />
+                      <StatusCell v={v} docId={doc.id} onChanged={() => { reload(); onChanged(); }} />
                     </td>
                     <td>
-                      <B>{v.page_count ?? "—"}</B>
+                      {v.page_count != null ? <B>{v.page_count}</B> : <span className="small muted">DOCX (ללא עמודים)</span>}
                       {incompletePages(v)}
                     </td>
                     <td>
-                      <B>{v.records_total ?? "—"}</B>
+                      <ReadingCell v={v} />
                     </td>
                     <td>
-                      <B>{v.records_needing_review ?? "—"}</B>
+                      <DataCell v={v} />
                     </td>
                     <td>
                       <B>{formatTimestamp(v.created_at)}</B>
@@ -239,7 +746,10 @@ function DocumentsTab({
 }) {
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("");
+  const [kind, setKind] = useState<"" | SourceKind>("");
   const polling = !!docs && docs.some((d) => isActive(d.current_version));
+  // the kind filter works on the listed documents (a list holds one office's documents, not pages of them)
+  const shown = docs ? docs.filter((d) => !kind || kindOf(d) === kind) : null;
   useInterval(reload, POLL_MS, polling);
 
   return (
@@ -273,6 +783,22 @@ function DocumentsTab({
             </option>
           ))}
         </select>
+        <label htmlFor="doc-kind" className="visually-hidden">
+          סינון לפי סוג
+        </label>
+        <select
+          id="doc-kind"
+          className="input"
+          value={kind}
+          onChange={(e) => setKind(e.target.value as "" | SourceKind)}
+        >
+          <option value="">כל הסוגים</option>
+          {SOURCE_KINDS.map((k) => (
+            <option key={k} value={k}>
+              {SOURCE_KIND_LABEL[k]}
+            </option>
+          ))}
+        </select>
         <button type="submit" className="btn">
           חיפוש
         </button>
@@ -280,8 +806,8 @@ function DocumentsTab({
       </form>
       <ErrorAlert message={error} onRetry={reload} />
       {docs === null && !error && <p className="muted">טוען...</p>}
-      {docs && docs.length === 0 && <p className="muted">לא נמצאו מסמכים.</p>}
-      {docs && docs.length > 0 && (
+      {shown && shown.length === 0 && <p className="muted">לא נמצאו מסמכים.</p>}
+      {shown && shown.length > 0 && (
         <div className="table-wrap">
           <table className="table">
             <caption className="visually-hidden">רשימת מסמכים</caption>
@@ -291,14 +817,13 @@ function DocumentsTab({
                 <th scope="col">קבוצה</th>
                 <th scope="col">סטטוס</th>
                 <th scope="col">גרסה</th>
-                <th scope="col">עמודים</th>
-                <th scope="col">רשומות</th>
-                <th scope="col">לבדיקה</th>
+                <th scope="col">קריאה</th>
+                <th scope="col">נתונים</th>
                 <th scope="col">נוצר</th>
               </tr>
             </thead>
             <tbody>
-              {docs.map((d) => {
+              {shown.map((d) => {
                 const v = d.current_version;
                 return (
                   <tr key={d.id} className={d.id === selected ? "selected" : undefined}>
@@ -306,11 +831,14 @@ function DocumentsTab({
                       <button type="button" className="btn-link" onClick={() => onSelect(d.id)}>
                         {d.title}
                       </button>
+                      {" "}
+                      <KindBadge kind={kindOf(d)} />
                       {d.deleted && <span className="badge badge-danger"> נמחק</span>}
+                      {d.professional && <ProfessionalSummary info={d.professional} compact onOpen={onSelect} />}
                     </td>
                     <td>{d.group.name}</td>
                     <td>
-                      <StatusCell v={v} />
+                      <StatusCell v={v} docId={d.id} onChanged={reload} />
                     </td>
                     <td>
                       <B>{v?.version_no ?? "—"}</B>
@@ -322,13 +850,10 @@ function DocumentsTab({
                       )}
                     </td>
                     <td>
-                      <B>{v?.page_count ?? "—"}</B>
+                      <ReadingCell v={v} />
                     </td>
                     <td>
-                      <B>{v?.records_total ?? "—"}</B>
-                    </td>
-                    <td>
-                      <B>{v?.records_needing_review ?? "—"}</B>
+                      <DataCell v={v} />
                     </td>
                     <td>
                       <B>{formatTimestamp(d.created_at)}</B>
@@ -441,7 +966,13 @@ export default function DocumentsPage() {
         />
       )}
       {selected && (
-        <DocumentPanel key={selected} id={selected} onClose={() => setSelected(null)} onChanged={refresh} />
+        <DocumentPanel
+          key={selected}
+          id={selected}
+          onClose={() => setSelected(null)}
+          onChanged={refresh}
+          onOpenDocument={setSelected}
+        />
       )}
       <section className="card">
         <div className="tabs" role="tablist" aria-label="תצוגת מסמכים">
