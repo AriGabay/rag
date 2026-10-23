@@ -31,7 +31,7 @@ import pytest
 from sqlalchemy import text
 
 from app import worker
-from app.chat import contexts
+from app.chat import contexts, slots
 from app.chat import tools as T
 from app.db import tenant_tx
 from app.platform import pipeline
@@ -410,18 +410,25 @@ def test_the_reported_conversation_a_general_question_twice_and_then_the_approac
 # AE2: an ordinal names the item of the previous answer's list
 # =======================================================================================================================
 
+def _list_labels(context: dict, message_id: str) -> list[str] | None:
+    """The item labels of the list the message ``message_id`` printed, as the conversation context keeps it (round 22 U12)."""
+    return next(([i["label"] for i in entry["items"]] for entry in context.get("lists") or [] if entry["message_id"] == message_id), None)
+
+
 def test_ae2_the_second_names_the_second_item_of_the_list_and_stays_a_professional_question(world):
     cid = conversation(world)
     first = professional_turn(world, cid, first=True, body=LIST_ANSWER)
-    assert first.context["topic"]["items"] == APPROACHES and first.context["topic"]["message_id"] == first.message["id"]
-    for question, item in (("הסבר את הגישה השנייה", 2), ("הסבר את השנייה", 2), ("ואת השלישית", 3)):
+    # round 22 U12 (KTD14): the printed list is a named list of the context, carrying the message that printed it
+    assert _list_labels(first.context, first.message["id"]) == APPROACHES
+    for n, (question, item) in enumerate((("הסבר את הגישה השנייה", 2), ("הסבר את השנייה", 2), ("ואת השלישית", 3)), 1):
         t = professional_turn(world, cid, question, query="גישת ההכנסות", reference="prior_answer_item", item=item)
         assert_professional(t, world)
         intent = t.settled
         assert intent["item"] == item and intent["item_label"] == APPROACHES[item - 1] and intent["reference"] == "prior_answer_item"
         assert APPROACHES[item - 1] in t.request["standalone_question"] and t.request["topic"] == APPROACHES[item - 1]
         assert t.decisions["item"].startswith(f"bound: {item}"), t.decisions
-        assert t.context["topic"]["items"] == APPROACHES  # a later answer lists none: the list persists
+        # a later answer lists none: the list persists while its answer is one of the last ``LIST_AGE`` (round 22 KTD14), and binds until then
+        assert _list_labels(t.context, first.message["id"]) == (APPROACHES if n < slots.LIST_AGE else None)
         assert t.cited_kinds() == {"standard"}
 
 
@@ -466,7 +473,7 @@ def test_ae3_how_to_apply_it_to_this_property_is_mixed_with_the_topic_the_proper
     assert appraisal["document_id"] == world.rent_doc  # the property's own appraisal, not another property's
     ctx = t.context
     assert ctx["property"]["document_ids"] == [world.rent_doc] and ctx["topic"]["text"] == APPROACHES_TOPIC
-    assert ctx["topic"]["items"] == APPROACHES
+    assert APPROACHES in [[i["label"] for i in entry["items"]] for entry in ctx["lists"]]
     assert {x["source_kind"] for x in ctx["sources"]} == {"standard", "appraisal"}
 
 
