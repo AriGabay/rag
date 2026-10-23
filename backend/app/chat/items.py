@@ -372,15 +372,22 @@ def _row_of(body: Sequence[str], flat: str) -> str | None:
     return next((ln for ln in body if flat in _flat_span(ln)), None)
 
 
-def source_name(src, quote: str) -> str:
-    """How the source names the span an item quotes (round 18 U7, KTD6): the first cell of its table row, else the quote itself. A server
-    line names an item by this, never by the agent's own label."""
+def row_name(src, quote: str) -> str:
+    """The first cell of the table row an item quotes, as the source writes it, or "" when the quote is no table row or the row's first cell
+    names nothing (round 22 review: a row is named by its own label, never by the quoted sentence - a quote that is the condition itself would
+    name the row by the condition and write it twice)."""
     if src is not None:
         row = _row_of(context_of_source(src)[1], SupportScope.flat(quote))
         cells = _row_cells(row) if row is not None and "|" in row else []
         if len(cells) >= 2 and re.search(r"[^\W\d_]", cells[0]):
             return " ".join(cells[0].split())
-    return " ".join(quote.split())
+    return ""
+
+
+def source_name(src, quote: str) -> str:
+    """How the source names the span an item quotes (round 18 U7, KTD6): the first cell of its table row (``row_name``), else the quote
+    itself. A server line names an item by this, never by the agent's own label."""
+    return row_name(src, quote) or " ".join(quote.split())
 
 
 MISSING_DETAIL_CHARS = 60  # the source words that name a missing figure, at most

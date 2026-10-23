@@ -5313,8 +5313,8 @@ def _addition_verdict(ws: Workspace, st: dict, row, answer: str | None) -> Appli
 
     if row.status in (ledger.ROW_NAMED, ledger.ROW_ALONE):
         named = ""
-        if row.with_rows:  # the clause merges several rows: the note says which one it is about
-            named = ledger.source_name(ws.sources.get(st["source"]), st["quote"])
+        if row.with_rows:  # the clause merges several rows: the note says which one it is about, by the row's own label (none: unnamed)
+            named = ledger.row_name(ws.sources.get(st["source"]), st["quote"])
         return Applies(APPLIES, "structure", named=named)
     if row.status == ledger.ROW_OTHER:
         return Applies(NOT_APPLIES, "structure", why="the sentence states another row of the passage")

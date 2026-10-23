@@ -412,3 +412,17 @@ def test_the_scope_note_is_decided_by_structure_and_dropped_when_the_stored_verd
     again, _ = coverage.compose_components(ws, answer, report)
     assert L.SCOPE_ADDED not in again.doc.text and [s for s in again.doc.spans() if s.addition == "scope"] == []
     assert report.unbound_data() and report.unbound_data()[0].kind == "scope"
+
+
+def test_a_merged_row_is_named_by_its_own_first_cell_and_a_prose_quote_names_no_row():
+    """Round 22 review: the note of a clause that merges rows names the row by the row's own label; an item quoted from a sentence (the
+    condition itself, say) names no row, so the note is the plain one and the condition is never written twice."""
+    ws = C._plan_file(*ROWS)
+    (src,) = [s for s in ws.sources.values() if "|" in (s.text or "")][:1]
+    assert items.row_name(src, f"{NORTH} | 300") == NORTH
+    assert items.row_name(src, NOTE) == NORTH  # the condition stands in the north row's own note cell: that row
+    prose = "בוצע תחשיב לפי שיעור היוון שונה לרכיב המסחר"
+    assert items.row_name(src, prose) == ""  # a sentence that is no row of the table names no row
+    assert items.source_name(src, prose) == prose  # a server line naming an item still falls back to the quote
+    _, _, doc, *_ = _compose("שטח הקרקע הצפונית והדרומית הוא 300 מ״ר [S2].")
+    assert doc.text.count(NOTE) == 1, doc.text
