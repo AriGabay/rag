@@ -2685,3 +2685,39 @@ def test_shape_7_a_designator_the_items_condition_negates_is_no_designator_of_th
     assert _paragraph_item(quote, answer, label="תוספת לשיפור תכנון בחלקה 56", value="4.15%", condition=condition) == ["omitted"]
     assert _paragraph_item("חלקה 57: " + quote, answer, label="תוספת", value="4.15%", condition=condition) == ["covered"]
     assert _paragraph_item("חלקה 56: " + quote, answer, label="תוספת", value="4.15%", condition=condition) == ["omitted"]
+
+
+# --- round 22 U5 (KTD5, R8; finding g): the notes of a table the hit's text lacks are completed from the stored structure ----------------------
+
+U5_LEASE_NOTE = "(*) המחיר בכפוף לקבלת היתר בנייה ואינו כולל מע\"מ"
+U5_ROW = "להלן טבלת שווי: תיאור: דירה 20 | מחיר (₪): 1020,000 (*)"
+U5_OTHER_ROW = "להלן טבלת שווי: תיאור: דירה 30 | מחיר (₪): 1030,000"
+
+
+def _u5_ws(kind: str, text: str, notes: list[str], table_index: int | None = 0) -> Workspace:
+    ws = Workspace(ctx=None)
+    ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="דוח בדיקה", section="3. שווי", location="טבלה", kind=kind,
+                  text=text, table_index=table_index, table_notes=list(notes))
+    return ws
+
+
+def test_u5_condition_spans_of_a_value_in_a_row_chunk_include_its_completed_marked_note():
+    ws = _u5_ws("table_row", U5_ROW, [U5_LEASE_NOTE])
+    assert [(s.place, s.text) for s in items.condition_spans(ws.sources["S1"], "מחיר (₪): 1020,000 (*)", value="1020000")] == [("paragraph", U5_LEASE_NOTE)]
+    bare = _u5_ws("table_row", U5_ROW, [])
+    assert items.condition_spans(bare.sources["S1"], "מחיר (₪): 1020,000 (*)", value="1020000") == []  # the gap the completion closes
+
+
+def test_u5_a_completed_marked_note_does_not_reach_the_other_rows_of_a_table_chunk_and_an_unmarked_one_does():
+    chunk = "\n".join(["להלן טבלת שווי", "תיאור | מחיר (₪)", "דירה 20 | 1020,000 (*)", "דירה 30 | 1030,000"])
+    plain = "הערה: המחירים נכונים למועד הקובע"
+    ws = _u5_ws("table", chunk, [U5_LEASE_NOTE, plain])
+    marked = [s.text for s in items.condition_spans(ws.sources["S1"], "דירה 20 | 1020,000 (*)", value="1020000")]
+    other = [s.text for s in items.condition_spans(ws.sources["S1"], "דירה 30 | 1030,000", value="1030000")]
+    assert U5_LEASE_NOTE in marked and U5_LEASE_NOTE not in other
+
+
+def test_u5_a_paragraph_source_takes_no_table_notes_into_its_condition_spans():
+    ws = _u5_ws("text", "מחיר הדירה הוא 1,020,000 ₪ (*)", [U5_LEASE_NOTE], table_index=None)
+    assert items.condition_spans(ws.sources["S1"], "מחיר הדירה הוא 1,020,000 ₪ (*)", value="1020000") == []
+    assert all(U5_LEASE_NOTE not in s.text for s in items.condition_spans(ws.sources["S1"], "מחיר הדירה הוא 1,020,000 ₪"))

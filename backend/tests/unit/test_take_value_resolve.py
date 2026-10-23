@@ -700,3 +700,42 @@ def test_u9_taking_a_cell_again_with_another_kind_corrects_a_kind_the_source_was
     with pytest.raises(T.ToolError, match="V1"):
         T.tool_take_value(d.ws, d.sid, _loc(row="שווי המגרש", column="סכום (₪)"), _meaning(unit="ILS", kind="cost"), "שווי")
     assert d.ws.values["V1"].kind == "value" and d.ws.values["V1"].provenance["kind"] == "source"
+
+
+# --- round 22 U5 (KTD5, R8; finding g): the quote path reads the notes the cell path reads, from the stored structure ---------------------------
+
+U5_NOTE = "(*) הסכומים מוצגים באלפי ₪"
+
+
+def _u5_hit_workspace(monkeypatch, row_index: int, hit_text: str) -> SimpleNamespace:
+    """A stored table whose thousands note is marked «(*)», and a row-chunk search hit of it (S2) whose text lacks the note."""
+    table = {"headers": ["Item", "Q1", "Q2"], "units": [None, None, None], "caption": "", "title": [], "notes": [U5_NOTE],
+             "rows": [{"cells": ["Rent (*)", "1020", "1020"], "page": 1}, {"cells": ["Fees", "120", "120"], "page": 1}]}
+    d = _workspace(monkeypatch, table)
+    hit = d.ws.add_source(document_id=VERSION.document_id, version_id=VERSION.version_id, title=VERSION.title, section="נתונים",
+                          location="עמוד 1", kind="table_row", text=hit_text, block_start=0, block_end=0, reading_id="reading-1",
+                          status="complete", table_index=0, row_index=row_index)
+    return SimpleNamespace(ws=d.ws, sid=hit.sid)
+
+
+def test_u5_a_quote_in_a_row_hit_that_names_no_single_cell_takes_the_thousands_note_of_its_marked_row(monkeypatch):
+    d = _u5_hit_workspace(monkeypatch, 0, "Item: Rent (*) | Q1: 1020 | Q2: 1020")
+    _take(d, _loc(quote="1020", number="1020"), kind="rent", unit="ILS")  # two cells hold it: taken as a quote
+    assert d.ws.values["V1"].scale == 1000 and d.ws.values["V1"].locator == {"quote": "1020"}
+
+
+def test_u5_the_same_quote_in_the_row_without_the_mark_takes_no_scale_from_that_note(monkeypatch):
+    d = _u5_hit_workspace(monkeypatch, 1, "Item: Fees | Q1: 120 | Q2: 120")
+    _take(d, _loc(quote="120", number="120"), kind="rent", unit="ILS")
+    assert d.ws.values["V1"].scale == 1
+
+
+def test_u5_the_cell_path_of_a_row_without_the_mark_takes_no_scale_from_a_marked_note(monkeypatch):
+    d = _u5_hit_workspace(monkeypatch, 1, "Item: Fees | Q1: 120 | Q2: 120")
+    _take(d, _loc(row="Fees", column="Q1"), kind="rent", unit="ILS")
+    assert d.ws.values["V1"].scale == 1
+    marked = d.ws.add_source(document_id=VERSION.document_id, version_id=VERSION.version_id, title=VERSION.title, section="נתונים", location="עמוד 1",
+                             kind="table_row", text="Item: Rent (*) | Q1: 1020 | Q2: 1020", block_start=0, block_end=0, reading_id="reading-1",
+                             status="complete", table_index=0, row_index=0)
+    T.tool_take_value(d.ws, marked.sid, _loc(row="Rent (*)", column="Q1"), _meaning(kind="rent", unit="ILS"), "שכירות")
+    assert d.ws.values["V2"].scale == 1000

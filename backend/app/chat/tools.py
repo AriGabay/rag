@@ -172,7 +172,7 @@ from sqlalchemy import Connection, text
 
 from app.answering.numread import read_separators
 from app.answering.verify import numbers_in
-from app.chat import anchors, calc, contexts, datum, meaning, reader
+from app.chat import anchors, calc, contexts, datum, meaning, reader, scopes
 from app.chat import dates as chat_dates
 from app.chat import units as unit_store
 from app.chat import unread as unread_text
@@ -413,6 +413,11 @@ class Source:
     # that attributes each to it (``TablePart``); empty for a source that is not a table read. Verification reads them from here,
     # not from the tags in ``text``, and needs no database read for it
     table_parts: list = field(default_factory=list)
+    # the notes of its table that apply to the rows a search hit holds and that its text lacks (round 22 U5, KTD5, R8; finding g): the chunker writes a
+    # table's notes only into the last table chunk, so a row chunk or an earlier group chunk is completed from the stored structure when the hit is
+    # made (``_hit_notes``). Marked notes only for the rows that carry the mark, unmarked ones for the table; empty for a source that is no table hit.
+    # The verifier reads them as notes of the table (``verify.context_of_source``); they are not text the agent was shown, so they are no evidence of a value
+    table_notes: list = field(default_factory=list)
 
     @property
     def is_listing(self) -> bool:
@@ -1301,6 +1306,79 @@ def _table_at(ws: Workspace, conn: Connection, version_id, table_index: int) -> 
         if found[0] is not None:  # round 22 U0: the multi-page stored tables the turn served (measurement only)
             ws.clock.note_table(key, stored_tables.spans_pages(found[0]))
     return found
+
+
+def _notes_of_rows(st: dict | None, rows: Iterable[int] | None) -> list[str]:
+    """The notes of a stored table (``structure.notes``) that govern the rows ``rows`` (indexes into ``structure.rows``; None or none: the rows are
+    not known), by their scope (round 22 U5, KTD5, R8): a note that opens with a mark («*», «(1)», «(***)») belongs to the rows that carry the mark,
+    a mark in a header cell to every row (``scopes.note_rows``, the one reader ``items._note_of_row`` uses); a note without a mark, and a mark no cell
+    of the table carries, to its own table. With the rows unknown, a marked note applies only when the mark governs every row. The table's OWN notes
+    alone: never those of another table, and never across a candidate link (``candidate_of``) to the other part."""
+    notes = [str(n) for n in (st or {}).get("notes") or [] if n]
+    if not notes:
+        return []
+    body = [" | ".join(str(c) for c in r.get("cells") or []) for r in st.get("rows") or []]
+    header = [str(h) for h in st.get("headers") or []]
+    held = set(rows) if rows is not None else set()
+    out: list[str] = []
+    for note in notes:
+        mark = scopes.note_mark(note)
+        bound = scopes.note_rows(mark, header, body) if mark else None
+        if bound is not None and not (held & bound if held else len(bound) >= len(body)):
+            continue
+        out.append(note)
+    return out
+
+
+def _mark_label(mark: str) -> str:
+    """A note mark as ``scopes.note_mark`` keys it, written the way notes are: «*» -> «(*)», «#1» -> «(1)»."""
+    return f"({mark.removeprefix('#')})"
+
+
+def _hit_notes(ws: Workspace, conn: Connection | None, h: dict, passage: str, handle: str = "") -> tuple[list[str], str]:
+    """The notes of the table of a search hit on a stored table (a table chunk or a row chunk) that apply to the rows the hit holds and that the hit's own
+    text lacks, and the flag that tells the agent they exist (round 22 U5, KTD5, R8; finding g): the chunker writes a table's notes only into its last table
+    chunk, so every other chunk reaches the agent and the verifier without them. ``passage`` is the hit's stored text (its rows are found in the stored
+    structure by their lines). The flag names the marks only («[לטבלה יש הערות: (*) (1); לקריאתן: read(table=T3)]»), never the text of a note: the agent reads
+    the table for it. The structure is the per-turn cache (``_table_at``), read by ``_served_hit_text`` for the same hit already. ([], "") for any other hit."""
+    if not _is_table_hit(h):
+        return [], ""
+    st = _table_at(ws, conn, h["version_id"], h["table_index"])[0]
+    if not st or not st.get("notes"):
+        return [], ""
+    if h["kind"] == "table_row":
+        rows = [int(h["row_index"])] if h.get("row_index") is not None else None
+    else:
+        lines = {ln.strip() for ln in passage.split("\n")}
+        rows = [i for i, r in enumerate(st.get("rows") or []) if (line := " | ".join(str(c) for c in r.get("cells") or []).strip()) and line in lines]
+    shown = meaning._flat(passage)
+    held = [n for n in _notes_of_rows(st, rows) if meaning._flat(n) not in shown]
+    if not held:
+        return [], ""
+    marks = list(dict.fromkeys(_mark_label(m) for n in held if (m := scopes.note_mark(n))))
+    if any(not scopes.note_mark(n) for n in held):
+        marks.append("ללא סימן")
+    return held, f"[לטבלה יש הערות: {' '.join(marks)}" + (f"; לקריאתן: read(table={handle})" if handle else "") + "]"
+
+
+def _quote_table_notes(ws: Workspace, conn: Connection | None, src: Source, full: str, loc: dict) -> list[str]:
+    """The notes of the table of ``src`` that govern the quote ``loc['quote']`` of it, read from the stored structure (round 22 U5, KTD5, R8): the row of a
+    row chunk, else the rows whose line holds the quote, else (the quote is in no unique row) the notes whose mark the quote carries itself and those
+    that govern every row. [] for a source that is no table (a paragraph quote gets no table notes)."""
+    if src.table_index is None or src.kind not in ("table", "table_row") or src.version_id is None:
+        return []
+    st = _table_at(ws, conn, src.version_id, src.table_index)[0]
+    if not st or not st.get("notes"):
+        return []
+    quote = loc.get("quote") or ""
+    if src.row_index is not None:
+        return _notes_of_rows(st, [src.row_index])
+    shaped = _loose(quote)
+    rows = [i for i, r in enumerate(st.get("rows") or []) if shaped and shaped in _loose(" | ".join(str(c) for c in r.get("cells") or []))]
+    if len(rows) == 1:
+        return _notes_of_rows(st, rows)
+    whole, carried = _notes_of_rows(st, None), scopes.marks_of(quote)
+    return [n for n in map(str, st["notes"]) if n and (n in whole or scopes.note_mark(n) in carried)]
 
 
 def _note_above(full: str, start: int) -> str:
@@ -3312,6 +3390,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                     if passage is None:
                         continue
                 held = [n for n in held if n in kept] or held
+            stored = passage
             passage = _served_hit_text(ws, conn, h, passage)
             paragraphs, media, blocks = _block_info(conn, h["version_id"], bs, be,
                                                     with_text=h["kind"] not in ("table", "table_row"))
@@ -3319,6 +3398,8 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
             if h.get("table_index") is not None:  # a matched row opens its whole table
                 tags["table"] = _table_handle(ws, h["document_id"], h["version_id"],
                                               ws.readings.get(str(h["version_id"])), h["table_index"])
+            # the notes of its table that govern the rows it holds and its text lacks (round 22 U5, KTD5): completed from the stored structure
+            table_notes, notes_flag = _hit_notes(ws, conn, h, stored, tags.get("table", ""))
             # a hit of a unit-scoped search shows the passage around the query's terms, the rest on demand (round 15 U2, R9)
             shown, cut = (_around_terms(passage, around, SCOPED_PASSAGE_CHARS, h["kind"] in ("table", "table_row"))
                           if scoped else (_clip(passage, get_settings().chat_passage_chars), False))
@@ -3330,12 +3411,14 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                 table_index=h.get("table_index"), chunk_id=h["chunk_id"], page_list=page_list or None,
                 # read in part only when the page or section it cites has an unread region (R28)
                 partial_document=gaps.get(h["version_id"], whole).cites(page_list, h["section"]), tags=tags,
-                row_index=h.get("row_index") if h["kind"] == "table_row" else None),
+                row_index=h.get("row_index") if h["kind"] == "table_row" else None, table_notes=table_notes),
                 cx, held, ws)
             if not h["section"]:
                 src.heading = _heading_of(conn, h["version_id"], bs)
             if cut:  # what the model reads says where the rest is; what a claim is checked against is the passage shown
                 src.body = f"{src.text}\n{MSG_PASSAGE_CUT.format(sid=src.sid)}"
+            if notes_flag:  # the agent is told the table has notes (marks only); the claims are checked against ``text`` and the completed notes
+                src.body = f"{src.body if src.body is not None else src.text}\n{notes_flag}"
             src.label = _label_of(src, cx, h["pool"], h["role"], ws.intent)
             uv = valuation_of(ws, conn, h["version_id"], bs)
             src.date_line = valuation_line(uv)
@@ -3429,6 +3512,9 @@ def _professional_hit(ws: Workspace, conn: Connection, h: dict, bs, be, sizes: d
     tags = {"document": ws.doc_handle(h["document_id"])}
     if h.get("table_index") is not None:
         tags["table"] = _table_handle(ws, h["document_id"], vid, ws.readings.get(str(vid)), h["table_index"])
+    table_notes, notes_flag = _hit_notes(ws, conn, h, h["text"], tags.get("table", ""))  # round 22 U5
+    if notes_flag:
+        notes.append(notes_flag)
     src = ws.add_source(
         document_id=h["document_id"], version_id=vid, title=standard_title(std, h["title"]), section=section_string(std),
         location=standard_location(std, h["page_list"], h["kind"]), kind=h["kind"], text=body,
@@ -3436,7 +3522,7 @@ def _professional_hit(ws: Workspace, conn: Connection, h: dict, bs, be, sizes: d
         chunk_id=h["chunk_id"], page_list=h["page_list"] or None, tags=tags,
         partial_document=gaps.cites(h["page_list"], h["section"]), source_kind=kind, standard=std,
         rules=section_rules(secs, bs, be),
-        row_index=h.get("row_index") if h["kind"] == "table_row" else None)
+        row_index=h.get("row_index") if h["kind"] == "table_row" else None, table_notes=table_notes)
     src.label = _label_of(src, None, PROFESSIONAL_POOL, role, ws.intent)
     return src
 
@@ -6483,14 +6569,16 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
         label = next((c for c in cells if c and _parse_number(c) is None), "")
     column_units = st.get("units") or []
     near = [cell, label, header, str(column_units[ci]) if ci < len(column_units) and column_units[ci] else ""]
-    table_text = [st.get("caption") or "", *(st.get("title") or []), *(st.get("notes") or [])]
+    # the notes that govern THIS row (round 22 U5, KTD5, R8): a note marked «(*)» belongs to the rows that carry the mark; the quote path reads the same ones
+    row_notes = _notes_of_rows(st, [ri])
+    table_text = [st.get("caption") or "", *(st.get("title") or []), *row_notes]
     row_page = (st.get("rows") or [])[ri].get("page")
     later = (unconfirmed or {}).get(row_page)  # why this cell's page is unconfirmed (None: the caption's own, or a continuation)
     stated_text = [] if later else table_text  # what the table says of this cell: nothing is taken from it when unconfirmed
     # the parts the source states the cell's meaning in, nearest first (round 12 U9, KTD9): the words of each attribute
     # are anchored to the first that writes them
     caption_text = " ".join(x for x in [st.get("caption") or "", *(st.get("title") or [])] if x)
-    notes_text = " ".join(x for x in st.get("notes") or [] if x)
+    notes_text = " ".join(x for x in row_notes if x)
     vat_parts = [("cell", cell), ("row", label), ("header", header), ("header", near[3]), ("caption", caption_text),
                  ("note", notes_text)]
     vats = meaning.vat_attested("\n".join(near + stated_text), forms)
@@ -6535,7 +6623,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     said = (attribution_in(header, adopted=True) or attribution_in(label, adopted=True)
             or attribution_in(" ".join(x for x in stated_text if x), adopted=True))
     return {"written": written, "value": value, "forms": forms, "quote": line,
-            "qualifiers": meaning.number_qualifiers(_table_text(st, st.get("rows") or []), forms, line),
+            "qualifiers": meaning.number_qualifiers(_table_text(st | {"notes": row_notes}, st.get("rows") or []), forms, line),
             "units": units, "vat": vats, "vat_from": _vat_anchors(vats, vat_parts, "note"),
             "kind_context": " ".join([label, header, st.get("caption") or ""]),
             "kind_parts": [("row", label), ("header", header), ("caption", st.get("caption") or "")],
@@ -6762,13 +6850,14 @@ def _block_sentence(blocks: Iterable[tuple] | None, anchor: dict, quote: str) ->
 
 
 def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = None,
-                governing: Callable[[int], str | _ScaleNote] | None = None) -> dict:
+                governing: Callable[[int], str | _ScaleNote] | None = None, notes: Iterable[str] = ()) -> dict:
     """The number inside an exact quote of the source: the quote must occur in the source's full text, and the
     number inside the quote. ``blocks``: the source's blocks (``(block_index, text, page)``), where the quote is
     located within the cited range only (KTD4): one occurrence records its block and word span; several that write
     the same number record the blocks holding them (block precision); several that write different numbers are
     refused, asking for a longer quote. Never the first occurrence. ``governing``: the scale note that governs a
-    block from a block above it (``calc.governing_note``), for the block the number is in."""
+    block from a block above it (``calc.governing_note``), for the block the number is in. ``notes``: the notes of the table the quote is of that govern
+    its row and that the source's text lacks (``_quote_table_notes``, round 22 U5): read as the cell path reads them, for the scale, the unit and the VAT."""
     if not loc.get("number"):
         raise ToolError("ציטוט (quote) דורש גם את המספר כפי שנכתב בו (number)")
     wanted = _parse_number(loc["number"])
@@ -6814,16 +6903,22 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
     # the scale the source states it in (R14): its own scale word, else a note of the quote, else of its line, else
     # of the heading-like line above that governs its block ("ממצאי הבדיקה באלפי ₪" over one figure per paragraph)
     held = _value_blocks(anchor)
+    table_notes = [str(n) for n in notes if n]
+    note_text = meaning._norm(" ".join(table_notes))
     notes = [governing(b) for b in sorted(held)] if governing is not None and held else [""]
     # a duration, count, coefficient, area or rate takes neither the currency nor the scale of a heading
     own_kind_not_money = meaning.nonmonetary(local) or (len(_numbers_of(quote)) == 1 and meaning.nonmonetary(quote))
     scales = ({calc.stated_scale(text_, at + start, at + end)}
               if own_kind_not_money or units and not units & {"ILS", "ILS_per_sqm"} else
-              {_value_scale(text_, at + start, at + end, quote, line, governing=note) for note in notes})
+              {_value_scale(text_, at + start, at + end, quote, line, note_text, governing=note) for note in notes})
     if len(scales) != 1:
         raise ToolError(MSG_QUOTE_AMBIGUOUS.format(sid=src.sid))
     scale = scales.pop()
     unit_from = "quote" if units else None
+    if not units and not own_kind_not_money and table_notes:  # the table's own notes state the unit, as for a cell (round 22 U5)
+        units = set(meaning.units_attested(note_text))
+        if units:
+            unit_from = "table"
     if not units and not own_kind_not_money:
         inherited = {frozenset(_note_units(note)) for note in notes}
         if len(inherited) > 1:
@@ -6831,13 +6926,14 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
         units = set(inherited.pop())
         if units:
             unit_from = "governing_note"
-    vats = meaning.vat_attested(line, forms, full)
+    whole = "\n".join([full, *table_notes])
+    vats = meaning.vat_attested(line, forms, whole)
     sentence = _block_sentence(blocks, anchor, quote)
     return {"written": written, "value": sign * value, "forms": forms, "quote": loc["quote"].strip(),
             **({"sentence": sentence} if sentence else {}),
             "qualifiers": meaning.number_qualifiers(full, forms, quote),
             "units": units, "vat": vats,
-            "vat_from": _vat_anchors(vats, [("sentence", quote), ("paragraph", line), ("note", full)], "paragraph"),
+            "vat_from": _vat_anchors(vats, [("sentence", quote), ("paragraph", line), ("note", whole)], "paragraph"),
             "kind_context": quote, "kind_parts": [("sentence", quote)], "locator": {"quote": loc["quote"].strip()},
             "source_text": full,  # the source the quote is of: a kind or a unit its fragment lacks is confirmed in the number's own clause (round 21 U3)
             "total": False, "table": None,
@@ -7485,7 +7581,8 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
                 rows = reader.blocks_between(conn, src.version_id, src.block_start,
                                              src.block_end if src.block_end is not None else src.block_start)
                 blocks = [(r.block_index, r.text or "", r.page) for r in rows]
-            taken = _take_quote(src, full, loc, blocks, lambda b: _governing_note(ws, conn, src.version_id, b))
+            taken = _take_quote(src, full, loc, blocks, lambda b: _governing_note(ws, conn, src.version_id, b),
+                                notes=_quote_table_notes(ws, conn, src, full, loc))
             at = _value_blocks(taken.get("anchor") or {})
         reading_id = src.reading_id or v.reading_id
         # the number's place, from the anchor ``take`` located (no read): a value already registered there answers this call

@@ -4793,13 +4793,16 @@ class ContextPart(NamedTuple):
     above it, or the section of a passage), ``before``/``after`` (a block before or after the table), ``caption`` or ``note`` (the
     table's own); ``between``: the block lies between two tables, so it belongs to neither more than to the other; ``reason``: why a
     block beside the table is not attributed to it (``SCOPE_REASONS``; empty: it is, and so is every other place); ``block``: the
-    block number of a part of a table read."""
+    block number of a part of a table read; ``completed``: a note of the table that the source's text lacks, completed from the stored structure for
+    the rows the source holds (``Source.table_notes``, round 22 U5): it limits and scopes the values of the table, but it is no text the agent was
+    shown, so it is no item of its own."""
 
     place: str
     text: str
     between: bool = False
     reason: str = ""
     block: int | None = None
+    completed: bool = False
 
 
 def _reason_of(reasons) -> str:
@@ -4861,6 +4864,12 @@ def context_of_source(src: Source) -> tuple[list[ContextPart], list[str]]:
         held = {p.block_index: p for p in src.table_parts}
         parts = [_structured_part(held.pop(p.block)) if p.block in held else p for p in parts]
         parts += [_structured_part(p) for p in held.values()]
+    if src.table_notes and src.table_index is not None and src.kind in ("table", "table_row"):
+        # round 22 U5 (KTD5, R8): the notes of its table that govern the rows this hit holds, which the chunk lacks, completed from the stored structure
+        # at the search (``tools._hit_notes``): one reader of a source's conditions and scope, so the condition spans, the scope check and the
+        # absence checks all see the note the table-level read shows. A paragraph source takes none.
+        held = _norm(" ".join(p.text for p in parts))
+        parts += [ContextPart("note", " ".join(n.split()), completed=True) for n in src.table_notes if _norm(" ".join(n.split())) not in held]
     section = _norm(src.section or "")
     if section and not any(p.place == "heading" and p.text == section for p in parts):
         parts.insert(0, ContextPart("heading", section))

@@ -252,3 +252,127 @@ def test_two_lists_bind_on_the_real_resolve_call(real_key):  # noqa: F811
             else:
                 _record(name, attempt, request, "pass", {})
     assert not failures, failures
+
+
+# --- round 22 U5 (KTD5, R8; finding g): a row hit of a table whose scale note sits only under the table -----------------------------------------
+#
+# The chunker writes a table's notes into the LAST table chunk only, so a search hit on one row reaches the agent without «(*) הסכומים באלפי ₪».
+# U5 adds a short flag to such a hit («[לטבלה יש הערות: (*); לקריאתן: read(table=T#)]», marks only) and completes the note at the consumer
+# (take_value, the condition spans, the verification) from the stored structure. This sequence asks for one value of a long synthetic table
+# (a seeded document: the production chunker and persistence over an invented table, no PDF) and checks, by behaviour, that the answer states
+# the value IN THOUSANDS: the stored cell says «4,250» under «(₪) (*)», the note says thousands. Every name and figure is invented.
+#
+# - ``answered`` / ``cited``: the answer is an answer and cites the document;
+# - ``shape_produced``: the answer states the value at all (otherwise the repetition is ``shape not produced`` and is not a pass);
+# - ``scale_kept``: a line of the answer states the value in thousands (4,250 thousand, or 4,250,000);
+# - ``no_unscaled_value``: no line states the bare «4,250» as shekels (the harm the note prevents).
+#
+# Recorded per repetition under ``real_documents/eval/round22/real-model/`` (gitignored). NOT RUN by the development workflow.
+
+THOUSANDS_RESULTS_FILE = RESULTS_DIR / f"thousands-note-{STAMP}.json"
+THOUSANDS_RECORDS: list[dict] = []
+THOUSANDS_NOTE = "(*) הסכומים באלפי ₪"
+THOUSANDS_HEADERS = ["בניין", "הכנסה שנתית (₪) (*)"]
+THOUSANDS_ROWS = [("בניין הגפן", "4,250"), ("בניין התמר", "3,120"), ("בניין האלון", "5,980"), ("בניין הארז", "2,740"), ("בניין הברוש", "6,310"),
+                  ("בניין הדולב", "1,980"), ("בניין הזית", "3,860"), ("בניין החרוב", "4,730"), ("בניין הלוז", "2,150"), ("בניין המילה", "5,420"),
+                  ("בניין הנרקיס", "3,390"), ("בניין הסביון", "4,060"), ("בניין העפרוני", "2,870"), ("בניין הפרג", "5,110"), ("בניין הרימון", "3,640"),
+                  ("בניין השקד", "4,490"), ("בניין התאנה", "2,330"), ("בניין הדקל", "6,020")]
+THOUSANDS_QUESTION = "מהי ההכנסה השנתית של בניין הגפן לפי השומה?"
+THOUSANDS_TARGET = "4,250"
+IN_THOUSANDS = re.compile(r"4[,.]?250[,.]?000(?![\d])|4[,.]25\s*מיליון|(?<![\d,.])4[,.]?250\s*(?:אלפי|אלף|K\b)|(?:אלפי|אלף)\s*₪?\s*[:\-–]?\s*4[,.]?250(?![\d,.])")
+BARE_TARGET = re.compile(r"(?<![\d,.])4[,.]?250(?![\d]|[.,]\d)")
+
+
+def _seed_thousands_table(office) -> str:
+    """A document of one long table (invented) whose thousands note «(*) הסכומים באלפי ₪» stands only under it, written by the PRODUCTION
+    chunker and persistence as a reading would: the notes in the last table chunk, none in a row chunk. Returns the document id."""
+    from app.db import tenant_tx
+    from app.extraction.base import Block, ExtractionResult, PageResult, TableResult, TableRow
+    from app.extraction.chunking import chunk_blocks
+    from app.extraction.docx import render_table
+    from app.platform import pipeline
+    from app.platform.pipeline import VersionInfo
+    from tests.factories import make_document
+
+    title = "שומת הדגמה לתיק בניינים ברחוב הגפן — הכנסות לפי בניין"
+    section = "3. הכנסות לפי בניין"
+    lead = "הטבלה שלהלן מציגה את ההכנסה השנתית של כל בניין בתיק."
+    table = TableResult(index=0, headers=list(THOUSANDS_HEADERS), units=[None, None], rows=[TableRow(page=1, cells=[n, v]) for n, v in THOUSANDS_ROWS],
+                        page_start=1, page_end=1, section=section, caption=lead, notes=[THOUSANDS_NOTE], block_index=3)
+    blocks = [Block(0, "heading", title, section=title, section_path=[title], page=1),
+              Block(1, "paragraph", "מסמך סינתטי לדמו — כל הנתונים בדויים", section=title, section_path=[title], page=1),
+              Block(2, "heading", section, section=section, section_path=[title, section], page=1),
+              Block(3, "table", render_table(table), section=section, section_path=[title, section], page=1, table_index=0)]
+    chunks = chunk_blocks(blocks, [table])
+    assert not any("הסכומים באלפי" in c.text for c in chunks if c.kind == "table_row"), "a row chunk holds the note: the gap is not reproduced"
+    doc, ver = make_document(office, office.default_group_id, title, sha="22" * 32)
+    result = ExtractionResult(1, [PageResult(1, "\n".join(b.text for b in blocks), "text_layer", 1.0, True)], [table], chunks, blocks=blocks)
+    with tenant_tx(office.system) as conn:
+        pipeline.persist_extraction(conn, VersionInfo(ver, doc, "k", "application/pdf", None), result)
+    pipeline.embed_stage(office.system, VersionInfo(ver, doc, "k", "application/pdf", None), 1e18)
+    return str(doc)
+
+
+def _thousands_record(attempt: int, rec: dict) -> None:
+    THOUSANDS_RECORDS.append(rec | {"attempt": attempt})
+    THOUSANDS_RESULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    THOUSANDS_RESULTS_FILE.write_text(json.dumps({"model": "gpt-6-luna (settings)", "attempts": THOUSANDS_RECORDS}, ensure_ascii=False, indent=2,
+                                                 default=str), encoding="utf-8")
+
+
+# the scale stated in the value's own line in words: «4,250 אלפי ₪» or «4,250; ... הסכומים הם באלפי ₪» says the same as «4,250,000 ₪»
+_THOUSANDS_WORDS = re.compile(r"(?<![א-ת])ב?אלפי\s*(?:₪|ש[\"״]?ח|שקל)")
+
+
+def _in_thousands(ln: str) -> bool:
+    return has(ln, IN_THOUSANDS) or (has(ln, BARE_TARGET) and bool(_THOUSANDS_WORDS.search(ln)))
+
+
+def _scale_kept(t: Turn21) -> None:
+    assert any(_in_thousands(ln) for ln in t.stated_lines), ("no line states the value in thousands", t.markdown[:500])
+
+
+def _no_unscaled_value(t: Turn21) -> None:
+    bad = [ln[:200] for ln in t.stated_lines if has(ln, BARE_TARGET) and not _in_thousands(ln)]
+    assert not bad, ("a line states the bare value as if it were shekels", bad[:2])
+
+
+def test_a_row_hit_with_a_thousands_note_is_read_with_its_scale(office, monkeypatch):  # noqa: F811
+    doc = _seed_thousands_table(office)
+    failures: list[str] = []
+    for attempt in range(1, ATTEMPTS + 1):
+        rec = {"sequence": "row_hit_thousands_note", "turns": [], "checks": {}, "info": {}, "outcome": None}
+        try:
+            cid = new_conversation(office.client)
+            started = time.perf_counter()
+            r = office.client.post(f"/api/chat/conversations/{cid}/messages", json={"content": THOUSANDS_QUESTION})
+            assert r.status_code == 200, r.text
+            m = office.client.get(f"/api/chat/messages/{r.json()['assistant']['id']}").json()
+            t = Turn21(office.client, m, THOUSANDS_QUESTION, time.perf_counter() - started)
+            rec["turns"].append(t.record())
+            assert m["status"] == "done", (m.get("status"), m.get("error"))
+            produced = stated(t, BARE_TARGET) or stated(t, IN_THOUSANDS)
+            rec["info"] = {"shape_produced": produced, "markdown": t.markdown[:600],
+                           "spans": [(s["kind"], s["text"][:160], s["claim_ids"], s["datum"]) for s in t.spans]}
+            _thousands_checks(rec, t, doc, produced)
+        except AssertionError as exc:
+            rec["aborted"] = str(exc)[:2000]
+        for name in ("answered", "cited", "shape_produced", "scale_kept", "no_unscaled_value"):
+            rec["checks"].setdefault(name, {"outcome": "fail", "failure": "never ran: " + rec.get("aborted", "?")})
+        rec["outcome"] = "pass" if all(v["outcome"] == "pass" for v in rec["checks"].values()) else "fail"
+        _thousands_record(attempt, rec)
+        failures += [f"attempt {attempt} / {name}: {v['failure']}" for name, v in rec["checks"].items() if v["outcome"] == "fail"]
+    assert not failures, failures
+
+
+def _must(condition: bool, message: str, t: Turn21) -> None:
+    assert condition, (message, t.markdown[:500])
+
+
+def _thousands_checks(rec: dict, t: Turn21, doc: str, produced: bool) -> None:
+    """The five checks of one repetition, each recorded on its own (a failure never stops the others)."""
+    _check(rec, "answered", lambda: answered(t))
+    _check(rec, "cited", lambda: cites_document(t, doc))
+    _check(rec, "shape_produced", lambda: _must(produced, "SHAPE NOT PRODUCED: the answer does not state the value of the first building", t))
+    _check(rec, "scale_kept", lambda: _scale_kept(t))
+    _check(rec, "no_unscaled_value", lambda: _no_unscaled_value(t))

@@ -1034,7 +1034,7 @@ def _raws(src, known: Collection[str] = frozenset()) -> tuple[list[_Raw], dict[s
                 quote = _clip_row(line)
                 raws.append(_Raw(quote, cells[0], _row_value(cells, header, known), "row", f"{quote} {' '.join(header)} {about}", "table"))
         for part in parts:
-            if part.place in ("before", "after", "note") and not part.reason:
+            if part.place in ("before", "after", "note") and not part.reason and not part.completed:  # a completed note was never shown: no item of its own
                 for sentence in _SENTENCE_END.split(part.text):
                     number = _first_value(sentence)
                     if number and not conditions.material(sentence):  # a note that limits a value is that value's condition span
