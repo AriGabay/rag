@@ -1135,6 +1135,84 @@ def _flat(text: str) -> str:
     return " ".join(_norm(text).split())
 
 
+# a hyphen a line wrap leaves inside a word: the hyphen-minus, the maqaf and the typographic hyphens
+_WRAP_HYPHENS = "-־‐‑"
+
+
+def _skeleton(text: str) -> tuple[str, list[int]]:
+    """``text`` as the verbatim comparison reads it, with the position in ``text`` of each kept character (round 23 U6, M8): the abbreviation
+    marks in one spelling (``_norm``), every run of whitespace dropped — a PDF's stored text breaks a word with a line break or extra spaces
+    — except between two digits (a number is never closed or split by the comparison: "1 250" is not "1250"), and a hyphen a line wrap
+    leaves inside a word (a letter before it, whitespace, a letter after it) dropped. Nothing else is touched, so another letter, another
+    number or a sign still differs."""
+    s = _norm(text or "")
+    out: list[str] = []
+    at: list[int] = []
+    n, i = len(s), 0
+    while i < n:
+        ch = s[i]
+        if ch.isspace():
+            j = i
+            while j < n and s[j].isspace():
+                j += 1
+            if i > 0 and j < n and s[i - 1].isdigit() and s[j].isdigit():
+                out.append(" ")
+                at.append(i)
+            i = j
+            continue
+        if ch in _WRAP_HYPHENS and 0 < i < n - 1 and s[i - 1].isalpha() and s[i + 1].isspace():
+            j = i + 1
+            while j < n and s[j].isspace():
+                j += 1
+            if j < n and s[j].isalpha():
+                i = j
+                continue
+        out.append(ch)
+        at.append(i)
+        i += 1
+    return "".join(out), at
+
+
+def loose_hits(text: str, quote: str) -> list[tuple[int, int, dict[int, int]]]:
+    """Every place ``quote`` stands in ``text`` when whitespace and a line-wrap hyphen inside a word are ignored (round 23 U6, M8; the one
+    verbatim comparison ``take_value``, the anchor locator and the support scope share): ``(start, end, where)`` for each, the half-open span
+    of ``text`` from the first to the last character of the source's OWN words, and ``where`` mapping the index of each character of
+    ``quote`` the comparison kept to its index in ``text`` (so a number inside the quote is cited at its exact position, never at an offset
+    shifted by the split). A quote with no letter or digit has no hit."""
+    want, want_at = _skeleton(quote)
+    if not want or not any(c.isalnum() for c in want):
+        return []
+    have, have_at = _skeleton(text)
+    out: list[tuple[int, int, dict[int, int]]] = []
+    k = have.find(want)
+    while k >= 0:
+        last = k + len(want) - 1
+        out.append((have_at[k], have_at[last] + 1, {want_at[j]: have_at[k + j] for j in range(len(want))}))
+        k = have.find(want, k + 1)
+    return out
+
+
+def loose_spans(text: str, quote: str) -> list[tuple[int, int]]:
+    """The spans of ``text`` that hold ``quote`` ignoring whitespace and a line-wrap hyphen inside a word (``loose_hits``)."""
+    return [(a, b) for a, b, _ in loose_hits(text, quote)]
+
+
+def loose_contains(text: str, quote: str) -> bool:
+    """Whether ``text`` holds ``quote`` ignoring whitespace and a line-wrap hyphen inside a word: the verbatim test a quote of a source
+    passes when the source's stored text splits a word. A real difference of a letter, a word or a number still fails it."""
+    return bool(loose_hits(text, quote))
+
+
+# a percentage a row's NAME carries ("תשואה 7%", "היוון 6.5%", "(7%)"): part of what the row is called, never the unit of its cell
+_NAMED_PERCENT = re.compile(r"\d[\d.,]*\s*%|%\s*\d[\d.,]*")
+
+
+def unit_label(label: str) -> str:
+    """A row label as the unit reader sees it (round 23 U6, M8): the percentages that are part of its name removed. A percent sign that is the
+    label's unit mark ("שיעור היוון (%)") stays — it has no number beside it."""
+    return _NAMED_PERCENT.sub(" ", _norm(label or ""))
+
+
 def _one_point(text: str) -> str:
     """``text`` with every separator between digits written as a point: a quote is the same line of the source whether its decimal
     comma was read as a decimal in the line or in the quote alone (the reading depends on what surrounds the comma)."""

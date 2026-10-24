@@ -65,6 +65,7 @@ from sqlalchemy import Connection, text
 from app.answering.numread import NUMBER, _span_end, read_separators
 from app.chat import datum, reader
 from app.chat.meaning import _norm, units_attested
+from app.chat.meaning import loose_hits as meaning_loose_hits
 from app.chat.slots import clip
 from app.extraction import tables as stored_tables
 from app.extraction.base import PageGeometry
@@ -202,25 +203,32 @@ def locate_quote(blocks, quote: str, value: Decimal) -> Located | None:
     q = " ".join(_norm(quote or "").split())
     if not q or not tokens:
         return None
-    hits: list[int] = []
+    # where the quote stands in the flat text: as written; else, when no place has it so, with whitespace and a line-wrap hyphen inside
+    # a word ignored (round 23 U6: a PDF's stored text splits a word) — each hit with the flat position of every character of the quote,
+    # so the cited words and number are the source's own at their exact positions, never offsets shifted by the split
+    hits: list[tuple[int, int, dict[int, int] | None]] = []
     i = flat.find(q)
     while i >= 0:
-        hits.append(i)
+        hits.append((i, i + len(q), None))
         i = flat.find(q, i + 1)
+    if not hits:
+        hits = list(meaning_loose_hits(flat, q))
     if not hits:
         return None
     read_q = read_separators(q)
     in_quote = next((m for m in NUMBER.finditer(read_q) if _number_value(m.group(0)) == abs(value)), None)
+    # the written number's length in the quote: "1.234,56" is read "1234.56 " but written eight characters long
+    written_len = _span_end(read_q, q, in_quote.end()) - in_quote.start() if in_quote is not None else 0
 
     def raw_at(f: int) -> tuple[int, int]:
         tok = max((t for t in tokens if t[3] <= f), key=lambda t: t[3])
         return tok[0], tok[1] + (f - tok[3])
 
-    def segments_of(start: int) -> list[list[int]]:
+    def segments_of(start: int, end: int) -> list[list[int]]:
         out: list[list[int]] = []
-        first, last = raw_at(start), raw_at(start + len(q) - 1)
+        first, last = raw_at(start), raw_at(end - 1)
         for t in tokens:
-            if t[3] + (t[2] - t[1]) <= start or t[3] >= start + len(q):
+            if t[3] + (t[2] - t[1]) <= start or t[3] >= end:
                 continue
             if out and out[-1][0] == t[0]:
                 out[-1][2] = t[2]
@@ -230,24 +238,30 @@ def locate_quote(blocks, quote: str, value: Decimal) -> Located | None:
         out[-1][2] = last[1] + 1
         return out
 
+    def flat_of(hit: tuple[int, int, dict[int, int] | None], k: int) -> int:
+        return hit[0] + k if hit[2] is None else hit[2][k]
+
     numbers = []
     for h in hits:
         if in_quote is None:
             numbers.append(None)
             continue
-        block, pos = raw_at(h + in_quote.start())
+        block, pos = raw_at(flat_of(h, in_quote.start()))
         numbers.append(_number_at(texts[block], pos))
     if len(hits) > 1:
         if len(set(numbers)) > 1:
             raise AmbiguousQuote
-        held = sorted({s[0] for h in hits for s in segments_of(h)})
+        held = sorted({s[0] for h in hits for s in segments_of(h[0], h[1])})
         return Located([], None, held)
-    segments = segments_of(hits[0])
+    segments = segments_of(hits[0][0], hits[0][1])
     number = None
     if in_quote is not None:
-        block, pos = raw_at(hits[0] + in_quote.start())
-        # the end is the written number's, not the read one's: "1.234,56" is read "1234.56 " but written eight characters long
-        number = [block, pos, pos + _span_end(read_q, q, in_quote.end()) - in_quote.start()]
+        block, pos = raw_at(flat_of(hits[0], in_quote.start()))
+        if hits[0][2] is None:
+            number = [block, pos, pos + written_len]
+        else:  # the number's last character, mapped on its own (a split word may sit before it, never inside it)
+            end_block, end_pos = raw_at(flat_of(hits[0], in_quote.start() + written_len - 1))
+            number = [block, pos, end_pos + 1] if end_block == block else None
     return Located(segments, number, [s[0] for s in segments])
 
 

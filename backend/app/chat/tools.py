@@ -6359,10 +6359,39 @@ def _header_units(header: str, column_unit: str = "") -> set[str]:
     per m² — the header names an amount, and the area is its denominator, not its unit."""
     text_ = f"{header} {column_unit}"
     units = meaning.units_attested(text_)
-    if units == {"sqm"} and meaning._PER_SQM.search(meaning._norm(text_)) \
-            and any(meaning.kind_attested(k, text_) for k in meaning.MONEY_KINDS):
+    if units == {"sqm"} and any(meaning.kind_attested(k, text_) for k in meaning.MONEY_KINDS) \
+            and (meaning._PER_SQM.search(meaning._norm(text_)) or not re.search(r"\d", text_)):
+        # a money column that names the area ("מחיר (מ״ר)", "שווי מ״ר"): the area is its denominator, in whatever spelling (round 23 U6);
+        # a number beside the area ("שווי דירה 90 מ״ר") describes a property, not a rate
         return {"ILS_per_sqm"}
     return units
+
+
+_UNIT_FAMILY = {"percent": "percent", "ILS": "money", "ILS_per_sqm": "money", "sqm": "area", "dunam": "area"}
+
+
+def _header_conflict(pieces: Iterable[str]) -> set[str]:
+    """The units the rows of a column header state when they cannot all be the cell's (round 23 U6, M8): one row says a percentage and
+    another a currency, or an area and a dunam. A currency beside an area is no conflict (an amount per area). Empty when they agree or only
+    one states a unit."""
+    stated = [u for p in pieces if p and (u := meaning.units_attested(p))]
+    families = {_UNIT_FAMILY.get(x, x) for u in stated for x in u}
+    if len(families) < 2 or families == {"money", "area"}:
+        return set()
+    return {x for u in stated for x in u}
+
+
+def _rows_under_header(rows: list[list[str]], ri: int, ci: int) -> list[str]:
+    """The cells of column ``ci`` in the rows that sit between a table's header row and its first row of numbers, when the header is more than
+    one row (round 23 U6, M8: the unit word in "₪ למ״ר" under a group heading is in the second header row): the leading rows before ``ri``
+    that write no digit in any cell, at most two. The stored header is one row; the rest of a multi-row header is stored as the first rows."""
+    out: list[str] = []
+    for r in rows[:min(ri, 2)]:
+        if any(re.search(r"\d", c or "") for c in r):
+            break
+        if ci < len(r) and r[ci]:
+            out.append(str(r[ci]))
+    return out
 
 
 _AREA_MARK = re.compile(r"מ\"ר|מטר")
@@ -6784,30 +6813,48 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     # the unit of the cell, its row or its column; the table's caption or notes only when those state none. A cell that
     # states no unit of its own takes the one its column header states, before the cell, row label and header are read
     # together (round 15 U1, KTD9): "שווי למ״ר" over a row that names "דירה 3 חדרים" is ₪ per m², not m²
-    head_units = set() if meaning.units_attested(cell) else _header_units(header, near[3])
-    units = head_units or meaning.units_attested(" ".join(near)) or meaning.units_attested(" ".join(stated_text))
+    # the evidence ranked (round 23 U6, M8): the cell's own unit > every row of the column header (the leaf header, the unit the extraction read
+    # from it, the unit row under a group heading) > the row label's words > the table's caption and notes. A percentage a row's NAME
+    # carries ("תשואה 7%") is never read as a unit; a header that conflicts with another header row leaves the unit ambiguous (the flag
+    # below), never a refusal
+    cell_units = meaning.units_attested(cell)
+    label_name = meaning.unit_label(label)  # the label's words as the unit reader takes them: no percentage of its name
+    under = _rows_under_header(rows, ri, ci)
+    head_text = " ".join(x for x in (header, *under) if x)
+    head_conflict = set() if cell_units else _header_conflict([header, near[3], *under])
+    head_units = set() if cell_units or head_conflict else _header_units(head_text, near[3])
+    stated_head = " ".join([head_text, near[3]])
+    if cell_units:
+        units = cell_units
+        if cell_units == {"ILS"}:  # a currency-only cell takes the denominator its header or label states ("למ״ר"); a "%" elsewhere is not its unit
+            units = (_header_units(head_text, near[3]) & {"ILS_per_sqm"}
+                     or meaning.units_attested(" ".join([cell, label_name, stated_head]).replace("%", "")) or units)
+    else:
+        units = head_units or meaning.units_attested(" ".join([cell, label_name, stated_head])) or meaning.units_attested(" ".join(stated_text))
+    if head_conflict:
+        units = set()
     # a row label that names money per area gives a cell that states only the currency that unit; a cell or a header
     # that states another unit keeps it (round 15 U1 follow-up, KTD9)
-    label_units = (_label_units(label) if not head_units and meaning.units_attested(cell) == {"ILS"}
-                   and meaning.units_attested(" ".join([header, near[3]])) <= {"ILS"} else set())
+    label_units = (_label_units(label) if not head_units and cell_units == {"ILS"}
+                   and meaning.units_attested(stated_head) <= {"ILS"} else set())
     if label_units:
         units = label_units
     # where the source states the unit (R10): the cell, its row label, its column header (or the column's unit
     # read from it), else the table's caption, title or notes
     unit_from = "header" if head_units else "row" if label_units else next(
-        (where for where, t in (("cell", near[0]), ("row", near[1]), ("header", near[2] + " " + near[3]))
+        (where for where, t in (("cell", near[0]), ("row", label_name), ("header", stated_head))
          if meaning.units_attested(t)), "table" if units else None)
     # a unit only the row's own label mentions, beside a caption that states another, and nothing in the cell or its
     # header: "דירה 90 מ״ר | 21,000" under "(₪)" — the m² describes the row's property, the amount is the caption's. The
     # source does not say which: the value registers with the model's unit and a flag that blocks calculating with it
-    row_units = meaning.units_attested(label)
+    row_units = meaning.units_attested(label_name)
     caption_units = meaning.units_attested(" ".join(stated_text))
-    ambiguous = (not head_units and not label_units and not meaning.units_attested(" ".join([cell, header, near[3]])) and bool(row_units)
-                 and bool(caption_units) and row_units != caption_units and bool(re.search(r"\d", label)))
-    if ambiguous:
+    ambiguous = (not head_units and not label_units and not head_conflict and not meaning.units_attested(" ".join([cell, stated_head]))
+                 and bool(row_units) and bool(caption_units) and row_units != caption_units and bool(re.search(r"\d", label)))
+    if ambiguous or head_conflict:
         units, unit_from = set(), None
-    own_kind_not_money = meaning.nonmonetary(" ".join(near))
-    if not units and not own_kind_not_money and not ambiguous and not later:
+    own_kind_not_money = meaning.nonmonetary(" ".join([cell, label_name, stated_head])) and not cell_units & {"ILS", "ILS_per_sqm"}
+    if not units and not own_kind_not_money and not ambiguous and not head_conflict and not later:
         units = _note_units(governing)
         if units:
             unit_from = "governing_note"
@@ -6832,7 +6879,7 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
             "total": bool(calc.TOTAL_WORDS.search(meaning._norm(cells[0] if cells else ""))),
             "table": (str(src.version_id), index), "said": said, "context": " ".join([*near, *table_text]),
             "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale,
-            **({"unit_ambiguous": sorted(row_units | caption_units)} if ambiguous else {}),
+            **({"unit_ambiguous": sorted(row_units | caption_units | head_conflict)} if ambiguous or head_conflict else {}),
             **({"unconfirmed": MSG_LATER_PAGE_UNCONFIRMED.format(page=row_page, text=later)} if later else {}),
             # what the facet is read from (round 13 U3, KTD2): the row label, the column header and the caption and title
             "facet_in": _cell_facet_in(label, header, st, cells),
@@ -7084,6 +7131,11 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
         raise _not_one_number(loc["number"])
     quote = meaning._flat(loc["quote"])
     text_ = meaning._flat(full)
+    loose = False
+    if len(quote) >= 3 and quote not in text_ and (spans := meaning.loose_spans(text_, quote)):
+        # the source's stored text splits a word (a line break, extra spaces, a wrap hyphen) that the quote joins: the quote is the source's
+        # own words at the place found (round 23 U6, M8), so every later reading and the stored quote are verbatim as the source writes it
+        quote, loose = text_[spans[0][0]:spans[0][1]], True
     if len(quote) < 3 or quote not in text_:
         raise ToolError(f"הציטוט אינו מופיע כלשונו ב-{src.sid}: העתק את המשפט מהמקור בדיוק (או בחר תא בטבלה)")
     if " | " in quote:
@@ -7150,12 +7202,13 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
     whole = "\n".join([full, *table_notes])
     vats = meaning.vat_attested(line, forms, whole)
     sentence = _block_sentence(blocks, anchor, quote)
-    return {"written": written, "value": sign * value, "forms": forms, "quote": loc["quote"].strip(),
+    stored = quote if loose else loc["quote"].strip()
+    return {"written": written, "value": sign * value, "forms": forms, "quote": stored,
             **({"sentence": sentence} if sentence else {}),
             "qualifiers": meaning.number_qualifiers(full, forms, quote),
             "units": units, "vat": vats,
             "vat_from": _vat_anchors(vats, [("sentence", quote), ("paragraph", line), ("note", whole)], "paragraph"),
-            "kind_context": quote, "kind_parts": [("sentence", quote)], "locator": {"quote": loc["quote"].strip()},
+            "kind_context": quote, "kind_parts": [("sentence", quote)], "locator": {"quote": stored},
             "source_text": full,  # the source the quote is of: a kind or a unit its fragment lacks is confirmed in the number's own clause (round 21 U3)
             "total": False, "table": None,
             "anchor": anchor, "said": said, "context": f"{line}\n{quote}",
