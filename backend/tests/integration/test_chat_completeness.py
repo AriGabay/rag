@@ -229,6 +229,31 @@ def test_an_unmet_style_instruction_triggers_a_repair_round_that_changes_the_ans
     assert a["verification"]["completeness"] == {"status": "full", "requirements": 2, "missing": []}
 
 
+def test_a_requirement_a_repair_round_completed_is_marked_attempted_in_the_stored_rounds_and_the_answer_is_unchanged(
+        client, office, monkeypatch):
+    """Round 23 U0 (KTD11): the rounds the diagnostics keep were serialised before the repair prompt, so a repaired problem showed
+    ``repair_attempted`` false, and a requirement (no unit) was never stamped. The answer is the one ``test_ae6`` asserts."""
+    steps = [*_ae4_steps(office.doc)[:4], final(FIRST, documents=[office.doc]),
+             [call("calculate", expression="C1 / V1", label="שיעור הרווח מההכנסות", justification=None)],
+             final(COMPLETE, documents=[office.doc])]
+    agent = ScriptedAgent(steps, judge=_judge(ASKS))
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    m = send(client, new_conversation(client), QUESTION)
+    assert m["status"] == "done", m
+    a = m["answer"]
+    assert a["status"] == "answered" and a["markdown"].endswith("שיעור הרווח מההכנסות הוא 12.3% [C2].")
+    assert a["verification"]["completeness"] == {"status": "full", "requirements": 3, "missing": []}
+    d = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()
+    first, *later = d["rounds"]
+    (asked,) = [p for p in first if p["kind"] == "requirement"]
+    assert asked["component"] == "N3" and asked["repair_attempted"] is True  # the prompt named the rate the answer omitted
+    assert all(not p["repair_attempted"] for r in later for p in r if p["kind"] == "requirement")  # nothing left to name
+    gates = d["timing"]["repair_gate"]
+    assert gates[0]["decision"] == "repair" and gates[0]["repairable_kinds"] == {"requirement": 1}
+    assert gates[-1]["decision"] == "refused" and "settled" in gates[-1]["refused_by"]
+
+
 # --- a calculation component is full only through a computation (round 7 KTD3, R6, R7) -------------------------------
 
 FORMULA_ASK, SCENARIO_ASK = "איך מחושב הרווח הכולל", "הרווח אם כל העלויות יעלו ב-5%"

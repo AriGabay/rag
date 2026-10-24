@@ -1739,6 +1739,15 @@ def repair_key(unit: Unit) -> str:
     return _norm(unit.text)
 
 
+def problem_repair_key(p: Problem) -> str:
+    """A problem as a repair prompt names it (``repair_key`` of its unit; a requirement or a request mismatch has no unit, and is named by
+    its kind, the component it is about and the check that raised it), so a later round's same problem is known (round 23 U0, KTD11,
+    ``mark_repairs``). Diagnostics only: no decision reads whether a problem was repaired."""
+    if p.unit.index >= 0:
+        return repair_key(p.unit)
+    return f"{p.kind}:{p.component or ''}:{p.check or ''}"
+
+
 def removal_summary(kind: str, cause: str = "", component: str | None = None, check: str | None = None) -> dict:
     """A removal on the user's normal path (KTD5): its kind, its component and the server's fixed sentence — a claim
     that could not be checked says why (R14): each cause its own sentence, none a contradiction. A claim removed by the scope check
@@ -2230,11 +2239,11 @@ class VerifyReport:
                 p.component = gave.get(p.unit.index) or said.get(p.unit.index)
 
     def mark_repairs(self, attempted: set[str]) -> None:
-        """Record on each unit problem whether a repair round was asked to fix its unit (``attempted``: the keys,
-        ``repair_key``, of the units the turn's repair prompts named)."""
+        """Record on each problem whether a repair round was asked to fix it (``attempted``: the keys, ``problem_repair_key``, of the
+        problems the turn's repair prompts named: a unit's by its text, a requirement's by its component; round 23 U0 stamps the
+        requirements too). Diagnostics only."""
         for p in self.problems:
-            if p.unit.index >= 0:
-                p.repair_attempted = repair_key(p.unit) in attempted
+            p.repair_attempted = problem_repair_key(p) in attempted
 
     def _partial_number_claim(self, r: ClaimRecord) -> str:
         """The words of a claim the judge called partly supported whose number the verification supported (round 21 U9, KTD5, R10): a datum
@@ -2406,8 +2415,9 @@ class VerifyReport:
         return merged, todo + [(u, r) for u, r, _ in bound]
 
     def repair_keys(self, claims_only: bool = False) -> set[str]:
-        """The units the repair prompt (``problems_text``) names: not one whose failing claim the server cuts."""
-        return {repair_key(p.unit) for p in self.problems if p.unit.index >= 0 and p.resolution != "cut"
+        """The problems the repair prompt (``problems_text``) names, as keys (``problem_repair_key``): not one whose failing claim the server
+        cuts, and with ``claims_only`` not a requirement a round with no tools cannot complete (round 23 U0: the requirements are named too)."""
+        return {problem_repair_key(p) for p in self.problems if p.resolution != "cut"
                 and not (claims_only and p.kind == "requirement" and not p.completable_offline)}
 
     def partial_problems(self, index: int | None = None) -> list[Problem]:

@@ -221,7 +221,7 @@ from app.chat.timeframe import (
     WINDOW,
     TimeMode,
 )
-from app.chat.timing import StageClock
+from app.chat.timing import CURSORS_KEPT, StageClock
 from app.config import get_settings
 from app.db import TenantContext, current_data_version, tenant_tx
 from app.extraction import tables as stored_tables
@@ -555,6 +555,8 @@ class Workspace:
     # contiguously from its beginning (``READ_TO_END`` at its end), "unread": a region of it was not read,
     # "document_id"}
     reads: dict[tuple, dict] = field(default_factory=dict)
+    # the read cursors (K#) the agent used in ``read`` (round 23 U0, KTD11): ``unfollowed_cursors`` lists those it was given and never used
+    followed_cursors: set = field(default_factory=set)
     # the turn's settled intent (round 10 U6; ``intent.Intent.value``): what the tools' pools are set from; ``unknown``
     # until the request is read, and when it is not known
     intent: str = "unknown"
@@ -765,6 +767,43 @@ class Workspace:
         a = self.activity.get(document_id)
         if a is not None:
             a["read_complete"], a["read_partial"] = any(done), not all(done)
+
+    def unfollowed_cursors(self) -> list[dict]:
+        """The continuation cursors (K#) the turn's reads returned and the agent never followed (round 23 U0, KTD11, R15), for the diagnostics only:
+        the cursor, the first source that carried it, its document, the kind of its target, the position it reads on from and how much remained
+        after the part (``left``: blocks and characters of a window, rows of a table - recorded when the part was cut). A cursor is followed
+        when ``read`` was given it, or when the same target was since read to its end or past its position (by any route). A pointer to read a
+        section whole (a § handle in ``Source.more``) is no cursor. Numbers, handles and ids: no text."""
+        out: list[dict] = []
+        seen: set[str] = set()
+        for sid, s in self.sources.items():
+            cursor = s.more
+            data = self.handles.get(cursor) if cursor else None
+            if data is None or data.get("kind") != "K" or cursor in seen or cursor in self.followed_cursors:
+                continue
+            seen.add(cursor)
+            if self._read_past(data.get("target"), data.get("pos")):
+                continue
+            doc = str(data.get("document_id") or s.document_id or "")
+            pos = data.get("pos")
+            out.append({"cursor": cursor, "source": sid, "document_id": doc,
+                        "document": self.handle_ids.get(("D", (doc,))), "target": (data.get("target") or ("",))[0],
+                        "pos": list(pos) if isinstance(pos, tuple) else pos, "left": data.get("left")})
+            if len(out) >= CURSORS_KEPT:
+                break
+        return out
+
+    def _read_past(self, target, pos) -> bool:
+        """Whether ``target`` was read to its end, or beyond ``pos`` (where a cursor reads on from)."""
+        st = self.reads.get(target) if target is not None else None
+        if st is None:
+            return False
+        if st["to"] == READ_TO_END:
+            return True
+        try:
+            return st["to"] is not None and st["to"] > pos
+        except TypeError:
+            return False
 
     def read_complete(self, target) -> bool | None:
         """Whether a target was read to its end with no unread region (None: never read as a target)."""
@@ -4079,11 +4118,21 @@ def _cursor(ws: Workspace, v: reader.Version, target: tuple, pos, within: tuple[
                      reading_id=v.reading_id, target=target, pos=pos, within=within)
 
 
+def _left_after(rows: list, part: reader.Part) -> dict | None:
+    """What a window had left after ``part`` (round 23 U0, diagnostics only): the blocks from the one the next part starts in, and their
+    characters (the next part's own offset into its first block left out). None when the part ends the window."""
+    if part.next is None:
+        return None
+    block, offset = part.next
+    rest = [r for r in rows if r.block_index >= block]
+    return {"blocks": len(rest), "chars": max(0, sum(len(r.text or "") for r in rest) - offset)}
+
+
 def _emit(ws: Workspace, v: reader.Version, target: tuple, pos, part: reader.Part, *, name: str, scope: str,
           location: str, section: str | None, lines: list[str], read: bool, more: str | None = None,
           cut: bool = False, unread_pages: list[int] | None = None, cx=None,
           within: tuple[int, int] | None = None, standard: tuple[str, dict] | None = None,
-          rules: dict | None = None) -> Source:
+          rules: dict | None = None, left: dict | None = None) -> Source:
     """A part of a window as a source of the turn. Its ``text`` is the part's full text (what the verifier
     checks); what is sent leaves out blocks the turn already returned whole, as a pointer to the source that
     returned them, and marks unread and uncertain regions where they are in reading order with their R#.
@@ -4142,6 +4191,8 @@ def _emit(ws: Workspace, v: reader.Version, target: tuple, pos, part: reader.Par
     flush()
     if part.next is not None:
         more = _cursor(ws, v, target, part.next, within)
+        if left is not None:
+            ws.handles[more].setdefault("left", left)  # round 23 U0: what remained after this part, for the diagnostics
     clipped = part.next is not None or cut
     status = ("clipped" if clipped else "has_unread_regions" if unread
               else "uncertain_reading" if uncertain else "complete")
@@ -4265,7 +4316,8 @@ def _read_window_once(ws: Workspace, conn: Connection, v: reader.Version, target
         if unread_pages:
             raise ToolError(f"{name}: לא נקראו בעיבוד המסמך (אין בהם טקסט שנקרא)")
         raise ToolError(f"אין קטעים שנשמרו ב{name}" if target[0] == "pages" else "אין קטעים בסעיף הזה")
-    part = reader.take(_served_rows(ws, conn, vid, rows), pos, read_chars(), ws.sent.get(str(vid), {}))
+    served = _served_rows(ws, conn, vid, rows)
+    part = reader.take(served, pos, read_chars(), ws.sent.get(str(vid), {}))
     pages = sorted({r.page for r, _, _ in part.items if r.page})
     if target[0] == "section":
         location = _location(name, "text", pages, None, None, (None, None), None)
@@ -4282,7 +4334,7 @@ def _read_window_once(ws: Workspace, conn: Connection, v: reader.Version, target
     std = standard_for(ws, conn, vid, part.items[0][0].block_index)
     s = _emit(ws, v, target, pos, part, name=name, scope=target[0], location=location, section=section,
               lines=lines, read=True, unread_pages=unread_pages if pos is None else None, cx=cx, within=within,
-              standard=std, rules=_rules_of_part(ws, conn, vid, part) if std else None)
+              standard=std, rules=_rules_of_part(ws, conn, vid, part) if std else None, left=_left_after(served, part))
     if target[0] == "pages":  # a section opened by name is its own opening
         _whole_sections(ws, conn, v, cx, part, s)
     return s
@@ -4331,11 +4383,13 @@ def _read_professional_section(ws: Workspace, conn: Connection, v: reader.Versio
     # ``take`` starts at ``pos``: the blocks before it are not loaded (as for the appraisal windows)
     rows = reader.blocks_between(conn, vid, max(sec.block_first, pos[0]) if pos else sec.block_first, sec.block_last,
                                  limit=None)
-    part = reader.take(_served_rows(ws, conn, vid, rows), pos, read_chars(), ws.sent.get(str(vid), {}))
+    served = _served_rows(ws, conn, vid, rows)
+    part = reader.take(served, pos, read_chars(), ws.sent.get(str(vid), {}))
     std = standard_for(ws, conn, vid, part.items[0][0].block_index if part.items else sec.block_first, secs)
     name = called(sec)
     return _emit(ws, v, target, pos, part, name=name, scope="section", location="", section=name, lines=lines,
-                 read=True, standard=std, rules=section_rules(secs, sec.block_first, sec.block_last) if std else None)
+                 read=True, standard=std, rules=section_rules(secs, sec.block_first, sec.block_last) if std else None,
+                 left=_left_after(served, part))
 
 
 def _reference_lines(ws: Workspace, conn: Connection, st, by_no: dict, handle) -> list[str]:
@@ -4486,6 +4540,8 @@ def _read_table_once(ws: Workspace, conn: Connection, v: reader.Version, table_i
     target = ("table", str(v.version_id), table_index)
     vid = str(v.version_id)
     more = _cursor(ws, v, target, nxt) if nxt is not None else None
+    if more is not None:
+        ws.handles[more].setdefault("left", {"rows": len(rows) - nxt})  # round 23 U0: what remained, for the diagnostics only
     uncertain = block is not None and block.status == reader.UNCERTAIN
     status = "clipped" if nxt is not None else "uncertain_reading" if uncertain else "complete"
     head = [f"מצב הטבלה: {TABLE_STATUS_LABELS[status]}" + (f"; להמשך: read(cursor={more})" if more else "")]
@@ -4694,6 +4750,7 @@ def tool_read(ws: Workspace, target: dict) -> str:
         else:
             data = _handle(ws, value, "K")
             v = _bound(conn, ws, value, data)
+            ws.followed_cursors.add(value)  # round 23 U0: the agent used this cursor (diagnostics only)
             if data["target"][0] == "table":
                 s = _read_table(ws, conn, v, data["target"][2], data["pos"])
             else:

@@ -13,6 +13,11 @@ call's lexical and fused candidate counts and seconds (on the tool's record, ``s
 skipped for the tool budget) and the number of multi-page stored tables served (``multi_page_tables``). Counts, statuses
 and handles only.
 
+Round 23 U0 (KTD11, R15) adds two more records, again with no effect on any decision or answer text: what the repair gate saw and decided
+after each verification (``repair_gate``: the attempt, whether the report was ok or settled, the steps used, the seconds the turn had to the
+gate, the answer step's seconds, the kinds of problem a repair would take, and the cause when the gate refused the round), and the read
+cursors the agent was given and never followed (``unfollowed_cursors``, from ``Workspace.unfollowed_cursors``, at the turn's end).
+
 A read or an inspection also records the first and last page of the sources it returned (``pages``, numbers only), which
 the evaluation's reading-completeness measure uses.
 
@@ -37,6 +42,8 @@ TOOL_STAGE = {"search": "locate", "find_documents": "locate", "list_documents": 
 TOOLS_KEPT = 200  # tool records kept for a turn's summary (a turn makes a few dozen at most)
 SEARCHES_KEPT = 12  # search records kept on one tool record (a tool call makes one to a few searches)
 READ_TARGETS_KEPT = 200  # read targets kept for a turn's summary
+REPAIR_GATES_KEPT = 8  # repair-gate records kept for a turn (one per verification round, a few at most)
+CURSORS_KEPT = 40  # unfollowed continuation cursors kept for a turn's summary
 
 
 @dataclass
@@ -58,6 +65,9 @@ class StageClock:
     read_docs: dict[str, set] = field(default_factory=dict)  # round 22 U7: the documents each read target names (never in the summary)
     tables_served: set = field(default_factory=set)
     multi_page: set = field(default_factory=set)
+    # round 23 U0: what the repair gate saw and decided after each verification, and the continuation cursors never followed
+    repair_gate: list[dict] = field(default_factory=list)
+    unfollowed: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.started = self.now()
@@ -132,6 +142,16 @@ class StageClock:
             if spans_pages:
                 self.multi_page.add(key)
 
+    def note_repair_gate(self, record: dict) -> None:
+        """What the repair gate saw after one verification round, and its decision (round 23 U0, KTD11): the engine's numbers and labels only.
+        Read by no decision."""
+        if len(self.repair_gate) < REPAIR_GATES_KEPT:
+            self.repair_gate.append(record)
+
+    def note_unfollowed(self, cursors: list[dict]) -> None:
+        """The read cursors the turn gave the agent and it never followed (``Workspace.unfollowed_cursors``), kept at the turn's end."""
+        self.unfollowed = list(cursors[:CURSORS_KEPT])
+
     def summary(self) -> dict:
         """The turn so far: every stage with its seconds and calls, the tool records, the turn's seconds and the part
         of it no stage holds. The total is never less than the stages' sum (they are disjoint intervals of the turn;
@@ -147,6 +167,8 @@ class StageClock:
         out["reads"] = {k: dict(v) for k, v in self.reads.items()}
         out["tables_served"] = len(self.tables_served)
         out["multi_page_tables"] = len(self.multi_page)
+        out["repair_gate"] = [dict(r) for r in self.repair_gate]
+        out["unfollowed_cursors"] = [dict(r) for r in self.unfollowed]
         return out
 
 

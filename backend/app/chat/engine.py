@@ -763,7 +763,9 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     rereader = ContextReader(ws)  # a claim the judge lacked context for is read again once (round 8 U5)
     reused = 0
     checked = None  # the last verified answer with its report, kept when a repair round cannot finish
-    repaired: set[str] = set()  # the units a repair prompt named (``verify.repair_key``)
+    repaired: set[str] = set()  # the problems a repair prompt named (``verify.problem_repair_key``)
+    # round 23 U0 (KTD11): each verification round's report with its slot in ``rounds``, so the stored round shows what was repaired
+    report_slots: list[tuple[VerifyReport, int]] = []
     answer_seconds = 0.0  # how long the step that wrote the last answer took
     progress("understand", "מבין את הבקשה")
     request = None
@@ -898,11 +900,25 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         if ranked is not None:
             first_decisions["candidates"] = _candidates_decision(ranked.cards, ranked.more)
 
+    def stamp_repairs(rep: VerifyReport) -> None:
+        """Mark on ``rep``'s problems which a repair prompt named, and carry it into the round the diagnostics keep (round 23 U0, KTD11): the
+        round was serialised when it was verified, before any repair prompt, so its ``repair_attempted`` was always false. Only that flag of
+        the stored dicts is set (they are parallel to the report's problems); no decision reads it."""
+        rep.mark_repairs(repaired)
+        for held, slot in report_slots:
+            if held is rep and slot < len(rounds) and len(rounds[slot]) == len(rep.problems):
+                for stored, problem in zip(rounds[slot], rep.problems, strict=True):
+                    stored["repair_attempted"] = problem.repair_attempted
+
+    def note_gate(decision: str, **fields) -> None:
+        """What the repair gate decided after a verification round and why (round 23 U0, KTD11, R15), kept in the turn's timing; diagnostics only."""
+        ws.clock.note_repair_gate({"attempt": attempt, "decision": decision, "steps": steps, **fields})
+
     def finish(answer: FinalAnswer, report: VerifyReport) -> TurnOutcome:
         # removals; each component recomputed from the surviving units; the absences the server states removed; one
         # gap paragraph after the answer (round 7 U3) — then the limits reached and the coverage ledger. Each decision
         # records whether a repair round was asked to fix its unit (round 7 U4, KTD5)
-        report.mark_repairs(repaired)
+        stamp_repairs(report)
         # all of it in one composer (round 8 U4, KTD6), which records every span the server wrote — and the composed
         # text is checked as the whole it is, in the verification allowance, before anything is saved (U6): every path
         # that returns an answer comes through here, the fallbacks to an earlier round's answer included
@@ -930,6 +946,10 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                                   | {str(d["document_id"]) for d in (request.offered if request is not None else [])})
                            if final.status == "clarification" else [])
         report.completeness = coverage.completeness(outcomes, report.unbound_data())
+        try:  # round 23 U0 (KTD11): the read cursors the turn was given and never followed, in the timing (diagnostics only)
+            ws.clock.note_unfollowed(ws.unfollowed_cursors())
+        except Exception:  # noqa: BLE001 - a diagnostics record never fails the turn
+            logger.warning("chat unfollowed-cursor record failed", exc_info=True)
         # the side effects, once, after the last pass: the documents the final text cites are marked verified
         if final.status != "clarification":
             coverage.touch_verified(ws, final.answer_markdown)
@@ -1045,6 +1065,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             # a repair round that fails (a timeout on a long rewrite, say) leaves the answer already verified: it is
             # used as a round without time would use it, its unverified claims removed, instead of failing the turn
             logger.warning("chat repair round failed: %s; the verified answer is kept", failure[0])
+            note_gate("repair_round_failed", cause=failure[0], answer_seconds=round(time.monotonic() - step_started, 3))
             return finish(*checked)
         restored = False
         if failure is not None:
@@ -1137,6 +1158,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             # an answer that cannot be checked is never shown: a repaired one gives way to the answer already
             # verified, a first one fails the turn, saying why
             if checked is not None:
+                note_gate("no_verify_time", seconds_to_deadline=round(deadline - time.monotonic(), 3))
                 return finish(*checked)
             raise ProviderFailure("verify_no_time")
         progress("verify", "מאמת את הטענות מול המקורות")
@@ -1160,6 +1182,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         if cancelled():
             raise TurnCancelled
         rounds.append([p.as_dict() for p in report.problems])
+        report_slots.append((report, len(rounds) - 1))
         try:
             drafts.append(draft_record(ws, answer.answer_markdown, len(rounds), attempt + 1))
         except Exception:  # noqa: BLE001 - a diagnostics record never fails the turn
@@ -1180,7 +1203,21 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         checked = (answer, report)
         # a rewrite takes about as long as the answer it rewrites: a round that would not fit is not started
         repair_from = deadline - max(REPAIR_MIN_SECONDS, REPAIR_TIME_FACTOR * answer_seconds)
-        if report.ok or settled or attempt >= repairs or steps >= settings.chat_max_steps or time.monotonic() > repair_from:
+        gate_now = time.monotonic()
+        # round 23 U0 (KTD11, R15): what the gate saw and decided, with every cause that held (the first of them is the one the chain below
+        # names); the kinds of problem a repair round would take. Diagnostics only: the decision is the one it always was
+        refused_by = [name for name, held in (("ok", report.ok), ("settled", settled), ("rounds_exhausted", attempt >= repairs),
+                                              ("steps", steps >= settings.chat_max_steps), ("time", gate_now > repair_from)) if held]
+        kinds: dict[str, int] = {}
+        for p in report.problems:
+            if p.repairable and p.resolution != "cut":
+                kinds[p.kind] = kinds.get(p.kind, 0) + 1
+        note_gate("refused" if refused_by else "repair", round=len(rounds), ok=report.ok, settled=settled,
+                  max_steps=settings.chat_max_steps, repairs_allowed=repairs, answer_seconds=round(answer_seconds, 3),
+                  gate_window_seconds=round(max(REPAIR_MIN_SECONDS, REPAIR_TIME_FACTOR * answer_seconds), 3),
+                  seconds_to_deadline=round(deadline - gate_now, 3), seconds_to_gate=round(repair_from - gate_now, 3),
+                  repairable_kinds=kinds, refused_by=refused_by)
+        if refused_by:
             return finish(answer, report)
         attempt += 1
         if attempt == 1:
@@ -1192,6 +1229,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             # a rewrite from verified content cannot complete a requirement: only the claims are its problems
             items.append({"role": "user", "content": REWRITE.format(problems=report.problems_text(claims_only=True))})
             repaired |= report.repair_keys(claims_only=True)
+        stamp_repairs(report)  # the round stored for this verification now shows which of its problems the prompt named
 
 
 def _record_intent(resolution: dict, settled: intent_mod.Intent, decisions: dict | None = None) -> None:

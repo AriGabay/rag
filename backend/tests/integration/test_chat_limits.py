@@ -614,3 +614,85 @@ def test_the_tools_and_instructions_are_identical_across_turns_and_on_the_forced
     # nothing of the moment the turn ran is in what every step repeats
     assert not re.search(r"\d{4}-\d{2}-\d{2}|\d{1,2}:\d{2}", engine.POLICY + TOOLS)
 
+
+
+# --- round 23 U0 (KTD11, R15): what the repair gate saw, which problems a repair named, and the cursors never followed ---------------
+
+def stored_answer(office, m: dict) -> dict:
+    """The fields of an answer a diagnostics record must never change: its text, status, limits and the spans the server wrote."""
+    a = m["answer"]
+    return {"markdown": a["markdown"], "status": a["status"], "limits_hit": a["limits_hit"],
+            "spans": [(s["kind"], s["start"], s["end"]) for s in a["server_spans"]]}
+
+
+# the answers of the scripted turns below, as the code before round 23 U0 produced them (measured on that code)
+GROUNDLESS = {"markdown": "לא הצלחתי לבסס תשובה על המקורות.", "status": "partial", "limits_hit": [], "spans": [("replacement", 0, 32)]}
+REPAIRED = {"markdown": "שטח המגרש הוא 812 מ\"ר [S1].", "status": "answered", "limits_hit": [], "spans": []}
+CURSOR_TURN = {"markdown": "שטח המגרש הוא 812 מ\"ר [S1][S3].", "status": "answered", "limits_hit": [], "spans": [("citation", 26, 30)]}
+
+WRONG = final("שטח המגרש הוא 990 מ\"ר [S1].")
+RIGHT = final("שטח המגרש הוא 812 מ\"ר [S1].")
+
+
+def test_a_repair_round_the_time_gate_refuses_records_the_gate_inputs_and_the_refusal(client, office, monkeypatch):
+    monkeypatch.setattr(engine, "REPAIR_MIN_SECONDS", 100_000)  # no time is ever left for a repair round
+    agent = Reader([[pages(office.doc, 2)]], WRONG)
+    m = ask(client, office, monkeypatch, agent)
+    assert len(agent.snapshots) == 2  # one reading step, one answer: no repair step was asked for
+    d = diagnostics(client, m)
+    (gate,) = d["timing"]["repair_gate"]
+    assert gate["decision"] == "refused" and gate["refused_by"] == ["time"] and gate["attempt"] == 0 and gate["round"] == 1
+    assert gate["ok"] is False and gate["settled"] is False and gate["repairs_allowed"] >= 1
+    assert gate["steps"] == 2 and gate["max_steps"] >= gate["steps"]
+    assert gate["answer_seconds"] >= 0 and gate["gate_window_seconds"] == 100_000
+    assert gate["seconds_to_gate"] < 0 < gate["seconds_to_deadline"]  # the turn had time; the gate's window was what ruled it out
+    assert gate["repairable_kinds"] and sum(gate["repairable_kinds"].values()) >= 1
+    # the problem was never named by a repair prompt, so the stored round says so
+    assert d["rounds"][0] and all(p["repair_attempted"] is False for p in d["rounds"][0])
+    # the answer is the one it always was: the wrong claim removed, the turn partial
+    assert stored_answer(office, m) == GROUNDLESS
+
+
+def test_a_turn_that_repairs_records_the_attempt_and_its_stored_round_shows_the_problem_named(client, office, monkeypatch):
+    agent = Reader([[pages(office.doc, 2)]], WRONG)
+    agent.answer = WRONG
+    m = ask(client, office, monkeypatch, agent)
+    d = diagnostics(client, m)
+    gates = d["timing"]["repair_gate"]
+    assert [g["decision"] for g in gates] == ["repair", "repair", "refused"]
+    assert [g["attempt"] for g in gates] == [0, 1, 2] and gates[-1]["refused_by"] == ["rounds_exhausted"]
+    assert all(g["refused_by"] == [] for g in gates[:2]) and gates[0]["seconds_to_gate"] > 0
+    first, second, third = d["rounds"]
+    # the first two rounds were followed by a prompt that named their problem; the last one's sentence is the same, so it is known as named
+    assert first and all(p["repair_attempted"] is True for p in first)
+    assert second and all(p["repair_attempted"] is True for p in second)
+    assert third and all(p["repair_attempted"] is True for p in third)
+    assert stored_answer(office, m) == GROUNDLESS
+
+
+def test_the_gate_record_does_not_change_a_repair_that_succeeds(client, office, monkeypatch):
+    agent = ScriptedAgent([[pages(office.doc, 2)], WRONG, RIGHT])
+    m = ask(client, office, monkeypatch, agent)
+    d = diagnostics(client, m)
+    assert [g["decision"] for g in d["timing"]["repair_gate"]] == ["repair", "refused"]
+    assert d["timing"]["repair_gate"][1]["refused_by"] == ["ok", "settled"] and d["timing"]["repair_gate"][1]["repairable_kinds"] == {}
+    assert all(p["repair_attempted"] is True for p in d["rounds"][0])
+    assert stored_answer(office, m) == REPAIRED
+
+
+def test_a_read_cursor_the_agent_never_followed_is_in_the_turns_diagnostics_and_a_followed_one_is_not(client, office, monkeypatch):
+    setting(monkeypatch, chat_read_chars=500)  # the paragraphs are cut: every part of the pages read has a cursor
+    agent = Reader([[pages(office.doc, 2, 3)], [read(cursor="K1")]], RIGHT)
+    m = ask(client, office, monkeypatch, agent)
+    cursors = diagnostics(client, m)["timing"]["unfollowed_cursors"]
+    assert [c["cursor"] for c in cursors] == ["K2"]  # K1 was followed; the part it returned has a cursor of its own
+    (c,) = cursors
+    assert c["source"] == "S2" and c["document_id"] == office.doc and c["target"] == "pages"
+    assert c["left"]["blocks"] >= 1 and c["left"]["chars"] > 0
+    assert stored_answer(office, m) == CURSOR_TURN
+
+
+def test_a_turn_that_reads_to_the_end_leaves_no_unfollowed_cursor(client, office, monkeypatch):
+    agent = Reader([[pages(office.doc, 2)]], RIGHT)  # one part of the default size: nothing remained
+    m = ask(client, office, monkeypatch, agent)
+    assert diagnostics(client, m)["timing"]["unfollowed_cursors"] == []
