@@ -10,8 +10,10 @@ migration:
 - only *labelled* property identifiers count (``identifiers``): a block and parcel pair written with its labels
   ("גוש 30871 חלקה 15", the pattern of ``answering.entities._BP_LABELED``, as ``appraisal.normalize.
   parse_block_parcel`` reads a labelled pair), and an address with a street label and a house number ("רחוב הצפצפה
-  7", the street labels of ``answering.entities.STREET_LABELS``). A bare number, a section number, a plan number
-  ("דמו/5110"), a year, a slash pair ("30871/22") or a street without a label is never one;
+  7", the street labels of ``answering.entities.STREET_LABELS``). A pair is also read in the other notations the units use
+  (round 23 U3, KTD10): a joint label ("גוש/חלקה: 30871/15") and Latin labels ("Block 30871 Parcel 15", "Gush ... Helka ..."), and,
+  in the block/parcel field of an identity card, a bare slash pair (``identifiers(card=True)``). A bare number, a section number, a
+  plan number ("דמו/5110"), a year, a slash pair outside such a field ("30871/22") or a street without a label is never one;
 - the first context's identity is the identifiers of the file's title block (the blocks before its first heading);
   a file whose title block names none is one context;
 - a new context opens only where a heading, or a title block (the run of blocks at the top of a page that ends at a
@@ -69,7 +71,15 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
-from app.answering.entities import _BP_LABELED, _PREFIXES, STREET_LABELS, _canon, _street_regex, _strip_prefix
+from app.answering.entities import (
+    _BP_LABELED,
+    _BP_SLASH,
+    _PREFIXES,
+    STREET_LABELS,
+    _canon,
+    _street_regex,
+    _strip_prefix,
+)
 from app.extraction.base import PageGeometry
 from app.extraction.geometry import geometry_box
 
@@ -106,6 +116,16 @@ _ADDRESS = re.compile(
     rf"(?<![א-ת])[{_PREFIXES}]{{0,2}}(?:{_LABELS})\s+((?:{_STREET_WORD}\s+){{0,2}}{_STREET_WORD})"
     r"\s*,?\s*(?:מס׳\s*|מספר\s*)?(\d{1,3})([א-ת](?![א-ת]))?(?![\d.,]?\d)"
     r"(?!\s*(?:מ״ר|מטר|מ׳|ס״מ|%|₪|קומות|קומה|חדרים|שנים|שנה|דונם|יח׳))")
+# the block and parcel labels of the notations a unit is written in, Hebrew or Latin (round 23 U3, KTD10, R7): "Block 6158 Parcel 42",
+# "Blk. 6158 / Lot 42", "Gush 6158 Helka 42", and the joint label "גוש/חלקה: 6158/42" or "Block/Parcel: 6158/42". The Hebrew pair with its
+# own labels each (``answering.entities._BP_LABELED``) and the bare slash pair (``_BP_SLASH``, read only in a block/parcel field of an
+# identity card) are the other two notations; all three read the same pair
+_BLOCK_WORD = r"(?:block|blk|bl|gush|גוש)"
+_PARCEL_WORD = r"(?:parcel|plot|lot|prcl|pcl|helka|chelka|חלק(?:ה|ות)?)"
+_LABEL_TAIL = r"\.?\s*(?:no\.?|#|:)?\s*"
+_BP_LATIN = re.compile(rf"(?<![a-z]){_BLOCK_WORD}{_LABEL_TAIL}(\d{{3,6}})\D{{0,20}}?(?<![a-z]){_PARCEL_WORD}{_LABEL_TAIL}(\d{{1,5}})(?!\d)", re.I)
+_BP_JOINT = re.compile(rf"(?<![a-z]){_BLOCK_WORD}\s*[/\-]\s*{_PARCEL_WORD}\s*[:\-]?\s*(\d{{3,6}})\s*[/\-]\s*(\d{{1,5}})(?!\d)", re.I)
+_LABELLED_BP = (_BP_LABELED, _BP_JOINT, _BP_LATIN)
 _NOT_STREET = frozenset({"גוש", "חלקה", "חלקות", "מגרש", "תכנית", "דירה", "קומה", "בניין"})
 _CANDIDATE_SQL = "גוש|רחוב|רח׳|רח'|שד׳|שד'|שדרות|שדרת|דרך|סמטת|כיכר"
 SKIP_STATUS = ("decorative", "unread", "no_text")  # the statuses of a block that holds no text to read (the block readers skip them)
@@ -182,7 +202,9 @@ def _patterns(identity: Identity) -> tuple[re.Pattern, ...]:
         out.append(_street_regex(list(words), number, letter)[0])
     for b, p in identity.parcels:
         out.append(re.compile(rf"גוש\D{{0,6}}?0*{b}\D{{0,20}}?חלק(?:ה|ות)?\D{{0,6}}?0*{p}(?!\d)"
-                              rf"|(?<![\d/])0*{b}\s*/\s*0*{p}(?!\d)"))
+                              rf"|(?<![\d/])0*{b}\s*/\s*0*{p}(?!\d)"
+                              rf"|(?<![a-z]){_BLOCK_WORD}{_LABEL_TAIL}0*{b}(?!\d)\D{{0,20}}?(?<![a-z]){_PARCEL_WORD}{_LABEL_TAIL}0*{p}(?!\d)",
+                              re.I))
     return tuple(out)
 
 
@@ -214,9 +236,21 @@ def _name_patterns(names: tuple[str, ...]) -> tuple[re.Pattern, ...]:
     return tuple(out)
 
 
-def identifiers(raw: str | None) -> Identity:
-    """The labelled property identifiers of a text (KTD7): block and parcel pairs with their labels, and addresses
-    with a street label and a house number. Anything else is not an identifier."""
+def _parcel_matches(norm: str, card: bool) -> list[tuple[str, str, tuple[int, int]]]:
+    """The block and parcel pairs a normalized text writes, with where: the labelled notations (Hebrew labels, a joint label, Latin labels),
+    and, for ``card`` (a block/parcel field of an identity card), a bare slash pair when the text writes no labelled one."""
+    found = [(m.group(1).lstrip("0"), m.group(2).lstrip("0"), m.span()) for rx in _LABELLED_BP for m in rx.finditer(norm)]
+    if card and not found:
+        found = [(m.group(1).lstrip("0"), m.group(2).lstrip("0"), m.span()) for m in _BP_SLASH.finditer(norm)]
+    return found
+
+
+def identifiers(raw: str | None, card: bool = False) -> Identity:
+    """The labelled property identifiers of a text (KTD7): block and parcel pairs with their labels, in every notation the units write
+    them (Hebrew labels, a joint "גוש/חלקה" label, Latin "block/parcel/plot/lot" labels; round 23 U3, KTD10), and addresses with a street
+    label and a house number. Anything else is not an identifier: a bare digit pair, a plan number, a year. ``card``: the text is a
+    block/parcel field of an identity card, whose kind labels it, so a bare slash pair ("6158/42") is its pair too (and only when the
+    text writes no labelled pair); a digit pair with no slash is still none."""
     if not raw:
         return Identity()
     norm = _canon(raw)
@@ -234,12 +268,25 @@ def identifiers(raw: str | None) -> Identity:
             label = re.match(rf"[{_PREFIXES}]{{0,2}}((?:{_LABELS}))", m.group(0).strip())
             shown.append(f"{label.group(1) if label else ''} {' '.join(words)} {number}{letter}".strip())
             streets.append(street)
-    for m in _BP_LABELED.finditer(norm):
-        b, p = m.group(1).lstrip("0"), m.group(2).lstrip("0")
+    for b, p, _ in _parcel_matches(norm, card):
         if (b, p) not in parcels:
             parcels.add((b, p))
             shown.append(f"גוש {b} חלקה {p}")
     return Identity(frozenset(addresses), frozenset(parcels), tuple(shown), tuple(streets))
+
+
+def parcel_only(text: str | None) -> Identity:
+    """The parcel a text says and nothing else (round 23 U3, KTD10): a title, an alias or a card quote that is only a block and parcel
+    in some notation ("Block 6158 Parcel 42", "6158/42") is an identifier of its unit, never a name that tells it from the asked property.
+    Empty when the text writes no pair, or any word besides the pair and its labels."""
+    norm = _canon(text or "")
+    found = _parcel_matches(norm, True)
+    if not found:
+        return Identity()
+    rest = norm
+    for _, _, (a, b) in sorted(found, key=lambda x: x[2], reverse=True):
+        rest = rest[:a] + " " + rest[b:]
+    return Identity() if _LETTER_RUN.search(rest) else identifiers(text, card=True)
 
 
 # --- derivation ----------------------------------------------------------------------------------------------------
@@ -837,7 +884,11 @@ def _card_identity(fields: Sequence[dict]) -> Identity:
     """What the subject fields of a unit's identity card name (round 15 U5, KTD5): the name of the property and its
     address are names the unit answers to, an address and a block and parcel are identifiers when they are written as
     labelled ones. A city, a property type and a date as written name no unit (they are shown in the candidates and
-    never matched), and a card holds no party's name."""
+    never matched), and a card holds no party's name.
+
+    An identity quote that parses to nothing is noise (round 23 U3, KTD10, R7): a block/parcel quote is read in every notation the units
+    use (``identifiers``) and, when it still names no pair, it is neither a name nor an identifier of the unit, so it conflicts with nothing
+    and the decision about whom its data belong to is ``UNKNOWN``; an address quote with no word in it (``noise_heading``) is none either."""
     ident = Identity()
     names: list[str] = []
     for f in fields:
@@ -847,9 +898,9 @@ def _card_identity(fields: Sequence[dict]) -> Identity:
             if not noise_heading(quote):
                 names.append(name_key(quote))
         elif kind in ("address", "block_parcel"):
-            found = identifiers(quote)
+            found = identifiers(quote, card=True)
             ident |= found
-            if kind == "address" or found.empty:
+            if kind == "address" and not noise_heading(quote) and parcel_only(quote).empty:
                 names.append(name_key(quote))
     return Identity(names=tuple(dict.fromkeys(n for n in names if n))) | ident
 
@@ -857,7 +908,8 @@ def _card_identity(fields: Sequence[dict]) -> Identity:
 def _unit_identity(u, card_fields: Sequence[dict] = ()) -> Identity:
     """A unit's identity: its labelled identifiers (stored with how they were written, which read again give the
     street words the matching needs) and its title and aliases as names; with a ``done`` identity card, the subject
-    fields of the card as well (``_card_identity``). A unit without a card keeps the structural identity."""
+    fields of the card as well (``_card_identity``). A unit without a card keeps the structural identity. A title or alias
+    that is only a block and parcel (in any notation) is that parcel's identifier, not a name (round 23 U3)."""
     stored = u.identifiers or {}
     shown = tuple(stored.get("shown") or ())
     ident = identifiers("\n".join(shown))
@@ -865,8 +917,13 @@ def _unit_identity(u, card_fields: Sequence[dict] = ()) -> Identity:
             tuple(p) for p in stored.get("parcels") or ()}:
         ident = Identity(frozenset(tuple(a) for a in stored.get("addresses") or ()),
                          frozenset(tuple(p) for p in stored.get("parcels") or ()), shown)
-    names = tuple(dict.fromkeys(k for x in ([u.title] if u.title else []) + list(u.aliases)
-                                if not noise_heading(x) and (k := name_key(x))))
+    texts = [x for x in ([u.title] if u.title else []) + list(u.aliases) if not noise_heading(x)]
+    for x in texts:
+        if not (only := parcel_only(x)).empty:
+            ident = Identity(ident.addresses, ident.parcels | only.parcels,
+                             tuple(dict.fromkeys(shown + only.shown)), ident.streets)
+            shown = ident.shown
+    names = tuple(dict.fromkeys(k for x in texts if parcel_only(x).empty and (k := name_key(x))))
     base = Identity(ident.addresses, ident.parcels, shown, ident.streets, names)
     return base | _card_identity(card_fields) if card_fields else base
 
