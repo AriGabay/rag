@@ -706,6 +706,8 @@ QUALIFIER_LABELS = {"period": "התקופה", "basis": "בסיס השטח", "vat
 QUALIFIER_UNSTATED = {"period": " (התקופה לא צוינה במקור)", "basis": " (בסיס השטח לא צוין במקור)",
                       "vat": " (המע\"מ לא צוין במקור)"}
 MSG_QUALIFIER_EDITED = "> הוסר ניסוח של {label} שלא נכתב במקור לגבי {n} נתונים; הנתונים עצמם נשארו בתשובה."
+# the same edit when a cited source was not read in full or clearly (round 23 U2, R3, KTD3): the server does not say the source is silent
+MSG_QUALIFIER_UNCONFIRMED = "> הוסר ניסוח של {label} שלא אומת מהמקור לגבי {n} נתונים; הנתונים עצמם נשארו בתשובה."
 # a derived number that did not verify (round 13 U9, KTD9, R12): the clause that wrote it went, the grounded number stayed
 MSG_NUMBER_EDITED = "> הוסר ניסוח של מספר נגזר שלא אומת מהנתונים שצוטטו לגבי {n} נתונים; הנתונים עצמם נשארו בתשובה."
 QUALIFIER_NOTES = {"number": MSG_NUMBER_EDITED}  # the removal note's line of an edit kind; any other kind: MSG_QUALIFIER_EDITED
@@ -2023,6 +2025,9 @@ class QualifierEdit:
     end: int
     written: str
     marker: str = ""
+    # whether every source and value the unit cites was read in full and clearly when the edit was planned (round 23 U2, R3, KTD3): the removal
+    # note says the wording "was not written in the source" and the marker "not stated in the source" only then; otherwise "not confirmed"
+    confirmed: bool = True
 
 
 @dataclass(frozen=True)
@@ -3313,8 +3318,10 @@ class VerifyReport:
         status = answer.status
         if any(s.kind == "marker" for s in doc.spans()) and status == "answered":
             status = "partial"  # part of the answer was left out
-        edited = [QUALIFIER_NOTES.get(kind, MSG_QUALIFIER_EDITED).format(label=QUALIFIER_LABELS[kind], n=n)
-                  for kind in QUALIFIER_LABELS if (n := sum(1 for q in qualifiers if q.kind == kind))]
+        edited = [template.format(label=QUALIFIER_LABELS[kind], n=n)
+                  for kind in QUALIFIER_LABELS
+                  for confirmed, template in ((True, QUALIFIER_NOTES.get(kind, MSG_QUALIFIER_EDITED)), (False, MSG_QUALIFIER_UNCONFIRMED))
+                  if (n := sum(1 for q in qualifiers if q.kind == kind and q.confirmed == confirmed))]
         if removed:
             lines = removal_lines(removals) + edited
             if answer.status == "clarification" and doc.text.strip():
@@ -4096,8 +4103,9 @@ def conditional_qualifier(c, stated: bool = False, ws: Workspace | None = None) 
     said = MSG_UNCERTAIN_INPUTS.format(ids=", ".join(uncertain)) if uncertain else None
     why = []
     # the user's note tells a value whose kind or unit the source does not confirm apart from one whose reading is unclear; the judge's (no
-    # workspace) names the ids as before. Only what the calculation read counts (``Outcome.consulted``; a record without any: all)
-    consulted = c.outcome.consulted or None
+    # workspace) names the ids as before. Only what the calculation read counts (``Outcome.consulted``): a calculation that consumed no kind or
+    # unit of a value is not conditional on what the source leaves unconfirmed about them (round 23 U2, R8; an empty set counts none)
+    consulted = c.outcome.consulted
     unconfirmed = {i: attrs for i in uncertain if ws is not None and (attrs := unconfirmed_attributes(ws, i, consulted))}
     unclear = [i for i in uncertain if i not in unconfirmed]
     if unclear:
@@ -4534,6 +4542,15 @@ def vat_attachments(text: str, *, skip_absence: bool = False) -> tuple[set[tuple
     return pairs, general
 
 
+def _registered_forms(v) -> set[str]:
+    """The forms of a registered value's number as its source writes it and, for a value its source states in a scale ("באלפי ₪"), as the full
+    amount (``Value.scale``): an answer that restates 12,000 thousand as 12 million or 12,000,000 is the same number (round 23 U2, G11)."""
+    forms = set(numbers_in(v.written))
+    if getattr(v, "scale", 1) != 1:
+        forms |= numbers_in(format((v.value * v.scale).normalize(), "f"))
+    return forms
+
+
 def _computation_vat(unit: Unit, ws: Workspace, c) -> set[tuple[str, str]]:
     """The (number, VAT) pairs a calculation backs: its result, as shown in the unit at its precision and scale,
     with the VAT basis its money inputs share (none when they differ or do not say), and each value input with the
@@ -4547,7 +4564,7 @@ def _computation_vat(unit: Unit, ws: Workspace, c) -> set[tuple[str, str]]:
         v = ws.values.get(x["id"])
         # a value's VAT backs a claim only when its source gave it, as in ``_vat_problems`` (round 12 U10, R6, R8)
         if v is not None and v.vat in ("included", "excluded") and v.provenance.get("vat") == "source":
-            out |= {(f, v.vat) for f in numbers_in(v.written)}
+            out |= {(f, v.vat) for f in _registered_forms(v)}
     if not c.vat:
         # a result whose money inputs are stored measurements: the VAT their own words state backs it when they all agree — in the quote, the
         # table caption or the column header of the cell (round 21 packet A, R5); a status no words state, or an input with none, backs nothing
@@ -4596,7 +4613,7 @@ def _vat_backing(unit: Unit, ws: Workspace) -> set[tuple[str, str]]:
             # quote's own words are still read below (round 11 U2, KTD10)
             v = ws.values[i]
             if v.vat in ("included", "excluded") and v.provenance.get("vat") == "source":
-                backed |= {(f, v.vat) for f in numbers_in(v.written)}
+                backed |= {(f, v.vat) for f in _registered_forms(v)}
             # the passage the value was taken from also writes its VAT, on a line the quote leaves out or in a note the
             # model did not cite (round 13 V2/W5/W10: a claim citing only [V#]): what that passage writes for this number
             # (or for the whole passage) backs it, as it would had the claim cited the passage
@@ -4605,6 +4622,8 @@ def _vat_backing(unit: Unit, ws: Workspace) -> set[tuple[str, str]]:
                 forms = numbers_in(v.written)
                 pairs, general = vat_attachments(passage.text)
                 backed |= {(f, pol) for f, pol in pairs if f in forms} | {(f, g) for g in general for f in forms}
+                scaled = _registered_forms(v) - forms  # the same number restated in full when the source states it in a scale
+                backed |= {(sf, pol) for f, pol in pairs if f in forms for sf in scaled} | {(sf, g) for g in general for sf in scaled}
         parts = _source_parts(ws, i, dated=False)
         if parts is None:
             continue
@@ -4647,9 +4666,28 @@ def _decimal(token: str) -> Decimal | None:
         return None
 
 
+def _vat_read_in_full(unit: Unit, ws: Workspace, number: str) -> bool:
+    """Whether the VAT of ``number`` was read in full from everything the unit cites: a registered value of that number was taken with a complete
+    read of its parts (``Value.read["vat"]``), and a cited passage was not clipped or left regions unread. A measurement was read in full."""
+    for sid in unit.ids:
+        if sid in ws.values:
+            v = ws.values[sid]
+            if number in numbers_in(v.written) | _registered_forms(v) and not v.read.get("vat"):
+                return False
+            continue
+        src = ws.sources.get(sid)
+        if src is not None and (src.clipped or src.unread_regions or src.status in ("clipped", "has_unread_regions", "uncertain_reading")):
+            return False
+    return True
+
+
 def _vat_problems(unit: Unit, ws: Workspace) -> list[str]:
     """VAT the unit gives a number that its cited sources do not give that number."""
-    wrong = sorted({n for n, _ in _wrong_vat(unit, ws)})
+    backed = _vat_backing(unit, ws)
+    # a VAT the answer states that the cited sources do not give, where they state no other status and were not read in full for it, is unknown, not
+    # absent: it is kept (round 23 U2, follow-up 1; R3, KTD3). A source that states the other status is the evidence and keeps the removal
+    wrong = sorted({n for n, pol in _wrong_vat(unit, ws, backed)
+                    if any((n, other) in backed for other in ("included", "excluded") if other != pol) or _vat_read_in_full(unit, ws, n)})
     shown = [m.group(0) for m in _NUM_AT.finditer(unit.text) if numbers_in(m.group(0)) & set(wrong)]
     return [f"מע\"מ שהתשובה מייחסת ל-{x} לא נכתב לגבי ערך זה במקור" for x in dict.fromkeys(shown)][:1]
 
@@ -5715,7 +5753,9 @@ def _attested_qualifiers(u: Unit, ws: Workspace, forms: frozenset) -> tuple[list
     occurrences, general = meaning._evidence(u, ws, forms)
     attested = meaning.Qualifiers().merge(general)
     for o in occurrences:
-        attested.merge(o.qualifiers).merge(meaning._all(o.context, rates=False))
+        # the period of the header of the column layout the number's row is in is read too, as ``meaning.check`` reads it: a source whose column
+        # header states a period is not silent about it (round 23 U2, R3)
+        attested.merge(o.qualifiers).merge(meaning._all(o.context, rates=False)).merge(o.column_period)
     return occurrences, attested
 
 
@@ -5850,6 +5890,23 @@ def _silent_vat_spans(u: Unit, ws: Workspace, text: str) -> list[tuple[int, int,
     return out or None
 
 
+def _read_in_full(u: Unit, ws: Workspace) -> bool:
+    """Whether every source and value the unit cites was read in full and clearly (round 23 U2, R3, KTD3): a passage that was clipped, has
+    regions not read or was read uncertainly, and a value whose own region stayed unclear, may hold the attribute the server would otherwise
+    call unstated. A passage with no recorded status counts as read."""
+    from app.chat.tools import reading_unclear
+
+    for sid in u.ids:
+        if sid in ws.values:
+            if reading_unclear(ws, sid):
+                return False
+            continue
+        src = ws.sources.get(sid)
+        if src is not None and (src.clipped or src.unread_regions or src.status in ("clipped", "has_unread_regions", "uncertain_reading")):
+            return False
+    return True
+
+
 def _qualifier_edits(u: Unit, ws: Workspace, question: str, blocking: list, vat: bool) -> list[QualifierEdit] | None:
     """The edits that remove from the unit every qualifier its blocking problems name (``blocking`` meaning problems; ``vat``:
     the VAT check failed too) — or None when any of them is not an edit: the source states something else there, the
@@ -5877,6 +5934,7 @@ def _qualifier_edits(u: Unit, ws: Workspace, question: str, blocking: list, vat:
     out: list[QualifierEdit] = []
     marked: set[str] = set()
     last = -1
+    complete = _read_in_full(u, ws)  # the sentence about the source ("not stated") needs a complete read of what the unit cites (round 23 U2)
     for a, b, kind, written in sorted(set(found)):
         lead = a
         while a > 0 and text[a - 1] in " \t":
@@ -5892,10 +5950,10 @@ def _qualifier_edits(u: Unit, ws: Workspace, question: str, blocking: list, vat:
         if _IDS.search(u.raw[raw_a:raw_b]) or any(c in u.raw[raw_a:raw_b] for c in "|\n"):
             return None
         marker = ""
-        if kind not in marked and _asked_about(kind, question):
+        if complete and kind not in marked and _asked_about(kind, question):
             marker = QUALIFIER_UNSTATED[kind]
             marked.add(kind)
-        out.append(QualifierEdit(u.index, kind, u.start + raw_a, u.start + raw_b, written.strip(), marker))
+        out.append(QualifierEdit(u.index, kind, u.start + raw_a, u.start + raw_b, written.strip(), marker, confirmed=complete))
         last = b
     return out or None
 
@@ -6065,8 +6123,9 @@ def _calls_latest(text: str) -> bool:
     """Whether a unit's words call something the latest, apart from a period of time ("בשנה האחרונה")."""
     for m in _LATEST.finditer(text):
         before = re.findall(r"[א-ת]+", text[max(0, m.start() - 24):m.start()])
-        word = re.sub(r"^[בהלמוכש]{1,2}(?=[א-ת]{2,})", "", before[-1]) if before else ""
-        if before and (before[-1] in _TIME_NOUNS or word in _TIME_NOUNS):
+        # the noun with none, one or two prefix letters ("בשנה" is ב + שנה, not בש + נה): round 23 U2 - a latent greedy-prefix miss that a
+        # period word kept from the number's check hid until the period was no longer called unstated
+        if before and any(before[-1][i:] in _TIME_NOUNS for i in range(min(3, len(before[-1])))):
             continue
         if (before and re.sub(r"^(?:[וש]?ה)", "", m.group()) in _CURRENT_WORDS
                 and (_is_document_noun(before[-1]) or _is_present_value(text[:m.start()]))):

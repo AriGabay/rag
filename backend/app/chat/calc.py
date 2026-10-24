@@ -1263,6 +1263,11 @@ class Value:
     # the source's own words for a kind it states differently from the one registered ("שווי" for a value registered as a price): only
     # for an attribute whose provenance is "stated_different" (round 22 U9, KTD8); the conditional note quotes it
     stated: dict = field(default_factory=dict)
+    # whether the read of the datum's own parts (its cell, row label, every header row, caption, table notes, the governing note, its
+    # sentence) was complete for each defining attribute (round 23 U2, R3, KTD3): ``{"kind": True, "unit": True}``. Only a complete read
+    # that found no support lets a note say the source does not state the attribute; an attribute missing here was not read completely
+    # (a value of an older record, a quote whose clause could not be isolated, a cell of a page the table's header does not reach)
+    read: dict = field(default_factory=dict)
 
     def unconfirmed(self, consulted=None) -> list[str]:
         """The defining attributes (kind, unit) the source does not confirm for this value: stated differently, or supported by nothing
@@ -1313,7 +1318,8 @@ class Value:
                 "reading_id": self.reading_id, "title": self.title, "location": self.location, "kind": self.kind,
                 "unit": self.unit, "unit_label": UNIT_LABELS.get(self.unit, ""), "period": self.period,
                 "vat": self.vat, "area_basis": self.area_basis, "subject": self.subject, "role": self.role,
-                "provenance": dict(self.provenance), "certainty": self.certainty, "stated": dict(self.stated), "locator": dict(self.locator),
+                "provenance": dict(self.provenance), "certainty": self.certainty, "stated": dict(self.stated), "read": dict(self.read),
+                "locator": dict(self.locator),
                 "quote": self.quote, "total": self.total, "approx": self.approx, "section": self.section,
                 "stated_by": self.stated_by, "stance": self.stance, "scenario": self.scenario,
                 "attribution": self.attribution, "meaning_from": dict(self.meaning_from), "reading": self.reading,

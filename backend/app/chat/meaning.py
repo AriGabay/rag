@@ -98,7 +98,8 @@ _BASIS = [
     ("עיקרי", r"(?:מ\"ר\s*|שטח\s*)?(?<![א-ת])עיקרי(?![א-ת])"),
     ("רשום", r"(?:מ\"ר\s*|שטח\s*)(?<![א-ת])רשום(?![א-ת])"),
     # "מ״ר בנוי 500" and "שטח בנוי 500 מ״ר": the basis before the number is as much the basis as the one after it (round 21 U3, KTD3)
-    ("בנוי", r"(?:מ\"ר|שטח)\s+בנוי(?![א-ת])"),
+    # "מבונה" / "מבונים" is the same basis written another way (round 23 U2, G01): one key, so a source that states "למ״ר מבונה" is read as stating it
+    ("בנוי", r"(?:מ\"ר|שטח)\s+(?:בנוי|מבונ(?:ה|ים|ות))(?![א-ת])"),
 ]
 _MONTH_NAMES = (r"(?:[בל]?(?:ינואר|פברואר|מרץ|מרס|אפריל|מאי|יוני|יולי|אוגוסט|ספטמבר|אוקטובר|נובמבר|דצמבר|תשרי|חשוון|"
                 r"חשון|כסלו|טבת|שבט|אדר|ניסן|אייר|סיוון|סיון|תמוז|אב|אלול)(?![א-ת]))")
@@ -116,16 +117,24 @@ def _period_pattern(key: str, abbreviations: str = "") -> str:
             rf"|(?<![א-ת])(?:ו?ה?{adj}(?:{endings})?{abbreviations})(?![א-ת])")
 
 
-# English period words, as a table header or a phrase writes them (round 21 U3, KTD3): the adjective ("Monthly", "Annual"), "per month" and
-# "/month". "Quarterly" is no period of this vocabulary (a month or a year only), so it states none and cannot make a mismatch with either.
+# English period words, as a table header or a phrase writes them (round 21 U3, KTD3; round 23 U2, G09): the adjective ("Monthly", "Annual",
+# "Quarterly"), "per month" and "/month", the column header "For the Years Ending" and "Year 1 / Year 2" (an annual figure per column; not
+# "in year 5 of the lease" nor "in the year 2020": the number after "year" is one or two digits and no word stands right before it).
+# A quarter is a period of its own (``PERIOD_SHOWN``): a source that states it states a period, so an answer's "per year" is a different
+# one, never an unstated one.
 _ENGLISH_PERIOD = {
     "month": r"(?<![A-Za-z])(?i:monthly|per\s+month|/\s?month)(?![A-Za-z])",
-    "year": r"(?<![A-Za-z])(?i:annual|annually|yearly|per\s+year|per\s+annum|/\s?year)(?![A-Za-z])",
+    "year": (r"(?<![A-Za-z])(?i:annual|annually|yearly|per\s+year|per\s+annum|/\s?year|for\s+the\s+years?\s+(?:ending|ended))(?![A-Za-z])"
+             r"|(?<![A-Za-z])(?<![A-Za-z]\s)(?i:years?\s?\d{1,2})(?!\d)"),
+    "quarter": r"(?<![A-Za-z])(?i:quarterly|per\s+quarter|/\s?quarter)(?![A-Za-z])",
 }
 _PERIOD = [
     # "לחודש", "חודשי"; not "לפני שנה", "12 חודשים" (a duration), "בחודש מאי" or "לשנה אחת" (a date, a duration)
     ("month", _period_pattern("month", "|לח'|לחו'") + "|" + _ENGLISH_PERIOD["month"]),
     ("year", _period_pattern("year") + "|" + _ENGLISH_PERIOD["year"]),
+    # "רבעוני" / "לרבעון": the quarter is a period of its own; "ברבעון הראשון" (a date) is none
+    ("quarter", r"(?:(?<![א-ת])ל|/\s?)רבעון(?![א-ת])(?!\s+(?:הראשון|השני|השלישי|הרביעי|\d))"
+     r"|(?<![א-ת])ו?ה?רבעוני(?:ת|ים|ות)?(?![א-ת])|" + _ENGLISH_PERIOD["quarter"]),
 ]
 # "כ-" right before a number; not the כ that ends an abbreviation (סה"כ)
 _APPROX_BEFORE = re.compile(r"(?:(?<![א-ת\"'])[בו]?כ[-־–]?\s?|בערך\s|בסביבות\s|כמעט\s)$")
@@ -151,17 +160,29 @@ _ENUMERATION = re.compile(r"^\s*\(?\d+(?:\.\d+)*[.)]?\s")
 
 KIND_LABELS = {"basis": "בסיס השטח", "period": "התקופה", "approx": "היותו ערך מקורב"}
 PERIOD_TEXT = {k: PERIOD_LABELS[k] for k in ("month", "year")}
-MEASUREMENT_PERIODS = set(PERIOD_TEXT)
+MEASUREMENT_PERIODS = set(PERIOD_TEXT)  # the periods a stored value or measurement can hold
+# every period a source can state, as the answer shows it; "quarter" is read from a source (round 23 U2, G09) but is no stored period
+PERIOD_SHOWN = {**PERIOD_TEXT, "quarter": "לרבעון"}
 
 
 def display(written: str) -> str:
     """A qualifier as the answer shows it, with Hebrew abbreviation marks."""
-    return written.replace('"', "״").replace("'", "׳")
+    return " ".join(written.replace('"', "״").replace("'", "׳").split())
+
+
+# the unit word for square metres as OCR and text layers write it: מ"ר with a space inside, a doubled apostrophe, a geresh or gershayim (round 23 U2,
+# follow-up 2): one spelling for every reader of a unit, a basis or a kind. The match keeps its length (the spelling is padded with blanks), so every
+# position stays valid
+_SQM_SPELLINGS = re.compile(r"מ\s*[\"'״׳”’]{1,2}\s*ר(?![א-ת])")
+
+
+def _sqm(m: re.Match) -> str:
+    return 'מ"ר' + " " * (len(m.group(0)) - 3)
 
 
 def _norm(text: str) -> str:
-    """One spelling of the Hebrew abbreviation marks (same length, so positions stay valid)."""
-    return (text or "").replace("״", '"').replace("׳", "'").replace("”", '"').replace("’", "'")
+    """One spelling of the Hebrew abbreviation marks (same length, so positions stay valid) and of the abbreviation for square metres."""
+    return _SQM_SPELLINGS.sub(_sqm, (text or "").replace("״", '"').replace("׳", "'").replace("”", '"').replace("’", "'"))
 
 
 PARTS = ("cell", "header", "caption", "note", "row", "sentence", "paragraph")
@@ -232,12 +253,19 @@ def _read(text: str) -> str:
 
 
 # a negation that governs the period word: one of the ``NEGATION_TOKENS`` words before it, in the same part of the clause ("אינו מוצג
-# כסכום חודשי", "לא נקבע לשנה"). A negation further back negates something else ("לא הושכר בפועל ולכן הוערך לפי 5,000 ₪ לחודש"). Not
-# a comparison ("לא פחות מ-5,000 ₪ לחודש") nor "לא כולל מע״מ"; a comma, "אלא" and the end of the clause close the negation.
-NEGATION_TOKENS = 3
-_NEGATION = re.compile(r"(?<![א-ת])ו?(?:לא|אין|אינו|אינה|אינם|אינן)(?![א-ת])"
-                       r"(?!\s+(?:פחות|יותר|כולל|כוללת|כוללים|נמוך|גבוה|עולה|עולים|מעל|מתחת|יעלה|יפחת|רק)(?![א-ת]))")
-_NEGATION_END = re.compile(r"(?<!\d),|,(?!\d)|[.;\n]|(?<![א-ת])אלא(?![א-ת])")
+# כסכום חודשי", "המקור אינו מציג אותו כתשלום חודשי", "לא נקבע לשנה"). A negation further back, or one a comma, "אלא" or a connective that opens a
+# new statement ("ולכן", "אבל", "כי") closes, negates something else ("לא הושכר בפועל ולכן הוערך לפי 5,000 ₪ לחודש"). Not a comparison
+# ("לא פחות מ-5,000 ₪ לחודש") nor "לא כולל מע״מ"; "ללא ציון / אזכור / הצגה" says the next thing is not stated (round 23 U2, G10).
+NEGATION_TOKENS = 6
+NEGATION_NEAR = 3  # the words right before the period word in which any negation governs it (round 21); further back, see ``_negated``
+_NEGATION = re.compile(r"(?<![א-ת])ו?(?:(?:לא|אין|אינו|אינה|אינם|אינן)(?![א-ת])"
+                       r"(?!\s+(?:פחות|יותר|כולל|כוללת|כוללים|נמוך|גבוה|עולה|עולים|מעל|מתחת|יעלה|יפחת|רק)(?![א-ת]))"
+                       r"|ללא(?=\s+(?:ציון|אזכור|הצגה|התייחסות|אמירה|פירוט|הבהרה)(?![א-ת])))")
+_NEGATION_END = re.compile(r"(?<!\d),|,(?!\d)|[.;\n]|(?<![א-ת])(?:אלא|ו?לכן|ו?אבל|ו?אך|ואילו|בעוד|שכן|מכיוון|ו?כי)(?![א-ת])")
+# a period word followed by its own negated statement verb ("תשלום חודשי אינו מוצג במקור"): the clause says the period is not shown
+_NOT_SHOWN_AFTER = re.compile(r"\s+(?:(?:הוא|היא|הם|הן)\s+)?ו?(?:לא|אין|אינו|אינה|אינם|אינן)\s+(?:הוא\s+)?(?:מוצג|מוצגת|מוצגים|מוצגות|מופיע|מופיעה|"
+                              r"מופיעים|מופיעות|מצוין|מצוינת|מצוינים|מצוינות|נקבע|נקבעה|נקבעו|נאמר|נאמרה|נכתב|נכתבה|נכתבו|הוצג|הוצגה|הוצגו|"
+                              r"צוין|צוינה|צוינו)(?![א-ת])")
 _PLURAL_ENDING = re.compile(r"(?:ים|ות|מי)$")
 # a preposition of a duration right before the word ("תקופה של חודשיים", "למשך שנתיים")
 _DURATION_PREPOSITION = re.compile(r"(?<![א-ת])(?:של|למשך|במשך|תוך|עד|כ|מעל|בערך|כמעט)\s+$")
@@ -263,8 +291,12 @@ def _negated(text: str, pos: int) -> bool:
     if not words:
         return False
     start = lo + words[0].start()
+    near = lo + words[-NEGATION_NEAR:][0].start()
     closings = list(_NEGATION_END.finditer(text, start, pos))
-    return bool(_NEGATION.search(text, closings[-1].end() if closings else start, pos))
+    opened = closings[-1].end() if closings else start
+    # a negation among the last ``NEGATION_NEAR`` words governs the word; one further back only when no number stands between them (the
+    # negation then governs the statement the period word ends, not an amount it follows: "לא הושכר ... לפי 5,000 ₪ לחודש")
+    return any(m.start() >= near or not re.search(r"\d", text[m.end():pos]) for m in _NEGATION.finditer(text, opened, pos))
 
 
 def _number_before(text: str, pos: int) -> str:
@@ -343,7 +375,7 @@ def _period_word_ok(text: str, m: re.Match) -> bool:
     """Whether the period word ``m`` states a period: not in a negated part of its clause, and — as an adjective — not right
     after a number ("36 חודשי שכירות", "2 חודשיים": a duration), the unprefixed plural ("חודשיים", "שנתיות") only after a
     plural noun ("דמי שכירות חודשיים") and not after a preposition of a duration ("של חודשיים")."""
-    if _negated(text, m.start()):
+    if _negated(text, m.start()) or _NOT_SHOWN_AFTER.match(text, m.end()):
         return False
     word = m.group(0).lstrip("ו")
     if word[:1] in ("ל", "ב", "/"):  # a noun after its prefix or a slash, or an abbreviation
@@ -379,6 +411,7 @@ def _scan(text: str, rates: bool = True) -> list[tuple[int, str, str, str]]:
     period words of a rate (``_of_rate``) — what a text states for numbers other than that rate."""
     text = _rejoin(text)
     out = []
+    absent: list[tuple[int, int]] | None = None  # the clauses of the text that say something is not stated, read once and only for a candidate
     for kind, table in (("basis", _BASIS), ("period", _PERIOD)):
         for key, pattern in table:
             for m in re.finditer(pattern, text):
@@ -386,6 +419,10 @@ def _scan(text: str, rates: bool = True) -> list[tuple[int, str, str, str]]:
                     continue
                 if kind == "period" and not (_period_word_ok(text, m) and (rates or not _of_rate(text, m.start()))):
                     continue
+                if absent is None:
+                    absent = _absence_clauses(text)
+                if any(a <= m.start() < b for a, b in absent):
+                    continue  # a word in a clause that says the source does not state it states nothing (round 23 U2, G10)
                 out.append((m.start(), kind, key, m.group(0)))
     return sorted(out)
 
@@ -605,6 +642,10 @@ class Occurrence:
     # and which number of the row it labels is unknown, so it is attached to none (``qualifiers``) and only keeps a period the answer
     # writes for the row from being called unstated (round 21 second pass, harm 3)
     column_period: Qualifiers = field(default_factory=Qualifiers)
+    # the qualifier kinds ("basis", "period") whose read of this evidence's own parts was complete (round 23 U2, follow-up 1; R3, KTD3): None when
+    # the evidence is a passage or a measurement read in full. A registered value read by older code, or from a passage that was clipped, has
+    # fewer (or none): the evidence being silent on a kind it did not read in full is unknown, not absence
+    read: frozenset[str] | None = None
 
     @cached_property
     def context_words(self) -> set[str]:
@@ -1264,10 +1305,20 @@ def confirmed_in_source(text: str, forms: frozenset[str], within: str, kind: str
     return kind_attested(kind, clause), unit in units_attested(clause), clause
 
 
+def basis_keys(text: str | None) -> set[str]:
+    """The area bases a text names, by key. A bare basis word the agent gives for the field ("בנוי", "מבונה", "ברוטו") names it as much as "מ״ר בנוי"
+    does: the area word the scan needs is added when the text has no basis of its own (round 23 U2, G01)."""
+    norm = _norm(text or "")
+    keys = {key for _, kind, key, _ in _scan(norm) if kind == "basis"}
+    if not keys and norm.strip():
+        keys = {key for _, kind, key, _ in _scan('מ"ר ' + norm.strip()) if kind == "basis"}
+    return keys
+
+
 def basis_key(text: str | None) -> str:
-    """One spelling of an area basis for comparing two values ("מ״ר אקוו׳" and "אקווי'" are one basis); a basis
+    """One spelling of an area basis for comparing two values ("מ״ר אקוו׳" and "אקווי'" are one basis, "מ״ר בנוי" and "מבונה" too); a basis
     the vocabulary does not know is compared as written."""
-    keys = sorted({key for _, kind, key, _ in _scan(_norm(text or "")) if kind == "basis"})
+    keys = sorted(basis_keys(text))
     return " ".join(keys) if keys else " ".join(_norm(text or "").split())
 
 
@@ -1301,8 +1352,9 @@ def units_attested(context: str) -> set[str]:
     return set()
 
 
-# a label's number ("טבלה מספר 4", "מס' 7") counts nothing
-_LABEL_NUMBER = re.compile(r"(?:מספר|מס['\"]?)\s*\d+")
+# a label's number ("טבלה מספר 4", "מס' 7", "מס. 4") counts nothing and names no kind: the abbreviation for "number" is not the word for a levy
+# (round 23 U2, G03); the number, with its prefix letters and its dot, is read as one thing wherever a kind or a unit is looked for
+_LABEL_NUMBER = re.compile(r"(?<![א-ת])[והבלמשכ]{0,2}(?:מספר|מס['\"]?\.?)\s*\d+")
 
 
 def metric_word(token: str) -> bool:
@@ -1327,7 +1379,7 @@ def nonmonetary(context: str) -> bool:
 KIND_WORDS = {
     "value": r"שווי", "price": r"מחיר|תמורה", "rent": r"שכירות|שכ\"ד|דמ\"ש|שכר\s+דירה",
     "management_fee": r"ניהול|דמ\"נ", "cost": r"עלות|עלויות|הוצאות|הוצאה", "income": r"הכנסות|הכנסה|תקבולים|פדיון",
-    "area": r"שטח|מ\"ר", "rights_area": r"זכויות", "levy": r"היטל|(?<![א-ת])מס(?![א-ת])",
+    "area": r"שטח|מ\"ר", "rights_area": r"זכויות", "levy": r"היטל|(?<![א-ת])מס(?![א-ת'\"׳״.])",
     "rate": r"שיעור|%|תשואה|היוון", "coefficient": r"מקדם", "count": r"מספר|כמות|יח\"ד", "duration": r"שנים|חודשים|תקופת",
     "profit": r"רווח",
 }
@@ -1335,7 +1387,7 @@ KIND_WORDS = {
 
 def kind_attested(kind: str, context: str) -> bool:
     """Whether the words around a number name its kind (a per-area kind also needs "למ״ר")."""
-    c = _norm(context)
+    c = _LABEL_NUMBER.sub(" ", _norm(context))
     base = kind.removesuffix("_per_area")
     words = KIND_WORDS.get(base)
     if not words or not re.search(words, c):
@@ -1366,10 +1418,20 @@ def vat_words(text: str) -> dict[str, str]:
     return out
 
 
+# the marks of a unit in the words around a number ("מ״ר", "מטר רבוע", "%"): they are the number's unit, never another kind that its words state
+# (round 23 U2, G12: a "מ״ר" in a quote read as a stated area kind against a registered rights area)
+_UNIT_MARKS = re.compile(r"(?<![א-ת])(?:ל[-־]?|/\s?)?(?:מ\"ר|מטר\s+רבוע)(?![א-ת])|%")
+
+
+def without_unit_marks(context: str) -> str:
+    """The words around a number without the marks of its unit (``_UNIT_MARKS``): what is left names a kind or says nothing."""
+    return _UNIT_MARKS.sub(" ", _norm(context))
+
+
 def kind_written(kind: str, context: str) -> str:
     """The words of ``context`` that name the kind of value (``KIND_WORDS``), as written; empty when none do."""
     words = KIND_WORDS.get(kind.removesuffix("_per_area"))
-    found = re.search(words, _norm(context)) if words else None
+    found = re.search(words, _LABEL_NUMBER.sub(" ", _norm(context))) if words else None
     return found.group(0) if found else ""
 
 
@@ -1714,6 +1776,10 @@ class Fetcher:
         return rings
 
 
+# the qualifier kinds of ``check`` and the ``Value.read`` entry that says their read was complete
+_QUALIFIER_READ = {"basis": "area_basis", "period": "period"}
+
+
 def _evidence(unit: Unit, ws: Workspace, forms: frozenset[str]) -> tuple[list[Occurrence], Qualifiers]:
     occurrences: list[Occurrence] = []
     general = Qualifiers()
@@ -1726,12 +1792,16 @@ def _evidence(unit: Unit, ws: Workspace, forms: frozenset[str]) -> tuple[list[Oc
         if sid in ws.values:  # a value the server verified in its source, with the meaning recorded for it
             v = ws.values[sid]
             if forms & numbers_in(v.written):
-                occurrences.append(Occurrence(value_qualifiers(v, frozenset(forms)), v.quote, measurement=True))
+                whole = frozenset(k for k, name in _QUALIFIER_READ.items() if v.read.get(name))
+                occurrences.append(Occurrence(value_qualifiers(v, frozenset(forms)), v.quote, measurement=True, read=whole))
             continue
         src = ws.sources.get(sid)
         if src is None:
             continue
         occ, gen = source_occurrences(src.text, set(forms))
+        if src.clipped or src.unread_regions or src.status in ("clipped", "has_unread_regions", "uncertain_reading"):
+            for o in occ:  # a passage that was clipped may hold what it seems silent about
+                o.read = frozenset()
         occurrences += occ
         general.merge(gen)
     return occurrences, general
@@ -1750,7 +1820,7 @@ def _closest(occurrences: list[Occurrence], words: set[str]) -> list[Occurrence]
 
 def _as_written(kind: str, found: dict[str, str]) -> str:
     """A qualifier as the answer shows it: a period by its label, a basis in the source's words."""
-    return PERIOD_TEXT[sorted(found)[0]] if kind == "period" else display(" ".join(found.values()))
+    return PERIOD_SHOWN[sorted(found)[0]] if kind == "period" else display(" ".join(found.values()))
 
 
 def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[MeaningProblem]:
@@ -1801,6 +1871,11 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
                         written, kind, f"{KIND_LABELS[kind]} \"{display(claimed.found[kind][k])}\" של {written} נכתב "
                         f"ב-{where}; צטט אותו", blocking=False, cite=where, needs_citation=True, at=pos))
             extra = {k for k in extra if found_in.get(k) is None}
+            if extra and not attested.keys(kind) and any(o.read is not None and kind not in o.read for o in occurrences):
+                # the evidence states no such qualifier, but it was not read in full (a registered value taken without a complete read of its
+                # parts, a clipped passage): silence is not shown, so the qualifier is neither cut nor a reason to remove. A source that states
+                # ANOTHER value of the kind is the evidence, whatever the flags (round 23 U2, follow-up 1)
+                continue
             if extra and fetcher is not None and fetcher.unread_for(unit):
                 # the table, section or measurements around the cited passage were not read, so the source is not known to be silent: the period
                 # or basis is not called unstated, and no qualifier is edited out for it (round 21 U3, KTD3; unknown never removes)
@@ -1866,7 +1941,7 @@ def check(unit: Unit, ws: Workspace, fetcher: Fetcher | None = None) -> list[Mea
                 keys, written_q = next(iter(needed.items()))
                 if kind == "period" and len(keys) != 1:
                     continue  # agreeing on two periods does not establish which one belongs to this number
-                as_written = PERIOD_TEXT[keys[0]] if kind == "period" else display(written_q)  # one occurrence's words
+                as_written = PERIOD_SHOWN[keys[0]] if kind == "period" else display(written_q)  # one occurrence's words
                 problems.append(MeaningProblem(
                     written, kind, f"למספר {written} חסר {KIND_LABELS[kind]} כפי שנכתב במקור (\"{as_written}\"); "
                     "כתוב אותו ליד המספר", blocking=False, annotation=as_written, at=pos))

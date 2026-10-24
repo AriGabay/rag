@@ -532,6 +532,8 @@ def _registered(written: str, quote: str, *, period: str = "none", area_basis: s
                                  None, "שומת הדגמה", "סעיף 3", "דמי שכירות", kind, unit, period, "unknown",
                                  area_basis, "נכס הדגמה", "other", SOURCE_ALL | (provenance or {}),
                                  {"quote": quote}, quote)
+    # a value as the current code registers it: its own parts were read in full (round 23 U2, follow-up 1)
+    ws.values["V1"].read = dict.fromkeys(("kind", "unit", "period", "area_basis", "vat"), True)
     return ws
 
 
@@ -1380,7 +1382,7 @@ def test_u3_english_period_words_state_a_period(word, key):
     assert {k for _, kind, k, _ in meaning._scan(word) if kind == "period"} == {key}
 
 
-@pytest.mark.parametrize("text", ["Quarterly", "Q3 2024", "a monthlyish word", "monthlies", "permonth"])
+@pytest.mark.parametrize("text", ["Q3 2024", "a monthlyish word", "monthlies", "permonth"])
 def test_u3_a_quarter_and_a_word_that_only_contains_one_is_no_period(text):
     assert not [1 for _, kind, _, _ in meaning._scan(text) if kind == "period"]
 
@@ -1395,9 +1397,16 @@ def test_u3_a_small_amount_before_an_english_per_month_is_still_an_amount_per_mo
     assert [q.keys("period") for _, _, q in meaning.attached("rent 500 per month")[0]] == [{"month"}]
 
 
-def test_u3_a_quarterly_header_does_not_make_a_monthly_or_an_annual_claim_a_mismatch():
+def test_u3_a_quarterly_header_is_a_period_of_its_own_round_23_u2():
+    # round 23 U2 (R4, G09) supersedes the round-21 reading of "Quarterly" as no period: the header states a quarter, so a monthly or an annual
+    # claim is a different period (blocking), the answer that writes none is told the source's period, and the one that writes it is unchanged
     ws = _ws("Item | Quarterly (₪)\nBase rent | 155,000")
-    assert _problems("Base rent is 155,000 ₪ [S1].", ws) == []
+    assert _problems("Base rent is 155,000 ₪ quarterly [S1].", ws) == []
+    (silent,) = _problems("Base rent is 155,000 ₪ [S1].", ws)
+    assert not silent.blocking and silent.annotation == "לרבעון"
+    for claim in ("per month", "per year"):
+        (wrong,) = _problems(f"Base rent is 155,000 ₪ {claim} [S1].", ws)
+        assert wrong.blocking and wrong.kind == "period"
 
 
 @pytest.mark.parametrize("text", ["שטח בנוי 500 מ״ר", "שטח בנוי: 500 מ״ר", "מ״ר בנוי 500"])

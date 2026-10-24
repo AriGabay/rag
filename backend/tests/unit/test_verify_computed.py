@@ -1229,6 +1229,8 @@ def test_u3_a_value_the_agent_set_is_the_only_cause_named_in_the_calculations_ow
     ws = _conditional_sum(())
     _asserted(ws, "V1", "unit")
     assert tools.value_uncertain(ws, "V1") and not tools.reading_unclear(ws, "V1")
+    assert tools.uncertain_reason(ws, "V1") == "היחידה: לא ניתן היה לאשר אותה מהמקור, והחישוב מניח ₪"  # round 23 U2: no complete read of its parts
+    ws.values["V1"].read = {"unit": True}  # its parts were read whole and state no unit: only now may the note say the source does not
     assert tools.uncertain_reason(ws, "V1") == "היחידה לא נאמרה במקור, והחישוב מניח ₪"
     assert tools.uncertain_reason(ws, "V2") == ""
 
@@ -1286,6 +1288,7 @@ def test_u9_a_unit_nothing_states_makes_even_a_multiplication_by_twelve_conditio
 
     ws = _two_costs()
     _state(ws, "V1", unit="model_asserted")
+    ws.values["V1"].read = {"unit": True}  # round 23 U2: the note says "not stated" only after a complete read of the value's own parts
     c = _compute_conditional(ws, "V1 * 12")
     assert c.conditional and c.uncertain == ["V1"]
     note = conditional_qualifier(c, ws=ws)

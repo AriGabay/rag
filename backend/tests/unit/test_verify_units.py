@@ -456,6 +456,9 @@ def _registered(written: str, quote: str, *, vat: str = "not_stated", area_basis
     ws.values["V1"] = calc.Value("V1", Decimal(written.replace(",", "")), written, "S1", uuid.uuid4(), uuid.uuid4(),
                                  None, "שומת הדגמה", "סעיף 3", "שווי הנכס", "value", unit, period, vat, area_basis,
                                  "נכס הדגמה", "appraiser_determination", prov, {"quote": quote}, quote)
+    # a value as the current code registers it: the read of its own parts was complete (round 23 U2, follow-up 1), so a qualifier its evidence
+    # does not state is known to be unstated; a test of an older value sets ``read = {}``
+    ws.values["V1"].read = dict.fromkeys(("kind", "unit", "period", "area_basis", "vat"), True)
     return ws
 
 

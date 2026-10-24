@@ -40,8 +40,12 @@ _IDENTIFIER_BEFORE = re.compile(r"(?:(?<![א-ת])(?:מס|מספר|מס\"ד)[׳'�
 # prefix letters may be two, "ובקומה"; a unit or a currency after the number keeps it a quantity, "מרתף 250 מ״ר")
 _PREFIX = r"(?<![א-ת])[ובלמהש]{0,2}"
 _LEVEL_NOUNS = r"(?:טופס|תקנה|קומה|קומת|מרתף|חניון|מפלס)"
+# (round 23 U2, G02: the plurals too - "חלקות 12-14", "גושים 1234 ו-1235" - and the numbers that go on after the first one: ``_LIST_JOINER``)
 _LABEL_BEFORE = re.compile(
-    rf"{_PREFIX}(?:תא[\s-]+שטח|תא|מגרש|תת[\s-]*חלקה|חלקה|גוש|סעיף|עמוד|נספח|{_LEVEL_NOUNS})[׳']?\s*:?\s*$")
+    rf"{_PREFIX}(?:תאי[\s-]+שטח|תא[\s-]+שטח|תא|מגרשים|מגרש|תת[\s-]*חלקות|תת[\s-]*חלקה|חלקות|חלקה|גושים|גוש|סעיפים|סעיף|עמודים|עמוד|נספחים|נספח"
+    rf"|{_LEVEL_NOUNS})[׳']?\s*:?\s*$")
+# the number before the one at hand when they are joined as a list or a range or a fraction: "12-14", "12 ו-13", "1234/56", "7 עד 9"
+_LIST_JOINER = re.compile(r"(\d[\d,.]*)\s*(?:[-–־/]|(?<![א-ת])ו[-־]?|(?<![א-ת])עד)\s*$")
 # the nouns added in round 20 label a short number (a floor, a form, a regulation): "שכר קומה 1200" is an amount
 _LEVEL_BEFORE = re.compile(rf"{_PREFIX}{_LEVEL_NOUNS}[׳']?\s*:?\s*$")
 # a counted noun right after the number of a floor label makes it a count ("בכל קומה 8 דירות"), not the floor's name
@@ -118,6 +122,12 @@ def not_an_amount(text: str, start: int, end: int, *, years: bool = True) -> boo
             and not (_LEVEL_BEFORE.search(before) and (not re.fullmatch(r"\d{1,3}", text[start:end])
                                                     or _COUNTED_AFTER.match(text, end))):
         return True
+    joined = _LIST_JOINER.search(text[max(0, start - 16):start])
+    if joined and "," not in text[start:end] and not _QUANTITY_AFTER.match(text, end):
+        # the continuation of a list or a range of identifiers ("חלקות 12-14", "גוש 1234/56"): an identifier when the number it continues is one
+        first = start - len(text[max(0, start - 16):start]) + joined.start(1)
+        if not_an_amount(text, first, first + len(joined.group(1)), years=False):
+            return True
     if any(d.start() <= start and end <= d.end() for d in _DATE.finditer(text)):
         return True
     if years and _YEAR.fullmatch(text[start:end]):

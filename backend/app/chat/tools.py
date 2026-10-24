@@ -6265,8 +6265,14 @@ def value_status(ws: Workspace, i: str) -> str:
 MSG_ATTR_KIND_DIFFERENT = "סוג הנתון: המקור מציין «{stated}» והחישוב מניח «{assumed}»"
 MSG_ATTR_KIND_ASSERTED = "סוג הנתון לא נאמר במקור, והחישוב מניח שהוא «{assumed}»"
 MSG_ATTR_KIND_SILENT = "סוג הנתון לא נאמר במפורש בשורה או בכותרת, והחישוב מניח שהוא «{assumed}»"
-MSG_ATTR_UNIT_DIFFERENT = "היחידה: המקור מציין יחידה אחרת מ«{assumed}», שבה החישוב משתמש"
+MSG_ATTR_UNIT_DIFFERENT = "היחידה: המקור מציין «{stated}», והחישוב מניח {assumed}"
 MSG_ATTR_UNIT_ASSERTED = "היחידה לא נאמרה במקור, והחישוב מניח {assumed}"
+# a sentence about the source needs a complete read of the value's own parts (round 23 U2, R3, KTD3): when the read was not complete (or the
+# source's own words were not kept), the note says only that the attribute could not be confirmed
+MSG_ATTR_KIND_UNCONFIRMED = "סוג הנתון: לא ניתן היה לאשר אותו מהמקור, והחישוב מניח שהוא «{assumed}»"
+MSG_ATTR_UNIT_UNCONFIRMED = "היחידה: לא ניתן היה לאשר אותה מהמקור, והחישוב מניח {assumed}"
+MSG_ATTR_UNIT_UNCONFIRMED_BARE = "היחידה: לא ניתן היה לאשר אותה מהמקור"
+MSG_ATTR_UNIT_NOT_STATED_BARE = "היחידה לא נאמרה במקור"
 
 
 def unconfirmed_attributes(ws: Workspace, vid: str, consulted=None) -> list[str]:
@@ -6281,19 +6287,32 @@ def unconfirmed_attributes(ws: Workspace, vid: str, consulted=None) -> list[str]
 
 def attribute_clauses(ws: Workspace, vid: str, attributes: list[str]) -> list[str]:
     """What the source does not confirm about each of ``attributes`` of a value, in words the user reads (round 22 U9, KTD8): the attribute
-    named, what the source says when it says another thing, and what the calculation assumes. Never that the value is not in the source."""
+    named, what the source says when it says another thing, and what the calculation assumes. Never that the value is not in the source.
+
+    Round 23 U2 (R3, KTD3): "the source does not state it" is written only when the value's own parts were read completely (``Value.read``)
+    and found nothing, and "the source states another" only with the source's own words (``Value.stated``); otherwise the attribute "could
+    not be confirmed". A unit with no word of its own (other, a ratio) is never printed as its enum: the note then names no assumption."""
     v = ws.values[vid]
     out = []
     for a in attributes:
         state = v.provenance.get(a)
+        complete = bool(v.read.get(a))
         if a == "kind":
             assumed = VALUE_KINDS.get(v.kind, v.kind)
-            out.append(MSG_ATTR_KIND_DIFFERENT.format(stated=v.stated.get("kind") or "סוג אחר", assumed=assumed) if state == "stated_different"
-                       else MSG_ATTR_KIND_SILENT.format(assumed=assumed) if state == "silent"
-                       else MSG_ATTR_KIND_ASSERTED.format(assumed=assumed))
+            stated = v.stated.get("kind")
+            out.append(MSG_ATTR_KIND_DIFFERENT.format(stated=stated, assumed=assumed) if state == "stated_different" and stated
+                       else MSG_ATTR_KIND_SILENT.format(assumed=assumed) if state == "silent" and complete
+                       else MSG_ATTR_KIND_ASSERTED.format(assumed=assumed) if state == "model_asserted" and complete
+                       else MSG_ATTR_KIND_UNCONFIRMED.format(assumed=assumed))
         else:
-            assumed = UNIT_LABELS.get(v.unit, v.unit) or v.unit
-            out.append((MSG_ATTR_UNIT_DIFFERENT if state == "stated_different" else MSG_ATTR_UNIT_ASSERTED).format(assumed=assumed))
+            assumed = UNIT_LABELS.get(v.unit, "")  # "" for a unit with no word of its own: nothing is assumed in words
+            stated = v.stated.get("unit")
+            if state == "stated_different" and stated:
+                out.append(MSG_ATTR_UNIT_DIFFERENT.format(stated=stated, assumed=assumed or "יחידה אחרת"))
+            elif state == "model_asserted" and complete:
+                out.append(MSG_ATTR_UNIT_ASSERTED.format(assumed=assumed) if assumed else MSG_ATTR_UNIT_NOT_STATED_BARE)
+            else:
+                out.append(MSG_ATTR_UNIT_UNCONFIRMED.format(assumed=assumed) if assumed else MSG_ATTR_UNIT_UNCONFIRMED_BARE)
     return out
 
 
@@ -6391,6 +6410,20 @@ def _rows_under_header(rows: list[list[str]], ri: int, ci: int) -> list[str]:
             break
         if ci < len(r) and r[ci]:
             out.append(str(r[ci]))
+    return out
+
+
+def _spanning_rows(rows: list[list[str]], ri: int, ci: int) -> list[str]:
+    """The table-wide lines that lead a table's rows (round 23 U2, G04, R3): the rows before ``ri``, up to the first row of numbers (at most two),
+    that hold text in exactly one cell and none in column ``ci`` — a unit or scale line that spans the table ("(באלפי ₪)" in the first cell, the
+    others empty). It belongs to every column that has no header cell of its own there, so it is read with the table's caption and title."""
+    out: list[str] = []
+    for r in rows[:min(ri, 2)]:
+        if any(re.search(r"\d", c or "") for c in r):
+            break
+        filled = [str(c) for c in r if c]
+        if len(filled) == 1 and not (ci < len(r) and r[ci]):
+            out.append(filled[0])
     return out
 
 
@@ -6799,7 +6832,8 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     near = [cell, label, header, str(column_units[ci]) if ci < len(column_units) and column_units[ci] else ""]
     # the notes that govern THIS row (round 22 U5, KTD5, R8): a note marked «(*)» belongs to the rows that carry the mark; the quote path reads the same ones
     row_notes = _notes_of_rows(st, [ri])
-    table_text = [st.get("caption") or "", *(st.get("title") or []), *row_notes]
+    lead = _spanning_rows(rows, ri, ci)  # a unit or scale line that spans the table (round 23 U2, G04)
+    table_text = [st.get("caption") or "", *(st.get("title") or []), *lead, *row_notes]
     row_page = (st.get("rows") or [])[ri].get("page")
     later = (unconfirmed or {}).get(row_page)  # why this cell's page is unconfirmed (None: the caption's own, or a continuation)
     stated_text = [] if later else table_text  # what the table says of this cell: nothing is taken from it when unconfirmed
@@ -6871,8 +6905,16 @@ def _cell_of(src: Source, full: str, loc: dict, st: dict, index, governing: str 
     return {"written": written, "value": value, "forms": forms, "quote": line,
             "qualifiers": meaning.number_qualifiers(_table_text(st | {"notes": row_notes}, st.get("rows") or []), forms, line),
             "units": units, "vat": vats, "vat_from": _vat_anchors(vats, vat_parts, "note"),
-            "kind_context": " ".join([label, header, st.get("caption") or ""]),
-            "kind_parts": [("row", label), ("header", header), ("caption", st.get("caption") or "")],
+            # the words the cell's kind is read from (round 23 U2, R3): the row label, every row of the column header (the unit row under it
+            # too), the caption and title; the notes of its row only attest a kind the others leave unnamed (``_settle_meaning``)
+            "kind_context": " ".join([label, head_text, caption_text]),
+            "kind_parts": [("row", label), ("header", head_text), ("caption", caption_text)],
+            "kind_notes": notes_text,
+            # whether the read of the cell's own parts was complete, per defining attribute (round 23 U2, R3): not for a cell on a page the
+            # table's header and notes may not reach, nor for a unit its header rows leave ambiguous
+            "read": {"kind": not later, "unit": not later and not ambiguous and not head_conflict,
+                     # the period, area basis and VAT are read from the whole table text (header rows, caption, notes) by ``number_qualifiers``
+                     "period": not later, "area_basis": not later, "vat": not later},
             "locator": {"table_index": index, "row": cells[0] if cells else "", "row_number": ri + 1,
                         "column": header, "column_number": stored_tables.stored_column(st, ci) + 1,
                         **({"column_shown": ci + 1} if st.get("columns") is not None else {})},
@@ -7112,6 +7154,13 @@ def _stored_place(found: anchors.Located, remap: dict[int, tuple]) -> anchors.Lo
     return anchors.Located(segments, number, found.blocks)
 
 
+def _read_in_full(src: Source) -> bool:
+    """Whether a source passage was read in full and clearly: not clipped, no region left unread, not read uncertainly (a passage with no
+    recorded status counts as read; round 23 U2, follow-up 1)."""
+    return not (getattr(src, "clipped", False) or getattr(src, "unread_regions", None)
+                or getattr(src, "status", None) in ("clipped", "has_unread_regions", "uncertain_reading"))
+
+
 def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = None,
                 governing: Callable[[int], str | _ScaleNote] | None = None, table_notes: Iterable[str] = (),
                 remap: dict[int, tuple] | None = None) -> dict:
@@ -7210,6 +7259,9 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
             "vat_from": _vat_anchors(vats, [("sentence", quote), ("paragraph", line), ("note", whole)], "paragraph"),
             "kind_context": quote, "kind_parts": [("sentence", quote)], "locator": {"quote": stored},
             "source_text": full,  # the source the quote is of: a kind or a unit its fragment lacks is confirmed in the number's own clause (round 21 U3)
+            # the period, area basis and VAT are read from the source's text around the quote (``number_qualifiers``): complete unless the passage
+            # was clipped or left regions unread (round 23 U2, follow-up 1); kind and unit are settled by the isolated clause (``_settle_meaning``)
+            "read": dict.fromkeys(("period", "area_basis", "vat"), _read_in_full(src)),
             "total": False, "table": None,
             "anchor": anchor, "said": said, "context": f"{line}\n{quote}",
             "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale,
@@ -7252,8 +7304,9 @@ def _kind_state(kind: str, unit: str, context: str, *, whole: bool) -> tuple[str
     if meaning.kind_attested(kind, context):
         return "source", ""
     base = kind.removesuffix("_per_area")
+    bare = meaning.without_unit_marks(context)  # a "מ״ר" or a "%" beside the number is its unit, not another kind (round 23 U2, G12)
     for other in meaning.KIND_WORDS:
-        if other != base and calc.kind_in_unit_family(other, unit) and (words := meaning.kind_written(other, context)):
+        if other != base and calc.kind_in_unit_family(other, unit) and (words := meaning.kind_written(other, bare)):
             return "stated_different", words
     return ("silent", "") if whole and calc.kind_fits_unit(kind, unit) else ("model_asserted", "")
 
@@ -7276,15 +7329,20 @@ def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict, dict]:
     prov["unit"] = "source" if units else "model_asserted"
     periods = q.keys("period")
     if periods:
+        shown = meaning.PERIOD_SHOWN  # every period a source can state, a quarter included (round 23 U2, G09)
         if given["period"] == "unknown" and len(periods) == 1:
             out["period"] = next(iter(periods))
         elif given["period"] not in periods:
             raise ToolError(f"המקור נותן ל-{written} תקופה "
-                            + " / ".join(PERIOD_LABELS.get(p, p) for p in sorted(periods))
+                            + " / ".join(shown.get(p) or PERIOD_LABELS.get(p, p) for p in sorted(periods))
                             + f", לא {PERIOD_LABELS.get(given['period'], given['period']) or given['period']}")
-        prov["period"] = "source"
-        anchors["period"] = {"part": q.part_of("period", out["period"]) or "paragraph",
-                             "written": q.found["period"][out["period"]]}
+        if out["period"] in meaning.MEASUREMENT_PERIODS:
+            prov["period"] = "source"
+            anchors["period"] = {"part": q.part_of("period", out["period"]) or "paragraph",
+                                 "written": q.found["period"][out["period"]]}
+        else:  # a period the source states that a value cannot hold (a quarter): the value keeps its own, and is not marked as the source's
+            out["period"] = given["period"] if given["period"] not in periods else "unknown"
+            prov["period"] = "not_stated"
     else:
         prov["period"] = "model_asserted" if given["period"] in ("month", "year") else "not_stated"
     vats = taken["vat"]
@@ -7301,12 +7359,9 @@ def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict, dict]:
     bases = q.found.get("basis", {})
     said = (given.get("area_basis") or "").strip()
     if bases:
-        keys = meaning.Qualifiers()
-        for _, kind, key, w in meaning._scan(meaning._norm(said)):
-            keys.add(kind, key, w)
         if not said:
             out["area_basis"] = meaning.display(" ".join(bases.values()))
-        elif not keys.keys("basis") & set(bases):
+        elif not meaning.basis_keys(said) & set(bases):
             raise ToolError(f"המקור נותן ל-{written} בסיס שטח «{meaning.display(' '.join(bases.values()))}», לא «{said}»")
         else:
             out["area_basis"] = meaning.display(" ".join(bases.values()))
@@ -7317,13 +7372,21 @@ def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict, dict]:
         prov["area_basis"] = "model_asserted" if said else "not_stated"
     parts = taken.get("kind_parts") or [("paragraph", taken["kind_context"])]
     quoted = bool(taken.get("source_text"))  # a quote is a fragment of its sentence; a table cell has its row, header and caption
+    # whether the read of the datum's own parts was complete, per defining attribute (round 23 U2, R3, KTD3): a cell's was, unless its page is
+    # not reached by the table's header and notes; a quote's only when its own clause was isolated below. Taken values of an older shape have none.
+    read = {k: bool(v) for k, v in (taken.get("read") or {}).items()}
     prov["kind"], stated = _kind_state(given["kind"], out["unit"], taken["kind_context"], whole=not quoted)
+    if prov["kind"] != "source" and meaning.kind_attested(given["kind"], taken.get("kind_notes") or ""):
+        # the notes of the cell's row name the kind the row label, header and caption leave unnamed
+        prov["kind"], stated, parts = "source", "", [("note", taken["kind_notes"])]
     if quoted and (prov["kind"] != "source" or prov["unit"] == "model_asserted"):
         # the quote of a value is often a fragment of its sentence: the same meaning reader is asked about the number's own clause of the
         # source before the value is called the agent's (round 21 U3, KTD3, C1). A kind or a unit the clause states is the source's; a
         # clause that is the number's alone and names no kind is the source being silent about it (round 22 U9, KTD8)
         kind_stated, unit_stated, clause = meaning.confirmed_in_source(taken["source_text"], taken["forms"], taken["quote"],
                                                                        given["kind"], out["unit"])
+        if clause:  # the number's own clause was isolated and read: a complete read of a quote's parts
+            read = read | {"kind": True, "unit": True}
         if prov["kind"] != "source" and kind_stated:
             prov["kind"], stated, parts = "source", "", [("sentence", clause)]
         elif prov["kind"] != "source" and clause:
@@ -7334,6 +7397,7 @@ def _settle_meaning(taken: dict, given: dict) -> tuple[dict, dict, dict]:
         anchors["kind"] = _kind_anchor(given["kind"], parts)
     elif prov["kind"] == "stated_different":
         anchors["kind_stated"] = {"written": stated}  # the source's words, for the conditional note; not a meaning_from anchor (``_new_value``)
+    anchors["read"] = read  # popped by ``_new_value`` into ``Value.read``; not a meaning_from anchor
     return out, prov, anchors
 
 
@@ -7438,6 +7502,7 @@ def _new_value(ws: Workspace, src: Source, sid: str, taken: dict, settled: tuple
     fields, prov, who, said, anchors = settled
     anchors = dict(anchors)
     stated = anchors.pop("kind_stated", None)  # the source's words for a kind it states differently: the value's, not an anchor
+    read = anchors.pop("read", None) or {}  # whether the read of the value's own parts was complete, per attribute (round 23 U2)
     where = taken["locator"]
     default = (f"{where['row']} — {where['column']}" if "row" in where
                else f"{VALUE_KINDS[fields['kind']]} {fields.get('subject') or ''}".strip())
@@ -7452,6 +7517,7 @@ def _new_value(ws: Workspace, src: Source, sid: str, taken: dict, settled: tuple
                        meaning_from=dict(taken.get("meaning_from") or {}) | anchors, scale=int(taken.get("scale") or 1))
     if stated:
         value.stated["kind"] = stated["written"]
+    value.read = dict(read)
     value.facet = _value_facet(ws, src, taken, fields["kind"])
     return value
 
@@ -8018,7 +8084,11 @@ def _facts_json(taken: dict, path: tuple) -> dict:
                      if said is not None else None),
             "context": taken.get("context") or "", "meaning_from": dict(taken.get("meaning_from") or {}),
             "anchor": dict(taken.get("anchor") or {}), "path": list(path), "scale": int(taken.get("scale") or 1),
-            **({"sentence": taken["sentence"]} if taken.get("sentence") else {})}
+            **({"sentence": taken["sentence"]} if taken.get("sentence") else {}),
+            # whether the read of the datum's own parts was complete, per attribute, and the notes of its row (round 23 U2): a cached value is
+            # checked as a fresh one; an older record has neither and is read as incomplete
+            **({"read": {k: bool(v) for k, v in taken["read"].items()}} if taken.get("read") else {}),
+            **({"kind_notes": taken["kind_notes"]} if taken.get("kind_notes") else {})}
 
 
 def _facts_from_json(d: dict) -> tuple[dict, tuple]:
@@ -8039,6 +8109,10 @@ def _facts_from_json(d: dict) -> tuple[dict, tuple]:
              "anchor": dict(d.get("anchor") or {}), "scale": int(d.get("scale") or 1)}
     if d.get("sentence"):  # the whole sentence of the quote's block (round 14 follow-up); an older record has none
         taken["sentence"] = d["sentence"]
+    if d.get("read"):
+        taken["read"] = {k: bool(v) for k, v in d["read"].items()}
+    if d.get("kind_notes"):
+        taken["kind_notes"] = d["kind_notes"]
     return taken, tuple(d.get("path") or ())
 
 
