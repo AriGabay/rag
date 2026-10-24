@@ -193,3 +193,80 @@ def test_identifiers_read_the_notations_units_use_and_nothing_unlabelled_without
     # a Latin or joint label is a label wherever it stands
     for text in ("Block 40100 Parcel 12", "גוש/חלקה: 40100/12", "Gush 40100 Helka 12"):
         assert contexts.identifiers(text).parcels == {ASKED}, text
+
+
+# --- a follow-up turn: the identity a requirement names is the conversation's property, not a label copied from the last answer (R9) -----------
+
+FOLLOW_UP_ASK = "ומה היה שיעור ההיוון שם?"  # names no property: a follow-up about the property the conversation is in
+FOLLOW_UP_CLAIM = "ההכנסה נטו השנתית היא 610,000 ₪"  # names no property either
+COPIED_LABEL = "פרויקט נחל הלוטם"  # another property's label, copied from the previous answer into the requirement text
+OWN_TEXT = "הכנסה נטו שנתית 610,000 ₪."
+OTHER_TEXT = "גוש 40100 חלקה 31: הכנסה נטו שנתית 610,000 ₪."
+
+
+def _follow_up_file() -> contexts.Contexts:
+    from tests.unit.test_appraisal_context import _ownership_file
+
+    return _ownership_file()
+
+
+def _follow_up(cx, number: int, text: str, *, origin: str = "resolve", focus: int | None = 1, located: int | None = None,
+               subject: str = COPIED_LABEL, claim: str = FOLLOW_UP_CLAIM, question: str = FOLLOW_UP_ASK):
+    """The context check of a claim citing a passage of context ``number``; the requirement subject is ``subject``, the conversation's unit
+    (``focus``) is the one the resolution kept, ``located`` the unit the answer declared (None: none)."""
+    from app.chat import verify
+
+    src = SimpleNamespace(contexts=[number], version_id="v", text=text, document_id="d", link=None)
+    ws = _declared_ws(cx, {}, question, sources={"S1": src})
+    ws.requirement_items = [{"subject": subject}]
+    ws.requirements = SimpleNamespace(origin=origin)
+    if focus is not None:
+        ws.unit_focus = {"handle": f"U{focus}", "document_id": "d", "display": cx.label(focus)}
+        ws.handles[f"U{focus}"]["units_tag"] = cx.tag
+    if located is not None:
+        ws.located_unit = {"key": cx.key(located), "anchor": {}}
+    return verify._context_check(verify.Unit(0, f"{claim} [S1].", claim, ["S1"]), ws, question)
+
+
+def test_r9_a_follow_up_claim_about_the_conversations_property_is_not_removed_for_a_label_copied_from_the_last_answer(enforced):  # noqa: F811
+    cx = _follow_up_file()
+    assert _follow_up(cx, 1, OWN_TEXT).reason is None  # the unit the conversation is in
+    assert _follow_up(cx, 1, OWN_TEXT, focus=None, located=1).reason is None  # the unit the answer declared
+    # the same wording of a requirement, any other copied label: the conversation's property decides
+    assert _follow_up(cx, 1, OWN_TEXT, subject="פרויקט עין השקמה").reason is None
+
+
+def test_r9_protection_the_same_claim_in_a_first_turn_is_unchanged(enforced):  # noqa: F811
+    cx = _follow_up_file()
+    for origin in ("analysis", "judge", "clarification_answer", ""):
+        assert _follow_up(cx, 1, OWN_TEXT, origin=origin).reason, origin  # the requirement names unit 3 and the evidence is unit 1's
+
+
+def test_r9_protection_a_follow_up_claim_that_cites_the_other_property_is_still_removed(enforced):  # noqa: F811
+    cx = _follow_up_file()
+    # the claim's own words name the conversation's property while its evidence is the other property's unit
+    own_words = "ההכנסה נטו השנתית של מתחם גבעת האלה היא 610,000 ₪"
+    found = _follow_up(cx, 3, OTHER_TEXT, claim=own_words)
+    assert found.reason and cx.describe(3) in found.reason
+    # a question that names the other property: the conversation's unit is not what is asked
+    assert _follow_up(cx, 1, OWN_TEXT, question="מה ההכנסה נטו השנתית של פרויקט עין השקמה?", subject="פרויקט עין השקמה").reason
+
+
+def test_r9_a_follow_up_with_no_property_known_decides_nothing_new(enforced):  # noqa: F811
+    cx = _follow_up_file()
+    # no unit kept and none declared: the copied label stays the only identity there is, as before
+    assert _follow_up(cx, 1, OWN_TEXT, focus=None).reason
+
+
+def test_r9_an_equal_number_or_the_same_file_alone_never_sets_identity(enforced):  # noqa: F811
+    cx = _follow_up_file()
+    # unit 4 is a third property of the same file with the same figure: only the conversation's own unit is excused, never a unit for its figure or file
+    found = _follow_up(cx, 4, "גוש 40100 חלקה 55: הכנסה נטו שנתית 610,000 ₪.")
+    assert found.reason and cx.describe(4) in found.reason
+
+
+@pytest.mark.parametrize(("number", "text"), [(1, OWN_TEXT), (1, "גוש 40100 חלקה 12: הכנסה נטו שנתית 610,000 ₪."), (1, "שנתית 610,000 ₪ הכנסה נטו.")])
+def test_r9_the_decision_is_the_same_under_other_wording_of_the_evidence(enforced, number, text):  # noqa: F811
+    cx = _follow_up_file()
+    assert _follow_up(cx, number, text).reason is None
+    assert _follow_up(cx, number, "הערה לא קשורה על המבנה. " + text).reason is None

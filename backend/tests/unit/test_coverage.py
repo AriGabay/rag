@@ -3186,7 +3186,7 @@ def test_an_old_reply_without_candidates_is_still_a_valid_requirement_score_and_
     out = verify.JudgeCoverageOutput.model_validate({"verdicts": [], "requirements": [{"id": "N1", "status": "full"}]})
     assert out.requirements[0].candidates == []
     assert "candidates" in verify.JudgeRequirement.model_json_schema()["properties"]
-    assert verify.JUDGE_VERSION == 22
+    assert verify.JUDGE_VERSION == 23
 
 
 def test_ae5_the_other_rows_of_a_cited_rate_table_are_candidates_the_judge_assigns_become_items_and_the_repair_adds_them():

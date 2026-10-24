@@ -320,7 +320,9 @@ JUDGE_FIRST_CALL_MIN_SECONDS = 40
 # same-property fact (the question's name is a name of the unit its address labels); rule (34) reads them.
 # 22 (round 22 U8, KTD7): the requirements call may carry ``<additions>`` (a condition the server is about to write beside a datum, its ``<clause>``,
 # ``<row>`` and ``<other_rows>``) and a requirement answers each with ``applies`` (``applies``, ``not_applies`` or ``unknown``).
-JUDGE_VERSION = 22
+# 23 (round 23 U4, KTD8): a source that holds a page-text row of numbers whose columns the stored word positions could not tell carries a
+# ``<column_binding>`` fact, and rule (36) reads it: a failure resting only on a column or cell mismatch of such a row is a mark.
+JUDGE_VERSION = 23
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -336,6 +338,9 @@ CANDIDATE_CHARS = 6_000
 # neither an external source nor wrong, only not linked to anything the turn read
 NOT_LINKED_REASON = "לא מקושר למקור שנקרא"
 
+# the lead of the judge's reason for a claim it cannot place under its column (rule 36), and the check of the mark the server writes for it
+COLUMN_UNKNOWN_MARK = "שיוך עמודה לא ידוע"
+COLUMN_UNKNOWN_CHECK = "column_unknown"
 JUDGE_POLICY = (
     "אתה בודק עובדות במשרד שמאות. ליחידות הממוספרות מתשובה מצורפים רק המקורות שהן מצטטות (<sources>). קבע לכל "
     "יחידה:\n"
@@ -481,7 +486,12 @@ JUDGE_POLICY = (
     "תא שהמקור תומך בו — supported; תא שחלקו נתמך (הנתון נתמך וההסתייגות או ההרחבה אינן) — partial; תא שהמקור אינו תומך בו — "
     "unsupported. אל תפצל את הטענה של תא לכמה claims, ואל תחזיר claim אחד לכל השורה כשהפגם בתא אחד. פגם שמשנה את משמעות שאר "
     "השורה (תא התווית שמזהה את הנכס, הצד או התכנית שהשורה מתארת הוא השגוי; יחידות, היקף או תכנית שגויים לכל השורה) — החזר אותו "
-    "כ-claim של אותו תא וקבע את ה-defect שלו (units, scope, framing, input, scenario, formula): השורה כולה נבדקת לפיו."
+    "כ-claim של אותו תא וקבע את ה-defect שלו (units, scope, framing, input, scenario, formula): השורה כולה נבדקת לפיו. "
+    "(36) <column_binding>…</column_binding> בתוך <source> הוא עובדה ניטרלית שהשרת רושם כשלא הצליח לשייך את המספרים בשורות טקסט של המקור "
+    "לעמודות שלהן (אין מיקומי מילים שמורים או כותרת עמודות שמתאימה): סדר המספרים בשורה כזו אינו ראיה לעמודה, לתא או לתקופה שלהם. טענה "
+    "שהכשל היחיד שלה הוא אי-התאמה של עמודה או תא בשורה כזו — המספר כתוב בשורה, אך לא נקבע שהוא תחת העמודה שהטענה מייחסת לו — אינה "
+    "unsupported ואינה contradicts: החזר partial עם defect none, ופתח את ה-reason ב-«" + COLUMN_UNKNOWN_MARK + "». כשהכשל נשען על דבר אחר "
+    "(מספר שאינו כתוב, נושא, יחידה או תקופה שכתובים במפורש אחרת) הוא נשפט כרגיל, וכך גם שורה שאין לה הערה כזו."
 )
 
 
@@ -1787,6 +1797,8 @@ PARTIAL_SENTENCES = {
     "context_not_read": "אומת חלקית: ההקשר שמגדיר חלק מהטענה לא נקרא.",
     "recency": "אומת חלקית: לא אומת שהנתון הוא העדכני ביותר.",
     "final": "אומת חלקית: הטענה, כפי שנוסחה בסוף, נתמכת במקורות רק בחלקה.",
+    # the judge could not place a number of a page-text row under its column, and the server could not tell the row's columns (round 23 U4)
+    "columns_unknown": "אומת חלקית: שיוך הנתון לעמודה או לתא בשורת הטקסט במקור לא נקבע.",
     "rescued": "אומת חלקית: הנתון נמצא במקור שהתשובה מצטטת ליד המשפט, ולא במקור שהמשפט עצמו מצטט.",
     "rescued_own": "אומת חלקית: המספר והמילים של הטענה נמצאים בשורה של המקור שהמשפט מצטט, אך הבדיקה לא אישרה את מלוא הטענה.",
     "unspecified": "אומת חלקית: המקורות תומכים בטענה רק בחלקה.",
@@ -1807,6 +1819,8 @@ def partial_reason_class(failure_kind: str | None, check: str | None = None) -> 
     kind = failure_kind if failure_kind in FAILURE_KINDS else None
     if check in (RESCUE_CHECK, RESCUE_OWN_CHECK):
         return "rescued" if check == RESCUE_CHECK else "rescued_own"
+    if check == COLUMN_UNKNOWN_CHECK:
+        return "columns_unknown"
     if check == SUBREFERENT_CHECK and kind == "wrong_subject":  # the same split as the removal sentence (``removal_summary``)
         return "scope_mismatch"
     return "recency" if check == RECENCY_CHECK else kind or ("final" if check == "final" else "unspecified")
@@ -6438,6 +6452,48 @@ def rescue_judged(report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: W
     return held
 
 
+# a judge reason that rests on the column or the cell a number stands in (round 23 U4, KTD8): "עמודה", "עמודת", "עמודות" (never "עמוד", a page) and
+# "תא" as a table cell (never "תא שטח", a plot), or the English words
+_COLUMN_MISMATCH = re.compile(r"(?<![א-ת])[הבמלכו]{0,2}(?:עמודה|עמודת|עמודות)(?![א-ת])|(?<![א-ת])[הבמלכו]{0,2}תא(?![א-ת])(?!\s+ה?שטח)"
+                              r"|\bcolumns?\b|\bcells?\b", re.IGNORECASE)
+COLUMN_FAILURES = (*RESCUABLE_FAILURES, "wrong_unit")  # the failures of a claim that a column mismatch alone may explain
+MSG_COLUMN_UNKNOWN = ("המספר כתוב בשורת טקסט שהשרת לא הצליח לשייך לעמודות שלה (אין מיקומי מילים שמורים), ולכן ההתאמה של הטענה לעמודה או לתא "
+                      "לא נבדקה; הנתון נשאר מסומן כמאומת חלקית")
+
+
+def column_unknown_marks(report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: Workspace, skip: set[int],
+                         reasons: dict[str, str]) -> set[int]:
+    """The units whose failure rests only on a column or cell mismatch of a page-text row whose column binding is unknown (round 23 U4, KTD8,
+    R5; judge rule 36): the unit cites a source that holds such a row (``tools.column_binding_note``) and the judge's reason leads with
+    ``COLUMN_UNKNOWN_MARK`` or, for an ``unsupported`` or ``contradicts`` verdict, names a column or cell. Their failing claims become
+    partly supported (a mark, no repair round), never a cut; a bound row, a row whose failure is another (an absent number, a subject, a unit
+    or period the source states otherwise are the judge's as before) and a claim the judge needed more context for are judged as usual.
+    All or nothing for a unit, as ``rescue_judged``. ``skip``: the units already decided."""
+    from app.chat import tools as T
+
+    marked: set[int] = set()
+    for u in report.units:
+        v, recs = verdicts.get(u.index), report.claims.get(u.index)
+        if v is None or not recs or u.index in skip or v.verdict in ("supported", "not_factual", "navigation"):
+            continue
+        if not any(T.column_binding_note(ws, ws.sources[i]) for i in u.ids if i in ws.sources):
+            continue
+        led = v.reason.lstrip().startswith(COLUMN_UNKNOWN_MARK)
+        failing = [r for r in recs if r.verdict in ("unsupported", "contradicts")]
+        if not led and not (failing and v.verdict in ("unsupported", "contradicts", "partial") and _COLUMN_MISMATCH.search(v.reason)):
+            continue
+        if any(r.failure not in COLUMN_FAILURES or r.needs_context != "none" or r.rereads for r in failing) or not (failing or led):
+            continue
+        for r in failing:
+            r.verdict, r.failure = "partial", "none"
+            reasons[r.id] = MSG_COLUMN_UNKNOWN
+        if v.verdict in ("unsupported", "contradicts"):
+            v = verdicts[u.index] = v.model_copy(update={"verdict": "partial", "defect": "none", "reason": MSG_COLUMN_UNKNOWN})
+            report.verdicts[u.index], report.unit_verdicts[u.index] = v.verdict, v
+        marked.add(u.index)
+    return marked
+
+
 SOURCE_SENTENCE_CHARS = 300  # the longest sentence of a source that is quoted back as a number's own wording
 _SOURCE_SENTENCES = re.compile(r"(?<=[.;!?])\s+|\n+")
 
@@ -7188,6 +7244,7 @@ def _check_evidence(u: Unit, names_from: str, ws: Workspace, question: str, head
         # words (or its column) name another property distinctively: a declaration, or the model's word for a value's subject, does not
         # outweigh where the question was read (round 21 U5, R4, R6) — the judge is told, nothing is removed
         unaccused: set[int] | None = None
+        follow_up = getattr(getattr(ws, "requirements", None), "origin", "") == "resolve" and not cx.named(question)
         states = []
         for n in sorted(numbers):
             state = cx.compare(n, asked, spans, linked, complete)
@@ -7197,7 +7254,12 @@ def _check_evidence(u: Unit, names_from: str, ws: Workspace, question: str, head
                 if unaccused is None:  # read only where a removal is at stake
                     # the located unit counts only when the request names no side: with a named side the location may be the agent's own
                     # declaration, which never excuses its evidence against a question that names another side (round 15 held-out)
-                    unaccused = _named_sides(ws, cx) | (set() if distinctive else located_contexts(ws, cx))
+                    # in a follow-up the requirement's subject may be a label copied from the previous answer: the unit the conversation is in
+                    # (and the one the answer declared) is the property the follow-up asks about, unless the question itself names a unit
+                    # (round 23 U3, R9); an equal number or the same file never sets it
+                    unaccused = _named_sides(ws, cx) | (set() if distinctive and not follow_up else located_contexts(ws, cx))
+                    if follow_up:
+                        unaccused |= _conversation_contexts(ws, cx)
                 if n in unaccused:
                     state = contexts.UNKNOWN
             states.append(state)
@@ -7230,6 +7292,18 @@ def _check_evidence(u: Unit, names_from: str, ws: Workspace, question: str, head
         others=", ".join(dict.fromkeys(d[2] for d in decided if d[0] != DIFFERENT)),
         elsewhere="; ".join(dict.fromkeys(d[1] for d in decided if d[0] != DIFFERENT))))
     return out
+
+
+def _conversation_contexts(ws: Workspace, cx) -> set[int]:
+    """The subject contexts of ``cx`` that are the unit the conversation is in (``Workspace.unit_focus``: the handle the engine gave the
+    resolved request's unit, or the one the answer declared), by the stable id of its handle (round 23 U3, R9)."""
+    from app.chat import contexts
+
+    data = (getattr(ws, "handles", None) or {}).get((getattr(ws, "unit_focus", None) or {}).get("handle", ""))
+    if not data or data.get("kind") != "U" or not cx.multi:
+        return set()
+    key = contexts.unit_key(data["version_id"], data.get("reading_id"), data["unit_no"], data.get("units_tag"))
+    return {n for n in cx.subjects if cx.key(n) == key}
 
 
 def _named_sides(ws: Workspace, cx) -> set[int]:
@@ -8155,7 +8229,7 @@ def _candidate_block(sid: str, texts: list[str], ws: Workspace, narrow: bool) ->
         a = max(0, min(at - limit // 4, len(shown) - limit))
         shown, excerpt = shown[a:a + limit], True
     return (f'<source id="{sid}" excerpt="{"true" if excerpt else "false"}" candidate="true" '
-            f'title="{prompt_attr(head)}">\n{prompt_text(shown)}\n</source>'), shown, excerpt
+            f'title="{prompt_attr(head)}">\n{prompt_text(shown)}{_column_binding(ws, sid)}\n</source>'), shown, excerpt
 
 
 def _sid_no(sid: str) -> int:
@@ -8861,6 +8935,16 @@ def label_as_statement(text: str) -> str:
     return text if m is None else f"{m.group(1)}{m.group(2).rstrip()}: {text[m.end():]}"
 
 
+def _column_binding(ws: Workspace, sid: str) -> str:
+    """The ``<column_binding>`` line of a source that holds a page-text row of numbers whose columns the stored word positions could not tell
+    (round 23 U4, KTD8; rule 36): the server's note, as a neutral fact; empty for a bound row, a table and any other source."""
+    from app.chat import tools as T
+
+    src = ws.sources.get(sid)
+    note = T.column_binding_note(ws, src) if src is not None else ""
+    return f"\n<column_binding>{prompt_text(note)}</column_binding>" if note else ""
+
+
 def _unit_text(u: Unit) -> str:
     """A unit's text for the judge, with its registered server spans marked ``<server>…</server>``: in place when the
     text holds the span, otherwise (an inserted citation) on a line after the text. The rest is escaped as any
@@ -8898,7 +8982,7 @@ def _render_batch(batch: _Batch, ws: Workspace, coverage: _Coverage | None = Non
         more = "".join(f'\n<expanded_context kind="{prompt_attr(k)}">\n{prompt_text(t)}\n</expanded_context>'
                        for k, t in batch.expanded.get(sid, []))
         blocks.append(f'<source id="{sid}" excerpt="{"true" if excerpt else "false"}" title="{prompt_attr(head)}">\n'
-                      f"{prompt_text(text_)}{more}\n</source>")
+                      f"{prompt_text(text_)}{more}{_column_binding(ws, sid)}\n</source>")
     # an uncited unit also sees the turn's sources that hold its numbers or words (R2, KTD3): the judge decides
     wanted: dict[str, list[str]] = {}
     for u in batch.units:
@@ -9755,6 +9839,8 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                 handled.add(idx)
         # a claim the judge failed that a source cited beside it holds is kept, cited and marked, before it is cut or removed (round 20 U9, F5)
         rescues = rescue_judged(report, verdicts, ws, question, handled, set(soft) | set(rescued_in), reasons, rescued_in)
+        # a failure that rests only on a column or cell mismatch of a page-text row whose columns are unknown is a mark, never a cut (round 23 U4)
+        unbound = column_unknown_marks(report, verdicts, ws, handled | set(rescues) | set(soft) | set(rescued_in), reasons)
         for u in to_judge:
             if u.index in handled:
                 continue
@@ -9817,6 +9903,11 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                     kind = (r.failure_kind() if r is not None and (r.verdict in ("unsupported", "contradicts")
                                                                    or r.failure == CONTEXT_NOT_READ)
                             else DEFECT_FAILURES.get(v.defect))
+                    if u.index in unbound and (r is None or r.verdict == "partial"):  # the column of the number is unknown: marked, never cut (U4)
+                        report.problems.append(Problem(u, PARTIAL_REASON_PREFIX + why, "partial", defect="none", check=COLUMN_UNKNOWN_CHECK,
+                                                       claim_id=r.id if r is not None else recs[0].id,
+                                                       cell_end=_cell_mark_end(u, r) if r is not None else None))
+                        continue
                     if (r.id in held) if r is not None else bool(held):  # a rescued claim: marked in place, no repair round (U9, F5)
                         report.problems.append(Problem(u, PARTIAL_REASON_PREFIX + why, "partial", defect="none",
                                                        check=_rescue_check(u, held[r.id] if r is not None else next(iter(held.values())), rescued_in),
@@ -10787,10 +10878,12 @@ class SupportScope:
         return None if _support_in_asked_units(self.ws, src, self.asked) else "outside_asked_unit"
 
     def verbatim(self, sid: str, src: Source, flat: str) -> bool:
-        """Whether the quote ``flat`` is a substring of the source's text (flattened once per source)."""
+        """Whether the quote ``flat`` is in the source's text (flattened once per source), by the comparison ``take_value`` and the anchor
+        locator make (``meaning.loose_contains``, round 23 U6a): whitespace and a line-wrap hyphen inside a word are ignored, so a quote of a
+        source that splits a word is evidence; a different letter, word or number is not."""
         if sid not in self._flat:
             self._flat[sid] = _flat_quote(src.text)
-        return flat in self._flat[sid]
+        return meaning.loose_contains(self._flat[sid], flat)
 
 
 ROW_MIN = 6  # a quote shorter than this names no row
