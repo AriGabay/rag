@@ -32,7 +32,7 @@ table, first match wins (``reason_of``):
 1. an instruction the shown answer does not meet — instruction not met;
 2. filled only by units removed in verification — removed in verification, its sentence naming why when they share
    one failure kind (round 7 U4, KTD5: ``removal_kinds``, ``REMOVED_BECAUSE``; a unit not checked is never called
-   wrong);
+   wrong); a removal no check gave a kind says only that it was removed in verification (round 23 U1, R2);
 3. a tool or provider failure tied to it (``E#``) — tool failure;
 4. a failed calculation tied to it (``F#``) — calculation not completed;
 5. a calculation resting on a parameter the user did not give, which no user assumption (``A#``), no document rate a
@@ -217,8 +217,10 @@ REASONS = {
 }
 _ORDER = tuple(REASONS)
 # why a component's units were removed (round 7 KTD5, R12): the variant of "removed" is their one failure kind
+# (round 23 U1, R2: a removal that no check gave a kind — the VAT check, an absence check, a dependency — says only that it was removed in
+# verification; "no support was found" is the judge's finding, said only for the kind that is it)
 REMOVED_BECAUSE = {
-    "": "כי לא נמצאה לו תמיכה במקורות.",
+    "": "",
     "absent_from_source": "כי המקורות שנבדקו אינם מציינים אותו.",
     "wrong_subject": "כי הנתון שבו שייך לנכס או לצד אחר.",
     "wrong_unit": "כי היחידה, התקופה, בסיס השטח או המע\"מ שלו אינם כבמקור.",
@@ -435,7 +437,8 @@ def gap_sentence(reason: str, variant: str, texts: list[str], place: dict | None
         lead = "הוראות שלא קוימו בתשובה" if many else "הוראה שלא קוימה בתשובה"
         return f"{lead}: {who}" + (f" (נתון בלי מראה מקום: «{detail}»)" if detail else "") + "."
     if reason == "removed":
-        return f"{who}: מה שנכתב על כך בתשובה הוסר באימות, " + REMOVED_BECAUSE.get(variant, REMOVED_BECAUSE[""])
+        because = REMOVED_BECAUSE.get(variant, "")
+        return f"{who}: מה שנכתב על כך בתשובה הוסר באימות" + (", " + because if because else ".")
     if reason == "tool_failure":
         return f"{who} לא {'הושלמו' if many else 'הושלם'} בגלל תקלה בכלי או בשירות המודל בזמן הבדיקה."
     if reason == "calculation_incomplete" and variant == "failed":
@@ -749,6 +752,11 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
             # the server's (round 18 U7, KTD6)
             return out | {"reason": None}
         return out | {"reason": "not_verifiable", "variant": "not_presented"}
+    # a partly given component whose part the units that give it state (or whose part is only the component's own words, which names nothing a
+    # source could be said not to hold) is reported as no absence at all - not "not located", not "not in the part read", not "unit not located",
+    # not "limit reached" (round 23 U1, R2: the gap paragraph reads the same audited units as the item lines)
+    if o.get("status") == "partial" and o.get("units") and (_part_stated(o, given_text) or _part_ownless(o)):
+        return out | {"reason": None}
     # a professional question whose pool was empty: the repository holds no standard or professional document (U8, KTD15,
     # R29). It says what the repository lacks — never that a search found nothing in a standard
     if ws.intent == PROFESSIONAL and ws.standards_absent:
@@ -785,16 +793,13 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
         docs = set(ev["documents"]) | set((claim or {}).get("document_ids") or [])
         if signal["multi"] and (not docs or docs & signal["multi"]) and not signal["located"]:
             return out | {"reason": "unit_not_located"}
-    partly_stated = o.get("status") == "partial" and bool(o.get("units")) and _part_stated(o, given_text)
     for sid, doc, o_ in readings:
         if ws.read_complete(o_.get("target")) is True and _inside_unit(ws, sid, signal):
-            if partly_stated:
-                return out | {"reason": None}
             return out | {"reason": "not_in_part_read", "searched": True,
                           "place": {"sid": sid, "scope": o_.get("scope"), "name": o_.get("name")},
                           "document_id": doc}
     if gap is not None and gap["reason"] == "not_in_part_read" and _inside_unit(ws, gap["place"]["sid"], signal):
-        return out | {"reason": None} if partly_stated else out | gap | {"searched": True}
+        return out | gap | {"searched": True}
     if ws.unread_named:  # the documents the turn's lookups matched by title were not read: nothing was searched in them
         return out | _not_read_gap(ws)
     documents = list(dict.fromkeys(ev["documents"] + ((claim or {}).get("document_ids") or [])))
@@ -806,8 +811,6 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
                           "document": a.get("title"), "document_id": doc}
     # a reading outside the located unit searched nothing of the appraisal asked about
     outside = [sid for sid in ev["checks"] if sid in ws.sources and not _inside_unit(ws, sid, signal)]
-    if partly_stated:
-        return out | {"reason": None}
     # a read of one of its documents (any document of the turn, when the judge tied none) broke for a technical reason and was not completed since
     # (round 22 U7, R18, R11): no search can say the datum is not in a region that read opened - the line says the check did not complete
     if ws.failed_reads(documents):
@@ -815,6 +818,20 @@ def reason_of(ws: Workspace, o: dict, turn: TurnRequirements | None, claim: dict
     if out["searched"] and len(outside) < len(ev["checks"]):
         return out | {"reason": "not_located", "variant": "searched"}
     return out | {"reason": "not_located", "searched": False}
+
+
+def _part_ownless(o: dict) -> bool:
+    """Whether the part the judge named missing is made only of the component's own words (round 23 U1, R2): it has words, numbers or designators
+    of its own to none of which a source could be said to lack. A sentence "not in the part read" / "not found in the search" about it would claim
+    something about the source that nothing established; the component stays partial, and no server sentence names the part."""
+    from app.chat.items import designators, without_designators
+    from app.chat.verify import _loose_forms, _part_words
+
+    part = o.get("missing_part") or ""
+    if not part:
+        return False
+    asked = {f for w in _part_words(o.get("text") or "") for f in _loose_forms(w)}
+    return not designators(part) and not [w for w in _part_words(without_designators(part)) if not _loose_forms(w) & asked]
 
 
 def _part_stated(o: dict, given_text: str) -> bool:
@@ -900,6 +917,10 @@ def item_line(ws: Workspace, state: dict, request: str = "") -> dict:
     elif state.get("outcome") == "partial" and missing:
         # round 19 U4, R15: the answer gives part of the item: it is not "not used"; the line names what the answer leaves out
         text = f"{name}: נקרא {place}, והתשובה נתנה אותו בחלקו; לא נאמר בה: {'; '.join(missing)}."
+    elif state.get("removed_in_verification"):
+        # round 23 U1, R2: the sentence that gave it was removed in verification - it was used, and the kind of its removal (when a check named one) is its reason
+        because = REMOVED_BECAUSE.get(state.get("removal_kind") or "", "")
+        text = f"{name}: נקרא {place}, אך מה שנכתב עליו בתשובה הוסר באימות" + (", " + because if because else ".")
     else:
         text = f"{name}: נקרא {place}, ולא נעשה בו שימוש בתשובה."
     return {"id": state["id"], "state": state["state"], "text": text,

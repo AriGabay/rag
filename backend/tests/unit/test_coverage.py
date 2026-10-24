@@ -2089,13 +2089,16 @@ def test_a_failed_completion_leaves_a_gap_line_saying_where_the_part_was_read_an
     assert c["variant"] == "read_not_used" and c["limitation"] == "not_verifiable" and "variant" in coverage.PUBLIC_FIELDS
 
 
-def test_a_component_whose_quote_was_invalid_keeps_the_not_located_wording_in_its_gap_line():
+def test_a_component_whose_quote_was_invalid_is_never_read_and_not_used_and_its_part_of_its_own_words_gets_no_absence_sentence():
+    """(round 23 U1, R2; was: keeps the not_located wording) the judge's part here is only the component's own words («שיעורי ההיוון» of
+    «שיעורי ההיוון שנקבעו»): the validated quote is invalid, so no "read and not used" line; and the part names nothing the source could be said
+    not to hold, so no "not found in the search" sentence either. The component stays partial."""
     ws = _rates_file()
     r, turn, answer = _support(ws, THREE_RATES, "שיעור היוון לגרעין 11.3%")
     final, outcomes = _finish(ws, answer, r, turn)
     (o,) = outcomes
-    assert o["limitation"] == "not_located" and o["variant"] != "read_not_used"
-    assert "נקרא" not in _gap(final, answer) or "לא אותר" in _gap(final, answer)
+    assert o["status"] == "partial" and o["limitation"] is None and o["variant"] != "read_not_used"
+    assert "נקרא" not in _gap(final, answer) and "לא נמצא" not in _gap(final, answer) and "לא אותר" not in _gap(final, answer)
     assert "support" in o and o["support"] == []
 
 

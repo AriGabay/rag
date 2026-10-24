@@ -132,6 +132,7 @@ from app.chat.verify import (
     asked_components,
     context_of_source,
     evidence_key,
+    ids_in,
     is_server_item,
     request_word_forms,
     shared_request_words,
@@ -426,6 +427,10 @@ def missing_detail(src, quote: str, group: frozenset[str]) -> str:
     the header of its column, for a passage the figure with the words next to it. Every word is the source's own, and a whole token of it:
     the figure's token is taken to the blanks around it ("ריבית5.4%שנתית" is one), and the cut at ``MISSING_DETAIL_CHARS`` falls between tokens
     (round 21 U7, KTD7)."""
+    for form in group:  # a range of dates the answer states in part (round 23 U1): the range as the source writes it, with the words next to it
+        if (at := quote.find(form)) >= 0 and shared_dates.parse(form) is not None:
+            left, right = _tokens(quote[:at])[-_WORDS_AROUND:], _tokens(quote[at + len(form):])[:_WORDS_AROUND]
+            return _whole_tokens(re.sub(r"[\[\]]", " ", " ".join([*left, form, *right])), MISSING_DETAIL_CHARS)
     cells = _row_cells(quote) if "|" in quote else []
     if len(cells) >= 2:
         at = next((i for i, c in enumerate(cells) if group & number_forms(c, source=True)), None)
@@ -721,14 +726,14 @@ def _states(pairs: Iterable[tuple[frozenset[str], str]], wanted: Mapping[str, se
     return any(_compatible(cls, w) for forms, cls in pairs for f in forms if f in wanted for w in wanted[f])
 
 
-def _unwrapped(lines: Sequence[str]) -> list[str]:
+def _unwrapped(lines: Sequence[str], least: int = WRAP_MIN) -> list[str]:
     """The lines of a passage with each wrapped sentence on one line (round 21 packet A, Q4): a line of at least ``WRAP_MIN`` characters that
     does not end a sentence and is no table row, heading or list member goes on in the next line when that is no list member, heading, table
     row or note (a footnote mark opens it) either. A sentence cut per source line leaves a headless fragment that no item may be built from."""
     out: list[str] = []
     for line in lines:
         prev = out[-1] if out else ""
-        if (prev and len(prev) >= WRAP_MIN and "|" not in prev and "|" not in line and not _SENTENCE_CLOSE.search(prev)
+        if (prev and len(prev) >= least and "|" not in prev and "|" not in line and not _SENTENCE_CLOSE.search(prev)
                 and not _HEADING_LINE.match(prev) and not _HEADING_LINE.match(line) and not _MEMBER_LINE.match(line)
                 and line.strip() and not scopes.note_mark(line)):
             out[-1] = prev.rstrip() + " " + line.strip()
@@ -1204,14 +1209,25 @@ def _holds_value(item: Item, src) -> bool:
     return all(g & have for g in groups)
 
 
+def _context_ids(unit: Unit) -> list[str]:
+    """What a table cites once for its rows (round 23 U1, KTD5, R1): the sources written in the table's header row and in the line above it
+    (``Unit.context``), for a BODY row that carries no citation of its own. A row that cites anything keeps that attribution (it is never given
+    the table's), and a header row or a unit outside a table inherits nothing. Coverage attribution only (``_attributed``): the row's own
+    verification, and ``_cites_source`` (the sentence that cites the item's source ITSELF), read ``unit.ids`` as before."""
+    if unit.ids or unit.table_span is None or unit.table_header:
+        return []
+    return ids_in(unit.context)
+
+
 def _attributed(item: Item, unit: Unit, ws) -> bool:
     """Whether the unit cites the item's source, or a value or calculation registered from it, or another passage of the item's
-    document and unit that holds its quote or its value (``_holds_value``) — and nothing of another document or appraisal unit."""
+    document and unit that holds its quote or its value (``_holds_value``) — and nothing of another document or appraisal unit. A table row
+    that cites nothing is given the citation its table's header row or lead-in line makes (``_context_ids``; round 23 U1, KTD5)."""
     home = _place(ws, item.source)
     if home is None:
         return False
     flat = SupportScope.flat(item.quote)
-    for cid in unit.ids:
+    for cid in unit.ids or _context_ids(unit):
         if cid in ws.sources:
             src = ws.sources[cid]
             place = _place(ws, cid)
@@ -1597,6 +1613,92 @@ def heading_only(quote: str) -> bool:
     return not shared_dates.find_all(text) and all(_stray(g) for g in headline(text, text))
 
 
+def _clipped(span: str, at: int, size: int) -> bool:
+    """Whether the piece ``span[at:at+size]`` starts or ends in the middle of a number of ``span``: a digit (or a separator and a digit) on the
+    other side of its edge, where the piece's own edge is a digit or the separator of one."""
+    head, piece, tail = span[:at], span[at:at + size], span[at + size:]
+    left = (head[-1:].isdigit() and (piece[:1].isdigit() or (piece[:1] in ".," and piece[1:2].isdigit()))) or (
+        bool(re.search(r"\d[.,]$", head)) and piece[:1].isdigit())
+    right = (tail[:1].isdigit() and (piece[-1:].isdigit() or (piece[-1:] in ".," and piece[-2:-1].isdigit()))) or (
+        bool(re.match(r"[.,]\d", tail)) and piece[-1:].isdigit())
+    return left or right
+
+
+def _span_holds(flat: str, spans: Sequence[str]) -> bool:
+    """Whether ``flat`` lies in one of the (flat) ``spans`` with no number cut at either end."""
+    for span in spans:
+        at = span.find(flat)
+        while at >= 0:
+            if not _clipped(span, at, len(flat)):
+                return True
+            at = span.find(flat, at + 1)
+    return False
+
+
+_MARK_ONLY = re.compile(r"[\s\[\]()\-–.,;:]*(?:\d{1,2}[\s\[\]()\-–.,;:]*)*")  # nothing but footnote marks, row ordinals and punctuation
+
+
+def _title_line(line: str, prev: str | None) -> bool:
+    """Whether a line of a passage is a title and no sentence (round 23 U1): a marked heading, or a short line (three words at most) that opens a
+    paragraph (the first line, or the one after a line that ends a sentence), ends like no sentence, holds no figure and is no list member —
+    «הסכם השכירות». A line that goes on a sentence of the line before it is never one."""
+    text = line.strip()
+    if (prev is not None and prev.strip() and not _SENTENCE_CLOSE.search(prev.strip()) and "|" not in prev and not _MEMBER_LINE.match(prev)
+            and not _HEADING_LINE.match(prev) and not _MEMBER_LINE.match(text) and not _HEADING_LINE.match(text)):
+        return False  # it goes on the sentence the line before it opens (a lead-in wrapped over lines, whose last line ends in a colon): never a title
+    if _HEADING_LINE.match(text) or heading_only(text):
+        return True
+    return ((prev is None or bool(_SENTENCE_CLOSE.search(prev.strip()))) and not _MEMBER_LINE.match(text) and not _SENTENCE_CLOSE.search(text)
+            and not re.search(r"\d", text) and len(_TOKEN.findall(text)) <= 3)
+
+
+def source_span_problem(src, quote: str) -> str:
+    """Why a judge's quote is no datum of the source ("" when it is one; round 23 U1, KTD6, R1): a judge's "missing part" becomes an item when
+    it lies in a sentence or a clause of the source (with or without a figure: a condition, a method, a statement that something was not
+    received), a list member, or a row or a cell of a table, or one of its notes. It is none when it is a line the reader wrote or the source
+    titles (a table caption, a title), only a footnote mark or a row ordinal, a header row alone, or a piece that begins or ends inside a number.
+    A quote of several lines is checked line by line (a header row of the table may stand among them), and at least one of them is a span of
+    its own. ``not_a_source_span``."""
+    parts, body = context_of_source(src)
+    spans: list[str] = []
+    rows: list[str] = []
+    if _is_tabular(src):
+        started = False  # the lines before the first row with a figure are the table's header
+        for line in body:
+            cells = _row_cells(line) if "|" in line else []
+            if len(cells) < 2:
+                if line.strip() and not cells and not _title_line(line, None):
+                    spans.append(_flat_span(line))  # a line of the table's text that is no row: a sentence
+                continue
+            if re.search(r"\d", " ".join(cells[1:])):
+                started = True
+            (spans if started else rows).append(_flat_span(line))  # (a data row without a figure is a row of the table too)
+        for part in parts:  # the notes around the table are the source's own; its captions and headings are the reader's
+            if part.place in ("before", "after", "note"):
+                spans += [_flat_span(x) for x in [part.text, *_SENTENCE_END.split(part.text)] if x.strip()]
+    else:
+        kept: list[str] = []
+        for line in body:
+            if _title_line(line, kept[-1] if kept else None):
+                rows.append(_flat_span(line))
+            else:
+                kept.append(line)
+        for line in _unwrapped(kept, 1):  # (a sentence the source wrapped over short lines is one sentence)
+            spans += [_flat_span(x) for x in [line, *_SENTENCE_END.split(line)] if x.strip()]
+    found = False
+    for piece in (x.strip() for x in quote.splitlines()):
+        if not piece:
+            continue
+        flat = _flat_span(piece)
+        if _MARK_ONLY.fullmatch(piece):
+            return "not_a_source_span"
+        if _span_holds(flat, spans):
+            found = True
+        elif not _span_holds(flat, rows):
+            return "not_a_source_span"
+    return "" if found else "not_a_source_span"
+
+
 # a count written as a word ("שתי קומות", two floors) is the digit the source writes ("2 קומות"), when it stands directly before the noun the
 # source writes after the digit (round 20 U5, KTD5; R17): "one", "two" and the like are ordinary words elsewhere. The words are read by
 # ``numread.number_words`` (round 22 U6/U10: "שנים עשר תשלומים" is 12, not a 2 and a 10), a claim's reading: no "one", no definite count
@@ -1641,6 +1743,7 @@ _CODE_BEFORE = re.compile(r"(?:[א-תA-Za-z]{1,4}|\d)\s?[/\\]\s?$")  # "ג/" or 
 _CODE_AFTER = re.compile(r"\s?[/\\]\s?\d")
 _MARK_AFTER = re.compile(r"\s*[)\]]")
 _MARK_BEFORE = re.compile(r"[(\[]\s*$")
+_ROW_ORDINAL_AFTER = re.compile(r"\)\s+[^\W\d_]")  # "2) מסחר": the closing bracket of a row's ordinal and the word the row opens with
 _ORDINAL_AT_START = re.compile(r"\s*(?:[-*+•]\s+)?\d{1,3}[.)]\s")
 _LIST_NUMBER = re.compile(r"\A\s*(?:[-*+•]\s+)?\d{1,3}[.)]\s")  # the number a numbered list item opens with: its place in the list
 
@@ -1673,6 +1776,12 @@ def _not_headline(text: str, start: int, end: int) -> bool:
         return True
     ordinal = _ORDINAL_AT_START.match(text)
     if ordinal and start < ordinal.end():
+        return True
+    # round 23 U1 (KTD6): a footnote mark the text extraction flattened onto its figure ("9.1%1": one digit glued to a percent sign) and an
+    # ordinal that numbers a row in the middle of a line ("1) משרדים … 2) מסחר …": a number and a closing bracket after a blank) state no amount
+    if (end - start == 1 and text[start].isdigit() and text[max(0, start - 1):start] == "%") or (
+            end - start <= 2 and text[start:end].isdigit() and _ROW_ORDINAL_AFTER.match(text, end)
+            and (start == 0 or text[start - 1].isspace())):
         return True
     section = _SECTION_NUMBER.match(text)
     return bool(section and section.start(1) <= start and end <= section.end(1)
@@ -2159,12 +2268,38 @@ def _names_row(item: Item, words: frozenset[str]) -> bool:
     return bool(named) and all(g & words for g in named)
 
 
+def _same_point(a: str, b: str) -> bool:
+    """Whether two ISO dates are one point of time at the coarser of their precisions ("2026-12" and "2026-12-31")."""
+    precision = shared_dates.coarser(shared_dates.precision_of(a), shared_dates.precision_of(b))
+    return shared_dates.cut(a, precision) == shared_dates.cut(b, precision)
+
+
+def _date_value_check(item: Item, parsed, text: str) -> _Check:
+    """Whether ``text`` states an item whose value is a date or a range of dates (round 23 U1, M1). A single date is stated by that date (finer
+    forms count: "2025-01" by "2025-01-15"). A RANGE is stated when the text writes the range itself (both ends, at the coarser precision of the
+    pair: "1.1.2025 – 31.12.2026" by "מינואר 2025 עד דצמבר 2026") or writes its start and its end as two dates; one end alone is a partial gift
+    (``missing``: the range as the source writes it), and another range is not the item's whatever end it shares."""
+    found = shared_dates.find_all(text)
+    if parsed.end is None:
+        return _Check("" if any(p.iso.startswith(parsed.iso) for p in found) else "value_not_stated")
+    if any(p.end and _same_point(p.iso, parsed.iso) and _same_point(p.end, parsed.end) for p in found):
+        return _Check("")
+    points = [p.iso for p in found if p.end is None]
+    start, end = (any(_same_point(parsed.iso, x) for x in points), any(_same_point(parsed.end, x) for x in points))
+    if start and end:
+        return _Check("")
+    if not (start or end):
+        return _Check("value_not_stated")
+    written = next((p.written for p in shared_dates.find_all(item.quote) if p.end and _same_point(p.iso, parsed.iso)), parsed.written)
+    return _Check("partial", (frozenset({written}),))
+
+
 def _value_check(item: Item, text: str, words: frozenset[str]) -> _Check:
     """Whether the block's ``text`` states the item's value: a date value by its date; else every headline value (``headline``), and, for an item
     with none, half of the words of its value, its label or its quote (the first that has content words)."""
     text = _positive(item, text)  # only the clauses that state it positively, for its own designators (round 22 U6, KTD6)
     if parsed := shared_dates.parse(item.value):
-        return _Check("" if any(p.iso.startswith(parsed.iso) for p in shared_dates.find_all(text)) else "value_not_stated")
+        return _date_value_check(item, parsed, text)
     groups = headline(item.value, item.quote)
     if groups:
         have = _have(text)
@@ -2187,9 +2322,14 @@ def _value_check(item: Item, text: str, words: frozenset[str]) -> _Check:
     # own, and its words are not the source's: the label and the quote come first. A value with no number is asked by its own words, and then
     # by the quote's — the source's words — before the agent's label, which the answer need not write ("פינוי" for a row the answer states
     # as "המגרש יפונה …"; round 21 U7, KTD7, R8)
-    order = (item.label, item.quote, item.value) if re.search(r"\d", item.value) else (item.value, item.quote, item.label)
+    digits = bool(re.search(r"\d", item.value))
+    order = (item.label, item.quote, item.value) if digits else (item.value, item.quote, item.label)
     wanted = next((t for t in order if _word_groups(t)), "")
     if _enough(wanted, words):
+        return _Check("")
+    # round 23 U1: the label is the agent's own description of the row and the quote is the source's: a value with digits the quote does not
+    # write is asked by the label first, and by the quote's words too when the block does not write the label (never by the agent's value)
+    if digits and any(_enough(t, words) for t in (item.label, item.quote) if t != wanted and _word_groups(t)):
         return _Check("")
     # an item with NO value is asked by the quote's words first, and then by its label's: the label is the agent's own description of the claim,
     # and the answer states the claim in its own words as often as in the source's (the label's words for a quote that names the same thing otherwise). A label of one content word is no evidence (it stands in unrelated blocks), so only a label of two or more counts (round 21
@@ -2203,7 +2343,10 @@ def _states_date(item: Item, text: str, lead: str = "") -> bool:
     """The item's date is stated by the block, or, when the block states no date of its own, by its lead: the lead-in sentence of
     its list, the sentence and header before its table, or the heading above it (``_leads``; round 18 U7)."""
     stated = [p.iso for p in shared_dates.find_all(text)] or [p.iso for p in shared_dates.find_all(lead)]
-    return all(any(s.startswith(iso) for s in stated) for iso in _item_dates(item))
+    # a value that is itself a date or a range is decided by the value check (``_date_value_check``: both ends, at the coarser precision of
+    # the two): its start is no date the block must state again, in the form of the source (round 23 U1)
+    own = shared_dates.parse(item.value)
+    return all(any(s.startswith(iso) for s in stated) for iso in _item_dates(item) if own is None or iso != own.iso)
 
 
 def _leads(units: Sequence[Unit]) -> dict[int, str]:
@@ -2214,33 +2357,189 @@ def _leads(units: Sequence[Unit]) -> dict[int, str]:
     out = {}
     for u in units:
         parts = [u.heading, u.context]
-        if u.list_item:
-            prev = by_index.get(u.index - 1)
-            while prev is not None and prev.list_item and not prev.leads_list:
-                prev = by_index.get(prev.index - 1)
-            if prev is not None and prev.leads_list:
-                parts.append(prev.text)
+        # round 23 U1: the lead of the list is the line above its FIRST item (``_list_lead``), for every item of it: a list item followed by
+        # another also has ``leads_list``, and read as the lead it gave the second item of a list the first item's text, not the lead-in
+        if (lead := _list_lead(u, by_index)) is not None:
+            parts.append(lead.text)
         out[u.index] = " ; ".join(x for x in parts if x)
     return out
 
 
+def _lead_gives_value(item: Item, text: str, lead: str) -> bool:
+    """Whether the value of an item that shares it with a twin is written once in the lead-in above its block (round 23 U1, M1): every headline
+    value of the item stands in the lead (the sentence that opens the list, the line before the table, the heading), and the block itself
+    writes no figure — a block that states a number of its own states that one. The block's words then tell the twins apart (``_tells_apart``)."""
+    groups = headline(item.value, item.quote)
+    if not groups or _have(text):
+        return False
+    have = _have(_positive(item, lead))
+    return all(g & have for g in groups)
+
+
+_ID_NUMBER = re.compile(r"(?<![\d.,])\d+(?!\d|[.,]\d)")
+_ID_RANGE = re.compile(r"(?<![\d.,])(\d+)\s*(?:[-‐‑‒–־—−]|עד)\s*(\d+)(?!\d|[.,]\d)")
+
+
+def _identifiers_in(text: str) -> frozenset[str]:
+    """Every whole number ``text`` writes (no decimal, no part of a longer number), each range of them written out ("9-12", "41 עד 45")."""
+    found = set(_ID_NUMBER.findall(text))
+    for m in _ID_RANGE.finditer(text):
+        a, b = int(m.group(1)), int(m.group(2))
+        if a < b <= a + RANGE_MAX:
+            found.update(str(n) for n in range(a, b + 1))
+    return frozenset(found)
+
+
+@functools.lru_cache(maxsize=2048)
+def _identifier_list(item_value: str, item_quote: str) -> frozenset[str] | None:
+    """The numbers of an item whose datum is a bare list of identifiers — lots, parcels, units: «9-12, 4, 41-45», «9 - 12 במלואן» — each range
+    written out; None for any other item (round 23 U1, R1). Bare: the value (the quote for an item with none) holds three whole numbers or more,
+    or a range of them, and at most two words of three letters or more (the noun of the list, «במלואן»); no percent, currency, decimal or
+    thousands sign; not a period (every number a year) and not a count or a duration (a number followed by the noun of one: «3-5 קומות»)."""
+    text = item_value if item_value.strip() else item_quote
+    core = re.sub(r"[^\W\d_]+", " ", text)
+    if (len([t for t in _TOKEN.findall(text) if len(t) >= 3]) > 2 or not re.fullmatch(r"[\d\s,;.\-‐‑‒–־—−]*", core)
+            or re.search(r"\d[.,]\d|\d{5}", core)):
+        return None
+    numbers = _ID_NUMBER.findall(core)
+    wanted = _identifiers_in(core)
+    if not numbers or (len(numbers) < 3 and len(wanted) < 3) or all(_YEAR_FORM.fullmatch(n) for n in numbers):
+        return None
+    if any(after_kind(text, m.end()) for m in _ID_NUMBER.finditer(text)):
+        return None
+    return wanted
+
+
+def _unit_in_place(sid: str, unit: Unit, ws) -> bool:
+    """Whether a block cites nothing, or only sources, values and calculations of the place (document and appraisal unit) of the source ``sid``
+    — its table's citations included (``_context_ids``): a block that cites another place is another place's, whatever it states."""
+    home = _place(ws, sid)
+    if home is None:
+        return False
+    for cid in unit.ids or _context_ids(unit):
+        if cid in ws.sources:
+            place = _place(ws, cid)
+        elif cid in ws.values:
+            place = _value_place(ws.values[cid])
+        elif cid in ws.computations:
+            places = [_value_place(v) for leaf in _leaves(ws, cid) if (v := ws.values.get(leaf)) is not None]
+            place = places[0] if places and all(_same_place(places[0], x) for x in places) else None
+        else:
+            place = None
+        if place is None or not _same_place(home, place):
+            return False
+    return True
+
+
+# function words the content-word reader keeps ("without", "except", "after", "according to"...): they say nothing of what a part is about
+_FUNCTION_WORDS = frozenset("""ללא למעט לאחר אחרי לפני לפי עבור בגין מול בין כולל כאשר אשר גם רק עוד כל כלל זה זאת זו אלה אלו אך אבל כי כך אז
+יותר פחות מאוד אפילו אולם לכן וכן כמו כגון היינו קרי אלא""".split())
+_YEAR_FORM = re.compile(r"(?:19|20)\d\d")
+
+
+def _wordy(value: str, quote: str) -> bool:
+    """Whether a datum has no figure that tells it from another: no headline number but a year (an identifier of a period, not an amount) or a
+    duration («3 שנים»: a count of the period the datum averages), no fraction, and no date but a range of years. A datum like that is stated by
+    its words alone (``distinctive_stated``); one with a figure of its own keeps the rule that asks the figure (round 23 U1, R1)."""
+    groups, fractions = value_tokens(value, quote)
+    if fractions or any(p.precision != "year" for p in shared_dates.find_all(quote)):
+        return False
+    durations = {f for m in _DURATION.finditer(quote) for f in number_forms(m.group(1))}
+    return all(any(_YEAR_FORM.fullmatch(f) for f in g) or g & durations for g in groups)
+
+
+def _distinct_groups(text: str, asked: str) -> tuple[frozenset[str], ...]:
+    """The distinctive content words of a datum's text, one group of variants each: words of three letters or more that are no function word, no
+    number or year, and no word of the component's own text (``asked``), whose every variant is a word of three letters or more as well."""
+    own = _words(asked)
+    own = own | {_unprefixed(w) for w in own}
+    out: dict[frozenset[str], None] = {}
+    for token in _TOKEN.findall(_CODE.sub(" ", _unjoined(text))):
+        if len(token) < 3 or token in _FUNCTION_WORDS or _unprefixed(token) in _FUNCTION_WORDS:
+            continue
+        group = frozenset(w for w in claim_terms(token)[1] if len(w) >= 3)
+        if group and not (group | {_unprefixed(w) for w in group}) & own:
+            out[group] = None
+    return tuple(out)
+
+
+def distinctive_stated(quote: str, asked: str, text: str) -> bool:
+    """Whether ``text`` (one block of the answer) states a datum that has only words: at least two of the datum's distinctive words
+    (``_distinct_groups``), and at least two thirds of them, in the clauses of the block that state it positively — a clause that negates or
+    denies it states nothing of it (``positive_text``) — a word counting in any of its variants and prefixes. The words of the component's own
+    text and the generic words of a sentence (years, durations, function words) are no evidence that a block says what the part says."""
+    groups = _distinct_groups(quote, asked)
+    if len(groups) < 2:
+        return False
+    positive = positive_text(_without_list_number(text), designators(quote), True, *_own_negation((quote,)))  # (a clause that negates anything is blanked whole)
+    have = frozenset(w for w in _words(positive) if len(w) >= 3)
+    have = have | {_unprefixed(w) for w in have}
+    hit = sum(1 for g in groups if (g | {_unprefixed(w) for w in g}) & have)
+    return hit * 3 >= 2 * len(groups)
+
+
+def giving_block_in_place(quote: str, source: str, blocks: Sequence[Block], ws, component: str = "") -> int | None:
+    """The index of the first block of the answer that states a quote of the source ``source`` and cites nothing of another place (the presence
+    test ``quote_in_blocks`` over those blocks), else None: the datum audit of a judge's part, decided by the datum and not by the form of a
+    citation (round 23 U1, R1)."""
+    wordy = _wordy(quote, quote)
+    for block in blocks:
+        if not _unit_in_place(source, block.unit, ws):
+            continue
+        if distinctive_stated(quote, component, block.unit.text) if wordy else quote_in_blocks(quote, (), component, blocks=[block]):
+            return block.unit.index
+    return None
+
+
+def _datum_words(item: Item, words: frozenset[str], text: str = "", asked: str = "") -> bool:
+    """Whether a block's words name the item's own row (round 23 U1, KTD4): every content word of its label, else at least half of the content
+    words of its quote (the source's own wording of the row). The words half of the datum audit: the value tokens say how much, these say of what.
+    An item with no figure of its own is stated by its distinctive words alone (``distinctive_stated``): common words of the part, a year or a
+    duration in a block that says something else are no presence."""
+    if _wordy(item.value, item.quote):
+        return distinctive_stated(item.quote or item.label, asked, text)
+    if _names_row(item, words):
+        return True
+    named = _word_groups(item.quote)
+    return bool(named) and sum(1 for g in named if g & words) >= (len(named) + 1) // 2
+
+
 def _check_block(item: Item, block: Block, ws, shared: bool, rivals: frozenset[str], lead: str = "",
-                 rival_dates: frozenset[str] = frozenset()) -> _Check:
+                 rival_dates: frozenset[str] = frozenset(), audit: bool = False, asked: str = "") -> _Check:
     """What one block of the answer gives of the item: its failure ``why`` (the first check it fails), ``partial`` with the headline values it
     leaves out, or "" when it gives it. Attribution is the union of the citations of the block's sentences (R5); the value is every headline
     value in the block's text; the date may stand in the block's lead; the condition words are asked only to tell apart items that
-    share a value, over the block's words, and a date the item states that its twins do not state tells it apart (round 19 U4)."""
+    share a value, over the block's words, and a date the item states that its twins do not state tells it apart (round 19 U4).
+
+    ``audit`` (round 23 U1, KTD4, R1): the datum audit of the coverage decision (``VerifyReport.item_states``). A block that carries no citation
+    at all, its table's included (``_context_ids``), is not refused for it: it gives the item when it states the item's value tokens AND names
+    its row (``_datum_words``) — decided by the datum, not by the form of a citation. A block that cites anything else (a source that is not
+    the item's) is still not the item's, whatever it states."""
     unit = block.unit
+    # a bare list of identifiers (lots, parcels) is stated by any block of its place that holds every number and range of it, the ranges written
+    # out or not; its words are the source's, not the answer's (round 23 U1)
+    if audit and (listed := _identifier_list(item.value, item.quote)) is not None and _unit_in_place(item.source, unit, ws):
+        if listed <= _identifiers_in(_outside_dates(unit.text)):
+            return _Check("")
+    uncited = False
     if not _attributed(item, unit, ws):
-        return _Check("not_attributed")
+        if not (audit and not unit.ids and not _context_ids(unit)):
+            return _Check("not_attributed")
+        uncited = True
     text = _positive(item, unit.text)  # what the block states positively for this item's row (round 22 U6, KTD6)
     words = _words(text)
     verdict = _value_check(item, text, words | _words(unit.context))
+    if verdict.why == "value_not_stated" and shared and _lead_gives_value(item, text, lead):
+        verdict = _Check("")
     if verdict.why:
         return verdict
+    if uncited and not _datum_words(item, words, unit.text, asked):
+        return _Check("value_not_stated")
     if not _states_date(item, text, lead):
         return _Check("date_not_stated")
-    if shared and not _tells_apart(item, words, rivals, rival_dates):
+    # twins (items that share a value) are told apart by the block's words and by the lead-in above it (round 23 U1): the words that name the
+    # twin may stand in the sentence that opens the list, or the line before the table, as its date may
+    if shared and not _tells_apart(item, words | _words(lead), rivals, rival_dates):
         return _Check("condition_not_stated")
     # another row of the cited passage holds the value: the block gives the item only when it names the item's own row (round 22 U8, KTD7)
     row = row_status(row_ref(item), text, ws, unit.ids, lead).status
@@ -2291,12 +2590,13 @@ _NO_GIVING = Giving(frozenset(), ())
 
 
 def _coverage_all(item: Item, blocks: Sequence[Block], ws, shared: bool, leads: Mapping[int, str],
-                  rivals: frozenset[str] = frozenset(), rival_dates: frozenset[str] = frozenset()) -> tuple[Coverage, Giving]:
+                  rivals: frozenset[str] = frozenset(), rival_dates: frozenset[str] = frozenset(),
+                  audit: bool = False, asked: str = "") -> tuple[Coverage, Giving]:
     """``_coverage`` and, from the same pass over the blocks, every sentence that gives the item (``Ledger.outcomes``): the coverage names
     the first of them. Raises ``CoverageUnavailable`` when the item's source is not in the workspace."""
     if ws is None or _place(ws, item.source) is None:
         raise CoverageUnavailable(item.id)
-    checks = [(b, _check_block(item, b, ws, shared, rivals, leads.get(b.unit.index, ""), rival_dates))
+    checks = [(b, _check_block(item, b, ws, shared, rivals, leads.get(b.unit.index, ""), rival_dates, audit, asked))
               for b in blocks]
     giving = [b for b, c in checks if not c.why]
     if giving:
@@ -2526,7 +2826,8 @@ class Ledger:
         self.items = {(item.key if k == old.key else k): (item if k == old.key else v) for k, v in self.items.items()}
         self._record(item, version)
 
-    def outcomes(self, units: Sequence[Unit], ws) -> list[dict]:
+    def outcomes(self, units: Sequence[Unit], ws, *, audit: bool = False, removed: Sequence[Unit] = (),
+                 asked: Mapping[str, str] | None = None) -> list[dict]:
         """Every fill with its state against these surviving units: ``covered`` (a block of them gives it), ``omitted`` (an included or
         judge-added fill no block gives, wholly or in part: ``outcome`` says which, and ``missing`` names what a partly given one is
         missing), ``unchecked`` (the check could not be completed), or the ``not_verifiable`` / ``not_applicable`` the agent declared
@@ -2539,7 +2840,11 @@ class Ledger:
         evidence — on the first of them a unit gives, against the units that give any of them — and the others carry no check.
         An origin ``source`` fill no surviving unit gives is not an open item: the sentence that cited its span
         is gone, so it is left out; a ``candidate`` fill (round 18 U6) is the exception: a component asks for it, so it stays
-        open (``omitted``) until a sentence gives it. ``history``: the answer versions' declarations of the fill."""
+        open (``omitted``) until a sentence gives it. ``history``: the answer versions' declarations of the fill. ``audit`` (round 23 U1, KTD4):
+        the datum audit of the coverage decision (``_check_block``): the one decision the gap lines, the caps and completeness read passes it.
+        ``removed`` (round 23 U1, R2): the units verification took out of the answer. An item still omitted that one of them would have given
+        (checked as the surviving units are) carries its index as ``removed_unit``: it was written and removed, never "read and not used".
+        ``asked`` (round 23 U1): the components' texts by id, whose own words are no evidence that a block states a part of them."""
         out = []
         # each item's signature is computed once, and the items of a component that share one are counted: an item's condition is
         # asked when another item of its component has its signature (``_coverage``). Only the fills alive in the latest version count
@@ -2557,6 +2862,14 @@ class Ledger:
         blocks = blocks_of(units)
         by_index = {u.index: u for u in units}
         leads = _leads(units)
+        gone_blocks: list[Block] = []
+        gone_leads: Mapping[int, str] = {}
+        if removed:
+            gone_at = {u.index for u in removed}
+            everyone = sorted([*units, *model_units(removed)], key=lambda u: u.index)
+            gone_blocks = [b for b in blocks_of(everyone) if any(p.index in gone_at for p in b.parts)]
+            gone_leads = _leads(everyone)
+        removed_by: dict[int, int] = {}  # id(item) -> the first removed unit that would have given it
         # per evidence, once: of the LAST fill that rests on it (the fills of one evidence may name it by another S# or write its quote
         # with other blanks, and the later fill's reading is the one that stood)
         quotes = [i.quote for i in scored]  # a note whose mark another item's quote carries is that item's (round 20 U9, F2)
@@ -2575,13 +2888,20 @@ class Ledger:
             shared = bool(sig) and bool(rivals)
             got = None
             if item.state in (ITEM_INCLUDED, OMITTED, *NEEDS_REASON):  # a declared item passes the same check (R16)
+                rival_words = frozenset().union(*(_words(j.condition or j.label) for j in rivals))
+                rival_dates = frozenset().union(*(_condition_dates(j) for j in rivals))
                 try:
-                    got, covering = _coverage_all(item, blocks, ws, shared, leads,
-                                                  frozenset().union(*(_words(j.condition or j.label) for j in rivals)),
-                                                  frozenset().union(*(_condition_dates(j) for j in rivals)))
+                    got, covering = _coverage_all(item, blocks, ws, shared, leads, rival_words, rival_dates, audit, (asked or {}).get(item.component, ""))
                 except Exception as exc:  # noqa: BLE001 - any failure of the check is "could not be completed", never "not used" (R17)
                     logger.warning("item coverage check could not be completed: %s", type(exc).__name__)
                     got, covering = Coverage(False, None, ITEM_UNCHECKED, checked=False), _NO_GIVING
+                if gone_blocks and not got.ok and got.checked:
+                    try:
+                        if (taken := _coverage_all(item, gone_blocks, ws, shared, gone_leads, rival_words, rival_dates, audit,
+                                                (asked or {}).get(item.component, ""))[0]).ok:
+                            removed_by[id(item)] = taken.unit
+                    except Exception:  # noqa: BLE001 - a check of the removed text that fails only leaves the wording as it was
+                        pass
                 if got.ok:
                     gave[item.evidence] = gave.get(item.evidence, frozenset()) | covering.units
                     wide[item.evidence] = wide.get(item.evidence, ()) + tuple(x for x in covering.blocks if x not in wide.get(item.evidence, ()))
@@ -2615,6 +2935,7 @@ class Ledger:
                     checked.add(item.evidence)
             out.append({**item.public(), "state": state, "declared": item.state, "covered_by": got.unit if got else None,
                         "why": got.why if got else "", "outcome": outcome, "missing": missing,
+                        "removed_unit": removed_by.get(id(item)) if outcome != COVERED else None,
                         "history": [dict(h) for h in item.history], **check})
         return out
 

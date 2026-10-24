@@ -2089,6 +2089,10 @@ class VerifyReport:
     # the judge's support the server validated (round 16 U2, KTD2), merged by component id across the calls: component ->
     # [{"id": a read S#, "quote": its verbatim sentence or row}] that the answer omits (``validated_support``)
     text_support: dict[str, list[dict]] = field(default_factory=dict)
+    # the passages the judge quoted for an omitted part that are no datum of the source (a caption, a title, a header row, a mark: round 23 U1,
+    # KTD6): no item and no gap line is made of them, but the part is still omitted, and the repair round is told which passage the judge
+    # pointed at and keeps its tools (round 21 U9) - the item decision and the repair decision are separate
+    quoted_support: dict[str, list[dict]] = field(default_factory=dict)
     # the answer's completeness (``coverage.completeness``), set once the final answer is stated
     completeness: dict | None = None
     reused: int = 0  # units whose verdict came from an earlier round of the turn (``VerdictCache``)
@@ -2656,10 +2660,29 @@ class VerifyReport:
         units = [self._as_edited(u) for u in self.units if u.index in kept]
         # an origin ``source`` item exists only while a surviving unit gives it (the sentence that cited its span): otherwise it is no
         # open item and no line (round 18 U5); a candidate a component asks for is open until a unit gives it (round 18 U6)
-        states = [st for st in ledger.outcomes(units, self.item_ws) if not is_server_item(st) or st["state"] == ITEM_COVERED]
+        gone = [u for u in self.units if u.index not in kept]  # what verification took out: an item only they gave is "removed", not "not used"
         texts = texts if texts is not None else {r["id"]: r["text"] for r in self.requirements}
+        states = [st for st in ledger.outcomes(units, self.item_ws, audit=True, removed=gone, asked=texts)
+                  if not is_server_item(st) or st["state"] == ITEM_COVERED]
+        why_gone = {p.unit.index: p.failure_kind or "" for p in self.removals()}
+        for st in states:
+            # round 23 U1 (R2): the unit that would have given an omitted item was removed in verification (and the kind of its removal, when
+            # a check named one): the item's line says so (``coverage.item_line``)
+            at = st.pop("removed_unit", None)
+            st["removed_in_verification"] = st["state"] == ITEM_OMITTED and at is not None
+            st["removal_kind"] = why_gone.get(at, "") if st["removed_in_verification"] else ""
         blocks = None  # built on the first judge-added item that needs the presence test, then shared by the others
         for st in states:
+            if st["origin"] == ORIGIN_JUDGE_SUPPORT and st["state"] == ITEM_OMITTED:
+                # the datum audit of a part the judge named (round 23 U1, R1): a block of the part's own place that states it closes it, whatever
+                # it cites - the part is given, and neither "read and not used" nor "removed" is true of it
+                if blocks is None:
+                    blocks = _answer_blocks(units)
+                at = _giving_block(st["quote"], st["source"], blocks, self.item_ws, texts.get(st["component"], ""))
+                if at is not None:
+                    st |= {"state": ITEM_COVERED, "covered_by": at, "why": "", "outcome": "covered", "missing": [],
+                           "removed_in_verification": False, "removal_kind": ""}
+                continue
             # the judge names a part by its quote alone: unit attribution is not enough for it, the round-16 presence test must
             # hold too (the quote's numbers with half of the words that name the item, not the component's own words), or a
             # sentence of the same table that shares the rate's words would close an omitted rate
@@ -8282,7 +8305,7 @@ def _read_passages(coverage: _Coverage, ws: Workspace, shown: dict[str, tuple[st
 class _VoteTrace:
     """What one vote's support entries became (diagnostics only): an entry per support quote the judge returned, in its order,
     with its ``outcome`` — ``accepted``, or the first condition it failed (``not_returned_source``, ``too_short``, ``too_long``,
-    ``other_document``, ``outside_asked_unit``, ``heading_only``, ``already_in_answer``, ``not_verbatim``), or why it was never weighed
+    ``other_document``, ``outside_asked_unit``, ``heading_only``, ``already_in_answer``, ``not_verbatim``, ``not_a_source_span``), or why it was never weighed
     (``not_partial_or_missing``: support on a vote that is neither; ``duplicate``; ``over_cap``). Notes the entry as the judge
     wrote it, a quote prefix at most; ``None`` outcome: not decided yet. Bounded by ``TRACE_SUPPORT_PER_VOTE``."""
 
@@ -10674,6 +10697,13 @@ def _answer_blocks(units: list[Unit]) -> list:
     return blocks_of(model_units(units))
 
 
+def _giving_block(quote: str, source: str, blocks: list, ws, component: str = "") -> int | None:
+    """The unit index of the block of the answer that states a part of the judge's (``items.giving_block_in_place``), else None."""
+    from app.chat.items import giving_block_in_place
+
+    return giving_block_in_place(quote, source, blocks, ws, component)
+
+
 def _in_answer(quote: str, units: list[Unit], component: str = "", *, blocks: list | None = None) -> bool:
     """Whether the quoted part is in the answer (KTD2): one block of the answer — a sentence, a list item with all its sentences, a paragraph,
     a table row — holds the quote's headline values together with at least half of its content words, the words that name the item (its
@@ -10790,8 +10820,9 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
     numbers with half of the words that name the item, ``_in_answer``). An invalid entry is dropped silently, never failing a
     unit; the first condition it fails is kept on its vote's trace (``VerifyReport.requirements_trace``). ``failed``: the
     indexes of the units removed (not in the answer)."""
-    from app.chat.items import heading_only
+    from app.chat.items import heading_only, source_span_problem
 
+    report.quoted_support = {}
     votes = {cid: [v for v in vs if v.status in ("partial", "missing") and v.support]
              for cid, vs in report.requirement_votes.items()}
     if not any(votes.values()):
@@ -10804,6 +10835,7 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
     for cid, vs in votes.items():
         seen: set[tuple[str, str]] = set()
         kept: list[dict] = []
+        quoted: list[dict] = []  # the entries that are no datum of the source (``not_a_source_span``): a hint for the repair round only
         notes: list[tuple[JudgeRequirement, str, str]] = []  # the accepted entries, to say which the cap left out
         for v, x in ((w, y) for w in vs for y in w.support):
             given = x.quote.strip()
@@ -10822,11 +10854,17 @@ def validated_support(report: VerifyReport, ws: Workspace, failed: set[int]) -> 
                     why = "already_in_answer"
                 elif why is None and not scope.verbatim(sid, src, flat):
                     why = "not_verbatim"
+                elif why is None and (why := source_span_problem(src, quote) or None):
+                    pass  # round 23 U1 (KTD6): a caption, a title, a footnote mark or a clipped number is no datum of the source
                 elif why is None:
                     why = "accepted"
                     kept.append({"id": sid, "quote": quote})
                     notes.append((v, sid, given))
             _settle(v, sid, given, why)
+            if why == "not_a_source_span" and not any(q["id"] == sid and q["quote"] == quote for q in quoted):
+                quoted.append({"id": sid, "quote": quote})
+        if quoted:
+            report.quoted_support[cid] = quoted[:SUPPORT_PER_REQUIREMENT]
         for v, sid, given in notes[SUPPORT_PER_REQUIREMENT:]:
             _settle(v, sid, given, "over_cap")
         if kept:
@@ -10918,11 +10956,14 @@ def _check_requirements(report: VerifyReport, ws: Workspace, turn: TurnRequireme
         # the repair round runs with tools off only when a quoted passage holds a value of the asked kind (``_holds_value``): a quote that is a
         # heading or a label of the asked part leaves the round its tools, and its request does not say a search is needless (round 21 U9, KTD5)
         asked = f"{o['text']} {o.get('missing_part') or ''}"
+        # a passage the judge quoted that is no datum of the source (a caption, a title, a header row: ``quoted_support``) makes no item and no gap
+        # line, and still tells the round which passage it pointed at: the part is omitted whatever the passage is (round 23 U1, KTD6)
+        passages = ev["text"] or [x for x in report.quoted_support.get(o["id"], []) if o["status"] in ("partial", "not_answered")]
         valued = any(_holds_value(x["quote"], asked) for x in ev["text"])
         found = (REQ_TEXT_FOUND if valued else REQ_TEXT_QUOTED).format(text=o.get("missing_part") or o["text"], where="; ".join(
-            f"{x['id']} «{prompt_text(x['quote'])}»" for x in ev["text"][:ITEMS_PER_COMPONENT])
-            + (REQ_TEXT_FOUND_MORE.format(n=len(ev["text"]) - ITEMS_PER_COMPONENT)
-               if len(ev["text"]) > ITEMS_PER_COMPONENT else "")) if ev["text"] else ""
+            f"{x['id']} «{prompt_text(x['quote'])}»" for x in passages[:ITEMS_PER_COMPONENT])
+            + (REQ_TEXT_FOUND_MORE.format(n=len(passages) - ITEMS_PER_COMPONENT)
+               if len(passages) > ITEMS_PER_COMPONENT else "")) if passages else ""
         if ev["data"]:
             reason = REQ_DATA_FOUND.format(text=o["text"], ids=", ".join(ev["data"]))
             if found:  # the validated passage is named beside the data; no check, so the repair round keeps its tools

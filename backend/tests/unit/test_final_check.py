@@ -1658,7 +1658,7 @@ def _sent_text_states(out: engine.TurnOutcome) -> list[dict]:
     units = verify.split_units(md)
     for u in units:
         u.server = [md[max(s.start, u.start):min(s.end, u.end)] for s in out.server_spans if s.start < u.end and u.start < s.end]
-    return out.report.item_ledger.outcomes(items.model_units(units), out.report.item_ws)
+    return out.report.item_ledger.outcomes(items.model_units(units), out.report.item_ws, audit=True)  # (the decision's own datum audit: round 23 U1)
 
 
 def test_the_item_lines_of_the_sent_text_are_the_coverage_functions_output_on_that_text_and_a_server_line_covers_nothing(offline):
@@ -1700,7 +1700,8 @@ def test_the_decision_is_computed_again_over_the_final_text_so_a_sentence_the_fi
     md = out.answer.answer_markdown
     assert "1,200" not in md.split("«")[0], md  # the sentence is gone from the sent text
     (line,) = [x["text"] for x in out.report.item_gaps]
-    assert line.startswith("«שטח עיקרי»") and "לא נעשה בו שימוש" in line and line in md  # and the item it gave is a line now
+    # and the item it gave is a line now: it was written and removed in verification (round 23 U1, R2), never "read and not used"
+    assert line.startswith("«שטח עיקרי»") and "הוסר באימות" in line and "לא נעשה בו שימוש" not in line and line in md
     assert [s["state"] for s in _sent_text_states(out)] == ["omitted"] == [i["state"] for i in out.item_ledger["items"]]
 
 
