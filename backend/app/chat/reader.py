@@ -95,6 +95,25 @@ def blocks_between(conn: Connection, version_id: UUID, start: int | None = None,
          "b": end if end is not None else 2_000_000_000}).all()
 
 
+def page_words(conn: Connection, version_id: UUID, pages: Collection[int]) -> tuple[dict[int, list[tuple[int, str, list]]], dict[int, float]]:
+    """The blocks of ``pages`` that carry word positions (``document_blocks.spans``: the text-layer paragraphs and text boxes of pages whose
+    positions could be converted), by page, as ``(block index, text, spans)`` in reading order, and the rendered width of each page
+    (round 23 U4, KTD8). ``BLOCK_COLS`` leaves the spans out, being large; the column binding of page-text rows (``app.chat.columns``) reads them
+    here, once per page of a turn, bounded by the page."""
+    if not pages:
+        return {}, {}
+    found: dict[int, list[tuple[int, str, list]]] = {}
+    for r in conn.execute(text(
+            "SELECT block_index, page, text, spans FROM document_blocks WHERE version_id = :v AND page = ANY(:p)"
+            " AND spans IS NOT NULL AND kind IN ('paragraph', 'textbox') AND status = 'read' ORDER BY block_index"),
+            {"v": version_id, "p": sorted(pages)}):
+        found.setdefault(r.page, []).append((r.block_index, r.text or "", r.spans))
+    widths = {r.page_no: float(r.display_width) for r in conn.execute(text(
+        "SELECT page_no, display_width FROM pages WHERE version_id = :v AND page_no = ANY(:p) AND display_width IS NOT NULL"),
+        {"v": version_id, "p": sorted(pages)})}
+    return found, widths
+
+
 def blocks_above(conn: Connection, version_id: UUID, before: int, lo: int = 0, limit: int = 40) -> list:
     """The ``limit`` blocks nearest above block ``before`` (not it), down to block ``lo`` (inclusive), in reading order
     (round 14 U2, KTD3): the text a value's context is read from, nearest first once reversed by the caller. ``lo`` is the first

@@ -16,7 +16,7 @@ from app.db import TenantContext, tenant_tx
 
 def rebuild_source_text(ctx: TenantContext, locator: dict) -> str:
     """The text of the source ``locator`` places, as the serve path gives it now. A whole table is read as ``read`` of the table reads it; a
-    source with a block range is its blocks, in reading order, one per line; a search hit with only a chunk is the chunk. A locator that
+    source with a block range is its blocks as ``tools._served_rows`` serves them, in reading order, one per line; a search hit with only a chunk is the chunk. A locator that
     places none of these raises ``ValueError``."""
     ref = {k: locator[k] for k in ("version_id", "reading_id", "block_start", "block_end", "table_index", "chunk_id")
            if locator.get(k) is not None}
@@ -30,7 +30,10 @@ def rebuild_source_text(ctx: TenantContext, locator: dict) -> str:
     start = locator.get("block_start")
     if start is not None:
         with tenant_tx(ctx) as conn:
-            rows = reader.blocks_between(conn, UUID(str(locator["version_id"])), start, locator.get("block_end"))
+            version_id = UUID(str(locator["version_id"]))
+            # the rows are served as the agent and the verifier are served them: a table stored reversed in drawn order, a page-text row of numbers
+            # under its column labels (round 23 U4, KTD8) - one function, so the replay reads what they read
+            rows = T._served_rows(ws, conn, version_id, reader.blocks_between(conn, version_id, start, locator.get("block_end")))
         return "\n".join(r.text for r in rows if r.text)
     if locator.get("chunk_id"):
         return T.read_scope(ws, "S0", "neighbors", ref=ref).text

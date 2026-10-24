@@ -172,7 +172,7 @@ from sqlalchemy import Connection, text
 
 from app.answering.numread import read_separators
 from app.answering.verify import numbers_in
-from app.chat import anchors, calc, contexts, datum, meaning, reader, scopes
+from app.chat import anchors, calc, columns, contexts, datum, meaning, reader, scopes
 from app.chat import dates as chat_dates
 from app.chat import units as unit_store
 from app.chat import unread as unread_text
@@ -640,6 +640,12 @@ class Workspace:
     registration_log: list[dict] = field(default_factory=list)
     section_blocks: dict[tuple, list] = field(default_factory=dict)
     table_rows: dict[tuple, dict] = field(default_factory=dict)
+    # round 23 U4 (M3, KTD8): the page-text column binding of the turn (``columns``, ``_served_rows``). ``page_words``: (version, page) -> the page's
+    # blocks with word positions and its rendered width; ``column_bindings``: (version, block, text) -> its ``columns.Binding``; ``column_unknown``:
+    # (version, block) of every row of numbers whose columns could not be told - the judge's "column binding unknown" fact (``column_binding_note``)
+    page_words: dict[tuple, tuple] = field(default_factory=dict)
+    column_bindings: dict[tuple, columns.Binding] = field(default_factory=dict)
+    column_unknown: set[tuple] = field(default_factory=set)
     # the turn's salt for claim and unit ids (round 8 KTD2, ``verify.assign_ids``): an id is a hash of the salt and the
     # claim's context, so it is stable across the turn's rounds and reveals no text. Random per turn; a test sets it.
     claim_salt: str = field(default_factory=lambda: uuid4().hex[:16])
@@ -3483,7 +3489,7 @@ def tool_search(ws: Workspace, query: str, document_ids: list[str] | None = None
                         continue
                 held = [n for n in held if n in kept] or held
             stored = passage
-            passage = _served_hit_text(ws, conn, h, passage)
+            passage = _bound_passage(ws, conn, h, bs, be, _served_hit_text(ws, conn, h, passage))
             paragraphs, media, blocks = _block_info(conn, h["version_id"], bs, be,
                                                     with_text=h["kind"] not in ("table", "table_row"))
             tags = {"document": ws.doc_handle(h["document_id"])}
@@ -4495,29 +4501,112 @@ def _table_rows(ws: Workspace, conn: Connection, v: reader.Version) -> dict[int,
 
 
 class _ServedBlock:
-    """A stored block of a table served reversed, read with its text in the order the table is drawn (round 21 U8, KTD6): every other
-    attribute is the stored row's. Used by the reads that show blocks to the agent and to the verifier; a quote's word span is looked
-    up in the stored blocks (``take_value``), which this never replaces."""
+    """A stored block served in another form than it is stored in: a table block read with its text in the order the table is drawn
+    (round 21 U8, KTD6), or a page-text row served as "label: value" pairs in drawn order (round 23 U4, KTD8: ``parts`` maps each verbatim piece
+    of the served text back to the stored word it copies). Every other attribute is the stored row's. Used by the reads that show blocks to the
+    agent and to the verifier; a quote's word span is looked up in the stored blocks (``take_value``) through ``parts``, which this never replaces."""
 
-    __slots__ = ("_row", "text")
+    __slots__ = ("_row", "text", "parts")
 
-    def __init__(self, row, text_: str) -> None:
-        self._row, self.text = row, text_
+    def __init__(self, row, text_: str, parts: tuple = ()) -> None:
+        self._row, self.text, self.parts = row, text_, parts
+
+    @property
+    def stored_text(self) -> str | None:
+        return self._row.text
 
     def __getattr__(self, name: str):
         return getattr(self._row, name)
 
 
+MSG_COLUMNS_UNKNOWN = ("שיוך המספרים לעמודות בשורות הטקסט האלה לא נקבע (אין מיקומי מילים שמורים או כותרת עמודות שמתאימה להם): "
+                       "סדר המספרים בשורה אינו ראיה לעמודה שלהם")
+
+
 def _served_rows(ws: Workspace, conn: Connection, version_id, rows: list) -> list:
     """``rows`` (stored blocks) with the text of each block of a table stored in reversed cell order served in the order it is drawn,
-    each cell with its column label (``stored_tables.serve_text``); every other block, and every table served as stored, as it is."""
+    each cell with its column label (``stored_tables.serve_text``), and each page-text row of numbers whose columns the stored word positions
+    tell served as "label: value" pairs in drawn order (``_bound_rows``, round 23 U4); every other block, and every table or row served as
+    stored, as it is. The one function the agent's reads and the verifier's evidence take their text from."""
+    bound = _bound_rows(ws, conn, version_id, rows)
     out = []
     for r in rows:
+        if (b := bound.get(r.block_index)) is not None:
+            out.append(_ServedBlock(r, b.served, b.parts))
+            continue
         st = (_table_at(ws, conn, version_id, r.table_index)[0]
               if getattr(r, "kind", None) == "table" and getattr(r, "table_index", None) is not None else None)
         served = stored_tables.serve_text(st, r.text or "") if st else None
         out.append(r if served is None or served == (r.text or "") else _ServedBlock(r, served))
     return out
+
+
+def _bound_rows(ws: Workspace, conn: Connection, version_id, rows: list) -> dict[int, columns.Binding]:
+    """The page-text rows of ``rows`` (text-layer paragraphs on a page, each a left-to-right row of numbers) whose columns are told, by block index
+    (round 23 U4, M3, KTD8, R5). Decided from the stored word positions of the row and of the header lines above it (the row's page, then
+    the previous ones for a continuation); nothing stored is changed. A row the positions cannot place is served as stored, and remembered
+    in ``ws.column_unknown`` for the judge (``column_binding_note``)."""
+    vid = str(version_id)
+    todo = [r for r in rows if getattr(r, "kind", None) in ("paragraph", "textbox") and getattr(r, "page", None) and r.text
+            and getattr(r, "status", "read") == "read" and (vid, r.block_index, r.text) not in ws.column_bindings
+            and columns.row_shape(r.text) is not None]
+    if todo:
+        wanted = {p for r in todo for p in range(max(1, r.page - columns.PAGES_BACK), r.page + 1)}
+        missing = {p for p in wanted if (vid, p) not in ws.page_words}
+        if missing:
+            blocks, widths = reader.page_words(conn, UUID(vid), missing)
+            for p in missing:
+                ws.page_words[(vid, p)] = (blocks.get(p, []), widths.get(p))
+        for r in todo:
+            found = _bind_row(ws, vid, r)
+            ws.column_bindings[(vid, r.block_index, r.text)] = found
+            if found.status == columns.UNKNOWN and columns.unbound_note_due(r.text):
+                ws.column_unknown.add((vid, r.block_index))
+    return {r.block_index: b for r in rows
+            if getattr(r, "text", None) and (b := ws.column_bindings.get((vid, r.block_index, r.text))) is not None
+            and b.status == columns.BOUND}
+
+
+def _bind_row(ws: Workspace, vid: str, row) -> columns.Binding:
+    blocks, width = ws.page_words[(vid, row.page)]
+    mine = next(((t, s) for i, t, s in blocks if i == row.block_index), None)
+    if mine is None or mine[0] != row.text:
+        return columns.Binding(columns.UNKNOWN, "no word positions")
+    attempts = [columns.page_lines(row.page, blocks, before=row.block_index)]
+    for back in range(1, columns.PAGES_BACK + 1):
+        page = row.page - back
+        if page < 1:
+            break
+        earlier, other = ws.page_words.get((vid, page), ([], None))
+        if width is not None and other is not None and abs(width - other) > 1.0:
+            continue  # another page size: its x positions are no columns of this one
+        attempts.append(columns.page_lines(page, earlier))
+    return columns.bind(row.text, mine[1], attempts)
+
+
+def column_binding_note(ws: Workspace, src: Source) -> str:
+    """The neutral fact the judge reads beside a source that holds a row of numbers whose columns could not be told (round 23 U4, KTD8): empty
+    when the source holds none. The server states what it could not settle, never a verdict."""
+    if src.version_id is None or src.block_start is None or not ws.column_unknown:
+        return ""
+    vid = str(src.version_id)
+    end = src.block_end if src.block_end is not None else src.block_start
+    return MSG_COLUMNS_UNKNOWN if any(v == vid and src.block_start <= b <= end for v, b in ws.column_unknown) else ""
+
+
+def _bound_passage(ws: Workspace, conn: Connection, h: dict, bs: int | None, be: int | None, passage: str) -> str:
+    """The text of a search hit of page text with each line that is a bound row of numbers served as the read serves it (round 23 U4): the
+    chunk's own text and embedding are not touched. A line that is not exactly one row of the hit's blocks stays as it is."""
+    if h["kind"] in ("table", "table_row") or bs is None or be is None or not any(columns.row_shape(ln.strip()) for ln in passage.splitlines()):
+        return passage
+    rows = reader.blocks_between(conn, h["version_id"], bs, be, limit=reader.WINDOW_MAX)
+    lines = passage.split("\n")
+    for r in _served_rows(ws, conn, h["version_id"], rows):
+        if isinstance(r, _ServedBlock) and r.parts:
+            at = [i for i, ln in enumerate(lines) if ln.strip() == (r.stored_text or "").strip()]
+            if len(at) == 1:
+                lines[at[0]] = r.text
+    return "\n".join(lines)
 
 
 def _read_table(ws: Workspace, conn: Connection, v: reader.Version, table_index: int, row0: int = 0) -> Source:
@@ -6959,15 +7048,35 @@ def _block_sentence(blocks: Iterable[tuple] | None, anchor: dict, quote: str) ->
     return found.pop() if len(found) == 1 else None
 
 
+def _stored_place(found: anchors.Located, remap: dict[int, tuple]) -> anchors.Located:
+    """``found`` (a quote located in the text a source showed) in the stored blocks: the segments and the cited number of a bound page-text
+    row, which the source showed as "label: value" pairs, are the stored word spans of the verbatim pieces they cover (round 23 U4, KTD8). A
+    block the source showed as stored keeps its place."""
+    segments: list[list[int]] = []
+    for b, start, end in found.segments:
+        if b in remap:
+            segments += [[b, a, c] for a, c in columns.stored_segments(remap[b], start, end)]
+        else:
+            segments.append([b, start, end])
+    number = found.number
+    if number is not None and number[0] in remap:
+        placed = columns.stored_segments(remap[number[0]], number[1], number[2])
+        number = [number[0], *placed[0]] if len(placed) == 1 else None
+    return anchors.Located(segments, number, found.blocks)
+
+
 def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = None,
-                governing: Callable[[int], str | _ScaleNote] | None = None, table_notes: Iterable[str] = ()) -> dict:
+                governing: Callable[[int], str | _ScaleNote] | None = None, table_notes: Iterable[str] = (),
+                remap: dict[int, tuple] | None = None) -> dict:
     """The number inside an exact quote of the source: the quote must occur in the source's full text, and the
     number inside the quote. ``blocks``: the source's blocks (``(block_index, text, page)``), where the quote is
     located within the cited range only (KTD4): one occurrence records its block and word span; several that write
     the same number record the blocks holding them (block precision); several that write different numbers are
     refused, asking for a longer quote. Never the first occurrence. ``governing``: the scale note that governs a
     block from a block above it (``calc.governing_note``), for the block the number is in. ``table_notes``: the notes of the table the quote is of that govern
-    its row and that the source's text lacks (``_quote_table_notes``, round 22 U5): read as the cell path reads them, for the scale, the unit and the VAT."""
+    its row and that the source's text lacks (``_quote_table_notes``, round 22 U5): read as the cell path reads them, for the scale, the unit and the VAT.
+    ``remap``: for a block of ``blocks`` that is a bound page-text row shown as "label: value" pairs, the pieces of its shown text that copy
+    stored words (``columns.Part``); the anchor is then the stored word span (round 23 U4)."""
     if not loc.get("number"):
         raise ToolError("ציטוט (quote) דורש גם את המספר כפי שנכתב בו (number)")
     wanted = _parse_number(loc["number"])
@@ -6991,6 +7100,8 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
             found = anchors.locate_quote(blocks, loc["quote"], abs(wanted[1]))
         except anchors.AmbiguousQuote:
             raise ToolError(MSG_QUOTE_AMBIGUOUS.format(sid=src.sid), "quote_ambiguous") from None
+        if found is not None and remap:
+            found = _stored_place(found, remap)
         if found is not None:
             pages = {b[0]: b[2] for b in blocks if len(b) > 2}
             anchor = ({"segments": found.segments, "number": found.number} if found.segments
@@ -7686,13 +7797,18 @@ def tool_take_value(ws: Workspace, source: str, locator: dict | None, meaning_: 
             _, block = _table_at(ws, conn, src.version_id, taken["locator"]["table_index"])
             rows, at = ([block] if block is not None else []), None
         else:
-            blocks = None
+            blocks, served = None, {}
             if src.block_start is not None:
                 rows = reader.blocks_between(conn, src.version_id, src.block_start,
                                              src.block_end if src.block_end is not None else src.block_start)
-                blocks = [(r.block_index, r.text or "", r.page) for r in rows]
+                # a bound page-text row is located in the form the source showed it (the quote is of that text) and mapped back to its stored
+                # word span, so the anchor, the pages and the governing note are the stored ones (round 23 U4, KTD8)
+                served = {r.block_index: r for r in _served_rows(ws, conn, src.version_id, rows)
+                          if isinstance(r, _ServedBlock) and r.parts}
+                blocks = [(r.block_index, (served[r.block_index].text if r.block_index in served else r.text) or "", r.page) for r in rows]
+            remap = {i: r.parts for i, r in served.items()}
             taken = _take_quote(src, full, loc, blocks, lambda b: _governing_note(ws, conn, src.version_id, b),
-                                table_notes=_quote_table_notes(ws, conn, src, loc))
+                                table_notes=_quote_table_notes(ws, conn, src, loc), remap=remap)
             at = _value_blocks(taken.get("anchor") or {})
         reading_id = src.reading_id or v.reading_id
         # the number's place, from the anchor ``take`` located (no read): a value already registered there answers this call

@@ -228,3 +228,37 @@ def test_tables_without_positions_or_with_misaligned_boxes_keep_none():
     assert ocr.header_boxes is None and ocr.rows[0].cell_boxes is None
     bad = assemble_tables([RawTable(page=1, rows=[HEADERS, ["התאנה 3", "82", "1,640,000"]], boxes=[[_box(0, 0)]])])[0]
     assert bad.header_boxes is None and bad.rows[0].cell_boxes is None
+
+
+# --- page-text column binding in the display frame (round 23 U4, KTD8) -------------------------------------------------
+
+def _user_box(display_box, crop, rotation):
+    """A user-space box that appears at ``display_box`` on a page of this CropBox turned by ``rotation`` (0 or 90; the inverse of ``shown_box``)."""
+    d0, t0, d1, t1 = display_box
+    if rotation == 0:
+        return (d0 + crop[0], crop[3] - t1, d1 + crop[0], crop[3] - t0)
+    return (t0 + crop[0], d0 + crop[1], t1 + crop[0], d1 + crop[1])  # 90: x = top, y = left
+
+
+def _positioned_line(words, top, rotation):
+    """``(text, spans)`` of a line of ``words`` ``(word, left, right)`` drawn at ``top`` in the display frame of the MEDIA/CROP page turned by
+    ``rotation``: each glyph's user-space box is what the PDF holds, converted to the pdfplumber frame and then to the display one, as ingestion does."""
+    text = " ".join(w for w, _, _ in words)
+    glyphs = []
+    for w, left, right in words:
+        step = (right - left) / len(w)
+        for i in range(len(w)):
+            user = _user_box((left + i * step, top, left + (i + 1) * step, top + 10), CROP, rotation)
+            glyphs.append(to_display(plumber_box(user, MEDIA, rotation), MEDIA, CROP, rotation))
+        glyphs.append(None)  # the space
+    return text, word_spans([(text, text, glyphs[:-1])])
+
+
+@pytest.mark.parametrize("rotation", [0, 90])
+def test_the_columns_of_a_page_with_an_offset_crop_box_are_bound_in_the_rendered_pages_frame(rotation):
+    from app.chat import columns
+
+    header_text, header_spans = _positioned_line([("Q1", 100, 130), ("Q2", 200, 230), ("Q3", 300, 330)], 100, rotation)
+    text, spans = _positioned_line([("Revenue", 20, 70), ("3,300", 300, 340), ("2,200", 200, 240), ("1,100", 100, 140)], 120, rotation)
+    lines = columns.page_lines(1, [(0, header_text, header_spans)])
+    assert columns.bind(text, spans, [lines]).served == "Revenue — Q1: 1,100; Q2: 2,200; Q3: 3,300"
