@@ -10878,12 +10878,13 @@ class SupportScope:
         return None if _support_in_asked_units(self.ws, src, self.asked) else "outside_asked_unit"
 
     def verbatim(self, sid: str, src: Source, flat: str) -> bool:
-        """Whether the quote ``flat`` is in the source's text (flattened once per source), by the comparison ``take_value`` and the anchor
-        locator make (``meaning.loose_contains``, round 23 U6a): whitespace and a line-wrap hyphen inside a word are ignored, so a quote of a
-        source that splits a word is evidence; a different letter, word or number is not."""
+        """Whether the quote ``flat`` is in the source's text (flattened once per source), exactly. Round 23: the loose comparison
+        ``take_value`` and the anchor locator make (``meaning.loose_contains``) is NOT used here - on the stored real drafts every judge quote it
+        newly admitted became a "read and not used" line about a part the answer gives (the presence tests read the quote's own words), 4 of 4
+        wrong, none right; a quote of a source that splits a word stays no item until those tests read split words too."""
         if sid not in self._flat:
             self._flat[sid] = _flat_quote(src.text)
-        return meaning.loose_contains(self._flat[sid], flat)
+        return flat in self._flat[sid]
 
 
 ROW_MIN = 6  # a quote shorter than this names no row
