@@ -10,6 +10,7 @@ import re
 import pytest
 
 from app.chat import coverage, items, verify
+from app.config import get_settings
 from tests.unit.test_coverage import (
     SOURCE,
     _adj_item,
@@ -377,7 +378,8 @@ def _removed_item_report(kind: str):
 
 
 @pytest.mark.parametrize("kind", ["wrong_unit", None])
-def test_an_item_whose_only_giving_sentence_was_removed_in_verification_is_not_read_and_not_used(kind):
+def test_an_item_whose_only_giving_sentence_was_removed_in_verification_is_not_read_and_not_used(kind, monkeypatch):
+    monkeypatch.setattr(get_settings(), "chat_confirm_removals", 0)  # round 23 U5: this test is about the gap line of a removed item; the confirming reading is tested in test_verify_reread.py
     ws, turn, answer, r = _removed_item_report(kind)
     final, outcomes = _finish(ws, answer, r, turn)
     (line,) = _item_lines(final)

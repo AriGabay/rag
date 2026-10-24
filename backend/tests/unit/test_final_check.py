@@ -362,6 +362,7 @@ def test_without_time_a_cut_heading_never_lets_the_sentence_below_it_stay_unjudg
     holds no qualifier, so it stays), but the heading the sentence below was judged under changed — so the sentence is
     withheld with the time-limit cause and "proposed" is never read as approved."""
     offline.texts = ["נתוני תכנון: מצב מוצע. תכסית 40% מותרת. 900 דונם בסך הכול."]
+    monkeypatch.setattr(get_settings(), "chat_confirm_removals", 0)  # round 23 U5: this test is about the final check's time limit; the confirming reading is tested in test_verify_reread.py
     monkeypatch.setattr(final_check, "FINAL_MIN_SECONDS", 10**6)
     heading = "## נתוני תכנון: מצב מוצע ושטח 900 דונם"
 
@@ -1974,3 +1975,39 @@ def test_a_cut_makes_the_item_the_cell_gave_an_omitted_item_and_a_true_omission_
     assert [s["state"] for s in _sent_text_states(out)] == [i["state"] for i in out.item_ledger["items"]]
     # the row voted for the component, so it is judged again like every changed voter (KTD9): one call, not one per cell
     assert out.final_check["judge_calls"] == 2 and out.final_digest == text_digest(md)
+
+
+# --- round 23 U5 (R9, KTD9): the final check keeps the decision the verification took on a claim's datum -----------------------------------------
+
+from app.config import get_settings  # noqa: E402
+
+
+def _decided_rule(final_says: str):
+    """The first verification fails the area (unsupported) and the approval (cut); the second reading, if there is one, supports the area; the
+    sentence as saved (``<server>`` in the input) is judged by ``final_says``."""
+    def rule(text, input, n):
+        if "<server>" in input:
+            return {"verdict": final_says, "failure": "absent_from_source", "reason": "ניסוח"} if final_says != "supported" else "supported"
+        return {"verdict": "partial", "defect": "part", "claims": [
+            {"span": AREA, "verdict": "unsupported" if n == 1 else "supported", "failure": "absent_from_source" if n == 1 else "none"},
+            {"span": CLAUSE, "verdict": "unsupported", "failure": "absent_from_source"}]}  # (call 2: the confirming reading of the area)
+    return rule
+
+
+@pytest.mark.parametrize("final_says", ["unsupported", "contradicts"])
+def test_a_claim_the_second_reading_kept_is_not_removed_by_the_final_re_judge_of_the_sentence_as_saved(offline, monkeypatch, final_says):
+    monkeypatch.setattr(get_settings(), "chat_confirm_removals", 3)
+    judge = Judge(_decided_rule(final_says))
+    out = _turn(ScriptedAgent([SEARCH, final(MIXED)], judge=judge))
+    md = out.answer.answer_markdown
+    assert "1,200" in md and CLAUSE not in md and MARKER in md and "אומת חלקית" in md, md  # the area stays, marked; only the approval is cut
+    assert _purposes(out) == ["agent", "request", "agent", "verify", "verify_confirm", "verify_final"]
+    assert out.final_check["removed"] == 0 and out.report.removals() == [] and out.final_digest == text_digest(md)
+    assert out.report.confirm_summary()["flips"] == 1 and out.final_check["kept_by_decision"] == 1
+
+
+def test_without_the_confirming_reading_the_same_final_verdict_removes_the_sentence_as_before(offline, monkeypatch):
+    monkeypatch.setattr(get_settings(), "chat_confirm_removals", 0)  # round 23 U5: this test is about the final verdict with the confirming reading off; the confirming reading is tested in test_verify_reread.py
+    judge = Judge(_decided_rule("unsupported"))
+    out = _turn(ScriptedAgent([SEARCH, final(MIXED)], judge=judge))
+    assert "1,200" not in out.answer.answer_markdown and "verify_confirm" not in _purposes(out)  # (off: removed on the first verdict, as before)

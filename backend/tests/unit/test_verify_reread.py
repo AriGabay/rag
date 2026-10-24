@@ -789,3 +789,377 @@ def test_only_consecutive_rows_that_count_are_row_ordinals():
     # a lone first cell, or one that does not count on, is a value
     assert verify.numbers_in(verify._without_row_ordinals("3 | דירה ג | 300")) >= {"3"}
     assert verify.numbers_in(verify._without_row_ordinals("3 | א | 1\n7 | ב | 2")) >= {"3", "7"}
+
+
+# === round 23 U5 (M4, KTD9, R6, R9, R11): a removal of a value-bearing claim is not decided on one verdict =====================
+#
+# A: the deterministic rescue reads the turn's READ sources (same document, same unit and scope), not only the sources the answer cites.
+# Invented texts only.
+
+def _same_doc_ws(*texts: str, documents: tuple[int, ...] | None = None, **per_source) -> Workspace:
+    """Sources S1.. of ONE document and version (``documents``: for each source the number of the document it is from, to put one elsewhere);
+    ``per_source``: keyword -> list of values by source (e.g. ``clipped=[True, False]``)."""
+    docs = [(uuid.uuid4(), uuid.uuid4()) for _ in range(len(texts))]
+    ws = Workspace(ctx=None)
+    for n, t in enumerate(texts):
+        d, v = docs[documents[n] if documents else 0]
+        ws.add_source(document_id=d, version_id=v, title="דוח בדיקה", section="סיכום", location=f"עמוד {n + 1}", kind="context", text=t,
+                      **{k: vals[n] for k, vals in per_source.items()})
+    return ws
+
+
+def _by_text(rule) -> ScriptedProvider:
+    """A judge answering each unit by ``rule(text)``: a verdict word, or None for supported."""
+    p = ScriptedProvider()
+
+    def respond(instructions: str, input: str) -> dict:
+        return {"verdicts": [{"index": i, "verdict": rule(t) or "supported", "reason": "בדיקה"} for i, t in _units(input).items()]}
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p
+
+
+# (the claim, the source the sentence cites - it holds the number under another label, the source nobody cites - it holds the claim)
+HELD = [
+    ("הערך הראשון הוא 4,100 ₪", "הערך הכללי הוא 4,100 ₪.", "הערך הראשון הוא 4,100 ₪ לפי החוזה."),
+    ("תקרת הפיצוי היא 18,400 ₪", "מחיר הבסיס הוא 18,400 ₪.", "פרק הפיצויים. תקרת הפיצוי היא 18,400 ₪ לפי ההסכם."),
+    ("עלות הגידור היא 52,000 ₪", "אגרת הרישוי היא 52,000 ₪.", "עלות הגידור היא 52,000 ₪. עלות השילוט נמוכה יותר."),
+]
+
+
+@pytest.mark.parametrize(("claim", "cited", "holder"), HELD, ids=["first-value", "ceiling", "fence"])
+@pytest.mark.parametrize("holder_first", [False, True])
+def test_a_claim_the_judge_failed_is_kept_when_another_source_the_turn_read_in_the_same_document_holds_it(claim, cited, holder, holder_first):
+    ws = _same_doc_ws(*((holder, cited) if holder_first else (cited, holder)))
+    mine, other = ("S2", "S1") if holder_first else ("S1", "S2")
+    md = f"{claim} [{mine}]."
+    a = _answer(md)
+    report = verify_answer(_by_text(lambda t: "unsupported"), a, ws, "?", [])
+    out = report.apply(a).answer_markdown
+    assert report.removed_units() == set(), out
+    assert f"[{mine}][{other}]" in out and "אומת חלקית" in out, out  # the holder is cited and the sentence is marked
+    (rec,) = report.claims[0]
+    assert rec.verdict == "partial" and rec.rescue == other
+    assert [p.check for p in report.problems if p.severity == "partial"] == [verify.RESCUE_READ_CHECK]
+    assert not any(p.repairable for p in report.problems)  # no repair round is spent on it
+
+
+@pytest.mark.parametrize(("claim", "cited", "holder"), HELD, ids=["first-value", "ceiling", "fence"])
+def test_unrelated_text_in_the_holder_or_a_third_read_source_does_not_change_the_rescue(claim, cited, holder):
+    ws = _same_doc_ws(cited, "הערה כללית על מצב התחזוקה בנכס. 7 קומות.", holder + " נספח: 12 חדרים ו-3 מחסנים.")
+    a = _answer(f"{claim} [S1].")
+    report = verify_answer(_by_text(lambda t: "contradicts"), a, ws, "?", [])
+    assert report.removed_units() == set() and report.claims[0][0].rescue == "S3"
+
+
+@pytest.mark.parametrize(("claim", "cited", "holder"), HELD, ids=["first-value", "ceiling", "fence"])
+def test_a_holder_in_another_document_or_another_unit_of_the_file_or_with_another_number_leaves_the_removal(claim, cited, holder):
+    def removed(ws) -> bool:
+        a = _answer(f"{claim} [S1].")
+        return verify_answer(_by_text(lambda t: "unsupported"), a, ws, "?", []).removed_units() == {0}
+
+    assert removed(_same_doc_ws(cited, holder, documents=(0, 1)))  # another document
+    ws = _same_doc_ws(cited, holder)
+    ws.sources["S2"].unit = {"id": "v#r#2", "no": 2}
+    ws.sources["S1"].unit = {"id": "v#r#1", "no": 1}
+    assert removed(ws)  # another appraisal unit of the same file
+    ws = _same_doc_ws(cited, holder)
+    ws.sources["S2"].contexts = [2]
+    ws.sources["S1"].contexts = [1]
+    assert removed(ws)  # another appraisal context
+    number = re.search(r"\d[\d,]*", claim).group()
+    assert removed(_same_doc_ws(cited, holder.replace(number, number[:-1] + "9")))  # the holder states another number
+    assert removed(_same_doc_ws(cited, "הערה אחרת בלי המספר."))  # nothing holds it
+    other_label = holder.replace(claim.split(" הוא ")[0].split(" היא ")[0], "נתון אחר")
+    assert removed(_same_doc_ws(cited, other_label))  # the number is there, under another label
+
+
+def test_a_source_the_turn_read_is_offered_only_in_the_cited_sources_document_and_not_to_an_unanchored_claim():
+    # an uncited claim has no document to read the rescue in: nothing is offered to it
+    ws = _same_doc_ws("הערך הכללי הוא 4,100 ₪.", "הערך הראשון הוא 4,100 ₪ לפי החוזה.")
+    report = verify_answer(_by_text(lambda t: "unsupported"), _answer("הערך הראשון הוא 4,100 ₪."), ws, "?", [])
+    assert report.removed_units() == {0} and not report.claims[0][0].rescue
+
+
+PLANS_TABLE = ("טבלה 3.1 — זכויות הבנייה לפי תכנית\nהטבלה: 3 שורות\nרכיב | תכנית ג/11111 | תכנית ג/22222\n"
+               "שטח עיקרי | 1,200 | 1,800\nשטח שירות | 300 | 450")
+PLANS_HEAD = "| רכיב | תכנית ג/11111 | תכנית ג/22222 |\n|---|---|---|\n"
+PLAN_A_TABLE = "טבלה 5 — זכויות בנייה מעודכנות\nרכיב | תכנית ג/11111\nשטח עיקרי | 1,800"
+PLAN_ROW = PLANS_HEAD + "| שטח עיקרי | 1,800 [S1] | 1,800 [S1] |\n| שטח שירות | 300 [S1] | 450 [S1] |"
+
+
+def test_a_cell_under_another_plan_is_kept_when_a_table_the_turn_read_holds_it_under_its_plan():
+    ws = _same_doc_ws(PLANS_TABLE, PLAN_A_TABLE)
+    for src in ws.sources.values():
+        src.kind = "table"
+    a = _answer(PLAN_ROW)
+    report = verify_answer(_by_text(lambda t: "supported"), a, ws, "?", [])
+    assert report.removed_units() == set() and not report.cuts, report.apply(a).answer_markdown
+    out = report.apply(a).answer_markdown
+    assert "[S1][S2]" in out or "[S2]" in out  # the table that holds it is cited
+    assert [r.rescue for recs in report.claims.values() for r in recs if r.rescue] == ["S2"]
+    assert not any(p.check == verify.SUBREFERENT_CHECK and p.severity == "error" for p in report.problems)
+
+
+def test_a_cell_under_another_plan_is_cut_as_before_when_no_read_table_holds_it_under_its_plan():
+    for extra in (None, PLAN_A_TABLE.replace("1,800", "1,750"), "הערה כללית על התכנית."):
+        ws = _same_doc_ws(PLANS_TABLE, *([extra] if extra else []))
+        for src in ws.sources.values():
+            src.kind = "table"
+        a = _answer(PLAN_ROW)
+        report = verify_answer(_by_text(lambda t: "supported"), a, ws, "?", [])
+        out = report.apply(a).answer_markdown
+        assert report.cuts and "| שטח שירות | 300 [S1] | 450 [S1] |" in out and "| שטח עיקרי | 1,800 [S1] | 1,800 [S1] |" not in out, out
+
+
+def test_a_clipped_cited_passage_whose_stored_continuation_holds_the_claim_keeps_it_and_cites_the_continuation():
+    claim, first, rest = HELD[0]
+    ws = _same_doc_ws(first, clipped=[True])
+    fetcher = FakeFetcher({("S1", "continuation"): Expansion(rest, "המשך הסעיף")}, ws=ws)
+    a = _answer(f"{claim} [S1].")
+    report = verify_answer(_by_text(lambda t: "unsupported"), a, ws, "?", [], reread=fetcher)
+    out = report.apply(a).answer_markdown
+    assert report.removed_units() == set() and "[S1][S2]" in out and "אומת חלקית" in out, out
+    assert fetcher.calls == [("S1", "continuation")] and report.claims[0][0].rescue == "S2"
+    assert [p.check for p in report.problems if p.severity == "partial"] == [verify.RESCUE_READ_CHECK]
+
+
+def test_a_continuation_that_does_not_hold_the_claim_or_a_passage_that_was_not_clipped_leaves_the_removal():
+    claim, first, rest = HELD[1]
+    ws = _same_doc_ws(first, clipped=[True])
+    fetcher = FakeFetcher({("S1", "continuation"): Expansion(rest.replace("18,400", "18,450"), "המשך הסעיף")}, ws=ws)
+    report = verify_answer(_by_text(lambda t: "unsupported"), _answer(f"{claim} [S1]."), ws, "?", [], reread=fetcher)
+    assert report.removed_units() == {0} and not report.claims[0][0].rescue
+    ws = _same_doc_ws(first)  # not clipped: nothing is read for the rescue
+    fetcher = FakeFetcher({("S1", "continuation"): Expansion(rest, "המשך הסעיף")}, ws=ws)
+    report = verify_answer(_by_text(lambda t: "unsupported"), _answer(f"{claim} [S1]."), ws, "?", [], reread=fetcher)
+    assert report.removed_units() == {0} and fetcher.calls == []
+
+
+def test_the_rescue_reads_are_bounded_and_need_time(monkeypatch):
+    claim, first, rest = HELD[2]
+    monkeypatch.setattr(verify, "RESCUE_CLIPPED_READS", 1)
+    texts = (first, first.replace("אגרת הרישוי", "אגרת הביוב"))
+    ws = _same_doc_ws(*texts, clipped=[True, True])
+    fetcher = FakeFetcher({}, ws=ws)
+    a = _answer(f"{claim} [S1].\n\n{claim} [S2].")
+    report = verify_answer(_by_text(lambda t: "unsupported"), a, ws, "?", [], reread=fetcher)
+    assert len(fetcher.calls) == 1 and report.removed_units() == {0, 1}
+    monkeypatch.setattr(verify, "RESCUE_CLIPPED_READS", 4)
+    ws = _same_doc_ws(first, clipped=[True])
+    fetcher = FakeFetcher({("S1", "continuation"): Expansion(rest, "המשך")}, ws=ws)
+    monkeypatch.setattr(verify, "_reread_time_left", lambda deadline: False)  # less than REREAD_MIN_SECONDS left
+    report = verify_answer(_by_text(lambda t: "unsupported"), _answer(f"{claim} [S1]."), ws, "?", [], reread=fetcher)
+    assert report.removed_units() == {0} and fetcher.calls == []  # no read
+
+
+def test_a_number_no_cited_source_states_is_rescued_by_a_source_the_turn_read_from_the_same_place():
+    claim, _, holder = HELD[0]
+    ws = _same_doc_ws("מצב התחזוקה בנכס תקין. 7 קומות.", holder)  # the cited source states no such number at all
+    a = _answer(f"{claim} [S1].")
+    report = verify_answer(_by_text(lambda t: "supported"), a, ws, "?", [])
+    assert report.removed_units() == set() and "[S1][S2]" in report.apply(a).answer_markdown
+    assert [p.check for p in report.problems if p.severity == "partial"] == [verify.RESCUE_READ_CHECK]
+    ws = _same_doc_ws("מצב התחזוקה בנכס תקין. 7 קומות.", holder, documents=(0, 1))
+    assert verify_answer(_by_text(lambda t: "supported"), a, ws, "?", []).removed_units() == {0}
+
+
+# === round 23 U5, B: the bounded confirming call (KTD9, R6, R11) =================================================================
+#
+# Before a value-bearing claim or table cell is removed on one verdict that no deterministic rescue overturned, ONE more reading of it by
+# the same verify model (``verify_confirm``): removed only if both fail it; a disagreement keeps the grounded part, marked. Capped per turn by
+# ``chat_confirm_removals`` (0 = off) and gated by time.
+
+FIGURE, FIGURE_SRC = "הערך הראשון הוא 4,100 ₪", "הערך הכללי הוא 4,100 ₪."  # the cited source holds the number under another label; nothing holds the claim
+
+
+def _two_calls(first, second, first_seen: list | None = None, confirm_seen: list | None = None, confirm_status=None) -> ScriptedProvider:
+    """A judge whose first reading answers by ``first(text)`` and whose confirming reading (told by its policy) by ``second(text)``; each is
+    a verdict word or a dict (``verdict``, ``claims`` ...); None leaves the unit supported."""
+    p = ScriptedProvider()
+
+    def reading(rule, input: str) -> dict:
+        out = []
+        for i, t in _units(input).items():
+            v = rule(t) or "supported"
+            out.append({"index": i, "reason": "בדיקה"} | (v if isinstance(v, dict) else {"verdict": v}))
+        return {"verdicts": out}
+
+    def respond(instructions: str, input: str) -> dict:
+        if verify.JUDGE_CONFIRM_POLICY in instructions:
+            if confirm_seen is not None:
+                confirm_seen.append(input)
+            return reading(second, input)
+        if first_seen is not None:
+            first_seen.append(input)
+        return reading(first, input)
+
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p
+
+
+@pytest.fixture
+def confirm_on(monkeypatch):
+    monkeypatch.setattr(get_settings(), "chat_confirm_removals", 3)
+
+
+def _confirm_run(first, second, md: str = f"{FIGURE} [S1].", ws: Workspace | None = None, cache: VerdictCache | None = None, **kw):
+    usage: list = []
+    a = _answer(md)
+    ws = ws or _same_doc_ws(FIGURE_SRC)
+    report = verify_answer(_two_calls(first, second, **kw), a, ws, "?", usage, cache=cache)
+    return a, report, usage
+
+
+def test_the_setting_is_on_by_default_capped_at_four_and_is_a_cap_not_a_model():
+    assert type(get_settings()).model_fields["chat_confirm_removals"].default == 4
+    assert verify.JUDGE_CONFIRM_POLICY and verify.CONFIRM_LABEL == "verify_confirm"
+
+
+def test_on_by_default_the_removals_cost_one_extra_call_at_most_for_four_claims():
+    assert get_settings().chat_confirm_removals == 4  # the default, not pinned by the test
+    a, report, usage = _confirm_run(lambda t: "unsupported", lambda t: "supported")
+    assert report.removed_units() == set() and _purposes(usage) == ["verify", "verify_confirm"] and usage[1]["claims"] == 1
+    # five claims removed on the first verdict: ONE confirming call reads the first four, the fifth keeps its removal, recorded as past the cap
+    md = "\n\n".join(f"עלות {name} היא {i + 1},100 ₪ [S{i + 1}]." for i, name in enumerate(["שער", "דגל", "שלט", "גדר", "מעקה"]))
+    ws = _same_doc_ws(*[f"הערך הכללי של {name} הוא {i + 1},100 ₪." for i, name in enumerate(["שער", "דגל", "שלט", "גדר", "מעקה"])])
+    a, report, usage = _confirm_run(lambda t: "unsupported", lambda t: "supported", md, ws)
+    assert _purposes(usage).count("verify_confirm") == 1 and [u["claims"] for u in usage if u["purpose"] == "verify_confirm"] == [4]
+    assert report.removed_units() == {4} and report.confirm_summary()["skipped"] == {"cap": 1} and report.confirm_summary()["calls"] == 1
+
+
+def test_a_setting_of_zero_turns_the_confirming_reading_off(monkeypatch):
+    monkeypatch.setattr(get_settings(), "chat_confirm_removals", 0)
+    a, report, usage = _confirm_run(lambda t: "unsupported", lambda t: "supported")
+    assert report.removed_units() == {0} and _purposes(usage) == ["verify"] and report.confirm == []
+
+
+def test_a_confirming_reading_that_supports_the_claim_keeps_it_marked_and_costs_one_call(confirm_on):
+    a, report, usage = _confirm_run(lambda t: "unsupported", lambda t: "supported")
+    out = report.apply(a).answer_markdown
+    assert report.removed_units() == set() and FIGURE in out and "אומת חלקית" in out, out
+    assert _purposes(usage) == ["verify", "verify_confirm"]
+    assert usage[1]["claims"] == 1 and usage[1]["flips"] == 1 and "cost_usd" in usage[1]  # the cost record says what the call was for
+    (rec,) = report.claims[0]
+    assert rec.verdict == "partial" and rec.failure == "none"
+    assert [p.check for p in report.problems if p.severity == "partial"] == [verify.CONFIRM_CHECK]
+    assert not any(p.repairable for p in report.problems)  # a disagreement spends no repair round
+    assert verify.partial_reason_class(None, verify.CONFIRM_CHECK) == "confirm_split"
+    assert report.confirm_summary() == {"calls": 1, "claims": 1, "flips": 1, "removed": 0, "reused": 0, "skipped": {}}
+
+
+def test_a_confirming_reading_that_also_fails_the_claim_removes_it(confirm_on):
+    a, report, usage = _confirm_run(lambda t: "contradicts", lambda t: "unsupported")
+    assert report.removed_units() == {0} and FIGURE not in report.apply(a).answer_markdown
+    assert _purposes(usage) == ["verify", "verify_confirm"]
+    assert report.confirm_summary()["removed"] == 1 and report.confirm_summary()["flips"] == 0
+
+
+@pytest.mark.parametrize(("claim", "cited"), [(h[0], h[1]) for h in HELD], ids=["first-value", "ceiling", "fence"])
+def test_the_confirming_reading_decides_the_same_way_for_other_words_and_values(confirm_on, claim, cited):
+    ws = _same_doc_ws(cited)
+    a, kept, _ = _confirm_run(lambda t: "unsupported", lambda t: "supported", f"{claim} [S1].", ws)
+    assert kept.removed_units() == set() and claim in kept.apply(a).answer_markdown
+    a, gone, _ = _confirm_run(lambda t: "unsupported", lambda t: "unsupported", f"{claim} [S1].", _same_doc_ws(cited))
+    assert gone.removed_units() == {0}
+
+
+def test_the_confirming_reading_is_shown_the_read_sources_of_the_same_place_that_hold_the_number(confirm_on):
+    # nothing holds the claim in words, so the rescue keeps nothing; a read source of the same place and one of another document hold the number
+    ws = _same_doc_ws(FIGURE_SRC, "הערה: הסכום הראשון 4,100 ₪ לפי טבלה אחרת.", "הערה אחרת: 4,100 ₪ במסמך אחר.", documents=(0, 0, 1))
+    shown: list = []
+    a, report, usage = _confirm_run(lambda t: "unsupported", lambda t: "supported", ws=ws, confirm_seen=shown)
+    assert len(shown) == 1 and 'candidate="true"' in shown[0] and 'id="S2"' in shown[0] and 'id="S3"' not in shown[0]
+    assert re.search(r"<unit index=\"0\" cites=\"S1\">", shown[0])
+
+
+def test_a_claim_with_no_number_or_one_the_judge_failed_for_context_is_not_confirmed(confirm_on):
+    seen: list = []
+    a, report, usage = _confirm_run(lambda t: "unsupported", lambda t: "supported", "הנכס מושכר לטווח ארוך [S1].", confirm_seen=seen)
+    assert report.removed_units() == {0} and seen == [] and _purposes(usage) == ["verify"]
+    unit_claim = {"verdict": "partial", "claims": [{"span": FIGURE, "verdict": "unsupported", "needs_context": "heading"}]}
+    a, report, usage = _confirm_run(lambda t: unit_claim, lambda t: "supported", confirm_seen=seen)
+    assert seen == [] and _purposes(usage) == ["verify"]
+
+
+def test_a_rescued_claim_is_not_confirmed_it_is_already_kept(confirm_on):
+    claim, cited, holder = HELD[0]
+    ws = _same_doc_ws(cited, holder)
+    seen: list = []
+    a, report, usage = _confirm_run(lambda t: "unsupported", lambda t: "unsupported", f"{claim} [S1].", ws, confirm_seen=seen)
+    assert report.removed_units() == set() and report.claims[0][0].rescue == "S2" and seen == []
+
+
+def test_the_cap_is_per_turn_and_a_claim_past_it_keeps_the_original_removal_recorded(confirm_on, monkeypatch):
+    monkeypatch.setattr(get_settings(), "chat_confirm_removals", 1)
+    md = f"{FIGURE} [S1].\n\nעלות השילוט היא 9,900 ₪ [S2]."
+    ws = _same_doc_ws(FIGURE_SRC, "עלות השער היא 9,900 ₪.")
+    a, report, usage = _confirm_run(lambda t: "unsupported", lambda t: "supported", md, ws)
+    assert _purposes(usage).count("verify_confirm") == 1
+    assert report.removed_units() == {1}  # the second claim was past the cap: removed on its first verdict, as before
+    assert report.confirm_summary()["skipped"] == {"cap": 1} and report.confirm_summary()["calls"] == 1
+    cache = VerdictCache()  # the cap is the turn's: a second round of the same cache has nothing left either
+    ws = _same_doc_ws(FIGURE_SRC, "עלות השער היא 9,900 ₪.")
+    _, first, u1 = _confirm_run(lambda t: "unsupported", lambda t: "supported", md, ws, cache)
+    _, again, u2 = _confirm_run(lambda t: "unsupported", lambda t: "supported", md.replace("השילוט", "הדגל"), ws, cache)
+    assert _purposes(u1).count("verify_confirm") == 1 and _purposes(u2).count("verify_confirm") == 0
+
+
+def test_with_too_little_time_the_original_behaviour_stands_and_the_skip_is_recorded(confirm_on, monkeypatch):
+    monkeypatch.setattr(verify, "_reread_time_left", lambda deadline: False)
+    a, report, usage = _confirm_run(lambda t: "unsupported", lambda t: "supported")
+    assert report.removed_units() == {0} and _purposes(usage) == ["verify"]
+    assert report.confirm_summary()["skipped"] == {"no_time": 1} and report.confirm_summary()["calls"] == 0
+
+
+@pytest.mark.parametrize("status", [CallStatus.TIMEOUT, CallStatus.INVALID])
+def test_a_confirming_call_that_fails_technically_leaves_the_removal_and_is_recorded(confirm_on, status):
+    p = ScriptedProvider()
+    p.on(Purpose.VERIFY, lambda i, input: {"verdicts": [{"index": n, "verdict": "unsupported", "reason": "בדיקה"} for n in _units(input)]})
+    p.on(Purpose.VERIFY, status, repeat=True)  # the confirming call, and its retry
+    usage: list = []
+    report = verify_answer(p, _answer(f"{FIGURE} [S1]."), _same_doc_ws(FIGURE_SRC), "?", usage)
+    assert report.removed_units() == {0} and report.confirm_summary()["skipped"] == {"check_failed": 1}
+    assert _purposes(usage) == ["verify", "verify_confirm", "verify_confirm"] and report.confirm_summary()["flips"] == 0
+
+
+def test_a_confirming_call_that_leaves_the_unit_out_leaves_the_removal_and_is_recorded(confirm_on):
+    p = ScriptedProvider()
+    p.on(Purpose.VERIFY, lambda i, input: {"verdicts": [{"index": n, "verdict": "unsupported", "reason": "בדיקה"} for n in _units(input)]})
+    p.on(Purpose.VERIFY, {"verdicts": []}, repeat=True)
+    report = verify_answer(p, _answer(f"{FIGURE} [S1]."), _same_doc_ws(FIGURE_SRC), "?", [])
+    assert report.removed_units() == {0} and report.confirm_summary()["skipped"] == {"check_failed": 1}
+
+
+def test_a_cell_of_a_table_row_the_confirming_reading_supports_is_marked_in_its_own_cell(confirm_on):
+    ws = _same_doc_ws("מקדם ב הוא 5.10. משך החכירה 36 חודשים.")
+    md = "| נתון | ערך | משך |\n|---|---|---|\n| רכיב א | 5.10 [S1] | 36 חודשים [S1] |"
+
+    def first(t):
+        return {"verdict": "partial", "defect": "part", "claims": [{"span": "5.10", "verdict": "unsupported"},
+                                                                   {"span": "36 חודשים", "verdict": "supported"}]} if "5.10" in t else None
+
+    def second(t):
+        return {"verdict": "supported", "claims": [{"span": "5.10", "verdict": "supported"}, {"span": "36 חודשים", "verdict": "supported"}]}
+
+    a, report, usage = _confirm_run(first, second, md, ws)
+    row = next(ln for ln in report.apply(a).answer_markdown.splitlines() if "5.10" in ln)
+    assert report.removed_units() == set() and "5.10" in row and "36 חודשים [S1]" in row and "אומת חלקית" in row, row
+    assert len(verify.cell_bounds(row)) == 3
+    a, report, usage = _confirm_run(first, lambda t: dict(first(t), claims=[{"span": "5.10", "verdict": "unsupported"},
+                                                                          {"span": "36 חודשים", "verdict": "supported"}]), md, ws)
+    out = report.apply(a).answer_markdown
+    assert "5.10" not in out and "36 חודשים [S1]" in out  # both readings fail the cell: only that cell is cut, as before
+
+
+def test_a_failing_claim_among_correct_ones_is_the_only_one_confirmed(confirm_on):
+    ws = _same_doc_ws("הנכס בן 3 קומות. עלות הגידור היא 52,000 ₪. עלות השילוט 7,000 ₪.")
+    md = "הנכס בן 3 קומות, עלות הגידור היא 52,000 ₪ ועלות השער 7,000 ₪ [S1]."
+    claims = {"verdict": "partial", "defect": "part", "claims": [
+        {"span": "הנכס בן 3 קומות", "verdict": "supported"}, {"span": "עלות הגידור היא 52,000 ₪", "verdict": "supported"},
+        {"span": "עלות השער 7,000 ₪", "verdict": "unsupported"}]}
+    seen: list = []
+    a, report, usage = _confirm_run(lambda t: claims, lambda t: dict(claims), md, ws, confirm_seen=seen)
+    out = report.apply(a).answer_markdown
+    assert "7,000" not in out and "52,000" in out and "3 קומות" in out, out  # only the failing figure is cut
+    assert report.confirm_summary()["claims"] == 1 and len(seen) == 1

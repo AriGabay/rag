@@ -1080,3 +1080,82 @@ def test_a_period_the_source_does_not_state_is_edited_out_beside_a_number_that_e
     a, r = _report("שכר הדירה לחודש הוא 5,000, בלבד [V1].", _silent_period())
     assert r.removed_units() == set() and [q.kind for q in r.qualifier_edits[0]] == ["period"]
     assert r.edit(a).doc.text.startswith("שכר הדירה הוא 5,000, בלבד [V1].")
+
+
+# --- round 23 U5 (granularity, KTD9): one failing figure among correct ones costs only its own span -----------------------------------------------
+
+_FIGURES = [("מחיר הבסיס 4,100 ₪", "שטח המגרש 640 מ״ר", "מספר הקומות 3 קומות"),
+            ("עלות הגידור 52,000 ₪", "תקרת הפיצוי 18,400 ₪", "תוספת הניהול 7 אחוזים")]
+
+
+def _figure_source(figures, bad: int) -> str:
+    """The sources hold every figure, the failing one under another label (its number is there, its words are not)."""
+    return ". ".join(("סכום אחר " + f.rsplit(" ", 2)[-2] + " " + f.rsplit(" ", 1)[-1]) if n == bad else f for n, f in enumerate(figures)) + "."
+
+
+@pytest.mark.parametrize("figures", _FIGURES, ids=["first", "second"])
+@pytest.mark.parametrize("bad", [0, 1, 2])
+def test_a_sentence_with_one_failing_figure_among_correct_ones_loses_only_that_figures_span(figures, bad):
+    sentence = f"{figures[0]}, {figures[1]} ו{figures[2]} [S1]."
+    claims = [(f, "unsupported" if n == bad else "supported") for n, f in enumerate(figures)]
+    a = _answer(sentence)
+    r = verify_answer(_claims_judge(lambda t: claims if figures[0] in t else None), a, _ws(_figure_source(figures, bad)), "?", [])
+    out = r.apply(a).answer_markdown
+    assert r.removed_units() == set() and r.cuts, out
+    for n, f in enumerate(figures):
+        assert (f in out) is (n != bad), (n, out)  # the failing span is gone, every correct figure is still there
+
+
+def test_a_unit_verdict_of_unsupported_over_claims_that_stand_in_part_cuts_only_the_failing_span():
+    figures = _FIGURES[0]
+    sentence = f"{figures[0]}, {figures[1]} ו{figures[2]} [S1]."
+    a = _answer(sentence)
+    claims = [(figures[0], "supported"), (figures[1], "unsupported"), (figures[2], "supported")]
+
+    def respond(instructions: str, input: str) -> dict:
+        # the unit's own verdict is the worst of its claims here: unsupported, though two claims stand
+        return {"verdicts": [{"index": int(m.group(1)), "verdict": "unsupported", "reason": "בדיקה", "failure": "absent_from_source",
+                              "claims": [{"span": s, "verdict": v, "failure": "absent_from_source" if v == "unsupported" else "none"} for s, v in claims]}
+                             for m in re.finditer(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S)]}
+
+    p = ScriptedProvider()
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    r = verify_answer(p, a, _ws(_figure_source(figures, 1)), "?", [])
+    out = r.apply(a).answer_markdown
+    assert r.removed_units() == set() and figures[0] in out and figures[2] in out and figures[1] not in out, out
+
+
+def _unit_unsupported(claims):
+    """A judge whose unit verdict is unsupported over the given claims ([] for none)."""
+    def respond(instructions: str, input: str) -> dict:
+        return {"verdicts": [{"index": int(m.group(1)), "verdict": "unsupported", "reason": "בדיקה", "failure": "absent_from_source",
+                              "claims": [{"span": s, "verdict": v, "failure": "absent_from_source" if v == "unsupported" else "none"} for s, v in claims]}
+                             for m in re.finditer(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S)]}
+
+    p = ScriptedProvider()
+    p.on(Purpose.VERIFY, respond, repeat=True)
+    return p
+
+
+@pytest.mark.parametrize("claims_of", [
+    lambda f: [],  # the judge named no part: the unit is the claim
+    lambda f: [(f[0], "unsupported"), (f[1], "unsupported"), (f[2], "unsupported")],  # every part fails
+    lambda f: [("טקסט שאינו ביחידה", "supported"), (f[1], "unsupported")],  # a span the unit does not hold: the claims cannot divide it
+], ids=["no-claims", "all-fail", "span-not-in-unit"])
+def test_a_unit_verdict_of_unsupported_still_removes_the_sentence_when_the_claims_do_not_say_which_part_stands(claims_of):
+    figures = _FIGURES[1]
+    a = _answer(f"{figures[0]}, {figures[1]} ו{figures[2]} [S1].")
+    r = verify_answer(_unit_unsupported(claims_of(figures)), a, _ws(_figure_source(figures, 1)), "?", [])
+    assert r.removed_units() == {0} and all(f not in r.apply(a).answer_markdown for f in figures)
+
+
+@pytest.mark.parametrize(("failing", "date_part", "source"), [
+    ("השווי למ״ר הוא 9,500 ₪", "ונקבע ליום 15.3.2024", "סכום אחר 9,500 ₪. הנקבע ליום 15.3.2024."),
+    ("דמי הניהול הם 12 ₪ למ״ר", "ושולמו עד 1.6.2023", "תוספת אחרת 12 ₪ למ״ר. שולמו עד 1.6.2023."),
+], ids=["valuation", "fees"])
+def test_a_stated_date_the_cut_of_its_neighbour_would_take_stays_when_its_own_claim_is_supported(failing, date_part, source):
+    a = _answer(f"{failing} {date_part} [S1].")
+    r = verify_answer(_claims_judge(lambda t: [(failing, "unsupported"), (date_part, "supported")] if failing in t else None), a, _ws(source),
+                      "?", [])
+    out = r.apply(a).answer_markdown
+    assert r.removed_units() == set() and date_part in out and failing not in out, out

@@ -175,6 +175,12 @@ class Settings(BaseSettings):
     # claims one turn may re-read before they are given up (round 8 KTD5): one expansion of the cited source and one
     # re-judge for all of them; the rest keep their verdict, saying the source was read in part
     chat_reread_claims: int = Field(default=4, ge=0)
+    # claims one turn may have a SECOND, independent judge reading before a value-bearing claim or table cell is removed on one verdict
+    # (round 23 U5, KTD9, R6, R11): one extra call on the verify model per verification round, for the claims the deterministic rescue did
+    # not keep; removed only when both readings fail it, a disagreement keeps the grounded part marked partly verified. 0 = off. Not a model
+    # setting: the default is set after a live measurement of the flip rate and the cost (judge_live), and frozen before the end-to-end run.
+    # Measured on the traced removal turns: 3 confirming calls, 1 wrong removal undone, no claim wrongly kept, about USD 0.002 a call
+    chat_confirm_removals: int = Field(default=4, ge=0)
     # How long a first turn waits for its request analysis (which carries the question's intent, round 10 KTD3) before a
     # weaker unit pin or clarification is applied, and before the first step's tools run. Shorter than the reading
     # window; past it the intent is unknown, a provisional pin is dropped and the tools run with both pools labelled.

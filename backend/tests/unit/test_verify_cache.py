@@ -1448,3 +1448,144 @@ def test_a_carried_score_keeps_the_version_it_was_cast_on_through_every_round():
     stamps = [v._stamp for votes in report.requirement_votes.values() for v in votes]
     assert {s["version"] for s in stamps} <= {1, 2} and {s["origin"] for s in stamps} == {"carried"}  # none is of version 3 or 4
     assert report.version == 4 and report.requirement_decisions["N1"]["rests_on"][0]["version"] == 1
+
+
+# --- round 23 U5 (R9, KTD9): a verdict is kept by the claim's datum and source place, not by its position or its round ------------------------
+
+from tests.unit.test_verify_reread import FIGURE_SRC, _same_doc_ws, _two_calls  # noqa: E402
+
+CLAIM_A, CLAIM_B, CLAIM_C = "הערך הראשון הוא 4,100 ₪", "עלות הגידור היא 52,000 ₪", "תקרת הפיצוי היא 18,400 ₪"
+CITED_ALL = f"{FIGURE_SRC} אגרת הרישוי היא 52,000 ₪. מחיר הבסיס הוא 18,400 ₪."
+ORDER_ONE = f"{CLAIM_A} [S1].\n\n{CLAIM_B} [S1].\n\n{CLAIM_C} [S1]."
+ORDER_TWO = f"{CLAIM_C} [S1].\n\n{CLAIM_A} [S1].\n\n{CLAIM_B} [S1]."
+
+
+def _split_rule(text):
+    """The first reading fails the first two claims; the second keeps the first and fails the second."""
+    return "unsupported" if CLAIM_A in text or CLAIM_B in text else None
+
+
+def _second_rule(text):
+    return "unsupported" if CLAIM_B in text else "supported"
+
+
+def _rounds(first_md: str, second_md: str, monkeypatch, cap: int = 5):
+    monkeypatch.setattr(get_settings(), "chat_confirm_removals", cap)
+    cache, ws = VerdictCache(), _same_doc_ws(CITED_ALL)
+    first_seen, confirm_seen = [], []
+    judge = _two_calls(_split_rule, _second_rule, first_seen, confirm_seen)
+    usage: list = []
+    one = verify_answer(judge, _answer(first_md), ws, "?", usage, cache=cache)
+    n = len(usage)
+    two = verify_answer(judge, _answer(second_md), ws, "?", usage, cache=cache)
+    return one, two, usage, n, cache
+
+
+def test_a_repair_round_that_reorders_the_claims_keeps_every_decision_and_makes_no_call(monkeypatch):
+    one, two, usage, n, cache = _rounds(ORDER_ONE, ORDER_TWO, monkeypatch)
+    assert [u["purpose"] for u in usage[:n]] == ["verify", "verify_confirm"]
+    assert len(usage) == n, [u["purpose"] for u in usage]  # the second round called nothing, the confirming reading included
+    text = lambda r, md: r.apply(_answer(md)).answer_markdown  # noqa: E731
+    for report, md in ((one, ORDER_ONE), (two, ORDER_TWO)):
+        out = text(report, md)
+        assert CLAIM_A in out and CLAIM_C in out and CLAIM_B not in out and "אומת חלקית" in out, out  # kept+marked, supported, removed
+    assert two.reused == 3 and [c.verdict for cs in two.claims.values() for c in cs if CLAIM_A in c.text] == ["partial"]
+
+
+def test_the_confirmed_reading_is_the_one_cached_for_a_removed_claim_and_a_kept_one(monkeypatch):
+    one, two, usage, n, cache = _rounds(ORDER_ONE, ORDER_TWO, monkeypatch)
+    cached = {k: v for k, v in cache.verdicts.items()}
+    kept = [v for v in cached.values() if any(CLAIM_A in c.span for c in v.claims) or v.verdict == "partial"]
+    assert kept and all(v.verdict == "partial" and v.defect == "none" for v in kept)  # the keep is cached with its mark, not the first failure
+    removed = [v for v in cached.values() if v.verdict == "unsupported"]
+    assert len(removed) == 1  # the removed claim's cached verdict is the confirming reading's (it also failed)
+
+
+def test_a_changed_datum_is_judged_and_confirmed_again(monkeypatch):
+    monkeypatch.setattr(get_settings(), "chat_confirm_removals", 5)
+    cache, ws = VerdictCache(), _same_doc_ws(CITED_ALL + " סכום נוסף הוא 4,200 ₪.")
+    judge = _two_calls(lambda t: "unsupported" if "הערך הראשון" in t else None, lambda t: "supported")
+    usage: list = []
+    verify_answer(judge, _answer(f"{CLAIM_A} [S1]."), ws, "?", usage, cache=cache)
+    n = len(usage)
+    verify_answer(judge, _answer(f"{CLAIM_A} [S1]."), ws, "?", usage, cache=cache)
+    assert len(usage) == n  # the same datum: nothing is asked again
+    changed = f"{CLAIM_A.replace('4,100', '4,200')} [S1]."
+    two = verify_answer(judge, _answer(changed), ws, "?", usage, cache=cache)
+    assert [u["purpose"] for u in usage[n:]] == ["verify", "verify_confirm"]  # another datum: read twice
+    assert "4,200" in two.apply(_answer(changed)).answer_markdown and "אומת חלקית" in two.apply(_answer(changed)).answer_markdown
+
+
+def test_the_same_claim_moved_under_another_heading_is_read_again_and_under_the_same_heading_it_is_not(monkeypatch):
+    one, two, usage, n, cache = _rounds(f"## מצב מוצע\n{CLAIM_A} [S1].", f"## מצב מאושר\n{CLAIM_A} [S1].", monkeypatch)
+    after = [u["purpose"] for u in usage[n:]]
+    assert after == ["verify", "verify_confirm"]  # another heading is another reading: the first reading and the second are asked again
+    out = two.apply(_answer(f"## מצב מאושר\n{CLAIM_A} [S1].")).answer_markdown
+    assert CLAIM_A in out and "אומת חלקית" in out and [p.check for p in two.problems if p.severity == "partial"] == [verify.CONFIRM_CHECK]
+    one, two, usage, n, cache = _rounds(f"## מצב מוצע\n{CLAIM_A} [S1].", f"## מצב מוצע\n\nהערה.\n\n{CLAIM_A} [S1].", monkeypatch)
+    assert [u["purpose"] for u in usage[n:]] == ["verify"]  # the same heading, the claim moved down: only the new note is read - the claim is not
+
+
+def test_the_decision_does_not_depend_on_the_other_text_the_round_holds(monkeypatch):
+    extra = "ההערה הכללית אינה נתון."
+    one, two, usage, n, cache = _rounds(ORDER_ONE, f"{extra}\n\n{ORDER_TWO}\n\n{extra}", monkeypatch)
+    after = [u["purpose"] for u in usage[n:]]
+    assert "verify_confirm" not in after
+    out = two.apply(_answer(ORDER_TWO)).answer_markdown
+    assert CLAIM_B not in out
+
+
+def test_the_datum_key_is_the_numbers_and_the_cited_sources_with_their_content_and_nothing_positional():
+    ws = _same_doc_ws(CITED_ALL)
+    one, two = verify.split_units(ORDER_ONE), verify.split_units(ORDER_TWO)
+    find = lambda units, claim: next(u for u in units if claim in u.text)  # noqa: E731
+    key = lambda u: verify.datum_key(u, u.text, ws, {})  # noqa: E731
+    assert key(find(one, CLAIM_A)) == key(find(two, CLAIM_A)) and find(one, CLAIM_A).index != find(two, CLAIM_A).index
+    assert key(find(one, CLAIM_A)) != key(find(one, CLAIM_B))
+    changed = verify.split_units(f"{CLAIM_A.replace('4,100', '4,200')} [S1].")[0]
+    assert key(changed) != key(find(one, CLAIM_A))
+    other = _same_doc_ws(CITED_ALL + " סעיף חדש.")  # the cited source's content changed
+    assert verify.datum_key(find(one, CLAIM_A), find(one, CLAIM_A).text, other, {}) != key(find(one, CLAIM_A))
+
+
+def _decided(decision: str, text: str, ws, ids=("S1",)):
+    unit = verify.split_units(f"{text} [{ids[0]}].")[0]
+    settled = {verify.datum_key(unit, text, ws, {}): [verify.Settled(decision, " ".join(text.split()), "", (), verify.unit_context(unit))]}
+    return settled
+
+
+@pytest.mark.parametrize(("decision", "kept"), [("split", True), ("rescued", True), ("removed", False)])
+def test_the_final_check_keeps_a_claim_only_by_a_decision_that_kept_it_for_the_same_datum_wording_and_sources(decision, kept):
+    ws = _same_doc_ws(CITED_ALL)
+    settled = _decided(decision, CLAIM_A, ws)
+    claim = lambda text, whole=False: verify.UnitClaim(text, "datum", "unsupported", "absent_from_source", whole_unit=whole)  # noqa: E731
+    own = verify.split_units(f"{CLAIM_A} [S1].")[0]
+    assert verify.kept_by_decision(settled, own, [claim(CLAIM_A)], ws, {}) is kept
+    # the sentence as saved holds the claim and more words (a cut marker, a comma): the wording is held, the datum is the same
+    saved = verify.split_units(f"{CLAIM_A}, «[1: חלק שלא אומת הושמט]» [S1].")[0]
+    saved.server = ["«[1: חלק שלא אומת הושמט]»"]
+    assert verify.kept_by_decision(settled, saved, [claim(saved.text, whole=True)], ws, {}) is kept
+    # negative controls: another number, another cited source content, another claim of the unit, no failing claim
+    other = verify.split_units(f"{CLAIM_A.replace('4,100', '4,200')} [S1].")[0]
+    assert not verify.kept_by_decision(settled, other, [claim(other.text, whole=True)], ws, {})
+    assert not verify.kept_by_decision(settled, own, [claim(CLAIM_A), claim(CLAIM_B)], ws, {})  # every failing claim needs a decision
+    assert not verify.kept_by_decision(settled, own, [claim(CLAIM_B)], ws, {})
+    assert not verify.kept_by_decision(settled, own, [verify.UnitClaim(CLAIM_A, "datum", "supported")], ws, {})
+    assert not verify.kept_by_decision(settled, own, [claim(CLAIM_A)], _same_doc_ws(CITED_ALL + " סעיף חדש."), {})
+    under = verify.split_units(f"{CLAIM_A} [S1].")[0]
+    under.heading = "מצב מוצע"  # the same claim read under another heading is not the claim that was decided
+    assert not verify.kept_by_decision(settled, under, [claim(CLAIM_A)], ws, {})
+
+
+def test_a_decision_for_a_claim_with_too_few_words_is_told_apart_by_its_unit():
+    ws = _same_doc_ws("טבלה: 4,100 | 4,100")
+    row_a, row_b = "| רכיב א | 4,100 [S1] |", "| רכיב ב | 4,100 [S1] |"
+    cache = VerdictCache()
+    unit_a = verify.split_units(f"| נתון | ערך |\n|---|---|\n{row_a}")[-1]
+    unit_b = verify.split_units(f"| נתון | ערך |\n|---|---|\n{row_b}")[-1]
+    record = lambda u: verify.ClaimRecord(id="k", unit_id="u", unit=0, start=0, end=0, text="4,100", kind="datum", verdict="unsupported")  # noqa: E731
+    key = verify.datum_key(unit_a, "4,100", ws, {})
+    assert key == verify.datum_key(unit_b, "4,100", ws, {})  # the same number over the same source...
+    cache.settle(key, verify.Settled("split", *verify.claim_wording(unit_a, record(unit_a))))
+    assert cache.decided(key, *verify.claim_wording(unit_a, record(unit_a))) is not None
+    assert cache.decided(key, *verify.claim_wording(unit_b, record(unit_b))) is None  # ...is another cell of another row

@@ -607,3 +607,57 @@ def test_f2_the_cell_taken_under_an_ocr_spelled_header_registers_the_built_basis
     _take(d, _loc(row="עליונות", column_number=2), kind="value", unit="ILS_per_sqm")
     v = d.ws.values["V1"]
     assert v.provenance["area_basis"] == "source" and meaning.basis_key(v.area_basis) == "בנוי" and v.provenance["unit"] == "source"
+
+
+# --- follow-up 1 (R3, claim-datum-place link): an incomplete read still tries to ATTEST the attribute from the stored context -------------------------------
+
+VAT_CLAIM = "שווי הנכס הוא 2,450,000 ₪, כולל מע\"מ [V1]."
+
+
+def _vat_turn(note: str | None, *, read_in_full: bool, vat_note_status: str = "כוללים"):
+    """A turn whose V1 asserts a VAT the quote does not state; the stored table's notes (the fake fetcher's ``footnotes``) say ``note`` or nothing."""
+    from app.chat.verify import Expansion, verify_answer
+    from tests.unit.test_verify_reread import FakeFetcher
+    from tests.unit.test_verify_units import _answer, _judge
+
+    ws = _registered("2,450,000", "שווי הנכס: 2,450,000 ₪", vat="included", provenance={"vat": "model_asserted"})
+    if not read_in_full:
+        ws.values["V1"].read = {}  # a value taken by older code: its read of the VAT is not complete
+    ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="שומת הדגמה", section="סעיף 3", location="סעיף 3", kind="table",
+                  text="שווי הנכס: 2,450,000 ₪", table_index=0, block_start=2, block_end=2)
+    ws.values["V1"].source_id = "S1"
+    fetcher = FakeFetcher({("S1", "footnotes"): Expansion(note, "הערות")} if note else {}, ws=ws)
+    answer = _answer(VAT_CLAIM)
+    report = verify_answer(_judge(lambda t: "supported"), answer, ws, "?", [], reread=fetcher)
+    return ws, answer, report, fetcher
+
+
+@pytest.mark.parametrize("note", ["הערה: כל הסכומים כולל מע\"מ.", "(*) כולל מע\"מ"])
+def test_f1_an_incomplete_read_that_the_stored_notes_complete_cites_the_notes_and_edits_nothing(note):
+    ws, answer, report, fetcher = _vat_turn(note, read_in_full=False)
+    cites = [p.cite for p in report.problems if p.kind == "needs_citation"]
+    assert len(cites) == 1 and cites[0] in ws.sources and "מע\"מ" in ws.sources[cites[0]].text and ws.sources[cites[0]].server_made
+    out = report.apply(answer).answer_markdown
+    assert report.qualifier_edits == {} and report.removed_units() == set() and "כולל מע\"מ" in out and f"[{cites[0]}]" in out, out
+    assert fetcher.calls and fetcher.calls[0] == ("S1", "table_headers")
+
+
+@pytest.mark.parametrize("note", [None, "הערה: הנתונים נכונים למועד הקובע.", "הערה: מספר השורות בטבלה נמוך."])
+def test_f1_an_incomplete_read_that_nothing_attests_keeps_the_sentence_with_no_edit_and_no_claim_about_the_source(note):
+    ws, answer, report, fetcher = _vat_turn(note, read_in_full=False)
+    out = report.apply(answer).answer_markdown
+    assert report.qualifier_edits == {} and report.removed_units() == set() and report.removals() == [], out
+    assert "כולל מע\"מ" in out and "לא צוין במקור" not in out and "הוסר" not in out and "הוסרה" not in out, out
+    assert not [p for p in report.problems if p.kind == "needs_citation"] and list(ws.sources) == ["S1"]  # nothing registered
+    assert not any(p.unconfirmed for p in report.problems) and fetcher.calls  # the context was read, and the unconfirmed question dropped
+
+
+def test_f1_negative_controls_a_complete_read_or_notes_that_state_the_other_status_keep_the_edit_path():
+    # the read was complete and nothing states the VAT: the qualifier is edited out, as before
+    ws, answer, report, _ = _vat_turn("הערה: הנתונים נכונים למועד הקובע.", read_in_full=True)
+    assert report.qualifier_edits or report.removed_units() == {0}
+    assert "כולל מע\"מ" not in report.apply(answer).answer_markdown
+    # incomplete read, but the notes state the OTHER status: they are the evidence, the claim does not stand
+    ws, answer, report, _ = _vat_turn("הערה: כל הסכומים בטבלה אינם כוללים מע\"מ.", read_in_full=False)
+    assert report.qualifier_edits or report.removed_units() == {0}
+    assert "כולל מע\"מ" not in report.apply(answer).answer_markdown

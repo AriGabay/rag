@@ -95,6 +95,7 @@ from app.chat.verify import (
     has_back_reference,
     has_qualifier,
     ids_in,
+    kept_by_decision,
     key_context,
     note_not_checked,
     rescued_expansions,
@@ -225,7 +226,7 @@ class _Final:
         self.passed: set[str] = set()  # the reuse keys that have a verdict: the draft's, and the final check's own
         self.cell_cuts: dict[int, CellCut] = {}  # the rows this check cut cell by cell, by draft unit (round 20 U2)
         self.stats = {"passes": 0, "units": 0, "reused": 0, "judged": 0, "removed": 0, "withheld": 0,
-                      "unjudged_kept": 0, "unavailable": False, "cell_cuts": 0, "cell_marks": 0}
+                      "unjudged_kept": 0, "unavailable": False, "cell_cuts": 0, "cell_marks": 0, "kept_by_decision": 0}
         self.drafts = {d.index: d for d in report.units}
         self.draft_starts = [d.start for d in report.units]
         self._evidence: _Evidence | None = None
@@ -537,6 +538,14 @@ class _Final:
                 return self.accept(f, v.verdict)
             res.failures.append(Failure(f.drafts, "not_checked", NOT_CLASSIFIED, "not_classified", "unchecked"))
             return
+        if len(f.drafts) == 1 and v.verdict not in STANDING_VERDICTS and kept_by_decision(
+                self.report.settled, u, unit_claims(u, v, self.ws), self.ws, self.digests):
+            # round 23 U5 (R9, KTD9): every claim this reading fails is one the verification settled as kept - a source holds it, or a second reading
+            # stood it - for the same datum and sources: that decision stands, and the sentence keeps the partly verified mark
+            self.accept(f, "partial")
+            res.mutated |= self.mark(Problem(self.drafts[f.drafts[0]], FINAL_PARTIAL, "partial", defect="none", check="final"))
+            self.stats["kept_by_decision"] += 1
+            return
         if v.verdict in ("unsupported", "contradicts"):
             res.failures.append(Failure(f.drafts, _judged_failure(u, v, self.ws),
                                         FINAL_UNSUPPORTED.format(reason=v.reason), record=v.verdict))
@@ -547,6 +556,12 @@ class _Final:
         claims = unit_claims(u, v, self.ws)
         failing = [c for c in claims if not c.whole_unit and c.verdict in ("unsupported", "contradicts", "partial")]
         if v.defect == "scope" and v.verdict in STANDING_VERDICTS and not failing and self.scope(f, v, res):
+            return
+        if len(f.drafts) == 1 and any(c.verdict in ("unsupported", "contradicts") for c in claims) and kept_by_decision(
+                self.report.settled, u, claims, self.ws, self.digests):
+            self.accept(f, "partial")  # (a partly supported sentence whose failing claims the verification settled as kept: as above)
+            res.mutated |= self.mark(Problem(self.drafts[f.drafts[0]], FINAL_PARTIAL, "partial", defect="none", check="final"))
+            self.stats["kept_by_decision"] += 1
             return
         if v.verdict == "partial" and (failing or v.defect != "none") and not self.attribute_only(f, v, failing) or (
                 v.verdict == "supported" and any(c.verdict in ("unsupported", "contradicts") for c in claims)):
