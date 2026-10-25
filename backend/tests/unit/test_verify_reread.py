@@ -978,10 +978,12 @@ def _two_calls(first, second, first_seen: list | None = None, confirm_seen: list
     a verdict word or a dict (``verdict``, ``claims`` ...); None leaves the unit supported."""
     p = ScriptedProvider()
 
-    def reading(rule, input: str) -> dict:
+    def reading(rule, input: str, explicit: bool = False) -> dict:
         out = []
         for i, t in _units(input).items():
             v = rule(t) or "supported"
+            if explicit and not isinstance(v, dict):  # the confirming reading answers with a claim of its own for the unit's claim (round 23 closure P1)
+                v = {"verdict": v, "claims": [{"span": t, "verdict": v}]}
             out.append({"index": i, "reason": "בדיקה"} | (v if isinstance(v, dict) else {"verdict": v}))
         return {"verdicts": out}
 
@@ -989,7 +991,7 @@ def _two_calls(first, second, first_seen: list | None = None, confirm_seen: list
         if verify.JUDGE_CONFIRM_POLICY in instructions:
             if confirm_seen is not None:
                 confirm_seen.append(input)
-            return reading(second, input)
+            return reading(second, input, explicit=True)
         if first_seen is not None:
             first_seen.append(input)
         return reading(first, input)

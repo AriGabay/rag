@@ -2652,7 +2652,7 @@ def test_a_passage_read_after_round_one_that_bears_on_the_component_refuses_the_
     _read(ws, extra.sid)
     second = _round(ws, V2_MD, score, cache, turn, 2, seen)
     assert len(seen) == 2  # no judge round was added
-    assert list(_units(seen[1])) == [0, 1, 2, 3]  # the giving units of the refused vote joined the units judged fresh
+    assert sorted(_units(seen[1])) == [0, 1, 2, 3]  # the giving units of the refused vote joined the units judged fresh (the changed unit first: round 23 P4)
     (o,) = second.requirement_outcomes()
     assert o["status"] == "partial"  # decided from the fresh vote: the old full was not admitted
     d = second.requirement_decisions["N1"]

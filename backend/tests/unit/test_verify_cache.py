@@ -204,7 +204,7 @@ def test_a_requirement_given_jointly_re_judges_its_unchanged_unit_with_the_chang
     verify_answer(p, _answer(REPAIRED), ws, "?", [], requirements=turn, cache=cache)
     changed = REPAIRED.replace("55 ₪ למ\"ר לחודש", "55 ₪ למ\"ר לחודש, לפי הסקר")
     again = verify_answer(p, _answer(changed), ws, "?", [], requirements=turn, cache=cache)
-    assert list(_units(seen[1])) == [0, 1]
+    assert sorted(_units(seen[1])) == [0, 1] and list(_units(seen[1]))[0] == 1  # (the changed unit is asked first, the earlier-judged one after it: round 23 P4)
     assert [o["status"] for o in again.requirement_outcomes()] == ["full"]
 
 
@@ -1633,7 +1633,7 @@ def _holder_run(first, second, documents=None):
 def test_a_decision_is_found_by_the_final_unit_that_cites_the_holder_the_composer_added(how, monkeypatch):
     monkeypatch.setattr(get_settings(), "chat_confirm_removals", 5)
     if how == "split":  # the second reading keeps the claim and names S2 as the support
-        cache, ws = _holder_run(lambda t: "unsupported", lambda t: {"verdict": "supported", "supported_by": ["S2"]}, documents=(0, 1, 0))
+        cache, ws = _holder_run(lambda t: "unsupported", lambda t: {"verdict": "supported", "supported_by": ["S2"], "claims": [{"span": t, "verdict": "supported"}]}, documents=(0, 1, 0))
     else:  # a source the turn read (S2) holds the claim: the deterministic rescue
         cache, ws = _holder_run(lambda t: "unsupported", lambda t: "unsupported")
     decided = [e for es in cache.settled.values() for e in es if e.decision in ("split", "rescued")]
