@@ -132,6 +132,8 @@ A sentence that says information is not there: "there is no", "not found", "with
 
 It is told apart from sentences that merely contain a negation. "X is not a comparison datum" classifies X and states something positive about it; a missing physical or legal feature of the property ("lacks a permit", "has no elevator") is a fact about the property, not missing information; and a figure followed by "without breakdown" still states the figure. A negation that the datum itself carries, in any gender or number, is part of the datum: an answer that repeats it states the datum, it does not negate it.
 
+The same holds for the server's own sentences about a source: "the source does not state the period, unit, basis or kind" is allowed only after every part of the datum's own place (its cell, row label, header rows, caption, notes and sentence) was read in full. Otherwise the attribute is unconfirmed, not absent. An unconfirmed attribute is worded as "could not be confirmed from the source" and is never a reason to remove what the answer says; only the source stating another value is.
+
 ### Server addition
 
 Any text the server, not the model, writes into an answer: a qualifier such as a period, unit or basis, a condition note, a scope note, a "partly verified" mark, a cut marker, a removal note, or a read-and-not-used line. Each one names the datum it belongs to and is written at that datum's own place in the answer, so it can be checked like the model's own words.
