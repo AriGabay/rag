@@ -918,12 +918,13 @@ def _unit_identity(u, card_fields: Sequence[dict] = ()) -> Identity:
         ident = Identity(frozenset(tuple(a) for a in stored.get("addresses") or ()),
                          frozenset(tuple(p) for p in stored.get("parcels") or ()), shown)
     texts = [x for x in ([u.title] if u.title else []) + list(u.aliases) if not noise_heading(x)]
-    for x in texts:
-        if not (only := parcel_only(x)).empty:
+    parcels = [(x, parcel_only(x)) for x in texts]  # (each text read once)
+    for _, only in parcels:
+        if not only.empty:
             ident = Identity(ident.addresses, ident.parcels | only.parcels,
                              tuple(dict.fromkeys(shown + only.shown)), ident.streets)
             shown = ident.shown
-    names = tuple(dict.fromkeys(k for x in texts if parcel_only(x).empty and (k := name_key(x))))
+    names = tuple(dict.fromkeys(k for x, only in parcels if only.empty and (k := name_key(x))))
     base = Identity(ident.addresses, ident.parcels, shown, ident.streets, names)
     return base | _card_identity(card_fields) if card_fields else base
 

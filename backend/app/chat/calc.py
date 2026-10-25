@@ -1264,7 +1264,7 @@ class Value:
     # for an attribute whose provenance is "stated_different" (round 22 U9, KTD8); the conditional note quotes it
     stated: dict = field(default_factory=dict)
     # whether the read of the datum's own parts (its cell, row label, every header row, caption, table notes, the governing note, its
-    # sentence) was complete for each defining attribute (round 23 U2, R3, KTD3): ``{"kind": True, "unit": True}``. Only a complete read
+    # sentence) was complete for each defining attribute (round 23 U2, R3, KTD3): ``{"kind": True, "unit": True, "period": True, "area_basis": True, "vat": True}``. Only a complete read
     # that found no support lets a note say the source does not state the attribute; an attribute missing here was not read completely
     # (a value of an older record, a quote whose clause could not be isolated, a cell of a page the table's header does not reach)
     read: dict = field(default_factory=dict)

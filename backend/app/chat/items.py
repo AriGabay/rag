@@ -105,7 +105,7 @@ from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from typing import NamedTuple
 
-from app.answering.numread import number_forms, number_spans, number_words, whole_number_word
+from app.answering.numread import _YEAR, number_forms, number_spans, number_words, whole_number_word
 from app.answering.verify import _QUANTITY_AFTER, not_an_amount, numbers_in
 from app.chat import conditions, scopes
 from app.chat.evidence import OTHER_ITEM, claim_terms
@@ -2403,7 +2403,7 @@ def _identifier_list(item_value: str, item_quote: str) -> frozenset[str] | None:
         return None
     numbers = _ID_NUMBER.findall(core)
     wanted = _identifiers_in(core)
-    if not numbers or (len(numbers) < 3 and len(wanted) < 3) or all(_YEAR_FORM.fullmatch(n) for n in numbers):
+    if not numbers or (len(numbers) < 3 and len(wanted) < 3) or all(_YEAR.fullmatch(n) for n in numbers):
         return None
     if any(after_kind(text, m.end()) for m in _ID_NUMBER.finditer(text)):
         return None
@@ -2434,7 +2434,6 @@ def _unit_in_place(sid: str, unit: Unit, ws) -> bool:
 # function words the content-word reader keeps ("without", "except", "after", "according to"...): they say nothing of what a part is about
 _FUNCTION_WORDS = frozenset("""ללא למעט לאחר אחרי לפני לפי עבור בגין מול בין כולל כאשר אשר גם רק עוד כל כלל זה זאת זו אלה אלו אך אבל כי כך אז
 יותר פחות מאוד אפילו אולם לכן וכן כמו כגון היינו קרי אלא""".split())
-_YEAR_FORM = re.compile(r"(?:19|20)\d\d")
 
 
 def _wordy(value: str, quote: str) -> bool:
@@ -2445,7 +2444,7 @@ def _wordy(value: str, quote: str) -> bool:
     if fractions or any(p.precision != "year" for p in shared_dates.find_all(quote)):
         return False
     durations = {f for m in _DURATION.finditer(quote) for f in number_forms(m.group(1))}
-    return all(any(_YEAR_FORM.fullmatch(f) for f in g) or g & durations for g in groups)
+    return all(any(_YEAR.fullmatch(f) for f in g) or g & durations for g in groups)
 
 
 def _distinct_groups(text: str, asked: str) -> tuple[frozenset[str], ...]:
@@ -2890,15 +2889,16 @@ class Ledger:
             if item.state in (ITEM_INCLUDED, OMITTED, *NEEDS_REASON):  # a declared item passes the same check (R16)
                 rival_words = frozenset().union(*(_words(j.condition or j.label) for j in rivals))
                 rival_dates = frozenset().union(*(_condition_dates(j) for j in rivals))
+                asked_text = (asked or {}).get(item.component, "")
                 try:
-                    got, covering = _coverage_all(item, blocks, ws, shared, leads, rival_words, rival_dates, audit, (asked or {}).get(item.component, ""))
+                    got, covering = _coverage_all(item, blocks, ws, shared, leads, rival_words, rival_dates, audit, asked_text)
                 except Exception as exc:  # noqa: BLE001 - any failure of the check is "could not be completed", never "not used" (R17)
                     logger.warning("item coverage check could not be completed: %s", type(exc).__name__)
                     got, covering = Coverage(False, None, ITEM_UNCHECKED, checked=False), _NO_GIVING
                 if gone_blocks and not got.ok and got.checked:
                     try:
                         if (taken := _coverage_all(item, gone_blocks, ws, shared, gone_leads, rival_words, rival_dates, audit,
-                                                (asked or {}).get(item.component, ""))[0]).ok:
+                                                asked_text)[0]).ok:
                             removed_by[id(item)] = taken.unit
                     except Exception:  # noqa: BLE001 - a check of the removed text that fails only leaves the wording as it was
                         pass

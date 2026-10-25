@@ -63,7 +63,7 @@ def test_a_quote_whose_words_or_numbers_differ_is_not_found(text, quote):
 def test_the_exact_quote_is_found_where_it_is_and_every_occurrence_is_listed():
     text = "שווי השוק 5. שווי  השוק 6. שווי ה\nשוק 7."
     assert [text[a:b] for a, b in meaning.loose_spans(text, "שווי השוק")] == ["שווי השוק", "שווי  השוק", "שווי ה\nשוק"]
-    assert meaning.loose_contains(text, "שווי השוק") and not meaning.loose_contains(text, "שווי השוקים")
+    assert meaning.loose_hits(text, "שווי השוק") and not meaning.loose_hits(text, "שווי השוקים")
 
 
 # --- take_value: the quote ----------------------------------------------------------------------------------------------------------------

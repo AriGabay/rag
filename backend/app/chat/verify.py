@@ -1920,8 +1920,8 @@ def partial_reason_class(failure_kind: str | None, check: str | None = None) -> 
     the final check; any other mark is ``unspecified``. One rule for the answer's mark (``partial_summary``) and a claim's state
     (``timeline._unit_claim``)."""
     kind = failure_kind if failure_kind in FAILURE_KINDS else None
-    if check in (RESCUE_CHECK, RESCUE_OWN_CHECK, RESCUE_READ_CHECK):
-        return {RESCUE_CHECK: "rescued", RESCUE_OWN_CHECK: "rescued_own", RESCUE_READ_CHECK: "rescued_read"}[check]
+    if check in _RESCUE_CLASSES:
+        return _RESCUE_CLASSES[check]
     if check == COLUMN_UNKNOWN_CHECK:
         return "columns_unknown"
     if check == CONFIRM_CHECK:
@@ -4805,7 +4805,7 @@ def _vat_read_in_full(unit: Unit, ws: Workspace, number: str) -> bool:
                 return False
             continue
         src = ws.sources.get(sid)
-        if src is not None and (src.clipped or src.unread_regions or src.status in ("clipped", "has_unread_regions", "uncertain_reading")):
+        if src is not None and not meaning.passage_read_in_full(src):
             return False
     return True
 
@@ -4834,12 +4834,6 @@ def _vat_reasons(unit: Unit, numbers: Sequence[str]) -> list[str]:
 def _vat_problems(unit: Unit, ws: Workspace) -> list[str]:
     """VAT the unit gives a number that its cited sources do not give that number."""
     return _vat_reasons(unit, _vat_numbers(unit, ws)[0])
-
-
-def _vat_unconfirmed(unit: Unit, ws: Workspace) -> list[str]:
-    """The same for a VAT the sources are silent about but were not read in full for: not a problem to remove or edit for, a question for the stored
-    context of the source (the table's notes, the governing note), which ``_expand_qualifiers`` reads and cites when it attests the status."""
-    return _vat_reasons(unit, _vat_numbers(unit, ws)[1])
 
 
 def rests_on_documents(ws: Workspace, cid: str, _seen: frozenset = frozenset()) -> bool:
@@ -5055,10 +5049,13 @@ def deterministic(units: list[Unit], ws: Workspace, question: str,
             ws.scope_findings[_fact_key(u)] = dict(scope.cells)
         else:
             ws.scope_findings.pop(_fact_key(u), None)
-        for reason in _vat_problems(u, ws) if u.ids else []:
+        vat_firm, vat_unknown = _vat_numbers(u, ws) if u.ids else ([], [])  # (computed once: the firm ones are problems, the unknown ones below)
+        for reason in _vat_reasons(u, vat_firm):
             problems.append(Problem(u, reason, failure_kind="wrong_unit", check="vat"))
         if unconfirmed and u.ids and not any(p.check == "vat" and p.unit is u for p in problems):
-            problems += [Problem(u, reason, failure_kind="wrong_unit", check="vat", unconfirmed=True) for reason in _vat_unconfirmed(u, ws)]
+            # a VAT the sources are silent about but were not read in full for: not a problem to remove or edit for, a question for the stored context
+            # of the source (the table's notes, the governing note), which ``_expand_qualifiers`` reads and cites when it attests the status
+            problems += [Problem(u, reason, failure_kind="wrong_unit", check="vat", unconfirmed=True) for reason in _vat_reasons(u, vat_unknown)]
         blocking = [m for m in meanings.get(u.index, []) if m.blocking]
         if blocking:
             problems.append(Problem(u, "; ".join(m.reason for m in blocking), failure_kind="wrong_unit",
@@ -6043,7 +6040,7 @@ def _silent_vat_spans(u: Unit, ws: Workspace, text: str) -> list[tuple[int, int,
     return out or None
 
 
-def _read_in_full(u: Unit, ws: Workspace) -> bool:
+def _cited_read_in_full(u: Unit, ws: Workspace) -> bool:
     """Whether every source and value the unit cites was read in full and clearly (round 23 U2, R3, KTD3): a passage that was clipped, has
     regions not read or was read uncertainly, and a value whose own region stayed unclear, may hold the attribute the server would otherwise
     call unstated. A passage with no recorded status counts as read."""
@@ -6055,7 +6052,7 @@ def _read_in_full(u: Unit, ws: Workspace) -> bool:
                 return False
             continue
         src = ws.sources.get(sid)
-        if src is not None and (src.clipped or src.unread_regions or src.status in ("clipped", "has_unread_regions", "uncertain_reading")):
+        if src is not None and not meaning.passage_read_in_full(src):
             return False
     return True
 
@@ -6087,7 +6084,7 @@ def _qualifier_edits(u: Unit, ws: Workspace, question: str, blocking: list, vat:
     out: list[QualifierEdit] = []
     marked: set[str] = set()
     last = -1
-    complete = _read_in_full(u, ws)  # the sentence about the source ("not stated") needs a complete read of what the unit cites (round 23 U2)
+    complete = _cited_read_in_full(u, ws)  # the sentence about the source ("not stated") needs a complete read of what the unit cites (round 23 U2)
     for a, b, kind, written in sorted(set(found)):
         lead = a
         while a > 0 and text[a - 1] in " \t":
@@ -6371,6 +6368,7 @@ def _has_number(text: str, numbers: list[str]) -> bool:
 RESCUE_CHECK = "rescue"  # the check of the partial mark of a claim a source cited beside the sentence (or elsewhere in the answer) holds
 RESCUE_OWN_CHECK = "rescue_own"  # ... and of one that a source the sentence itself cites holds
 RESCUE_READ_CHECK = "rescue_read"  # ... and of one that a source the turn READ in the same document, unit and scope holds, that no sentence cites (round 23 U5, KTD9)
+_RESCUE_CLASSES = {RESCUE_CHECK: "rescued", RESCUE_OWN_CHECK: "rescued_own", RESCUE_READ_CHECK: "rescued_read"}  # the reason class of each (``partial_reason_class``)
 RESCUABLE_FAILURES = ("none", "absent_from_source", "contradicts_source")  # the failures of a claim a held source may rescue
 MSG_RESCUED = "נתמך במקור {sid}, שיחידה סמוכה בתשובה מצטטת, ולא במקור שהיחידה עצמה מצטטת; הנתון נשאר מסומן כמאומת חלקית"
 MSG_RESCUED_OWN = "המספר והמילים של הטענה נמצאים בשורה של {sid}, שהיחידה מצטטת, אך הבדיקה לא אישרה את מלוא הטענה; הנתון נשאר מסומן כמאומת חלקית"
@@ -6584,6 +6582,13 @@ def _rescue_sources(u: Unit, units: list[Unit], ws: Workspace, *, anywhere: bool
     return out
 
 
+def _rescue_source_pair(u: Unit, units: list[Unit], ws: Workspace, *, anywhere: bool = False,
+                        removed: Collection[int] = ()) -> tuple[list[str], list[str]]:
+    """``_rescue_sources`` without and with ``read``, in one pass: (the cited sources, those and then the sources the turn read from the same place)."""
+    cited = _rescue_sources(u, units, ws, anywhere=anywhere, removed=removed)
+    return cited, cited + [sid for sid in _read_sources(u, units, ws, removed) if sid not in cited]
+
+
 def _holding_source(u: Unit, claim: str, sids: list[str], ws: Workspace, question: str, lead: str = "",
                     cells: Collection[int] | None = None) -> str | None:
     """The first of ``sids`` that holds ``claim`` (``_holds_claim``) and is not another property's or another scope's for the unit. The unit is
@@ -6616,11 +6621,12 @@ def rescue_unstated(report: VerifyReport, units: list[Unit], ws: Workspace, ques
         if (p.check != "unstated_number" or not p.unstated or u.index < 0 or u.table_span is not None or u.table_header
                 or p.resolution == "qualifier"):
             continue
-        sids = [x for x in _rescue_sources(u, units, ws, anywhere=True, removed=removed, read=True) if x not in u.ids]
+        cited_by_units, offered = _rescue_source_pair(u, units, ws, anywhere=True, removed=removed)
+        sids = [x for x in offered if x not in u.ids]
         sid = _holding_source(u, _stated_text(u), sids, ws, question, leads.get(u.index, ""))
         if sid is None:
             continue
-        if sid not in _rescue_sources(u, units, ws, anywhere=True, removed=removed):
+        if sid not in cited_by_units:
             report.read_holders.add((u.index, sid))  # a source no sentence cites, read from the same place (round 23 U5)
         ids, before = list(u.ids), meanings.get(u.index, [])
         u.ids.append(sid)
@@ -6641,12 +6647,27 @@ def _rescue_own(u: Unit, sid: str, rescued_in: Mapping[int, str]) -> bool:
     return sid in u.ids and rescued_in.get(u.index) != sid
 
 
+def _rescue_ladder(u: Unit, sid: str, rescued_in: Mapping[int, str], read: Collection[tuple[int, str]] = ()) -> tuple[str, str]:
+    """The ``Problem.check`` and the message template of a rescued claim: held by a passage the turn read after the answer, by a passage the unit
+    itself cites, or by another source."""
+    if (u.index, sid) in read:
+        return RESCUE_READ_CHECK, MSG_RESCUED_READ
+    return (RESCUE_OWN_CHECK, MSG_RESCUED_OWN) if _rescue_own(u, sid, rescued_in) else (RESCUE_CHECK, MSG_RESCUED)
+
+
 def _rescue_check(u: Unit, sid: str, rescued_in: Mapping[int, str], read: Collection[tuple[int, str]] = ()) -> str:
-    return RESCUE_READ_CHECK if (u.index, sid) in read else RESCUE_OWN_CHECK if _rescue_own(u, sid, rescued_in) else RESCUE_CHECK
+    return _rescue_ladder(u, sid, rescued_in, read)[0]
 
 
 def _rescue_message(u: Unit, sid: str, rescued_in: Mapping[int, str], read: Collection[tuple[int, str]] = ()) -> str:
-    return (MSG_RESCUED_READ if (u.index, sid) in read else MSG_RESCUED_OWN if _rescue_own(u, sid, rescued_in) else MSG_RESCUED).format(sid=sid)
+    return _rescue_ladder(u, sid, rescued_in, read)[1].format(sid=sid)
+
+
+def _partly_verified(u: Unit, why: str, r: ClaimRecord | None, claim_id: str, check: str) -> Problem:
+    """The "partly verified" mark of a claim kept as decided, a claim whose number has no known column, or a rescued claim: placed in the cell of the
+    claim when it is one of a table row (``_cell_mark_end``), never a repair request."""
+    return Problem(u, PARTIAL_REASON_PREFIX + why, "partial", defect="none", check=check, claim_id=claim_id,
+                   cell_end=_cell_mark_end(u, r) if r is not None else None)
 
 
 def _cell_mark_end(u: Unit, r: ClaimRecord) -> int | None:
@@ -6720,8 +6741,7 @@ def rescue_judged(report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: W
             continue  # (a claim the judge needed more context for, or that was read again with it, is the judge's to settle)
         if u.table_span is not None and any(r.whole_unit or not r.exact or 0 in _claim_cells(u, r, cell_bounds(u.raw)) for r in failing):
             continue  # a row's key cell, or a claim of a row that is not placed in a cell
-        cited = _rescue_sources(u, report.units, ws, anywhere=u.index in anywhere, removed=removed)
-        sources = _rescue_sources(u, report.units, ws, anywhere=u.index in anywhere, removed=removed, read=True)
+        cited, sources = _rescue_source_pair(u, report.units, ws, anywhere=u.index in anywhere, removed=removed)
         found: dict[str, str | None] = {}
         bounds = cell_bounds(u.raw) if u.table_span is not None else None
         for r in failing:  # the first claim with no holder ends the try: the unit is not rescued
@@ -6755,7 +6775,7 @@ def rescue_judged(report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: W
 # "תא" as a table cell (never "תא שטח", a plot), or the English words
 _COLUMN_MISMATCH = re.compile(r"(?<![א-ת])[הבמלכו]{0,2}(?:עמודה|עמודת|עמודות)(?![א-ת])|(?<![א-ת])[הבמלכו]{0,2}תא(?![א-ת])(?!\s+ה?שטח)"
                               r"|\bcolumns?\b|\bcells?\b", re.IGNORECASE)
-COLUMN_FAILURES = (*RESCUABLE_FAILURES, "wrong_unit")  # the failures of a claim that a column mismatch alone may explain
+CONFIRMABLE_FAILURES = (*RESCUABLE_FAILURES, "wrong_unit")  # the failures of a claim that a column mismatch alone may explain, and that a second reading may overturn (U5)
 MSG_COLUMN_UNKNOWN = ("המספר כתוב בשורת טקסט שהשרת לא הצליח לשייך לעמודות שלה (אין מיקומי מילים שמורים), ולכן ההתאמה של הטענה לעמודה או לתא "
                       "לא נבדקה; הנתון נשאר מסומן כמאומת חלקית")
 
@@ -6781,7 +6801,7 @@ def column_unknown_marks(report: VerifyReport, verdicts: dict[int, JudgeVerdict]
         failing = [r for r in recs if r.verdict in ("unsupported", "contradicts")]
         if not led and not (failing and v.verdict in ("unsupported", "contradicts", "partial") and _COLUMN_MISMATCH.search(v.reason)):
             continue
-        if any(r.failure not in COLUMN_FAILURES or r.needs_context != "none" or r.rereads for r in failing) or not (failing or led):
+        if any(r.failure not in CONFIRMABLE_FAILURES or r.needs_context != "none" or r.rereads for r in failing) or not (failing or led):
             continue
         for r in failing:
             r.verdict, r.failure = "partial", "none"
@@ -9966,7 +9986,6 @@ CONFIRM_LABEL = "verify_confirm"  # the usage purpose of the confirming call
 CONFIRM_MIN_SECONDS = REREAD_MIN_SECONDS  # a confirming call does not start with less of the allowance left
 CONFIRM_CHECK = "confirm_split"  # the check of the partial mark of a claim the second reading kept
 CONFIRM_SKIPS = ("cap", "no_time", "check_failed")  # why a claim was not confirmed
-CONFIRMABLE_FAILURES = (*RESCUABLE_FAILURES, "wrong_unit")  # the failures a second reading may overturn
 MSG_CONFIRM_SPLIT = ("שתי קריאות בלתי תלויות של הטענה מול המקורות לא הסכימו, והשנייה מצאה אותה נתמכת; "
                      "הנתון נשאר מסומן כמאומת חלקית")
 
@@ -10432,28 +10451,23 @@ def verify_answer(provider: LLMProvider, answer: FinalAnswer, ws: Workspace, que
                     kind = (r.failure_kind() if r is not None and (r.verdict in ("unsupported", "contradicts")
                                                                    or r.failure == CONTEXT_NOT_READ)
                             else DEFECT_FAILURES.get(v.defect))
-                    if (r.id if r is not None else recs[0].id) in kept_marks:  # kept by the second reading (round 23 U5): marked, never cut
-                        report.problems.append(Problem(u, PARTIAL_REASON_PREFIX + why, "partial", defect="none", check=CONFIRM_CHECK,
-                                                       claim_id=r.id if r is not None else recs[0].id,
-                                                       cell_end=_cell_mark_end(u, r) if r is not None else None))
+                    claim_id = r.id if r is not None else recs[0].id
+                    if claim_id in kept_marks:  # kept by the second reading (round 23 U5): marked, never cut
+                        report.problems.append(_partly_verified(u, why, r, claim_id, CONFIRM_CHECK))
                         continue
                     if u.index in unbound and (r is None or r.verdict == "partial"):  # the column of the number is unknown: marked, never cut (U4)
-                        report.problems.append(Problem(u, PARTIAL_REASON_PREFIX + why, "partial", defect="none", check=COLUMN_UNKNOWN_CHECK,
-                                                       claim_id=r.id if r is not None else recs[0].id,
-                                                       cell_end=_cell_mark_end(u, r) if r is not None else None))
+                        report.problems.append(_partly_verified(u, why, r, claim_id, COLUMN_UNKNOWN_CHECK))
                         continue
                     if (r.id in held) if r is not None else bool(held):  # a rescued claim: marked in place, no repair round (U9, F5)
-                        report.problems.append(Problem(u, PARTIAL_REASON_PREFIX + why, "partial", defect="none",
-                                                       check=_rescue_check(u, held[r.id] if r is not None else next(iter(held.values())), rescued_in,
-                                                                           report.read_holders),
-                                                       claim_id=r.id if r is not None else recs[0].id,
-                                                       cell_end=_cell_mark_end(u, r) if r is not None else None))
+                        report.problems.append(_partly_verified(
+                            u, why, r, claim_id,
+                            _rescue_check(u, held[r.id] if r is not None else next(iter(held.values())), rescued_in, report.read_holders)))
                         continue
                     # a supported number the judge doubts only in its unit or scope: the mark states what was not verified (the failure
                     # kind), and the sentence is not a repair request (round 21 U9, KTD5)
                     report.problems.append(Problem(u, PARTIAL_REASON_PREFIX + why, "partial", defect="none" if keeps else v.defect,
                                                    failure_kind=kind, check="judge",
-                                                   claim_id=r.id if r is not None else recs[0].id))
+                                                   claim_id=claim_id))
             elif named := [s for s in dict.fromkeys(v.supported_by) if s not in u.ids]:
                 # supported by a shown source the unit does not cite: kept, and cited, only if the numbers agree
                 found_for_named: list[str] = []
@@ -11415,7 +11429,7 @@ class SupportScope:
 
     def verbatim(self, sid: str, src: Source, flat: str) -> bool:
         """Whether the quote ``flat`` is in the source's text (flattened once per source), exactly. Round 23: the loose comparison
-        ``take_value`` and the anchor locator make (``meaning.loose_contains``) is NOT used here - on the stored real drafts every judge quote it
+        ``take_value`` and the anchor locator make (``meaning.loose_hits``) is NOT used here - on the stored real drafts every judge quote it
         newly admitted became a "read and not used" line about a part the answer gives (the presence tests read the quote's own words), 4 of 4
         wrong, none right; a quote of a source that splits a word stays no item until those tests read split words too."""
         if sid not in self._flat:

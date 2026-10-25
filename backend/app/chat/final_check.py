@@ -528,6 +528,12 @@ class _Final:
         self._voters = None
         return before != {rid: [v.model_dump_json() for v in new] for rid, new in votes.items()}
 
+    def keep_as_decided(self, f: FinalUnit, res: Checked) -> None:
+        """A sentence whose failing claims the verification settled as kept stays: accepted, and marked partly verified (round 23 U5, R9, KTD9)."""
+        self.accept(f, "partial")
+        res.mutated |= self.mark(Problem(self.drafts[f.drafts[0]], FINAL_PARTIAL, "partial", defect="none", check="final"))
+        self.stats["kept_by_decision"] += 1
+
     def decide(self, f: FinalUnit, v: JudgeVerdict, res: Checked) -> None:
         """What the judge's verdict on a unit of the saved text means (the unit is already shown the server's spans as
         such): supported — it passes; partly supported with no concrete defect — it passes, marked; supported by a source it
@@ -542,9 +548,7 @@ class _Final:
                 self.report.settled, u, unit_claims(u, v, self.ws), self.ws, self.digests):
             # round 23 U5 (R9, KTD9): every claim this reading fails is one the verification settled as kept - a source holds it, or a second reading
             # stood it - for the same datum and sources: that decision stands, and the sentence keeps the partly verified mark
-            self.accept(f, "partial")
-            res.mutated |= self.mark(Problem(self.drafts[f.drafts[0]], FINAL_PARTIAL, "partial", defect="none", check="final"))
-            self.stats["kept_by_decision"] += 1
+            self.keep_as_decided(f, res)
             return
         if v.verdict in ("unsupported", "contradicts"):
             res.failures.append(Failure(f.drafts, _judged_failure(u, v, self.ws),
@@ -559,9 +563,7 @@ class _Final:
             return
         if len(f.drafts) == 1 and any(c.verdict in ("unsupported", "contradicts") for c in claims) and kept_by_decision(
                 self.report.settled, u, claims, self.ws, self.digests):
-            self.accept(f, "partial")  # (a partly supported sentence whose failing claims the verification settled as kept: as above)
-            res.mutated |= self.mark(Problem(self.drafts[f.drafts[0]], FINAL_PARTIAL, "partial", defect="none", check="final"))
-            self.stats["kept_by_decision"] += 1
+            self.keep_as_decided(f, res)  # (a partly supported sentence whose failing claims the verification settled as kept: as above)
             return
         if v.verdict == "partial" and (failing or v.defect != "none") and not self.attribute_only(f, v, failing) or (
                 v.verdict == "supported" and any(c.verdict in ("unsupported", "contradicts") for c in claims)):

@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from statistics import median
+
+from app.answering.numread import _YEAR
 
 HEBREW = re.compile(r"[֐-׿]")
 _STRIP = "()[]₪$€£%-−–+*:;"
 _NUMBER = re.compile(r"\d[\d.,]*\d|\d")
-_YEAR = re.compile(r"(?:19|20)\d\d")
 _TOKEN = re.compile(r"\S+")
 _SUFFIX_SIGNS = {"%", "‰"}
 
@@ -338,7 +339,7 @@ class Binding:
     reason: str = ""
     served: str = ""
     parts: tuple[Part, ...] = ()
-    labels: tuple[str, ...] = field(default=())  # the label of each cell, in drawn order
+    labels: tuple[str, ...] = ()  # the label of each cell, in drawn order
 
 
 NOT_A_ROW = Binding(NOT_ROW)

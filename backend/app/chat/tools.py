@@ -160,7 +160,7 @@ import math
 import re
 import time
 from collections import Counter
-from collections.abc import Callable, Container, Iterable
+from collections.abc import Callable, Container, Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -6400,17 +6400,20 @@ def _header_conflict(pieces: Iterable[str]) -> set[str]:
     return {x for u in stated for x in u}
 
 
+def _leading_text_rows(rows: list[list[str]], ri: int) -> Iterator[list[str]]:
+    """The leading rows before ``ri``, at most two, up to the first row that writes a digit in any cell (the multi-row header and the lines that
+    span a table, round 23 U2 and U6)."""
+    for r in rows[:min(ri, 2)]:
+        if any(re.search(r"\d", c or "") for c in r):
+            return
+        yield r
+
+
 def _rows_under_header(rows: list[list[str]], ri: int, ci: int) -> list[str]:
     """The cells of column ``ci`` in the rows that sit between a table's header row and its first row of numbers, when the header is more than
     one row (round 23 U6, M8: the unit word in "₪ למ״ר" under a group heading is in the second header row): the leading rows before ``ri``
     that write no digit in any cell, at most two. The stored header is one row; the rest of a multi-row header is stored as the first rows."""
-    out: list[str] = []
-    for r in rows[:min(ri, 2)]:
-        if any(re.search(r"\d", c or "") for c in r):
-            break
-        if ci < len(r) and r[ci]:
-            out.append(str(r[ci]))
-    return out
+    return [str(r[ci]) for r in _leading_text_rows(rows, ri) if ci < len(r) and r[ci]]
 
 
 def _spanning_rows(rows: list[list[str]], ri: int, ci: int) -> list[str]:
@@ -6418,9 +6421,7 @@ def _spanning_rows(rows: list[list[str]], ri: int, ci: int) -> list[str]:
     that hold text in exactly one cell and none in column ``ci`` — a unit or scale line that spans the table ("(באלפי ₪)" in the first cell, the
     others empty). It belongs to every column that has no header cell of its own there, so it is read with the table's caption and title."""
     out: list[str] = []
-    for r in rows[:min(ri, 2)]:
-        if any(re.search(r"\d", c or "") for c in r):
-            break
+    for r in _leading_text_rows(rows, ri):
         filled = [str(c) for c in r if c]
         if len(filled) == 1 and not (ci < len(r) and r[ci]):
             out.append(filled[0])
@@ -7154,13 +7155,6 @@ def _stored_place(found: anchors.Located, remap: dict[int, tuple]) -> anchors.Lo
     return anchors.Located(segments, number, found.blocks)
 
 
-def _read_in_full(src: Source) -> bool:
-    """Whether a source passage was read in full and clearly: not clipped, no region left unread, not read uncertainly (a passage with no
-    recorded status counts as read; round 23 U2, follow-up 1)."""
-    return not (getattr(src, "clipped", False) or getattr(src, "unread_regions", None)
-                or getattr(src, "status", None) in ("clipped", "has_unread_regions", "uncertain_reading"))
-
-
 def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = None,
                 governing: Callable[[int], str | _ScaleNote] | None = None, table_notes: Iterable[str] = (),
                 remap: dict[int, tuple] | None = None) -> dict:
@@ -7261,7 +7255,7 @@ def _take_quote(src: Source, full: str, loc: dict, blocks: list[tuple] | None = 
             "source_text": full,  # the source the quote is of: a kind or a unit its fragment lacks is confirmed in the number's own clause (round 21 U3)
             # the period, area basis and VAT are read from the source's text around the quote (``number_qualifiers``): complete unless the passage
             # was clipped or left regions unread (round 23 U2, follow-up 1); kind and unit are settled by the isolated clause (``_settle_meaning``)
-            "read": dict.fromkeys(("period", "area_basis", "vat"), _read_in_full(src)),
+            "read": dict.fromkeys(("period", "area_basis", "vat"), meaning.passage_read_in_full(src)),
             "total": False, "table": None,
             "anchor": anchor, "said": said, "context": f"{line}\n{quote}",
             "meaning_from": {"unit": unit_from} if unit_from else {}, "scale": scale,

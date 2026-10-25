@@ -1238,10 +1238,11 @@ def loose_spans(text: str, quote: str) -> list[tuple[int, int]]:
     return [(a, b) for a, b, _ in loose_hits(text, quote)]
 
 
-def loose_contains(text: str, quote: str) -> bool:
-    """Whether ``text`` holds ``quote`` ignoring whitespace and a line-wrap hyphen inside a word: the verbatim test a quote of a source
-    passes when the source's stored text splits a word. A real difference of a letter, a word or a number still fails it."""
-    return bool(loose_hits(text, quote))
+def passage_read_in_full(src) -> bool:
+    """Whether a source passage was read in full and clearly: not clipped, no region left unread, not read uncertainly (a passage with no
+    recorded status counts as read; round 23 U2, follow-up 1). The one predicate every "was this passage read in full" decision uses."""
+    return not (getattr(src, "clipped", False) or getattr(src, "unread_regions", None)
+                or getattr(src, "status", None) in ("clipped", "has_unread_regions", "uncertain_reading"))
 
 
 # a percentage a row's NAME carries ("תשואה 7%", "היוון 6.5%", "(7%)"): part of what the row is called, never the unit of its cell
@@ -1799,7 +1800,7 @@ def _evidence(unit: Unit, ws: Workspace, forms: frozenset[str]) -> tuple[list[Oc
         if src is None:
             continue
         occ, gen = source_occurrences(src.text, set(forms))
-        if src.clipped or src.unread_regions or src.status in ("clipped", "has_unread_regions", "uncertain_reading"):
+        if not passage_read_in_full(src):
             for o in occ:  # a passage that was clipped may hold what it seems silent about
                 o.read = frozenset()
         occurrences += occ

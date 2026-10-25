@@ -1,5 +1,5 @@
 """Round 23: the judge-support check compares a quote with the source exactly (flattened blanks only). The loose comparison of ``take_value``
-and the anchor locator (``meaning.loose_contains``) was tried here and withdrawn: on stored real drafts every quote it newly admitted became a
+and the anchor locator (``meaning.loose_hits``) was tried here and withdrawn: on stored real drafts every quote it newly admitted became a
 wrong "read and not used" line. A real difference fails either way. Synthetic text only."""
 
 from __future__ import annotations

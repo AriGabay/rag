@@ -410,7 +410,7 @@ def test_edit_a_cited_passage_is_read_in_full_only_when_it_was_not_clipped_or_le
     ws = _ws("שכר דירה 5,000 ₪")
     src = ws.sources["S1"]
     src.status, src.clipped, src.unread_regions = status, clipped, regions
-    assert verify._read_in_full(split_units("שכר הדירה הוא 5,000 ₪ [S1].")[0], ws) is expected
+    assert verify._cited_read_in_full(split_units("שכר הדירה הוא 5,000 ₪ [S1].")[0], ws) is expected
 
 
 # --- G01 flow: the basis a source states in either spelling is the draft's basis, not a second one ---------------------------------------------
