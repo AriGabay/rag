@@ -4442,3 +4442,25 @@ def test_post_review_an_answer_stating_the_datums_own_copular_negation_in_anothe
 def test_post_review_protection_an_answer_that_says_the_datum_is_absent_keeps_its_gap_line():
     lines, gaps = _copular_gap_lines("לא נמצא נתון השוואה בהצעות במכרז [S2].")
     assert len(lines) == 1 and len(gaps) == 1
+
+
+def test_the_tables_of_the_coverage_note_come_in_id_order_whatever_the_process_hash_order():
+    """Round 23: the cited ids were read from a set, so two tables of one answer were listed in an order that changed between processes
+    (the same stored answer gave two different coverage notes). The tables now come in id order (S2 before S10)."""
+    import uuid
+
+    from app.chat import coverage
+    from app.chat.tools import Workspace
+
+    ws = Workspace(ctx=None)
+    doc = uuid.uuid4()
+    ids = []
+    for n, title in enumerate(("טבלת שווי א", "טבלת שווי ב")):
+        text = "הטבלה: 3 שורות\nשם | שווי\nדירה 1 | 100\nדירה 2 | 200\nדירה 3 | 300"
+        src = ws.add_source(document_id=doc, version_id=uuid.uuid4(), title=title, section="נספח", location="עמוד 1",
+                            kind="table", text=text, table_index=n)
+        ids.append(src.sid)
+    first, second = ids
+    for md in (f"הערך 100 [{second}] והערך 200 [{first}].", f"הערך 200 [{first}] והערך 100 [{second}]."):
+        got = [t["title"] for t in coverage.tables_presented(ws, md)]
+        assert got == ["טבלת שווי א", "טבלת שווי ב"]

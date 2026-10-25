@@ -1105,11 +1105,27 @@ def test_the_cap_is_per_turn_and_a_claim_past_it_keeps_the_original_removal_reco
     assert _purposes(u1).count("verify_confirm") == 1 and _purposes(u2).count("verify_confirm") == 0
 
 
-def test_with_too_little_time_the_original_behaviour_stands_and_the_skip_is_recorded(confirm_on, monkeypatch):
-    monkeypatch.setattr(verify, "_reread_time_left", lambda deadline: False)
-    a, report, usage = _confirm_run(lambda t: "unsupported", lambda t: "supported")
+def test_the_confirm_floor_is_the_first_call_floor_of_a_judge_batch():
+    """Round 23 review #11: a confirming call needs what a first judge call needs (the p99 of healthy calls), not the re-read's 10 seconds."""
+    assert verify.CONFIRM_MIN_SECONDS == verify.JUDGE_FIRST_CALL_MIN_SECONDS
+
+
+@pytest.mark.parametrize("left", [verify.CONFIRM_MIN_SECONDS / 4, verify.REREAD_MIN_SECONDS * 2, verify.CONFIRM_MIN_SECONDS - 5])
+def test_with_too_little_time_the_original_behaviour_stands_and_the_skip_is_recorded(confirm_on, left):
+    """Less than ``CONFIRM_MIN_SECONDS`` of the allowance left (even when a re-read would still start): no confirming call, recorded ``no_time``."""
+    usage: list = []
+    report = verify_answer(_two_calls(lambda t: "unsupported", lambda t: "supported"), _answer(f"{FIGURE} [S1]."), _same_doc_ws(FIGURE_SRC), "?",
+                           usage, deadline=time.monotonic() + left)
     assert report.removed_units() == {0} and _purposes(usage) == ["verify"]
     assert report.confirm_summary()["skipped"] == {"no_time": 1} and report.confirm_summary()["calls"] == 0
+
+
+def test_with_the_time_for_a_first_judge_call_the_confirming_call_runs(confirm_on):
+    usage: list = []
+    report = verify_answer(_two_calls(lambda t: "unsupported", lambda t: "supported"), _answer(f"{FIGURE} [S1]."), _same_doc_ws(FIGURE_SRC), "?",
+                           usage, deadline=time.monotonic() + verify.CONFIRM_MIN_SECONDS * 3)
+    assert report.removed_units() == set() and _purposes(usage) == ["verify", "verify_confirm"]
+    assert not report.confirm_summary()["skipped"] and report.confirm_summary()["calls"] == 1
 
 
 @pytest.mark.parametrize("status", [CallStatus.TIMEOUT, CallStatus.INVALID])

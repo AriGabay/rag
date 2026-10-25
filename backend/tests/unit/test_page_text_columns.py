@@ -218,3 +218,115 @@ def test_a_row_that_ends_with_its_date_is_a_row_and_a_date_inside_prose_is_not()
     assert C.row_shape("1.25% 7,000 01.02.27") is not None
     assert C.number_token("31/12/2026") and C.number_token("1.2.27")
     assert C.row_shape("the deal closed on 31/12/2026 at 4,000") is None  # a sentence stays no row
+
+
+# --- header pick and ambiguity heuristics (round 23 review #2) ---------------------------------------------------------------------------
+# Tests only: the heuristics of ``pick_header`` (the stack, the prose line, the years-only line) and the two ways a row stays unknown on purpose
+# (an ambiguous column, a row of several lines). Invented labels and figures.
+
+ROW_AT = 200.0  # the row's top in these tests; a header line directly above it sits at ROW_AT - 2 * (H + 2) or so
+
+
+def _row(top: float = ROW_AT):
+    return block([("Cost", 20, 60), ("1,100", 100, 140), ("2,200", 200, 240), ("3,300", 300, 340)], top=top)
+
+
+TOTALS = [("Total", 100, 130), ("Total", 200, 230), ("Total", 300, 330)]
+
+
+def test_a_label_line_beyond_the_stack_gap_above_the_header_does_not_contribute():
+    far = attempt(1, block(TOTALS, top=100), block(QUARTERS, top=150))  # 40 above the Q line's top (gap 40 - H = 30 > LINE_GAP * H)
+    near = attempt(1, block(TOTALS, top=138), block(QUARTERS, top=150))  # directly above it: part of the stack
+    b = C.bind(*_row(), [far])
+    assert b.status == C.BOUND and b.labels == ("Q1", "Q2", "Q3")
+    assert b.served == "Cost — Q1: 1,100; Q2: 2,200; Q3: 3,300"
+    assert C.bind(*_row(), [near]).labels == ("Total Q1", "Total Q2", "Total Q3")  # negative control: the same line, stacked
+    assert [ln.top for ln in C.pick_header(far, [(100, 140)])] == [150.0]
+    # the gap is measured per line: a third line just above the far one is cut with it, whatever it says
+    cut = attempt(1, block([("Report", 100, 130), ("Report", 200, 230), ("Report", 300, 330)], top=88), block(TOTALS, top=100), block(QUARTERS, top=150))
+    assert C.bind(*_row(), [cut]).labels == ("Q1", "Q2", "Q3")
+
+
+PROSE = "The figures below were prepared for the annual review".split()  # nine words
+
+
+def _prose(n: int, top: float):
+    return block([(w, 20 + 34 * i, 50 + 34 * i) for i, w in enumerate(PROSE[:n])], top=top)
+
+
+def test_a_prose_line_of_seven_words_between_the_header_and_the_row_is_skipped_and_the_header_below_still_binds():
+    header = block(QUARTERS, top=100)
+    for n in (7, 9):
+        lines = attempt(1, header, _prose(n, top=130))  # the prose is nearer the row than the header, and over its columns
+        b = C.bind(*_row(), [lines])
+        assert b.status == C.BOUND and b.served == "Cost — Q1: 1,100; Q2: 2,200; Q3: 3,300", (n, b)
+        assert [ln.top for ln in C.pick_header(lines, [(100, 140)])] == [100.0]
+    # negative control: a line of six words is still a label group, so it is the header the row is read under (here, over two of its columns)
+    six = attempt(1, header, _prose(6, top=130))
+    assert [ln.top for ln in C.pick_header(six, [(100, 140)])][0] == 130.0
+    assert C.bind(*_row(), [six]).labels != ("Q1", "Q2", "Q3")
+
+
+def test_a_header_of_years_only_binds_and_a_line_with_another_number_is_no_header():
+    years = attempt(1, block([("2022", 100, 130), ("2023", 200, 230), ("2024", 300, 330)], top=150))
+    b = C.bind(*_row(), [years])
+    assert b.status == C.BOUND and b.served == "Cost — 2022: 1,100; 2023: 2,200; 2024: 3,300"
+    assert C.bind(*_row(), [years]).labels == ("2022", "2023", "2024")
+    # negative controls: a line of values (a number that is no year) is no header, a year with a letter-bearing label stays one
+    values = attempt(1, block([("2022", 100, 130), ("5,400", 200, 230), ("2024", 300, 330)], top=150))
+    assert C.bind(*_row(), [values]).status == C.UNKNOWN
+    mixed = attempt(1, block([("FY2022", 100, 140), ("2023", 200, 230), ("2024", 300, 330)], top=150))
+    assert C.bind(*_row(), [mixed]).status == C.BOUND
+
+
+AMBIGUOUS_STACK = [
+    [("Gross", 100, 130), ("Net", 150, 180), ("Zone", 300, 330)],  # two groups of one line ...
+    [("rent", 100, 140)],  # ... a label over the first only ...
+    [("annual", 135, 160), ("area", 300, 330)],  # ... and one that overlaps that label and the second group: one column holds both groups
+]
+
+
+def _two_cells(top: float = 190.0):
+    return block([("Lot", 20, 50), ("5", 110, 138), ("7", 300, 320)], top=top)
+
+
+def test_a_header_whose_two_groups_of_one_line_fall_in_one_column_leaves_the_number_unknown():
+    text, spans = _two_cells()
+    ambiguous = attempt(1, stack(AMBIGUOUS_STACK, top=140))
+    cols = C.columns_of(C.pick_header(ambiguous, [(110, 138), (300, 320)]))
+    assert [c.ambiguous for c in cols] == [True, False]
+    b = C.bind(text, spans, [ambiguous])
+    assert b.status == C.UNKNOWN and b.reason == "a number under no label or two"
+    # negative control: without the label that joins the two groups the same row is bound
+    clear = attempt(1, stack([AMBIGUOUS_STACK[0], AMBIGUOUS_STACK[1], [("area", 300, 330)]], top=140))
+    assert C.bind(text, spans, [clear]).status == C.BOUND
+    assert C.bind(text, spans, [clear]).labels == ("Gross rent", "Zone area")
+
+
+def test_a_row_whose_words_carry_two_line_numbers_is_unknown_several_lines():
+    text, spans = block([("Cost", 20, 60), ("1,100", 100, 140), ("2,200", 200, 240), ("3,300", 300, 340)], top=ROW_AT)
+    assert C.bind(text, spans, [quarter_header()]).status == C.BOUND
+    for k in (1, 2, 3):  # whichever word is on another line, and the number of words that are
+        moved = [list(s) for s in spans]
+        for s in moved[k:]:
+            s[0] = 1
+        b = C.bind(text, moved, [quarter_header()])
+        assert b.status == C.UNKNOWN and b.reason == "several lines", (k, b)
+        assert not b.served
+
+
+def test_a_header_stack_longer_than_the_most_lines_is_cut_at_that_many():
+    words = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
+    assert len(words) > C.MAX_HEADER_LINES
+    rows = [[(w, 100, 130), (w.upper(), 200, 230)] for w in words]  # eight lines, one under another, each overlapping the next
+    header = attempt(1, stack(rows, top=100))
+    picked = C.pick_header(header, [(100, 140)])
+    assert len(picked) == C.MAX_HEADER_LINES
+    text, spans = block([("Lot", 20, 50), ("1,100", 100, 140), ("2,200", 200, 240)], top=100 + len(words) * (H + 2) + 4)
+    b = C.bind(text, spans, [header])
+    assert b.status == C.BOUND
+    assert b.labels[0] == " ".join(words[-C.MAX_HEADER_LINES:])  # the nearest six, top to bottom: the two lines above them do not contribute
+    assert "alpha" not in b.labels[0] and "beta" not in b.labels[0]
+    # negative control: a stack of exactly the most lines is whole
+    few = attempt(1, stack(rows[:C.MAX_HEADER_LINES], top=100))
+    assert len(C.pick_header(few, [(100, 140)])) == C.MAX_HEADER_LINES

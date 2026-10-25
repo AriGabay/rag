@@ -1536,10 +1536,12 @@ def decision_for(settled: Mapping[str, Sequence[Settled]], key: str, wording: st
                  loose: bool = False) -> Settled | None:
     """The decision recorded under a datum key for a claim of this wording and context: exactly, or with ``loose`` also when one wording holds
     the other (a sentence the final check judges as saved holds the claim a verification decided). A claim of too few words is told apart by its
-    unit's text too (``Settled.unit_wording``). The context is always the same: a decision is not carried under another heading or table header."""
+    unit's text too (``Settled.unit_wording``), loose or not: ``loose`` widens only the claim's wording (round 23 review #8), so the decision for a bare
+    cell of one row does not keep the equal-number cell of another. The context is always the same: a decision is not carried under another heading
+    or table header."""
     for entry in settled.get(key, []):
         same = entry.wording == wording or (loose and _same_span(entry.wording, wording))
-        if same and entry.context == context and (entry.unit_wording == unit_wording or loose or not entry.unit_wording):
+        if same and entry.context == context and (entry.unit_wording == unit_wording or not entry.unit_wording):
             return entry
     return None
 
@@ -1554,7 +1556,8 @@ def kept_by_decision(settled: Mapping[str, Sequence[Settled]], unit: Unit, claim
         return False
     for c in failing:
         text = _without_server(unit.text if c.whole_unit else c.span, unit.server)  # (a marker the server wrote is no number of the claim)
-        known = decision_for(settled, datum_key(unit, text, ws, digests), _norm(_IDS.sub("", text)), "", unit_context(unit), loose=True)
+        known = decision_for(settled, datum_key(unit, text, ws, digests), _norm(_IDS.sub("", text)), _norm(_without_server(unit.text, unit.server)),
+                             unit_context(unit), loose=True)
         if known is None or known.decision not in ("rescued", "split"):
             return False
     return True
@@ -6780,11 +6783,35 @@ MSG_COLUMN_UNKNOWN = ("המספר כתוב בשורת טקסט שהשרת לא �
                       "לא נבדקה; הנתון נשאר מסומן כמאומת חלקית")
 
 
+def _in_unbound_row(ws: Workspace, src: Source, claim_text: str) -> bool | None:
+    """Whether the number(s) of a claim are located in a row of ``src`` that the server recorded as unbound (round 23 review #1): True when every
+    number of the claim that the source states stands in the text of a row in ``ws.column_unknown`` (``ws.column_bindings`` keeps each row's
+    text beside its block); False when a number the source states stands in no unbound row (a bound row, or a part of the source that is no
+    recorded row), or the claim has a number that the source does not state; None when it cannot be decided from the stored records (an unbound
+    row of the source's blocks whose text was not recorded, or a claim without a number)."""
+    nums = numbers_in(claim_text)
+    if not nums or src.version_id is None or src.block_start is None:
+        return None
+    vid = str(src.version_id)
+    end = src.block_end if src.block_end is not None else src.block_start
+    unknown = {b for v, b in ws.column_unknown if v == vid and src.block_start <= b <= end}
+    texts = {b: t for (v, b, t) in ws.column_bindings if v == vid and b in unknown}
+    if not unknown or unknown - set(texts):
+        return None
+    stated = nums & numbers_in(src.text)
+    if stated != nums:
+        return False
+    return bool(stated) and stated <= set().union(*(numbers_in(t) for t in texts.values()))
+
+
 def column_unknown_marks(report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: Workspace, skip: set[int],
                          reasons: dict[str, str]) -> set[int]:
     """The units whose failure rests only on a column or cell mismatch of a page-text row whose column binding is unknown (round 23 U4, KTD8,
-    R5; judge rule 36): the unit cites a source that holds such a row (``tools.column_binding_note``) and the judge's reason leads with
-    ``COLUMN_UNKNOWN_MARK`` or, for an ``unsupported`` or ``contradicts`` verdict, names a column or cell. Their failing claims become
+    R5; judge rule 36): the unit cites a source that holds such a row (``tools.column_binding_note``), and (a) the judge's reason leads with
+    ``COLUMN_UNKNOWN_MARK`` or, as a fallback, names a column or cell while every failing claim's failure is ``none`` or ``wrong_unit`` (a
+    regex hit alone never converts an ``absent_from_source`` or ``contradicts_source`` claim: the source states another number), and (b) every
+    failing claim's number is located in a row recorded as unbound for a cited source (``_in_unbound_row``) - not merely somewhere in the source's
+    block range; when (b) cannot be decided from the stored records, the judge's led marker (a) must hold. Their failing claims become
     partly supported (a mark, no repair round), never a cut; a bound row, a row whose failure is another (an absent number, a subject, a unit
     or period the source states otherwise are the judge's as before) and a claim the judge needed more context for are judged as usual.
     All or nothing for a unit, as ``rescue_judged``. ``skip``: the units already decided."""
@@ -6795,13 +6822,20 @@ def column_unknown_marks(report: VerifyReport, verdicts: dict[int, JudgeVerdict]
         v, recs = verdicts.get(u.index), report.claims.get(u.index)
         if v is None or not recs or u.index in skip or v.verdict in ("supported", "not_factual", "navigation"):
             continue
-        if not any(T.column_binding_note(ws, ws.sources[i]) for i in u.ids if i in ws.sources):
+        sources = [ws.sources[i] for i in dict.fromkeys(u.ids) if i in ws.sources and T.column_binding_note(ws, ws.sources[i])]
+        if not sources:
             continue
         led = v.reason.lstrip().startswith(COLUMN_UNKNOWN_MARK)
         failing = [r for r in recs if r.verdict in ("unsupported", "contradicts")]
-        if not led and not (failing and v.verdict in ("unsupported", "contradicts", "partial") and _COLUMN_MISMATCH.search(v.reason)):
+        regex = bool(failing) and v.verdict in ("unsupported", "contradicts", "partial") and bool(_COLUMN_MISMATCH.search(v.reason))
+        if not led and not regex:
             continue
         if any(r.failure not in CONFIRMABLE_FAILURES or r.needs_context != "none" or r.rereads for r in failing) or not (failing or led):
+            continue
+        if not led and any(r.failure not in ("none", "wrong_unit") for r in failing):
+            continue
+        located = [_claim_unbound_state(u, r, sources, ws) for r in failing]
+        if any(x is False for x in located) or (not led and not all(located)):
             continue
         for r in failing:
             r.verdict, r.failure = "partial", "none"
@@ -6811,6 +6845,13 @@ def column_unknown_marks(report: VerifyReport, verdicts: dict[int, JudgeVerdict]
             report.verdicts[u.index], report.unit_verdicts[u.index] = v.verdict, v
         marked.add(u.index)
     return marked
+
+
+def _claim_unbound_state(u: Unit, r: ClaimRecord, sources: list[Source], ws: Workspace) -> bool | None:
+    """``_in_unbound_row`` over the cited sources that carry the note: True when one of them locates the claim's number in an unbound row, False
+    when every decidable one places it elsewhere, None when none can tell."""
+    states = [_in_unbound_row(ws, src, _without_server(u.text if r.whole_unit else r.text, u.server)) for src in sources]
+    return True if any(x is True for x in states) else (False if any(x is False for x in states) else None)
 
 
 SOURCE_SENTENCE_CHARS = 300  # the longest sentence of a source that is quoted back as a number's own wording
@@ -9979,11 +10020,12 @@ def _reread(provider: LLMProvider, report: VerifyReport, verdicts: dict[int, Jud
 # from the same place that hold its numbers (``_confirm_candidates``). Removed only if both readings fail it; if the second reading stands it,
 # the claim is kept, marked partly verified (``CONFIRM_CHECK``), never fully verified. The confirmed reading is the one cached under the unit's key
 # and its decision is kept under the claim's datum (``Settled``), so a later round, a reorder or the final check does not ask again. Bounded:
-# ``chat_confirm_removals`` claims per turn (0: off), never with less than ``CONFIRM_MIN_SECONDS`` of the allowance left; a call that fails leaves
+# ``chat_confirm_removals`` claims per turn (0: off), never with less than ``CONFIRM_MIN_SECONDS`` of the allowance left (a confirming call is a judge call: it needs what a first judge call needs, the
+# p99 of healthy calls, ``JUDGE_FIRST_CALL_MIN_SECONDS``, not a re-read's ten seconds); a call that fails leaves
 # the first verdict as it was. The skipped claims are recorded (``VerifyReport.confirm``).
 
 CONFIRM_LABEL = "verify_confirm"  # the usage purpose of the confirming call
-CONFIRM_MIN_SECONDS = REREAD_MIN_SECONDS  # a confirming call does not start with less of the allowance left
+CONFIRM_MIN_SECONDS = JUDGE_FIRST_CALL_MIN_SECONDS  # a confirming call does not start with less of the allowance left (round 23 review #11)
 CONFIRM_CHECK = "confirm_split"  # the check of the partial mark of a claim the second reading kept
 CONFIRM_SKIPS = ("cap", "no_time", "check_failed")  # why a claim was not confirmed
 MSG_CONFIRM_SPLIT = ("שתי קריאות בלתי תלויות של הטענה מול המקורות לא הסכימו, והשנייה מצאה אותה נתמכת; "
@@ -10021,6 +10063,17 @@ def _marked_verdict(new: JudgeVerdict, spans: list[str]) -> JudgeVerdict:
     return new.model_copy(update={"claims": claims, "verdict": "partial", "defect": "none", "supported_by": [], "depends_on": []})
 
 
+def settle_decision(cache: VerdictCache, u: Unit, text: str, ws: Workspace, digests: dict[str, str], entry: Settled) -> None:
+    """Record ``entry`` under the datum key of the unit as verified and, when it names holders the unit does not cite, also under the key of the
+    unit with its ids extended by them (round 23 review #9): the composer then cites the holder (``needs_citation``), the final unit's ids
+    differ, and its datum key is the extended one - the final check finds the decision there (``kept_by_decision``). A different holder is
+    another source place: another key."""
+    cache.settle(datum_key(u, text, ws, digests), entry)
+    extra = [h for h in dict.fromkeys(entry.holders) if h not in u.ids]
+    if extra:
+        cache.settle(datum_key(dataclasses.replace(u, ids=[*u.ids, *extra]), text, ws, digests), entry)
+
+
 def confirm_removals(provider: LLMProvider, report: VerifyReport, verdicts: dict[int, JudgeVerdict], ws: Workspace, question: str,
                      usage: list[dict], deadline: float | None, cache: VerdictCache, keys: dict[int, str], reasons: dict[str, str],
                      skip: set[int], rescues: Mapping[int, Mapping[str, str]]) -> tuple[dict[str, str], dict[int, list[str]]]:
@@ -10036,8 +10089,8 @@ def confirm_removals(provider: LLMProvider, report: VerifyReport, verdicts: dict
         for r in report.claims.get(idx, []):
             if r.id in found:
                 wording, unit_wording = claim_wording(u, r)
-                cache.settle(datum_key(u, u.text if r.whole_unit else r.text, ws, digests),
-                             Settled("rescued", wording, unit_wording, (found[r.id],), unit_context(u)))
+                settle_decision(cache, u, u.text if r.whole_unit else r.text, ws, digests,
+                                Settled("rescued", wording, unit_wording, (found[r.id],), unit_context(u)))
     marks: dict[str, str] = {}
     cites: dict[int, list[str]] = {}
     first = dict(verdicts)
@@ -10095,7 +10148,7 @@ def confirm_removals(provider: LLMProvider, report: VerifyReport, verdicts: dict
     if not picks:
         return marks, cites
     left = cap - cache.confirm_spent
-    if left <= 0 or not _reread_time_left(deadline):
+    if left <= 0 or not has_time(deadline, CONFIRM_MIN_SECONDS):
         why = "cap" if left <= 0 else "no_time"
         report.confirm += [{"claim": r.id, "outcome": why} for _, r, _ in picks]
         return marks, cites
@@ -10136,7 +10189,7 @@ def confirm_removals(provider: LLMProvider, report: VerifyReport, verdicts: dict
                 continue
             named = [x for x in dict.fromkeys(new.supported_by) if x not in u.ids and x in ws.sources]
             holders = [x for x in named if _named_support(u, [x], ws, question) is None]
-            cache.settle(key, Settled("split", wording, unit_wording, tuple(holders), unit_context(u)))
+            settle_decision(cache, u, u.text if r.whole_unit else r.text, ws, digests, Settled("split", wording, unit_wording, tuple(holders), unit_context(u)))
             flip(u, r, holders)
             kept.append(r)
             report.confirm.append({"claim": r.id, "outcome": "flipped"})

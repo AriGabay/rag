@@ -1589,3 +1589,63 @@ def test_a_decision_for_a_claim_with_too_few_words_is_told_apart_by_its_unit():
     cache.settle(key, verify.Settled("split", *verify.claim_wording(unit_a, record(unit_a))))
     assert cache.decided(key, *verify.claim_wording(unit_a, record(unit_a))) is not None
     assert cache.decided(key, *verify.claim_wording(unit_b, record(unit_b))) is None  # ...is another cell of another row
+
+
+def test_the_final_check_keeps_a_bare_cell_only_of_the_row_its_decision_was_made_for():
+    """Round 23 review #8: ``kept_by_decision`` compares the unit's wording of a decision made for a claim with too few words of its own (a bare
+    cell) - the loose claim matching widens only the claim's wording - so the decision for row A does not keep the equal-number cell of row B."""
+    ws = _same_doc_ws("טבלה: 4,100 | 4,100")
+    head = "| נתון | ערך |\n|---|---|\n"
+    unit_a = verify.split_units(f"{head}| רכיב א | 4,100 [S1] |")[-1]
+    unit_b = verify.split_units(f"{head}| רכיב ב | 4,100 [S1] |")[-1]
+    record = lambda: verify.ClaimRecord(id="k", unit_id="u", unit=0, start=0, end=0, text="4,100", kind="datum", verdict="unsupported")  # noqa: E731
+    key = verify.datum_key(unit_a, "4,100", ws, {})
+    assert key == verify.datum_key(unit_b, "4,100", ws, {}) and verify.unit_context(unit_a) == verify.unit_context(unit_b)
+    wording, unit_wording = verify.claim_wording(unit_a, record())
+    assert unit_wording  # a bare cell: its unit's text tells it from another row's
+    claim = lambda: verify.UnitClaim("4,100", "datum", "unsupported", "absent_from_source")  # noqa: E731
+    for decision in ("split", "rescued"):
+        settled = {key: [verify.Settled(decision, wording, unit_wording, ("S1",), verify.unit_context(unit_a))]}
+        assert verify.kept_by_decision(settled, unit_a, [claim()], ws, {})  # row A itself is still kept
+        assert not verify.kept_by_decision(settled, unit_b, [claim()], ws, {})  # the equal number of row B is not
+        # the loose claim matching still widens the claim's wording: the sentence as saved holds the decided words and more
+        saved = verify.split_units(f"{head}| רכיב א | 4,100 [S1] |")[-1]
+        saved.server = ["«[1: חלק שלא אומת הושמט]»"]
+        saved.text += " «[1: חלק שלא אומת הושמט]»"
+        assert verify.kept_by_decision(settled, saved, [verify.UnitClaim(saved.text, "datum", "unsupported", whole_unit=True)], ws, {})
+    # a decision with no unit wording (a claim of enough words of its own) is not tied to a row
+    free = {key: [verify.Settled("split", wording, "", (), verify.unit_context(unit_a))]}
+    assert verify.kept_by_decision(free, unit_b, [claim()], ws, {})
+
+
+# --- round 23 review #9: a decision is also settled under the key of the unit as the composer cites it (the holder added) ------------------
+
+HOLDER_SRC = "הערך הראשון הוא 4,100 ₪ לפי החוזה."
+
+
+def _holder_run(first, second, documents=None):
+    cache, ws = VerdictCache(), _same_doc_ws("הערך הכללי הוא 4,100 ₪.", HOLDER_SRC, "מקור אחר ללא נתון.", documents=documents)
+    verify_answer(_two_calls(first, second), _answer(f"{CLAIM_A} [S1]."), ws, "?", [], cache=cache)
+    return cache, ws
+
+
+@pytest.mark.parametrize("how", ["split", "rescued"])
+def test_a_decision_is_found_by_the_final_unit_that_cites_the_holder_the_composer_added(how, monkeypatch):
+    monkeypatch.setattr(get_settings(), "chat_confirm_removals", 5)
+    if how == "split":  # the second reading keeps the claim and names S2 as the support
+        cache, ws = _holder_run(lambda t: "unsupported", lambda t: {"verdict": "supported", "supported_by": ["S2"]}, documents=(0, 1, 0))
+    else:  # a source the turn read (S2) holds the claim: the deterministic rescue
+        cache, ws = _holder_run(lambda t: "unsupported", lambda t: "unsupported")
+    decided = [e for es in cache.settled.values() for e in es if e.decision in ("split", "rescued")]
+    assert decided and decided[0].holders == ("S2",), cache.settled
+    claim = verify.UnitClaim(CLAIM_A, "datum", "unsupported", "absent_from_source", whole_unit=False)
+    before = verify.split_units(f"{CLAIM_A} [S1].")[0]
+    assert verify.kept_by_decision(cache.settled, before, [claim], ws, {})  # the unit as it was verified
+    final = verify.split_units(f"{CLAIM_A} [S1][S2].")[0]  # the composer cited the holder (needs_citation)
+    assert final.ids == ["S1", "S2"]
+    assert verify.kept_by_decision(cache.settled, final, [claim], ws, {})
+    # negative controls: another holder, and a cited source the decision never named
+    other = verify.split_units(f"{CLAIM_A} [S1][S3].")[0]
+    assert not verify.kept_by_decision(cache.settled, other, [claim], ws, {})
+    both = verify.split_units(f"{CLAIM_A} [S1][S2][S3].")[0]
+    assert not verify.kept_by_decision(cache.settled, both, [claim], ws, {})

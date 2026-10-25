@@ -1434,7 +1434,8 @@ def tables_presented(ws: Workspace, markdown: str) -> list[dict]:
 
     shown = numbers_in(markdown)
     tables: dict[tuple, dict] = {}
-    for sid in cited_ids(markdown):
+    # in id order: a set's order changes between processes, and the coverage note lists the tables in this order (round 23)
+    for sid in sorted(cited_ids(markdown), key=lambda x: (x[0], int(x[1:]))):
         s = ws.sources.get(sid)
         if s is None or s.kind not in ("table", "table_row") or s.table_index is None:
             continue
