@@ -10153,13 +10153,29 @@ MSG_CONFIRM_SPLIT = ("שתי קריאות בלתי תלויות של הטענה 
                      "הנתון נשאר מסומן כמאומת חלקית")
 
 
+def _same_window(a: Source, b: Source) -> bool:
+    """Whether two sources of the turn are of the same document, version and appraisal unit and their appraisal contexts are the same or share one
+    (round 23 closure): another stored block or page window of the same table, which ``_same_place`` (the very same contexts) does not accept. Another
+    file, another version, another unit, a source with no unit against one with, contexts that share none, or one with contexts and one with none, are not."""
+    if a.document_id is None or a.version_id is None or a.document_id != b.document_id or a.version_id != b.version_id:
+        return False
+    if (a.unit or {}).get("id") != (b.unit or {}).get("id"):
+        return False
+    ca, cb = set(a.contexts or ()), set(b.contexts or ())
+    return ca == cb or bool(ca & cb)
+
+
 def _confirm_candidates(u: Unit, units: list[Unit], ws: Workspace, removed: Collection[int]) -> list[str]:
     """The sources shown beside a unit in its confirming reading: an uncited unit gets the turn's sources that hold its numbers or words as
-    in the first reading (``_unit_candidates``); a cited one, the other sources the turn read from the same place of the same file (cited by
-    another sentence or by none) that state a number of its claims, at most ``CANDIDATE_SOURCES`` (the widened evidence of KTD9)."""
+    in the first reading (``_unit_candidates``); a cited one, first the other sources the turn read from the same place of the same file (cited by
+    another sentence or by none) that state a number of its claims, then (round 23 closure) the sources of the turn - cited by another sentence or
+    only read - of the same document, version and appraisal unit as one of its own (``_same_window``) that state a number of the claim that none of
+    its own sources states: the evidence the first reading may have had for it in a sibling's citation, another stored block of the same table
+    (the widened evidence of KTD9). At most ``CANDIDATE_SOURCES``."""
     if not u.ids:
         return _unit_candidates(u, ws)
-    mine = [ws.sources[evidence_source_id(ws, i)] for i in u.ids if evidence_source_id(ws, i) in ws.sources]
+    own = [evidence_source_id(ws, i) for i in u.ids]
+    mine = [ws.sources[sid] for sid in own if sid in ws.sources]
     numbers = numbers_in(_stated_text(u))
     out = []
     for sid in _rescue_sources(u, units, ws, anywhere=True, removed=removed, read=True):
@@ -10168,6 +10184,20 @@ def _confirm_candidates(u: Unit, units: list[Unit], ws: Workspace, removed: Coll
         parts = _source_parts(ws, sid)
         if parts is not None and numbers & _source_terms(ws, sid, parts[1])[0]:
             out.append(sid)
+    if len(out) < CANDIDATE_SOURCES:
+        stated: set[str] = set()  # the numbers the unit's own sources state, by the same test
+        for sid in dict.fromkeys(own):
+            parts = _source_parts(ws, sid) if sid in ws.sources else None
+            if parts is not None:
+                stated |= _source_terms(ws, sid, parts[1])[0]
+        lacking = numbers - stated
+        for sid, src in ws.sources.items():
+            if (not lacking or sid in u.ids or sid in out or not src.text or src.kind == "listing"
+                    or not any(_same_window(a, src) for a in mine)):
+                continue
+            parts = _source_parts(ws, sid)
+            if parts is not None and lacking & _source_terms(ws, sid, parts[1])[0]:
+                out.append(sid)
     return out[:CANDIDATE_SOURCES]
 
 
