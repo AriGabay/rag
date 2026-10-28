@@ -10192,7 +10192,7 @@ def _confirm_candidates(u: Unit, units: list[Unit], ws: Workspace, removed: Coll
                 stated |= _source_terms(ws, sid, parts[1])[0]
         lacking = numbers - stated
         for sid, src in ws.sources.items():
-            if (not lacking or sid in u.ids or sid in out or not src.text or src.kind == "listing"
+            if (not lacking or sid in u.ids or sid in out or not src.text or src.is_listing
                     or not any(_same_window(a, src) for a in mine)):
                 continue
             parts = _source_parts(ws, sid)
