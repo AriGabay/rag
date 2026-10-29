@@ -653,6 +653,11 @@ CANDIDATE_TEXT_CHARS = 120  # the most of a candidate's label or value the requi
 TRACE_VOTES_PER_COMPONENT = 8  # votes (judge calls) kept per component and round
 TRACE_COMPONENTS = 40  # components kept per round
 TRACE_PASSAGE_IDS = 60  # passage ids kept per call
+# round 25 U4 (R1, R7): the completeness record of a component decision and of the open items (``VerifyReport._decisions``, ``item_diagnostics``);
+# bounded like ``CONFIRM_RECORD_KEPT`` (the whole counts stay), ids, codes and short label prefixes only
+COMPLETENESS_OPEN_KEPT = 12  # open items (id, label prefix, source, kind) kept per component decision
+COMPLETENESS_LABEL_CHARS = 60  # the most of an open item's label the decision keeps
+COMPLETENESS_ANCHORS_KEPT = 12  # anchor sources kept per decision
 # why a score of an earlier round is not what a component's decision rests on (round 17 U1, KTD1): ``RESCORED`` — a unit it gave
 # changed (or it named none), so this round's calls scored the component again; ``EVIDENCE_CHANGED`` — the passages the turn read
 # for the component (or the related evidence it named, or the component's items) changed since it was cast; ``OVERRULED_*`` —
@@ -1912,6 +1917,26 @@ def problem_repair_key(p: Problem) -> str:
     return f"{p.kind}:{p.component or ''}:{p.check or ''}"
 
 
+def _open_label(state: Mapping) -> str:
+    """The label of an open item for the completeness record: as the ledger names it, with the item's own value taken out (a sentence is named by
+    its words, which may hold its figure; a record never states the value) and clipped to ``COMPLETENESS_LABEL_CHARS``."""
+    from app.chat.items import without_value
+
+    label = " ".join(str(state.get("label") or "").split())
+    return (without_value(state.get("value") or "", state.get("quote") or "", label) or "")[:COMPLETENESS_LABEL_CHARS]
+
+
+def _open_kind(state: Mapping) -> str:
+    """What made an open item an item of its component, as the completeness record names it (round 25 U4): ``judge_support`` — a part the
+    judge named —, ``condition`` — the value is given and the source's condition is not (``condition_gap``) —, ``sibling`` — a row, member or
+    sentence the requirements call assigned to the component (a candidate) —, else ``agent`` (an item the answer declared)."""
+    if state.get("origin") == ORIGIN_JUDGE_SUPPORT:
+        return "judge_support"
+    if state.get("condition_gap"):
+        return "condition"
+    return "sibling" if state.get("candidate") else "agent"
+
+
 def removal_summary(kind: str, cause: str = "", component: str | None = None, check: str | None = None) -> dict:
     """A removal on the user's normal path (KTD5): its kind, its component and the server's fixed sentence — a claim
     that could not be checked says why (R14): each cause its own sentence, none a contradiction. A claim removed by the scope check
@@ -3021,10 +3046,30 @@ class VerifyReport:
         if ledger is None or not (ledger.items or ledger.excluded or ledger.misattributed):
             return unbound
         # round 18 U5: the conditions an agent wrote that stand only in another item's context are recorded, never silent
-        return {"items": self.item_states() if self.decided is None else [dict(x) for x in self.decided],
+        return {"items": self._with_causes(self.item_states() if self.decided is None else [dict(x) for x in self.decided]),
                 "excluded": list(ledger.excluded)} | (
             {"misattributed": list(ledger.misattributed)} if ledger.misattributed else {}) | (
             {"candidates": dict(self.candidate_offer)} if self.candidate_offer.get("offered") else {}) | unbound
+
+    def _with_causes(self, states: list[dict]) -> list[dict]:
+        """Round 25 U4 (R7, KTD7): each open (``omitted``) item of ``states`` gets ``gap_cause``, the code its gap line was written with
+        (``item_gaps``, by item id) or, for an item with no line of its own, the one ``coverage.gap_cause`` names now. Only while a detection
+        setting is on (the gap lines carry the cause then); a cause that cannot be read leaves the record as it was."""
+        if not get_settings().completeness_gap_lines:
+            return states
+        from app.chat import coverage
+
+        written = {g["id"]: g["cause"] for g in self.item_gaps if g.get("cause")}
+        for st in states:
+            if st["state"] != ITEM_OMITTED:
+                continue
+            try:
+                cause = written.get(st["id"]) or (coverage.gap_cause(self.item_ws, self, st) if self.item_ws is not None else "")
+            except Exception:  # noqa: BLE001 - a diagnostics record never fails the turn
+                cause = ""
+            if cause:
+                st["gap_cause"] = cause
+        return states
 
     @staticmethod
     def _score_row(v: JudgeRequirement) -> dict:
@@ -3049,6 +3094,9 @@ class VerifyReport:
         out = {}
         pointer = get_settings().completeness_gap_lines  # round 25 U2 (R1): the units that fill a component and the sources they cite
         by_index = {u.index: u for u in self.units} if pointer else {}
+        # the sources whose siblings the requirements call was offered (the anchors that yielded a candidate), the same for every component
+        sources = list(dict.fromkeys(c.source for c in self.candidate_pool.values())) if pointer else []
+        anchors = {"sources": sources, "count": len(sources), "sources_left": int(self.candidate_offer.get("sources_left") or 0)}
         for o in outcomes:
             note = notes[o["id"]]
             rows = [self._score_row(v) for v in note["voters"]]
@@ -3059,8 +3107,14 @@ class VerifyReport:
                             "caps": list(note["caps"]), "evidence": list(dict.fromkeys(ids))[:TRACE_PASSAGE_IDS],
                             "from_children": list(o["children"])}
             if pointer:
-                out[o["id"]] |= {"units": list(o["units"]),
-                                 "cites": sorted({c for n in o["units"] if n in by_index for c in by_index[n].ids})}
+                cites = sorted({c for n in o["units"] if n in by_index for c in by_index[n].ids})
+                kept = note.get("open") or []
+                out[o["id"]] |= {"units": list(o["units"])[:CONFIRM_RECORD_KEPT], "cites": cites[:CONFIRM_RECORD_KEPT],
+                                 "open_items": [{"id": i["id"], "label": _open_label(i), "source": i["source"], "kind": _open_kind(i)}
+                                for i in kept[:COMPLETENESS_OPEN_KEPT]],
+                                 "anchors": anchors | {"sources": anchors["sources"][:COMPLETENESS_ANCHORS_KEPT]},
+                                 "counts": {"units": len(o["units"]), "cites": len(cites), "open_items": len(kept),
+                                            "anchors": anchors["count"]}}
         return out
 
     @property
@@ -3210,7 +3264,7 @@ class VerifyReport:
             live = {id(v): [i for i in v.units if i in kept and self.gives(v, i)] for v in votes}
             given = [v for v in offered if live[id(v)]]
             absent = [v for v in votes if v.status in ("missing", "undeterminable")]
-            note = {"voters": [], "overruled": [], "caps": []}
+            note = {"voters": [], "overruled": [], "caps": [], "open": []}
             if notes is not None:
                 notes[r["id"]] = note
             o = {"id": r["id"], "text": r["text"], "calculation": bool(r.get("calculation")), "kind": kind,
@@ -3241,6 +3295,7 @@ class VerifyReport:
                 # the judge's items first (the component's own gap line names the place of the first part): the part the judge
                 # named is stated by that line, the agent's items one by one (``coverage.item_gap_lines``)
                 omitted = sorted(omitted, key=lambda i: i["origin"] != ORIGIN_JUDGE_SUPPORT)
+                note["open"] = omitted  # round 25 U4: the decision record names them (``_decisions``)
                 have = {(x["id"], SupportScope.flat(x["quote"])) for x in o["support"]}
                 o["omitted_items"] = [i["id"] for i in omitted]
                 o["judge_items"] = [i["id"] for i in omitted if i["origin"] == ORIGIN_JUDGE_SUPPORT]
