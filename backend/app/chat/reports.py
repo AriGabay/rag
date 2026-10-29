@@ -36,6 +36,7 @@ from app.chat import api as chat_api
 from app.config import get_settings
 from app.db import TenantContext, tenant_tx
 from app.deps import NOT_FOUND, get_ctx, parse_uuid, require_admin
+from app.providers import llm
 
 router = APIRouter(tags=["answer-reports"])
 
@@ -55,6 +56,7 @@ ALLOWED_KEYS = MAP_KEYS | frozenset({
     # the snapshot's own shape
     "version", "answer", "counts", "cited_sources", "cited_measurements", "cited_values", "document_ids", "limits_hit", "rounds",
     "removed", "resolution", "redacted",
+    "verification",   # the answer's verification counts: booleans and numbers (its children are allowed below)
     "kind", "status", "judged", "partial", "annotated", "completed", "drafts", "requirements", "problems", "measurements", "values",
     # ids and structural locators (document, version, reading, block, table and row indexes, page)
     "id", "type", "document_id", "version_id", "reading_id", "chunk_id", "source_id", "source", "document", "claim_id", "component",
@@ -62,7 +64,7 @@ ALLOWED_KEYS = MAP_KEYS | frozenset({
     "block_last", "table_index", "row_index", "table_part", "page", "page_list", "pos", "left", "cursor", "listed_document_ids",
     # verification problems and decisions: codes
     "severity", "failure_kind", "check", "repair_attempted", "cause", "basis", "claim", "action", "verdict", "reason", "outcome",
-    "post_check", "ordinal", "rereads", "scope", "why", "supported", "not_verified",
+    "post_check", "ordinal", "rereads", "scope", "why",
     # the stage clock, the repair gate and the reads
     "timing", "total_seconds", "unattributed_seconds", "tools", "tool", "stage", "seconds", "chars", "pages", "search", "run",
     "memoized", "lexical", "fused", "depth", "attempted", "failed_with", "budget_skipped", "calls", "tables_served",
@@ -182,7 +184,7 @@ def _run_ids(message) -> tuple[str, dict]:
     """The build's commit sha (set at image build; ``unknown`` without it) and the model ids the run used."""
     sha = (os.environ.get("APP_BUILD_SHA") or "").strip()
     s = get_settings()
-    models = {"provider": s.llm_provider} | {p: s.model_for(p)[0] for p in ("agent", "resolve", "verify")}
+    models = {"provider": s.llm_provider} | {p: llm.purpose_model(p)[0] for p in ("agent", "resolve", "verify")}   # what the runtime calls
     if message.model:
         models["message"] = message.model
     return (sha if SAFE_CODE.match(sha) else "unknown"), {k: v for k, v in models.items() if SAFE_CODE.match(str(v))}
@@ -203,6 +205,11 @@ def report_message(message_id: str, body: ReportBody, ctx: TenantContext = Depen
         if found is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
         chat_api.lock_conversation(conn, found.conversation_id)   # the lock a retry holds: what it deletes is gone when this resumes
+        # the conversation row first, then the message: a conversation delete locks them in that order (its cascade reaches the
+        # messages), so the two never wait on each other (a deadlock would be a 500). KEY SHARE also holds the conversation in place
+        # for the insert's foreign-key check
+        if conn.execute(text("SELECT 1 FROM conversations WHERE id = :c FOR KEY SHARE"), {"c": found.conversation_id}).first() is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
         # the row lock keeps a conversation delete (which takes no chat lock) from removing the message between this read and the insert
         r = conn.execute(text(select + " FOR SHARE OF m"), {"m": mid}).first()
         if r is None:

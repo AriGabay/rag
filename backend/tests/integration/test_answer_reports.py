@@ -104,6 +104,8 @@ DRAFT = "טיוטת-תשובה-פנימית-5512 דמי הניהול הם 77 ₪
 DETAIL = "תקלה-חופשית-9921 מטקסט הספק"
 ASCII_LABEL = "ZX-4471-label"
 ASCII_QUOTE = "Rent was 12,345 per month"
+BARE_SPAN = "6158/23"   # a partly verified claim's span / the sentence as it stays can be one bare ASCII token: a code to SAFE_CODE
+BARE_AMOUNT = "1250000"
 
 
 def crafted(ids: dict, label: str = LABEL, quote: str = QUOTE, draft: str = DRAFT) -> dict:
@@ -119,7 +121,8 @@ def crafted(ids: dict, label: str = LABEL, quote: str = QUOTE, draft: str = DRAF
                      "resolution": None}]],
         "removed": [{"claim_id": "c1", "action": "removed", "text": draft, "remaining": "", "verdict": "unsupported",
                      "reason": "absent_from_source", "failure_kind": "absent_from_source", "check": "unstated_number",
-                     "component": "N1", "cause": "", "sources_checked": ["S1"],
+                     "component": "N1", "cause": "", "sources_checked": ["S1"], "supported": BARE_AMOUNT, "not_verified": BARE_SPAN,
+                     "why": "value_not_stated",
                      "sources": [{"type": "sources", "id": "S1", "document_id": ids["doc"], "version_id": ids["ver"],
                                   "title": label, "text": quote, "section": quote, "location": label, "kind": "table_row",
                                   "block_start": 3, "block_end": 4, "table_index": 1, "row_index": 2,
@@ -189,6 +192,7 @@ def test_the_owner_reports_a_done_answer_and_the_report_keeps_the_ids_the_note_a
     assert snap["resolution"]["timing"]["repair_gate"] == [{"attempt": 1, "decision": "refused", "steps": 4, "refused_by": "time"}]
     assert snap["resolution"]["drafts"][0]["sources"]["S1"]["row_index"] == 2   # the locator stays, the draft goes
     assert snap["limits_hit"] == ["tool_budget"] and set(snap["document_ids"]) == {ids["doc"], ids["doc2"]}
+    assert snap["answer"]["verification"] == {"judged": True, "removed": 1, "partial": 0, "annotated": 0}   # what verification did
 
 
 def test_the_build_sha_is_unknown_when_the_image_set_none(client, office, monkeypatch):
@@ -197,6 +201,20 @@ def test_the_build_sha_is_unknown_when_the_image_set_none(client, office, monkey
     login(client, "emp@example.test")
     assert post_report(client, s["mid"]).status_code == 200
     assert rows(office)[0].build_sha == "unknown"
+
+
+def test_the_model_ids_are_the_ones_the_runtime_calls_under_the_selected_provider(client, office, monkeypatch):
+    """Under Anthropic every purpose runs the one Anthropic model, not the OpenAI settings that never ran."""
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "llm_provider", "anthropic")
+    monkeypatch.setattr(get_settings(), "anthropic_model", "claude-test-7")
+    s = seed(office, office.emp, diagnostics=crafted(_ids(office)), model="claude-test-7")
+    login(client, "emp@example.test")
+    assert post_report(client, s["mid"]).status_code == 200
+    (row,) = rows(office)
+    assert row.model_ids == {"provider": "anthropic", "agent": "claude-test-7", "resolve": "claude-test-7",
+                             "verify": "claude-test-7", "message": "claude-test-7"}
 
 
 def test_a_second_report_by_the_same_user_updates_the_first(client, office):
@@ -408,7 +426,7 @@ def test_no_row_label_quote_draft_or_failure_text_reaches_the_snapshot_or_the_ex
     login(client, "admin-a@example.test")
     detail = client.get(f"/api/admin/answer-reports/{row.id}")
     export = client.get(f"/api/admin/answer-reports/{row.id}/export")
-    secrets = {label, quote, draft, DETAIL, ASCII_LABEL, ASCII_QUOTE, "1,234,567", "98,765"}
+    secrets = {label, quote, draft, DETAIL, ASCII_LABEL, ASCII_QUOTE, "1,234,567", "98,765", BARE_SPAN, BARE_AMOUNT}
     for where, blob in (("stored", stored), ("detail snapshot", json.dumps(detail.json()["snapshot"], ensure_ascii=False)),
                         ("export", export.text), ("export (unicode-escaped)", json.dumps(export.json()))):
         for secret in secrets:
@@ -422,6 +440,7 @@ def test_no_row_label_quote_draft_or_failure_text_reaches_the_snapshot_or_the_ex
                                                 "kind": "table_row", "block_start": 3, "block_end": 4, "table_index": 1,
                                                 "row_index": 2, "reading_id": "reading-1"}
     assert snap["removed"][0]["failure_kind"] == "absent_from_source" and snap["rounds"][0][0]["check"] == "unstated_number"
+    assert snap["removed"][0]["why"] == "value_not_stated" and not {"supported", "not_verified"} & set(snap["removed"][0])
     vote = snap["resolution"]["requirements_trace"][0]["votes"][0]
     assert vote["support"] == [{"id": "S1", "outcome": "accepted"}] and "missing" not in vote
     item = snap["resolution"]["requirements_trace"][0]["items"][0]
@@ -603,6 +622,56 @@ def test_a_conversation_delete_that_lands_between_the_lookup_and_the_insert_is_a
         conn.execute(text("DELETE FROM conversations WHERE id = :c"), {"c": s["cid"]})
     t.join(20)
     assert set(results) <= {200, 404}, results
+    assert all(r.message_id is None for r in rows(office))
+
+
+def test_a_conversation_delete_that_waits_on_a_report_between_its_message_lock_and_its_insert_never_deadlocks(client, office, monkeypatch):
+    """The report and the conversation delete take their locks in one order (conversation, then message). The report is held
+    after its message row lock and before its INSERT while the delete runs: with the order reversed the INSERT's foreign-key
+    check waits on the delete, which waits on the message, and Postgres aborts one of them (DeadlockDetected, a 500)."""
+    from app.chat import reports
+
+    s = seed(office, office.emp, diagnostics=crafted(_ids(office)))
+    login(client, "emp@example.test")
+    entered, release = threading.Event(), threading.Event()
+    real = reports.build_snapshot
+
+    def held(*a, **k):
+        entered.set()
+        assert release.wait(30), "the test never released the report"
+        return real(*a, **k)
+
+    monkeypatch.setattr(reports, "build_snapshot", held)
+    out: list = []
+    deleted: list = []
+    t = _post_in_thread(client, s["mid"], out)
+    assert entered.wait(15), out   # the report holds its message row lock and has not inserted yet
+
+    def delete():
+        try:
+            with tenant_tx(office.ctx("employee", office.emp)) as conn:
+                conn.execute(text("DELETE FROM conversations WHERE id = :c"), {"c": s["cid"]})
+            deleted.append("ok")
+        except Exception as exc:  # noqa: BLE001 - DeadlockDetected would surface here
+            deleted.append(repr(exc))
+
+    d = threading.Thread(target=delete)
+    d.start()
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:   # wait until the delete is really blocked on a lock
+        with tenant_tx(office.system) as conn:
+            waiting = conn.execute(text("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'"
+                                        " AND query ILIKE 'DELETE FROM conversations%'")).scalar_one()
+        if waiting:
+            break
+        time.sleep(0.05)
+    assert waiting, "the delete never blocked behind the report"
+    release.set()
+    t.join(20)
+    d.join(20)
+    assert not t.is_alive() and not d.is_alive()
+    assert out and out[0] in (200, 404), out   # never 500
+    assert deleted == ["ok"], deleted
     assert all(r.message_id is None for r in rows(office))
 
 
