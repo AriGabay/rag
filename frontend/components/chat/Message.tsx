@@ -2,6 +2,7 @@
 
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { B } from "@/components/ui";
+import type { AnswerReport } from "@/lib/api";
 import type {
   ChatAnswer,
   ChatAnswerTime,
@@ -200,6 +201,41 @@ interface AssistantProps {
   /** Opens the source viewer at a place that is not one of the answer's citations (a removed claim's checked source,
    * as the diagnostics route returned it). Without it those places are listed but not opened. */
   onOpenSource?: (nav: ViewerNav) => void;
+  /** The user's earlier report of this answer (round 25 U5): the action then shows a marker and reopens the report prefilled. */
+  report?: AnswerReport | null;
+  /** Opens the report dialog. Without it the answer has no report action. */
+  onReport?: (message: ChatMessage) => void;
+}
+
+/** "דווח על תשובה" (round 25 U5): on a finished, failed or cancelled answer, whether or not it is the last. Never on a running one. */
+function ReportAction({ message, report, onReport, icon }: {
+  message: ChatMessage;
+  report?: AnswerReport | null;
+  onReport?: (message: ChatMessage) => void;
+  icon?: boolean;
+}) {
+  if (!onReport || message.id.startsWith("local-")) return null;
+  const label = report ? "דווחה — עריכת הדיווח" : "דווח על תשובה";
+  return (
+    <>
+      <button
+        type="button"
+        className={icon ? "icon-btn" : "btn btn-small"}
+        onClick={() => onReport(message)}
+        aria-label={label}
+        title={label}
+        data-testid="report-action"
+        data-reported={report ? "true" : "false"}
+      >
+        {icon ? (report ? "⚑" : "⚐") : label}
+      </button>
+      {report && (
+        <span className="note" data-testid="report-marker">
+          דווחה
+        </span>
+      )}
+    </>
+  );
 }
 
 /** The lines the progress list shows: a tool's finished event (round 9: what it found) replaces its start event, so a
@@ -215,7 +251,7 @@ export function progressLines(progress: ChatProgressStep[]): ChatProgressStep[] 
   return lines;
 }
 
-export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onOpenSource }: AssistantProps) {
+export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onOpenSource, report, onReport }: AssistantProps) {
   const [copied, setCopied] = useState(false);
   const answer = message.answer;
   // a hidden answer keeps only its kind: it has no text or sources to cite
@@ -319,6 +355,7 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
               ניסיון חוזר
             </button>
           )}
+          <ReportAction message={message} report={report} onReport={onReport} />
         </div>
       </div>
     );
@@ -333,6 +370,7 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
               לנסות שוב
             </button>
           )}
+          <ReportAction message={message} report={report} onReport={onReport} />
         </div>
       </div>
     );
@@ -414,6 +452,7 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
             ↻
           </button>
         )}
+        <ReportAction message={message} report={report} onReport={onReport} icon />
         {answer.status === "partial" && <span className="note">תשובה חלקית</span>}
         {answer.status === "not_found" && <span className="note">לא נמצא במקורות</span>}
         {timeNote && (

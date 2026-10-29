@@ -13,6 +13,7 @@ _ROUTERS = [
     "app.platform.search",
     "app.answering.api",
     "app.chat.api",
+    "app.chat.reports",
     "app.platform.admin",
 ]
 

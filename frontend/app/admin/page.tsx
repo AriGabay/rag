@@ -1,5 +1,6 @@
 "use client";
 
+import { AnswerReportsPanel } from "@/components/admin/AnswerReportsPanel";
 import { CoveragePanel, ProviderPanel, UsersAndGroups } from "@/components/admin/AdminPanels";
 import { ReprocessPanel } from "@/components/admin/ReprocessPanel";
 import { useSession } from "@/components/AppShell";
@@ -20,6 +21,7 @@ export default function AdminPage() {
       <ProviderPanel />
       <ReprocessPanel />
       <UsersAndGroups />
+      <AnswerReportsPanel />
     </div>
   );
 }

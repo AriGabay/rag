@@ -235,6 +235,56 @@ export async function fetchSourceImage(url: string, signal?: AbortSignal): Promi
   };
 }
 
+/** The five categories of an answer report (round 25 U5); the Hebrew labels live with the dialog. */
+export type ReportCategory = "wrong" | "missing" | "wrong_source" | "wrong_property" | "other";
+export const REPORT_NOTE_MAX = 1000;
+
+/** A user's report of one answer, as the conversation's list returns it (the marker on the answer reopens it prefilled). */
+export interface AnswerReport {
+  id: string;
+  message_id: string;
+  category: ReportCategory;
+  note: string;
+}
+
+export interface AnswerReportResult {
+  id: string;
+  category: ReportCategory;
+  note: string;
+  message_id: string;
+  /** True when this call changed the user's earlier report of the same message instead of making a new one. */
+  updated: boolean;
+  created_at: string;
+}
+
+/** One row of the admin's list. `message_exists` is false once a retry or a deleted conversation removed the message. */
+export interface AnswerReportRow {
+  id: string;
+  category: ReportCategory;
+  message_status: string;
+  message_exists: boolean;
+  created_at: string;
+}
+
+/** The admin's detail view: the note and the structural snapshot (codes, statuses, timings, locators, counts: no text). */
+export interface AnswerReportDetail extends AnswerReportRow {
+  reporter_id: string;
+  note: string;
+  message_id: string | null;
+  conversation_id: string | null;
+  build_sha: string;
+  model_ids: Record<string, string>;
+  updated_at: string;
+  snapshot: Record<string, unknown>;
+}
+
+export const answerReportsApi = {
+  list: () => request<{ reports: AnswerReportRow[] }>("/api/admin/answer-reports"),
+  detail: (id: string) => request<AnswerReportDetail>(`/api/admin/answer-reports/${encodeURIComponent(id)}`),
+  /** The download link of the export (the structural snapshot without the note); the browser sends the session cookie. */
+  exportUrl: (id: string) => `/api/admin/answer-reports/${encodeURIComponent(id)}/export`,
+};
+
 export const chatApi = {
   conversations: (opts: { q?: string; archived?: boolean; before?: string | null; limit?: number } = {}, signal?: AbortSignal) =>
     request<{ conversations: ChatConversation[]; next: string | null }>(
@@ -264,6 +314,12 @@ export const chatApi = {
     request<ChatMessage>(`/api/chat/messages/${encodeURIComponent(id)}`, { signal }),
   cancel: (id: string) => request<ChatMessage>(`/api/chat/messages/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
   retry: (id: string) => request<ChatMessage>(`/api/chat/messages/${encodeURIComponent(id)}/retry`, { method: "POST" }),
+  /** Reports a problematic answer of the caller's own; a second report of the same message updates the first. */
+  report: (id: string, body: { category: ReportCategory; note: string }) =>
+    request<AnswerReportResult>(`/api/chat/messages/${encodeURIComponent(id)}/report`, { method: "POST", body }),
+  /** The caller's own reports of the messages in a conversation. */
+  reports: (conversationId: string, signal?: AbortSignal) =>
+    request<{ reports: AnswerReport[] }>(`/api/chat/conversations/${encodeURIComponent(conversationId)}/reports`, { signal }),
   /** What verification removed from an answer, with each draft and its sources (owner or office admin; a 404 when
    * any document behind it is no longer visible). Never cached: every call asks the server again. */
   diagnostics: (id: string, signal?: AbortSignal) =>

@@ -3,10 +3,11 @@
 import Link from "next/link";
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useSession } from "@/components/AppShell";
-import { api, ApiError, chatApi, errorMessage, isAbortError, newTurnId } from "@/lib/api";
+import { type AnswerReport, api, ApiError, chatApi, errorMessage, isAbortError, newTurnId } from "@/lib/api";
 import type { ChatAnswer, ChatConversation, ChatMessage, ViewerNav } from "@/lib/chatTypes";
 import { type AnswerOrigin, AssumptionView, CalculationView } from "./CalculationView";
 import { AssistantMessage, UserMessage, citedView } from "./Message";
+import { ReportDialog } from "./ReportDialog";
 import { SourceViewer } from "./SourceViewer";
 import "./chat.css";
 
@@ -133,6 +134,11 @@ export default function ChatApp() {
   const [sending, setSending] = useState(false);
   const [composerText, setComposerText] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
+  // the user's own reports of answers (round 25 U5), by message id; `reportTarget` is the answer whose dialog is open
+  const [reports, setReports] = useState<Record<string, AnswerReport>>({});
+  // `existing`: the user's earlier report as it was when the dialog opened (the title does not flip once the report is saved)
+  const [reportTarget, setReportTarget] = useState<{ message: ChatMessage; existing: AnswerReport | null } | null>(null);
+  const reportOpener = useRef<HTMLElement | null>(null);
   const activeRef = useRef<string | null>(null);
   activeRef.current = activeId;
   // The time-preference switch (round 11 U10, KTD14). A draft has no id yet, so its value lives here and travels in the
@@ -266,6 +272,17 @@ export default function ChatApp() {
     setUrlConversation(null);
     return undefined;
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId]);
+
+  // the user's reports of this conversation's answers: a convenience (the marker), so a failure to load them says nothing
+  useEffect(() => {
+    if (!activeId) return undefined;
+    const ctrl = new AbortController();
+    chatApi.reports(activeId, ctrl.signal).then(
+      (res) => setReports((cur) => ({ ...cur, ...Object.fromEntries(res.reports.map((r) => [r.message_id, r])) })),
+      () => undefined,
+    );
+    return () => ctrl.abort();
   }, [activeId]);
 
   // --- polling running answers of the active conversation ---------------------------------------------------
@@ -458,6 +475,19 @@ export default function ChatApp() {
     },
     [busy, updateThread],
   );
+
+  const openReport = useCallback(
+    (m: ChatMessage) => {
+      reportOpener.current = focusedElement();
+      setReportTarget({ message: m, existing: reports[m.id] ?? null });
+    },
+    [reports],
+  );
+  const closeReport = useCallback(() => {
+    setReportTarget(null);
+    reportOpener.current?.focus();
+  }, []);
+  const reportSaved = useCallback((r: AnswerReport) => setReports((cur) => ({ ...cur, [r.message_id]: r })), []);
 
   // --- panel stack ------------------------------------------------------------------------------------------
   /** Opens a level above the current ones (a breakdown's input above the breakdown). */
@@ -771,6 +801,14 @@ export default function ChatApp() {
           onRetry={retry}
           onStop={stop}
           onResend={(m) => void send(m.content, m.client_id ?? undefined)}
+          reports={reports}
+          onReport={openReport}
+        />
+        <ReportDialog
+          messageId={reportTarget?.message.id ?? null}
+          existing={reportTarget?.existing ?? null}
+          onClose={closeReport}
+          onSaved={reportSaved}
         />
         {notice && (
           <div className="composer-hint" role="alert" style={{ color: "var(--danger)" }}>
@@ -1006,6 +1044,8 @@ function ThreadView({
   onRetry,
   onStop,
   onResend,
+  reports,
+  onReport,
 }: {
   messages: ChatMessage[];
   thread: Thread | null;
@@ -1016,6 +1056,8 @@ function ThreadView({
   onRetry: (m: ChatMessage) => void;
   onStop: (m: ChatMessage) => void;
   onResend: (m: ChatMessage) => void;
+  reports: Record<string, AnswerReport>;
+  onReport: (m: ChatMessage) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
@@ -1089,6 +1131,8 @@ function ThreadView({
                 onOpenSource={onOpenSource}
                 onRetry={onRetry}
                 onStop={onStop}
+                report={reports[m.id] ?? null}
+                onReport={onReport}
               />
             ),
           )}

@@ -238,6 +238,11 @@ class SendBody(BaseModel):
     prefer_recent: bool | None = None
 
 
+def lock_conversation(conn: Connection, conversation_id) -> None:
+    """The conversation's lock: a send, a retry and a report (``app.chat.reports``) of its messages wait for one another until commit."""
+    conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"chat:{conversation_id}"})
+
+
 def _stale_after() -> int:
     return get_settings().chat_turn_seconds * STALE_FACTOR + 60
 
@@ -572,7 +577,7 @@ def retry_message(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> dic
             raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
         if r.status in ("running", "cancelling") and r.age <= _stale_after():
             raise HTTPException(status.HTTP_409_CONFLICT, "התשובה עדיין בעיבוד")
-        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"chat:{r.conversation_id}"})
+        lock_conversation(conn, r.conversation_id)
         later = conn.execute(text("SELECT 1 FROM messages WHERE conversation_id = :c AND created_at > :t LIMIT 1"),
                              {"c": r.conversation_id, "t": r.created_at}).first()
         if later is not None:

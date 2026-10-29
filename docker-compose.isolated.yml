@@ -61,7 +61,10 @@ services:
       retries: 30
 
   migrate:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        APP_BUILD_SHA: ${APP_BUILD_SHA:-unknown}
     image: appraisal-rag-isolated-backend
     command: ["alembic", "upgrade", "head"]
     environment: *backend-env
