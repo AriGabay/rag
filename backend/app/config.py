@@ -185,17 +185,6 @@ class Settings(BaseSettings):
     # weaker unit pin or clarification is applied, and before the first step's tools run. Shorter than the reading
     # window; past it the intent is unknown, a provisional pin is dropped and the tools run with both pools labelled.
     chat_intent_wait_seconds: float = Field(default=8.0, ge=0)
-    # Round 25 U2 (KTD8): each mechanism of the sibling check in the completeness decision sits behind its own setting until its pre-registered
-    # experiment (E1, E2) decides: the default becomes on for a mechanism that passes (the setting then stays an operator off-switch), and the
-    # code of one that misses is removed. All off: the decision, the judge's prompt and the cache keys are those of round 24.
-    # ``chat_sibling_anchors`` (KTD1, KTD2): the siblings of the block the answer used are offered to the requirements call for a component that
-    # asks for a set, from the sources that returned the same block too, and an assignment counts only from a vote that sees the component's answer.
-    chat_sibling_anchors: bool = False
-    # ``chat_condition_check`` (KTD3): an item whose own source states a condition is given in full only when the giving block states it too.
-    chat_condition_check: bool = False
-    # ``chat_own_attribution`` (KTD4): a value-bearing item is given only by a block that cites its own source (or the table's citation) and
-    # states its row; the uncited-block fallbacks and the loose "any passage of the unit holding the number" rule no longer give it.
-    chat_own_attribution: bool = False
     llm_timeout_agent_seconds: float = 90
     llm_timeout_measure_seconds: float = 90
 
@@ -260,11 +249,6 @@ class Settings(BaseSettings):
         else:
             self.openai_api_key = SecretStr("")
         return self
-
-    @property
-    def completeness_gap_lines(self) -> bool:
-        """The KTD7 gap lines (the cause of an item left open) are on whenever any of the three detection mechanisms is (round 25 U2, KTD8)."""
-        return self.chat_sibling_anchors or self.chat_condition_check or self.chat_own_attribution
 
 
 @lru_cache

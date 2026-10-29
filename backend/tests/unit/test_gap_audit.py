@@ -967,23 +967,3 @@ def test_follow_up_the_same_one_word_line_after_a_closed_sentence_and_a_real_sho
     short = ["הנחיות כלליות לשומה בנכס.", "הסכם חכירה", "השוכר מודע לתכנית א ולתכנית ב החלות על המגרש."]
     assert _span_of(short, "הסכם חכירה") == "not_a_source_span"
     assert _span_of(short, "השוכר מודע לתכנית א ולתכנית ב החלות על המגרש.") == ""
-
-
-# --- round 25 U2 (KTD4): ``chat_own_attribution`` narrows the datum audit's uncited fallbacks for a value-bearing item -------------------------------
-
-def test_own_attribution_leaves_the_uncited_fallback_of_an_identifier_list_alone(monkeypatch):
-    monkeypatch.setattr(get_settings(), "chat_own_attribution", True)
-    assert _lots("| נושא | מגרשים |\n|---|---|\n| פינוי | 9-12, 4, 41-45 |")["state"] == "covered"  # no headline figure: nothing to attribute
-    assert _lots("| נושא | מגרשים |\n|---|---|\n| פינוי | 9-12, 41-45 [S2] |")["state"] == "omitted"  # (a strict subset: still in part, as before)
-
-
-def test_own_attribution_refuses_an_uncited_bullet_for_a_value_bearing_item_and_keeps_a_cited_one(monkeypatch):
-    ws = _ws(TABLE)
-    item = _row_item("גיל הבניין", "2%")
-    bullet = "- ההתאמה לגיל הבניין היא 2%."
-    for on, state in ((False, "covered"), (True, "omitted")):
-        monkeypatch.setattr(get_settings(), "chat_own_attribution", on)
-        (got,) = _ledger_of(item).outcomes(_units(bullet), ws, audit=True)
-        assert got["state"] == state, on
-        (cited,) = _ledger_of(item).outcomes(_units(bullet.replace("2%.", "2% [S1].")), ws, audit=True)
-        assert cited["state"] == "covered", on

@@ -87,14 +87,6 @@ state and wording, never "omitted". A declared ``not_verifiable`` / ``not_applic
 covers it, and no line is written. ``Ledger.outcomes`` is that function over the ledger; ``VerifyReport.decision`` is its value over the units
 that stand, computed at every compose pass, and the body's caps, the gap paragraph and the item lines are all read from it.
 
-Round 25 U2 (KTD1-KTD4; R1-R5) widens what the coverage decision holds an answer to, each mechanism behind its own setting (``config``: all off by
-default, the decision is then round 24's): ``chat_sibling_anchors`` — ``candidates`` offers siblings only for a component that asks for a set
-(``request.set_components``) and also from the read sources that returned the same block, or an overlapping block range, as an anchor
-(``verify.same_block``), each block once; ``chat_condition_check`` — a block that states the value but not the condition its item's own source
-gives it (``conditions.MISSING``, the clear case the server decides alone) gives the item in PART (``Coverage.conditions``, ``condition_missing``),
-never removing the value; ``chat_own_attribution`` — a value-bearing item is not given by a block that cites nothing, nor by a number held in another
-passage of its unit unless the block names the item's own row.
-
 Round 22 U8 (KTD7; R12-R14) attributes an item to a sentence at the level of its ROW. Another row of the cited passage that holds the item's value
 is a rival (``rival_rows``); with one, a clause gives the item only when it names the item's row (``row_status``: a value of that row it cites, the
 designators, the numbers, the dates or the words of one of its names - label, condition, cells - that no rival row has), decided by structure and
@@ -118,7 +110,6 @@ from app.answering.verify import _QUANTITY_AFTER, not_an_amount, numbers_in
 from app.chat import conditions, scopes
 from app.chat.evidence import OTHER_ITEM, claim_terms
 from app.chat.meaning import _row_cells, after_kind
-from app.chat.request import set_components
 from app.chat.verify import (
     _FINAL_LETTERS,
     ITEM_COVERED,
@@ -144,13 +135,11 @@ from app.chat.verify import (
     ids_in,
     is_server_item,
     request_word_forms,
-    same_block,
     shared_request_words,
     shares_request_word,
     source_context,
     unit_referent,
 )
-from app.config import get_settings
 from app.extraction.normalize_text import (
     absence_clause,
     clause_spans,
@@ -243,9 +232,6 @@ class Coverage(NamedTuple):
     why: str
     missing: tuple[frozenset[str], ...] = ()
     checked: bool = True
-    # round 25 U2 (KTD3): the clauses of the item's own source condition that the giving block leaves out (``chat_condition_check``): the block states the
-    # value and not what limits it; ``why`` is then ``condition_missing``
-    conditions: tuple[str, ...] = ()
 
 
 def _text(value: object) -> str:
@@ -1112,9 +1098,6 @@ def candidates(units: Sequence[Unit], ws, ledger: Ledger, components: Sequence[M
     and a span is offered only when a content word of its own text stands in an asked component or the request (an assignment
     could never be kept otherwise). At most ``CANDIDATES_PER_SOURCE`` per source in the source's order, ``CANDIDATE_SOURCES`` sources;
     the counts left out are in the offer. No component is needed before the call."""
-    wide = get_settings().chat_sibling_anchors
-    if wide and not set_components(components, request):
-        return Offer([], {}, 0)  # round 25 U2 (KTD2, R5): no component asks for a set, so no sibling is asked for
     scope = SupportScope(ws, list(units))
     asked = asked_components(components)
     leads = _leads(units)
@@ -1128,14 +1111,6 @@ def candidates(units: Sequence[Unit], ws, ledger: Ledger, components: Sequence[M
     for unit in units:
         for sid, _ in _cited_sources(unit, ws):
             anchors.setdefault(sid)
-    if wide:
-        # round 25 U2 (KTD2): a read source that returned the same block, or an overlapping block range, of the same document version, reading and
-        # appraisal unit as an anchor is an anchor too (the same table returned under another S#): after the primary anchors, so the limits keep them
-        primary = [ws.sources[sid] for sid in anchors if sid in ws.sources]
-        for sid, src in ws.sources.items():
-            if sid not in anchors and src.text and not src.is_listing and any(same_block(a, src) for a in primary):
-                anchors.setdefault(sid)
-    seen_evidence: set[tuple[str, str, str]] = set()  # the evidence already offered (a block offered once, whichever S# returned it)
     offered: list[Candidate] = []
     left_out: dict[str, int] = {}
     used = 0
@@ -1158,15 +1133,7 @@ def candidates(units: Sequence[Unit], ws, ledger: Ledger, components: Sequence[M
         for n, (raw, flat, span) in enumerate(zip(raws, flats, spans, strict=True)):
             sig = _signature(span)
             shared = bool(sig) and signatures[sig] > 1
-            rival_words, rival_dates = frozenset(), frozenset()
-            if wide and shared:
-                # round 25 U2 (KTD2): a sibling that repeats the value of another span of its anchor is told apart from it by its own label, as the ledger
-                # does for twin items (``Ledger.outcomes``): the stated value of its twin does not give it
-                twins = [j for m, j in enumerate(spans) if m != n and _signature(j) == sig and not _same_row(j.evidence, span.evidence)]
-                rival_words = frozenset().union(*(_words(j.condition or j.label) for j in twins))
-                rival_dates = frozenset().union(*(_condition_dates(j) for j in twins))
-            if (any(_holds(h, sid, ws, flat) for h in held)
-                    or _coverage(span, units, ws, shared, leads, blocks, rival_words, rival_dates).ok):
+            if any(_holds(h, sid, ws, flat) for h in held) or _coverage(span, units, ws, shared, leads, blocks).ok:
                 touched.add(raw.group)
             else:
                 free.append(n)
@@ -1177,14 +1144,11 @@ def candidates(units: Sequence[Unit], ws, ledger: Ledger, components: Sequence[M
         found = [n for n in free if (raws[n].group == "table" or raws[n].group in touched)
                  and not scope.source_problem(sid, flats[n]) and scope.verbatim(sid, src, flats[n])
                  and shares_request_word(raws[n].own, known)]
-        document_id, unit_id = _site_of(src)
-        if wide:
-            found = [n for n in found if evidence_key(document_id, unit_id, sid, flats[n]) not in seen_evidence]
         if not found:
             continue
         used += 1
+        document_id, unit_id = _site_of(src)
         for n in found[:CANDIDATES_PER_SOURCE]:
-            seen_evidence.add(evidence_key(document_id, unit_id, sid, flats[n]))
             raw = raws[n]
             offered.append(Candidate(ledger.candidate_id(evidence_key(document_id, unit_id, sid, flats[n])), sid, raw.quote, raw.label, raw.value,
                                      " ; ".join(sp.text for sp in condition_spans(src, raw.quote, value=raw.value)), " ".join(raw.own.split()),
@@ -1269,10 +1233,8 @@ def _attributed(item: Item, unit: Unit, ws) -> bool:
             place = _place(ws, cid)
             if place is None or not _same_place(home, place):
                 continue
-            if _same_source(ws, cid, item.source) or flat in _flat_span(src.text or ""):
+            if _same_source(ws, cid, item.source) or flat in _flat_span(src.text or "") or _holds_value(item, src):
                 return True
-            if _holds_value(item, src) and (not get_settings().chat_own_attribution or _states_own_row(item, unit)):
-                return True  # (round 25 U2, KTD4: with ``chat_own_attribution`` another passage's number gives the item only when the block names its own row)
         elif cid in ws.values:
             v = ws.values[cid]
             if v.source_id == item.source and _same_place(home, _value_place(v)):
@@ -1283,12 +1245,6 @@ def _attributed(item: Item, unit: Unit, ws) -> bool:
                 if v is not None and v.source_id == item.source and _same_place(home, _value_place(v)):
                     return True
     return False
-
-
-def _states_own_row(item: Item, unit: Unit) -> bool:
-    """Whether the block's words name the item's own row (round 25 U2, KTD4): every content word of its label, or half of those of its quote
-    (``_datum_words``). With the headline values (``_value_check``) it is what a block must state to give a value-bearing item by a number alone."""
-    return _datum_words(item, _words(unit.text), unit.text)
 
 
 def _cites_source(item: Item, unit: Unit, ws) -> bool:
@@ -2083,7 +2039,6 @@ def quote_in_blocks(quote: str, units: Sequence[Unit], component: str = "", *, b
 class _Check(NamedTuple):
     why: str  # "" the block gives the item; "partial" it gives part of its headline values; else the furthest check it failed
     missing: tuple[frozenset[str], ...] = ()
-    conditions: tuple[str, ...] = ()  # "partial" with these: the block gives the value and leaves out these clauses of the item's condition (KTD3)
 
 
 class CoverageUnavailable(Exception):
@@ -2549,8 +2504,7 @@ def _datum_words(item: Item, words: frozenset[str], text: str = "", asked: str =
 
 
 def _check_block(item: Item, block: Block, ws, shared: bool, rivals: frozenset[str], lead: str = "",
-                 rival_dates: frozenset[str] = frozenset(), audit: bool = False, asked: str = "",
-                 condition_texts: Sequence[str] = ()) -> _Check:
+                 rival_dates: frozenset[str] = frozenset(), audit: bool = False, asked: str = "") -> _Check:
     """What one block of the answer gives of the item: its failure ``why`` (the first check it fails), ``partial`` with the headline values it
     leaves out, or "" when it gives it. Attribution is the union of the citations of the block's sentences (R5); the value is every headline
     value in the block's text; the date may stand in the block's lead; the condition words are asked only to tell apart items that
@@ -2570,8 +2524,6 @@ def _check_block(item: Item, block: Block, ws, shared: bool, rivals: frozenset[s
     if not _attributed(item, unit, ws):
         if not (audit and not unit.ids and not _context_ids(unit)):
             return _Check("not_attributed")
-        if get_settings().chat_own_attribution and headline(item.value, item.quote):
-            return _Check("not_attributed")  # round 25 U2 (KTD4): a value-bearing item is not given by a block that cites nothing
         uncited = True
     text = _positive(item, unit.text)  # what the block states positively for this item's row (round 22 U6, KTD6)
     words = _words(text)
@@ -2592,43 +2544,7 @@ def _check_block(item: Item, block: Block, ws, shared: bool, rivals: frozenset[s
     row = row_status(row_ref(item), text, ws, unit.ids, lead).status
     if row == ROW_UNNAMED:
         return _Check("condition_not_stated")
-    if row == ROW_OTHER:
-        return _Check("not_attributed")
-    if condition_texts and (left_out := _conditions_left_out(item, condition_texts, unit, lead)):
-        return _Check("partial", conditions=left_out)
-    return verdict
-
-
-_UNIT_TAIL = re.compile(r"\A\s*(?:₪|ש[\"״]ח|%|מ[\"״]ר|מיליון|אלף)")  # the unit a figure of the datum is written with
-
-
-def without_value(value: str, quote: str, clause: str) -> str:
-    """``clause`` (a condition of the datum, or the name of its sentence) with the datum's own value taken out of it (and the unit written beside it):
-    a negation the datum carries is part of the cell that holds the figure ("3,950,000 ₪ לא כולל מע״מ"), and a server line names the condition or the
-    item, never the value (round 25 U2, KTD7)."""
-    groups, fractions = value_tokens(value, quote)
-    places = sorted((r for found in token_places(clause, groups, fractions) for r in found), reverse=True)
-    for a, b in places:
-        tail = _UNIT_TAIL.match(clause[b:])
-        clause = clause[:a] + clause[b + (tail.end() if tail else 0):]
-    return " ".join(clause.split()).strip(" ,;:-–|")
-
-
-def _conditions_left_out(item: Item, condition_texts: Sequence[str], unit: Unit, lead: str) -> tuple[str, ...]:
-    """The clauses of the item's own source condition the block does not state (round 25 U2, KTD3): those the server decides alone
-    (``conditions.MISSING``: the operator's class and its operand are both absent from the block), unless the lead-in or the table's header
-    context above the block states them. A condition the block words differently (another operator of the class, a match of most of the
-    operand) is the judge's to decide and is never held against the item here; the value is never removed for a missing condition."""
-    out: list[str] = []
-    for text in condition_texts:
-        outcome, quote = conditions.read(text, unit.text)
-        if outcome != conditions.MISSING or not quote:
-            continue
-        if any(extra and conditions.read(text, extra)[0] == conditions.KEPT for extra in (lead, unit.context)):
-            continue
-        if (named := without_value(item.value, item.quote, quote)) and named not in out:
-            out.append(named)
-    return tuple(out)
+    return _Check("not_attributed") if row == ROW_OTHER else verdict
 
 
 def _giving_parts(item: Item, block: Block, ws=None, lead: str = "") -> list[Unit]:
@@ -2674,12 +2590,12 @@ _NO_GIVING = Giving(frozenset(), ())
 
 def _coverage_all(item: Item, blocks: Sequence[Block], ws, shared: bool, leads: Mapping[int, str],
                   rivals: frozenset[str] = frozenset(), rival_dates: frozenset[str] = frozenset(),
-                  audit: bool = False, asked: str = "", condition_texts: Sequence[str] = ()) -> tuple[Coverage, Giving]:
+                  audit: bool = False, asked: str = "") -> tuple[Coverage, Giving]:
     """``_coverage`` and, from the same pass over the blocks, every sentence that gives the item (``Ledger.outcomes``): the coverage names
     the first of them. Raises ``CoverageUnavailable`` when the item's source is not in the workspace."""
     if ws is None or _place(ws, item.source) is None:
         raise CoverageUnavailable(item.id)
-    checks = [(b, _check_block(item, b, ws, shared, rivals, leads.get(b.unit.index, ""), rival_dates, audit, asked, condition_texts))
+    checks = [(b, _check_block(item, b, ws, shared, rivals, leads.get(b.unit.index, ""), rival_dates, audit, asked))
               for b in blocks]
     giving = [b for b, c in checks if not c.why]
     if giving:
@@ -2692,22 +2608,20 @@ def _coverage_all(item: Item, blocks: Sequence[Block], ws, shared: bool, leads: 
                 Giving(indexes, tuple(b.unit for b, _ in parts if len(b.parts) > 1)))
     partial = [c for _, c in checks if c.why == "partial"]
     if partial:  # the block that gives the most of the item
-        best = min(partial, key=lambda c: (len(c.missing), len(c.conditions)))
-        return Coverage(False, None, "value_partial" if best.missing else "condition_missing", best.missing, conditions=best.conditions), _NO_GIVING
+        return Coverage(False, None, "value_partial", min(partial, key=lambda c: len(c.missing)).missing), _NO_GIVING
     furthest = max((_WHY_ORDER.index(c.why) for _, c in checks), default=-1)
     return Coverage(False, None, _WHY_ORDER[furthest] if furthest >= 0 else "not_attributed"), _NO_GIVING
 
 
 def _coverage(item: Item, units: Sequence[Unit], ws, shared: bool, leads: Mapping[int, str] | None = None,
-              blocks: Sequence[Block] | None = None, rivals: frozenset[str] = frozenset(),
-              rival_dates: frozenset[str] = frozenset()) -> Coverage:
+              blocks: Sequence[Block] | None = None) -> Coverage:
     """Whether the answer gives the item, block by block (R5, R13, R14; see the module docstring). ``shared``: another item of the item's
     component has its signature (its value, or its label), which makes its condition words (else its label's) needed. ``leads``: the
     text around each unit that dates it (``_leads``), and ``blocks``: ``blocks_of(units)``, when the caller already has them."""
     leads = _leads(units) if leads is None else leads
     blocks = blocks_of(units) if blocks is None else blocks
     try:
-        return _coverage_all(item, blocks, ws, shared, leads, rivals, rival_dates)[0]
+        return _coverage_all(item, blocks, ws, shared, leads)[0]
     except CoverageUnavailable:
         return Coverage(False, None, "not_attributed")
 
@@ -2959,7 +2873,6 @@ class Ledger:
         # with other blanks, and the later fill's reading is the one that stood)
         quotes = [i.quote for i in scored]  # a note whose mark another item's quote carries is that item's (round 20 U9, F2)
         spans = {ev: _spans_of(ws, i, quotes) for ev, i in {i.evidence: i for i in scored}.items()}
-        cond_on = get_settings().chat_condition_check  # round 25 U2 (KTD3): the condition is part of what a block must state to give the item
         rows: list[tuple[Item, Coverage | None]] = []
         gave: dict[Evidence, frozenset[int]] = {}  # the sentences that give each covered evidence (the first is the covering sentence)
         wide: dict[Evidence, tuple[Unit, ...]] = {}  # the multi-sentence blocks that give it, each as one unit
@@ -2977,16 +2890,15 @@ class Ledger:
                 rival_words = frozenset().union(*(_words(j.condition or j.label) for j in rivals))
                 rival_dates = frozenset().union(*(_condition_dates(j) for j in rivals))
                 asked_text = (asked or {}).get(item.component, "")
-                condition_texts = [sp.text for sp in spans.get(item.evidence, ())] if cond_on and not is_server_item(item) else ()
                 try:
-                    got, covering = _coverage_all(item, blocks, ws, shared, leads, rival_words, rival_dates, audit, asked_text, condition_texts)
+                    got, covering = _coverage_all(item, blocks, ws, shared, leads, rival_words, rival_dates, audit, asked_text)
                 except Exception as exc:  # noqa: BLE001 - any failure of the check is "could not be completed", never "not used" (R17)
                     logger.warning("item coverage check could not be completed: %s", type(exc).__name__)
                     got, covering = Coverage(False, None, ITEM_UNCHECKED, checked=False), _NO_GIVING
                 if gone_blocks and not got.ok and got.checked:
                     try:
                         if (taken := _coverage_all(item, gone_blocks, ws, shared, gone_leads, rival_words, rival_dates, audit,
-                                                asked_text, condition_texts)[0]).ok:
+                                                asked_text)[0]).ok:
                             removed_by[id(item)] = taken.unit
                     except Exception:  # noqa: BLE001 - a check of the removed text that fails only leaves the wording as it was
                         pass
@@ -3012,8 +2924,6 @@ class Ledger:
             else:  # a declared fill the answer does not give stays declared
                 state = item.state if item.state in NEEDS_REASON else OMITTED
             missing = [missing_detail(ws.sources.get(item.source), item.quote, g) for g in got.missing] if got is not None else []
-            if got is not None and got.conditions:
-                missing += list(got.conditions)  # a condition the block leaves out is named in the source's words, as a missing figure is
             # a quote that holds a smaller covered quote of the same place leaves the check to that one only when the narrow item is of the
             # same component and states the same datum, reads the conditions of the wide one and is given by the same sentences (round 20
             # U1, KTD1): each narrower quote keeps the condition of its own row, and a narrow item of another component or datum defers nothing
@@ -3026,8 +2936,7 @@ class Ledger:
             out.append({**item.public(), "state": state, "declared": item.state, "covered_by": got.unit if got else None,
                         "why": got.why if got else "", "outcome": outcome, "missing": missing,
                         "removed_unit": removed_by.get(id(item)) if outcome != COVERED else None,
-                        "history": [dict(h) for h in item.history], **check,
-                        **({"condition_gap": list(got.conditions)} if got is not None and got.conditions else {})})
+                        "history": [dict(h) for h in item.history], **check})
         return out
 
 
@@ -3053,7 +2962,7 @@ def _outcome(got: Coverage | None) -> str | None:
         return COVERED
     if not got.checked:
         return ITEM_UNCHECKED
-    return OUTCOME_PARTIAL if got.missing or got.conditions else OMITTED
+    return OUTCOME_PARTIAL if got.missing else OMITTED
 
 
 # --- the condition outcome of a covered item (round 18 U5) ---------------------------------------------------------------------
