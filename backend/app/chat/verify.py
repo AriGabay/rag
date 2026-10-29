@@ -2355,6 +2355,19 @@ class VerifyReport:
                 "flips": outcomes.count("flipped") + outcomes.count("partly_kept"), "removed": outcomes.count("both_failed"),
                 "reused": sum(o.startswith("reused") for o in outcomes), "skipped": skipped}
 
+    def confirm_record(self) -> dict:
+        """How the confirming readings and the timeout reuse of this verification ended, for the turn's diagnostics (round 23 closure): the judge status,
+        the confirm summary with the {claim id, outcome} of each claim it covered, and the units that took an earlier verdict because their call ran out of
+        time. Ids, counts and labels only - no text of the answer or of a document - and at most ``CONFIRM_RECORD_KEPT`` entries of each list (the counts stay
+        whole). Read by no decision: it changes nothing of the report."""
+        kept = self.confirm[:CONFIRM_RECORD_KEPT]
+        confirm = self.confirm_summary() | {"outcomes": [{"claim": e["claim"], "outcome": e["outcome"]} for e in kept]}
+        if len(self.confirm) > len(kept):
+            confirm["omitted"] = len(self.confirm) - len(kept)
+        reused = [{"unit": e["unit"], "claims": list(e["claims"]), "outcome": e["outcome"], "basis": e["basis"], "verdict": e["verdict"]}
+                  for e in self.reused_on_timeout[:CONFIRM_RECORD_KEPT]]
+        return {"judge_status": self.judge_status, "confirm": confirm, "reused_on_timeout": reused}
+
     def removed_units(self) -> set[int]:
         """Every unit cut from the answer: claims that failed, and absences the server states itself."""
         return {p.unit.index for p in self.problems if p.removes_unit}
@@ -10149,6 +10162,7 @@ SOFT_CAP_DIVISOR = 2  # the partly supported claims at risk may use 1/2 of the t
 CONFIRM_MIN_SECONDS = JUDGE_FIRST_CALL_MIN_SECONDS  # a confirming call does not start with less of the allowance left (round 23 review #11)
 CONFIRM_CHECK = "confirm_split"  # the check of the partial mark of a claim the second reading kept
 CONFIRM_SKIPS = ("cap", "no_time", "check_failed", "not_confirmed")  # why a claim was not confirmed (the first verdict stands)
+CONFIRM_RECORD_KEPT = 40  # entries of the confirm outcomes and of the timeout reuses a round's diagnostics keep (``VerifyReport.confirm_record``; the counts stay whole)
 MSG_CONFIRM_SPLIT = ("שתי קריאות בלתי תלויות של הטענה מול המקורות לא הסכימו, והשנייה מצאה אותה נתמכת; "
                      "הנתון נשאר מסומן כמאומת חלקית")
 

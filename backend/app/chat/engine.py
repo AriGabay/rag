@@ -1212,11 +1212,16 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         for p in report.problems:
             if p.repairable and p.resolution != "cut":
                 kinds[p.kind] = kinds.get(p.kind, 0) + 1
+        try:  # round 23 closure: how this round's confirming readings and timeout reuse ended - ids, counts and labels only (diagnostics only)
+            confirmed = report.confirm_record()
+        except Exception:  # noqa: BLE001 - a diagnostics record never fails the turn
+            logger.warning("chat confirm record failed", exc_info=True)
+            confirmed = {}
         note_gate("refused" if refused_by else "repair", round=len(rounds), ok=report.ok, settled=settled,
                   max_steps=settings.chat_max_steps, repairs_allowed=repairs, answer_seconds=round(answer_seconds, 3),
                   gate_window_seconds=round(max(REPAIR_MIN_SECONDS, REPAIR_TIME_FACTOR * answer_seconds), 3),
                   seconds_to_deadline=round(deadline - gate_now, 3), seconds_to_gate=round(repair_from - gate_now, 3),
-                  repairable_kinds=kinds, refused_by=refused_by)
+                  repairable_kinds=kinds, refused_by=refused_by, **confirmed)
         if refused_by:
             return finish(answer, report)
         attempt += 1
