@@ -7,6 +7,10 @@ uploaded again. It never touches another office: it signs in only as office C's 
 continue if that office holds a document this script did not upload.
 
     BACKEND_URL=http://localhost:8000 OWNER_DATABASE_URL=... uv run python scripts/seed_eval_office.py
+
+The target guard (scripts/seed_guard.py) prints the backend and database it will write to and refuses the office
+stack (ports 8000 and 5433, database `rag`) unless RAG_STACK=isolated is set for the isolated stack or
+--i-understand-office-target is passed. The isolated run is `scripts/isolated_stack.sh seed`.
 """
 
 from __future__ import annotations
@@ -21,6 +25,8 @@ from sqlalchemy import create_engine, text
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from seed_guard import guard_seed_target  # noqa: E402  (round 25 U6: target guard, same directory)
 
 from app.security import hash_password  # noqa: E402
 
@@ -42,6 +48,7 @@ def login() -> httpx.Client | None:
 
 
 def main() -> int:
+    guard_seed_target("seed_eval_office", sys.argv[1:])  # prints the target; refuses the office stack unmarked
     admin = login()
     if admin is None:
         owner = os.environ.get("OWNER_DATABASE_URL")

@@ -13,6 +13,11 @@ context. The held-out corpus (U12, KTD16; tests/fixtures/general/) goes into its
 visible to admin-a and dana but not yossi; it produces no records. The second held-out corpus
 (tests/fixtures/holdout_v2/, answer key tests/fixtures/holdout_v2_truth.yaml) goes the same way into its own
 group "ידע כללי ב". All data is synthetic.
+
+Target guard (round 25, scripts/seed_guard.py): the script prints the backend and database it will write to and
+refuses the office stack (ports 8000 and 5433, database `rag`) unless RAG_STACK=isolated is set for the isolated
+stack or --i-understand-office-target is passed, for example
+`docker compose exec backend python scripts/seed_demo.py --i-understand-office-target`.
 """
 
 from __future__ import annotations
@@ -29,6 +34,8 @@ from sqlalchemy import create_engine, text
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from seed_guard import guard_seed_target  # noqa: E402  (round 25 U6: target guard, same directory)
 
 from app.answering.attributes import STRUCTURED_ATTRIBUTES  # noqa: E402  (single source of truth, KTD7)
 from app.security import hash_password  # noqa: E402
@@ -232,6 +239,7 @@ def approve_matching(client: httpx.Client, docs: list[dict]) -> tuple[int, int]:
 
 
 def main() -> None:
+    guard_seed_target("seed_demo", sys.argv[1:])  # prints the target; refuses the office stack unmarked
     truth = yaml.safe_load((FIXTURES / "ground_truth.yaml").read_text(encoding="utf-8"))
     docs = truth["documents"]
     bootstrap_offices()
