@@ -9,7 +9,7 @@
 
 כל נתוני הדמו בריפו **סינתטיים** ומסומנים "מסמך סינתטי לדמו". אין להכניס לריפו מסמכים אמיתיים או פרטי לקוחות.
 
-מסמכים נוספים: ארכיטקטורה — `docs/architecture.md`; חוזה API — `docs/api-contract.md`; תוכנית והחלטות — `docs/plans/`; דוח הערכה — `docs/evaluation/report.md`.
+מסמכים נוספים: ארכיטקטורה — `docs/architecture.md`; חוזה API — `docs/api-contract.md`; תוכנית והחלטות — `docs/plans/`; דוח הערכה — `docs/evaluation/report.md`. הוראות הפעלה לפיילוט — `docs/operations/pilot.md`.
 
 ## דרישות
 
