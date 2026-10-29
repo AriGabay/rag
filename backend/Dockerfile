@@ -24,6 +24,11 @@ RUN if [ "$WITH_ML" = "true" ]; then uv sync --frozen --no-install-project --ext
 # Pre-download the default embedding model at build time (no network needed at runtime).
 RUN if [ "$WITH_ML" = "true" ]; then python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('intfloat/multilingual-e5-small')"; fi
 
+# The commit the image was built from (round 25 U5): the answer report records it. Set with --build-arg APP_BUILD_SHA=$(git rev-parse HEAD);
+# 'unknown' without it. Declared after the dependency layers so a new sha rebuilds only the layers below.
+ARG APP_BUILD_SHA=unknown
+ENV APP_BUILD_SHA=$APP_BUILD_SHA
+
 COPY . .
 RUN useradd --system --uid 10001 app && mkdir -p /data/files && chown -R app /data /app
 USER app

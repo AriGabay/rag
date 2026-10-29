@@ -78,6 +78,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
   const isAdmin = me.user.role === "admin";
 
+  // The chat is a full-screen app with its own sidebar (navigation, user, sign-out).
+  if (pathname.startsWith("/chat")) {
+    return <SessionContext.Provider value={me}>{children}</SessionContext.Provider>;
+  }
+
   return (
     <SessionContext.Provider value={me}>
       <header className="app-header">

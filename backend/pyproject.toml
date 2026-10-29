@@ -24,6 +24,7 @@ dependencies = [
   "anthropic>=1.11",
   "httpx>=0.28",
   "pyyaml>=6",
+  "openai==3.24.0",
 ]
 
 [project.optional-dependencies]
@@ -54,10 +55,13 @@ torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Real provider calls cost money and need a key: opt in with `-m real_model`.
+addopts = ["-m", "not real_model"]
 markers = [
   "db: needs the Postgres test database",
   "ocr: needs tesseract with Hebrew data",
   "slow: slow test",
+  "real_model: calls the real OpenAI API with the configured key (opt-in, skipped without a key)",
 ]
 filterwarnings = ["ignore::DeprecationWarning"]
 

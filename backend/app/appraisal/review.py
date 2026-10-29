@@ -30,6 +30,7 @@ from app.audit import audit
 from app.db import TenantContext, bump_data_version, system_ctx, tenant_tx
 from app.deps import FORBIDDEN, NOT_FOUND, get_ctx, parse_uuid
 from app.platform.documents import source_file_url
+from app.platform.source_kinds import APPRAISALS_SQL
 
 router = APIRouter(prefix="/api/review", tags=["review"])
 
@@ -70,7 +71,7 @@ def _occurrence(conn: Connection, occ_id: UUID):
         text(
             "SELECT o.*, v.mime_type, v.is_current, d.title FROM occurrences o"
             " JOIN document_versions v ON v.id = o.version_id"
-            " JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL WHERE o.id = :o"
+            f" JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL} WHERE o.id = :o"
         ),
         {"o": occ_id},
     ).first()
@@ -111,7 +112,8 @@ def _txn_summary(conn: Connection, txn_id: UUID) -> dict:
     t = conn.execute(text("SELECT * FROM transactions WHERE id = :t"), {"t": txn_id}).one()
     occs = conn.execute(
         text("SELECT o.document_id, o.version_id, o.page_no, o.row_index, o.address, d.title FROM occurrences o"
-             " JOIN documents d ON d.id = o.document_id WHERE o.transaction_id = :t ORDER BY d.title"),
+             f" JOIN documents d ON d.id = o.document_id AND {APPRAISALS_SQL} WHERE o.transaction_id = :t"
+             " ORDER BY d.title"),
         {"t": txn_id},
     ).all()
     return {
@@ -131,7 +133,7 @@ def queue(document_id: str | None = None, ctx: TenantContext = Depends(get_ctx))
         rows = conn.execute(
             text(
                 "SELECT o.*, d.title FROM occurrences o JOIN document_versions v ON v.id = o.version_id AND v.is_current"
-                " JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL"
+                f" JOIN documents d ON d.id = o.document_id AND d.deleted_at IS NULL AND {APPRAISALS_SQL}"
                 " WHERE o.verification_status IN ('needs_review', 'auto_extracted')"
                 " AND (CAST(:d AS uuid) IS NULL OR o.document_id = CAST(:d AS uuid))"
                 " ORDER BY (o.verification_status = 'needs_review') DESC, d.title, o.record_index"
@@ -141,9 +143,11 @@ def queue(document_id: str | None = None, ctx: TenantContext = Depends(get_ctx))
         cands = conn.execute(
             text("SELECT c.* FROM dedup_candidates c WHERE c.status = 'open'"
                  " AND EXISTS (SELECT 1 FROM occurrences o JOIN document_versions v ON v.id = o.version_id"
-                 "   AND v.is_current WHERE o.transaction_id = c.transaction_a)"
+                 f"   AND v.is_current JOIN documents d ON d.id = o.document_id AND {APPRAISALS_SQL}"
+                 "   WHERE o.transaction_id = c.transaction_a)"
                  " AND EXISTS (SELECT 1 FROM occurrences o JOIN document_versions v ON v.id = o.version_id"
-                 "   AND v.is_current WHERE o.transaction_id = c.transaction_b) ORDER BY c.created_at")
+                 f"   AND v.is_current JOIN documents d ON d.id = o.document_id AND {APPRAISALS_SQL}"
+                 "   WHERE o.transaction_id = c.transaction_b) ORDER BY c.created_at")
         ).all()
         visible_cands = [c for c in cands if _fully_visible(ctx, [c.transaction_a, c.transaction_b])]
         items = [

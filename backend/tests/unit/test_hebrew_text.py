@@ -114,3 +114,30 @@ def test_garbled_text_scores_below_threshold(garbled):
 def test_text_still_in_visual_order_scores_below_threshold():
     raw = "\n".join([RAW_ADDRESS, "ןג תמר :ריע", "םיזורח :הנוכש", "המושה תרטמ .1"] * 3)
     assert quality_score(raw) < QUALITY_THRESHOLD
+
+
+# --- a page with no Hebrew letter keeps the stored order of its digits-only lines (round 20, U4, KTD4) ----------------------
+
+NUMBER_LINE = "1,200 1,450 1,600"
+MINUS_LINE = "31/12/2022 4,368,752 -50,000 0 4,318,752 8.3933% 8.8527%"
+
+
+def test_a_number_only_line_on_a_page_with_no_hebrew_keeps_its_stored_order_when_the_file_default_is_visual():
+    assert fix_text_lines([NUMBER_LINE], default_visual=True) == [NUMBER_LINE]
+    assert fix_text_lines(["Quarterly revenue", NUMBER_LINE, "Total 12"], default_visual=True)[1] == NUMBER_LINE
+    assert fix_text_lines([NUMBER_LINE]) == [NUMBER_LINE]
+
+
+def test_the_same_number_line_on_a_page_with_hebrew_keeps_todays_reversal():
+    assert fix_text_lines(["ןג תמר :ריע", NUMBER_LINE], default_visual=True) == ["עיר: רמת גן", "1,600 1,450 1,200"]
+    assert fix_line(NUMBER_LINE, True) == "1,600 1,450 1,200"  # the line-level repair itself is not changed
+
+
+def test_a_page_with_hebrew_in_one_line_only_is_a_hebrew_page():
+    out = fix_text_lines(["Property", NUMBER_LINE, "ןג תמר"], default_visual=True)
+    assert out[0] == "Property" and out[1] == "1,600 1,450 1,200"
+
+
+def test_a_trailing_minus_number_keeps_its_sign_with_its_number_on_a_page_with_no_hebrew():
+    [out] = fix_text_lines([MINUS_LINE], default_visual=True)
+    assert out == MINUS_LINE and "-50,000" in out.split() and "50,000-" not in out.split()
