@@ -4464,3 +4464,65 @@ def test_the_tables_of_the_coverage_note_come_in_id_order_whatever_the_process_h
     for md in (f"הערך 100 [{second}] והערך 200 [{first}].", f"הערך 200 [{first}] והערך 100 [{second}]."):
         got = [t["title"] for t in coverage.tables_presented(ws, md)]
         assert got == ["טבלת שווי א", "טבלת שווי ב"]
+
+
+# --- round 25 walkthrough: a small number that is part of an address does not present a table row ----------------------------------------------
+
+SURVEY_ROWS = [("האורן 4", 2, 90, 60), ("הברוש 6", 1, 85, 61), ("הדקל 9", 3, 70, 58), ("שדרות הנחל 20", 6, 400, 68),
+               ("הגפן 12", 2, 120, 75), ("התמר 3", 5, 95, 52), ("הזית 15", 7, 110, 49)]
+
+
+def _survey(*, rows=SURVEY_ROWS) -> tuple[Workspace, str]:
+    """A cited market-survey table (address | floor | area | rent) of seven rows, as one table source (S1)."""
+    ws = Workspace(ctx=None)
+    body = "\n".join(" | ".join(str(c) for c in r) for r in rows)
+    text = f"הטבלה: {len(rows)} שורות\nכתובת | קומה | שטח | שכירות\n{body}\nהערה: הנתונים נכונים למרץ"
+    src = ws.add_source(document_id=uuid.uuid4(), version_id=uuid.uuid4(), title="סקר שוק", section="נספח", location="עמוד 3",
+                        kind="table", text=text, table_index=0)
+    return ws, src.sid
+
+
+def _survey_value(ws: Workspace, sid: str, row_number: int, column: str = "שכירות") -> str:
+    src, row = ws.sources[sid], SURVEY_ROWS[row_number - 1]
+    vid = f"V{len(ws.values) + 1}"
+    ws.values[vid] = calc.Value(vid, Decimal(row[3]), str(row[3]), sid, src.document_id, src.version_id, None, src.title,
+                                src.location, f"{row[0]} {column}", "rent", "ILS", "month", "included", "", "נכס הדגמה", "other",
+                                {"unit": "source"}, {"table_index": 0, "row": row[0], "row_number": row_number, "column": column},
+                                " | ".join(str(c) for c in row))
+    return vid
+
+
+def _presented(ws: Workspace, md: str) -> tuple[int, int]:
+    (t,) = coverage.tables_presented(ws, md)
+    return t["presented"], t["rows"]
+
+
+def test_a_floor_number_equal_to_a_house_number_in_the_answer_does_not_present_the_floor_6_row():
+    """The walkthrough: three rents stated with V# for three streets, the table cited (S1) for its date note; the row of floor 6 was counted
+    because 6 stands in «הברוש 6». The rows presented by cited V# count by their row, and a one-digit number is no presentation."""
+    ws, sid = _survey()
+    v = [_survey_value(ws, sid, n) for n in (1, 2, 3)]
+    md = (f"השכירות ב\"האורן 4\" היא 60 ₪ [{v[0]}], ב\"הברוש 6\" 61 ₪ [{v[1]}] וב\"הדקל 9\" 58 ₪ [{v[2]}]. הנתונים נכונים למרץ [{sid}].")
+    assert _presented(ws, md) == (3, 7)
+
+
+def test_the_rent_of_the_floor_6_row_stated_in_the_answer_presents_that_row():
+    ws, sid = _survey()
+    v = [_survey_value(ws, sid, n) for n in (1, 2, 3, 4)]
+    md = (f"השכירות ב\"האורן 4\" היא 60 ₪ [{v[0]}], ב\"הברוש 6\" 61 ₪ [{v[1]}], ב\"הדקל 9\" 58 ₪ [{v[2]}] וב\"שדרות הנחל 20\" 68 ₪ [{v[3]}]. [{sid}]")
+    assert _presented(ws, md) == (4, 7)
+    assert _presented(ws, f"השכירות ב\"הברוש 6\" היא 61 ₪ וב\"שדרות הנחל 20\" 68 ₪ [{sid}].") == (2, 7)  # by number only
+
+
+def test_without_cited_values_three_rents_stated_by_number_present_three_rows_not_four():
+    ws, sid = _survey()
+    md = f"השכירות ב\"האורן 4\" היא 60 ₪, ב\"הברוש 6\" 61 ₪ וב\"הדקל 9\" 58 ₪ [{sid}]."
+    assert _presented(ws, md) == (3, 7)
+
+
+def test_a_cited_value_of_a_floor_column_presents_its_row_and_a_row_of_small_numbers_only_is_presented_by_them():
+    ws, sid = _survey()
+    v = _survey_value(ws, sid, 2, "קומה")  # the cell of the floor column of the second row (the locator names the row)
+    assert _presented(ws, f"הקומה של הברוש 6 היא 1 [{v}]. [{sid}]") == (1, 7)
+    small, sid2 = _survey(rows=[("יחידה א", 2, 3), ("יחידה ב", 4, 5), ("יחידה ג", 6, 7)])
+    assert _presented(small, f"בטבלה 4 ו-5 [{sid2}].") == (1, 3)  # a row whose only numbers are small keeps them as its values

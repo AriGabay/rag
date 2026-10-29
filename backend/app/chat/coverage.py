@@ -1427,15 +1427,27 @@ def tidy(markdown: str) -> str:
     return doc.text
 
 
+# a one-digit whole number (optionally signed): a floor, a house number, a list mark (``tables_presented``)
+_SMALL_INT = re.compile(r"-?\d")
+
+
 def tables_presented(ws: Workspace, markdown: str) -> list[dict]:
-    """For each table the answer cites: its rows, and how many of them the answer presents a value of."""
+    """For each table the answer cites: its rows, and how many of them the answer presents a value of.
+
+    A row is presented in two ways (round 25, a walkthrough on a market-survey table of address | floor | area | rent: three rents stated
+    for three streets counted four rows, because the floor 6 of another row stood in the answer as the house number of «הברוש 6»):
+    a cited V# registered from that table presents the row its locator names; and a number of the row stated in the answer presents it,
+    except a one-digit whole number, which is as often a house number, a floor or a list mark as a value. A row whose only numbers are
+    one-digit ones (a floor and a room count) keeps them as its values."""
     from app.answering.verify import numbers_in
     from app.chat.tools import table_row_count
 
     shown = numbers_in(markdown)
     tables: dict[tuple, dict] = {}
+    labels: dict[tuple, dict[str, object]] = {}  # per table: a row's label -> the key it is counted under
     # in id order: a set's order changes between processes, and the coverage note lists the tables in this order (round 23)
-    for sid in sorted(cited_ids(markdown), key=lambda x: (x[0], int(x[1:]))):
+    ids = sorted(cited_ids(markdown), key=lambda x: (x[0], int(x[1:])))
+    for sid in ids:
         s = ws.sources.get(sid)
         if s is None or s.kind not in ("table", "table_row") or s.table_index is None:
             continue
@@ -1447,9 +1459,21 @@ def tables_presented(ws: Workspace, markdown: str) -> list[dict]:
             t["rows"] = size
         rows = [ln for ln in s.text.split("\n") if " | " in ln and re.search(r"\d", ln)]
         for n, row in enumerate(rows if s.kind == "table" else rows[-1:]):
+            key = row if s.kind == "table_row" else n
+            labels.setdefault((s.version_id, s.table_index), {}).setdefault(row.split(" | ")[0].strip(), key)
             cells = row.split(" | ")[1:] or [row]  # a row's label (an address, a floor) is not its value
-            if numbers_in(" ".join(cells)) & shown:
-                t["presented"].add(row if s.kind == "table_row" else n)
+            nums = numbers_in(" ".join(cells))
+            if any(_SMALL_INT.fullmatch(x) is None for x in nums):
+                nums = {x for x in nums if _SMALL_INT.fullmatch(x) is None}
+            if nums & shown:
+                t["presented"].add(key)
+    for vid in ids:  # the rows the answer presents through the values it cites from a cited table
+        v = ws.values.get(vid) if vid[0] == "V" else None
+        src = ws.sources.get(v.source_id) if v is not None else None
+        t = tables.get((src.version_id, src.table_index)) if src is not None and src.table_index is not None else None
+        row = str((v.locator or {}).get("row", "")).strip() if t is not None else ""
+        if row:
+            t["presented"].add(labels.get((src.version_id, src.table_index), {}).get(row, ("value row", row)))
     return [t | {"presented": len(t["presented"])} for t in tables.values() if t["rows"]]
 
 
