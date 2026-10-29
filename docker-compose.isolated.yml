@@ -13,7 +13,7 @@ x-backend-env: &backend-env
   SESSION_SECRET: ${SESSION_SECRET:?set in isolated.env}
   DEMO_MODE: ${DEMO_MODE:-true}
   EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
-  # Provider values pass through unchanged; empty means "use the settings default" (no model default here).
+  # Provider values pass through unchanged; empty means "use the settings default" (no model default here, except the Anthropic default below).
   LLM_PROVIDER: ${LLM_PROVIDER:-}
   OPENAI_KEY: ${OPENAI_KEY:-}
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}

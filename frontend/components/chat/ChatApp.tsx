@@ -279,7 +279,10 @@ export default function ChatApp() {
     if (!activeId) return undefined;
     const ctrl = new AbortController();
     chatApi.reports(activeId, ctrl.signal).then(
-      (res) => setReports((cur) => ({ ...cur, ...Object.fromEntries(res.reports.map((r) => [r.message_id, r])) })),
+      (res) =>
+        setReports((cur) =>
+          res.reports.length === 0 ? cur : { ...cur, ...Object.fromEntries(res.reports.map((r) => [r.message_id, r])) },
+        ),
       () => undefined,
     );
     return () => ctrl.abort();

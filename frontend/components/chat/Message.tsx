@@ -3,6 +3,7 @@
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { B } from "@/components/ui";
 import type { AnswerReport } from "@/lib/api";
+import { copyText } from "@/lib/clipboard";
 import type {
   ChatAnswer,
   ChatAnswerTime,
@@ -400,9 +401,9 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
   const copy = async () => {
     try {
       const plain = plainAnswer(answer.markdown);
-      await navigator.clipboard.writeText([plain, ...copiedExtras(answer.time)].join("\n\n"));
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
+      const ok = await copyText([plain, ...copiedExtras(answer.time)].join("\n\n"));
+      setCopied(ok);
+      if (ok) window.setTimeout(() => setCopied(false), 1500);
     } catch {
       setCopied(false);
     }

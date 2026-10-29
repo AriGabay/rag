@@ -236,7 +236,8 @@ export async function fetchSourceImage(url: string, signal?: AbortSignal): Promi
 }
 
 /** The five categories of an answer report (round 25 U5); the Hebrew labels live with the dialog. */
-export type ReportCategory = "wrong" | "missing" | "wrong_source" | "wrong_property" | "other";
+export const REPORT_CATEGORY_VALUES = ["wrong", "missing", "wrong_source", "wrong_property", "other"] as const;
+export type ReportCategory = (typeof REPORT_CATEGORY_VALUES)[number];
 export const REPORT_NOTE_MAX = 1000;
 
 /** A user's report of one answer, as the conversation's list returns it (the marker on the answer reopens it prefilled). */

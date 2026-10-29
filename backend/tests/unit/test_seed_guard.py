@@ -122,7 +122,7 @@ def test_missing_database_url_is_shown_as_not_set(capsys):
     assert "not set" in capsys.readouterr().out
 
 
-def _load(name, monkeypatch):
+def _load(name):
     spec = importlib.util.spec_from_file_location(f"_guard_probe_{name}", SCRIPTS / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -131,7 +131,7 @@ def _load(name, monkeypatch):
 
 @pytest.mark.parametrize("name", ["seed_eval_office", "seed_demo"])
 def test_scripts_refuse_the_default_target_before_any_request(name, monkeypatch):
-    module = _load(name, monkeypatch)
+    module = _load(name)
 
     def boom(*a, **k):
         raise AssertionError("the script reached the network or the database before the guard")
@@ -150,7 +150,7 @@ def test_scripts_pass_the_guard_for_an_isolated_target(name, monkeypatch, capsys
     monkeypatch.setenv("BACKEND_URL", "http://localhost:18000")
     monkeypatch.setenv("OWNER_DATABASE_URL", ISOLATED_DB)
     monkeypatch.setenv("RAG_STACK", "isolated")
-    module = _load(name, monkeypatch)
+    module = _load(name)
 
     class Reached(Exception):
         pass

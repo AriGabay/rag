@@ -135,6 +135,11 @@ def cited_ids(markdown: str) -> set[str]:
     return ids
 
 
+def cited_ids_ordered(markdown: str) -> list[str]:
+    """The ids the answer cites in a stable order (a set's order changes between processes): by letter, then number."""
+    return sorted(cited_ids(markdown), key=lambda x: (x[0], int(x[1:])))
+
+
 def cited_documents(ws: Workspace, markdown: str) -> dict[str, str]:
     """Document id -> title of every source, measurement, value and calculation input the answer cites."""
     out: dict[str, str] = {}
@@ -1429,6 +1434,8 @@ def tidy(markdown: str) -> str:
 
 # a one-digit whole number (optionally signed): a floor, a house number, a list mark (``tables_presented``)
 _SMALL_INT = re.compile(r"-?\d")
+# the key a row presented through a cited V# is counted under when no cited source row carries its label (``tables_presented``)
+_VALUE_ROW = "value row"
 
 
 def tables_presented(ws: Workspace, markdown: str) -> list[dict]:
@@ -1446,34 +1453,42 @@ def tables_presented(ws: Workspace, markdown: str) -> list[dict]:
     tables: dict[tuple, dict] = {}
     labels: dict[tuple, dict[str, object]] = {}  # per table: a row's label -> the key it is counted under
     # in id order: a set's order changes between processes, and the coverage note lists the tables in this order (round 23)
-    ids = sorted(cited_ids(markdown), key=lambda x: (x[0], int(x[1:])))
+    ids = cited_ids_ordered(markdown)
     for sid in ids:
         s = ws.sources.get(sid)
         if s is None or s.kind not in ("table", "table_row") or s.table_index is None:
             continue
         size = table_row_count(s.text)
-        t = tables.setdefault((s.version_id, s.table_index), {"document_id": str(s.document_id), "title": s.title,
-                                                              "location": s.location, "rows": None,
-                                                              "presented": set()})
+        table_key = (s.version_id, s.table_index)
+        t = tables.setdefault(table_key, {"document_id": str(s.document_id), "title": s.title,
+                                          "location": s.location, "rows": None, "presented": set()})
         if size:
             t["rows"] = size
         rows = [ln for ln in s.text.split("\n") if " | " in ln and re.search(r"\d", ln)]
         for n, row in enumerate(rows if s.kind == "table" else rows[-1:]):
             key = row if s.kind == "table_row" else n
-            labels.setdefault((s.version_id, s.table_index), {}).setdefault(row.split(" | ")[0].strip(), key)
-            cells = row.split(" | ")[1:] or [row]  # a row's label (an address, a floor) is not its value
+            parts = row.split(" | ")
+            labels.setdefault(table_key, {}).setdefault(parts[0].strip(), key)
+            cells = parts[1:] or [row]  # a row's label (an address, a floor) is not its value
             nums = numbers_in(" ".join(cells))
-            if any(_SMALL_INT.fullmatch(x) is None for x in nums):
-                nums = {x for x in nums if _SMALL_INT.fullmatch(x) is None}
+            big = {x for x in nums if not _SMALL_INT.fullmatch(x)}
+            nums = big or nums
             if nums & shown:
                 t["presented"].add(key)
     for vid in ids:  # the rows the answer presents through the values it cites from a cited table
         v = ws.values.get(vid) if vid[0] == "V" else None
-        src = ws.sources.get(v.source_id) if v is not None else None
-        t = tables.get((src.version_id, src.table_index)) if src is not None and src.table_index is not None else None
-        row = str((v.locator or {}).get("row", "")).strip() if t is not None else ""
+        if v is None:
+            continue
+        src = ws.sources.get(v.source_id)
+        if src is None or src.table_index is None:
+            continue
+        table_key = (src.version_id, src.table_index)
+        t = tables.get(table_key)
+        if t is None:
+            continue
+        row = str((v.locator or {}).get("row", "")).strip()
         if row:
-            t["presented"].add(labels.get((src.version_id, src.table_index), {}).get(row, ("value row", row)))
+            t["presented"].add(labels.get(table_key, {}).get(row, (_VALUE_ROW, row)))
     return [t | {"presented": len(t["presented"])} for t in tables.values() if t["rows"]]
 
 

@@ -1351,7 +1351,7 @@ def draft_record(ws: T.Workspace, markdown: str, round_no: int, version: int) ->
     """One verified draft kept for replay (round 21 U1, KTD9): its full Markdown and, per cited id, the stable locator of its
     source. ``round``: the number of the verification round in ``rounds``; ``version``: the answer version. The text is the
     answer's own, so the record is held behind the diagnostics permission with the documents it cites (``api._diagnostics``)."""
-    cited = sorted(coverage.cited_ids(markdown), key=lambda i: (i[0], int(i[1:])))
+    cited = coverage.cited_ids_ordered(markdown)
     sources = {sid: loc for sid in cited if (loc := _locator_of(ws, sid)) is not None}
     return {"round": round_no, "version": version, "markdown": markdown, "sources": sources}
 

@@ -65,14 +65,18 @@ config_check() {
   printf '%s' "$rendered" | python3 -c '
 import json, re, sys
 cfg = json.load(sys.stdin)
+project = sys.argv[1]
 errors = []
-if cfg.get("name") != "'"$PROJECT"'":
+if cfg.get("name") != project:
     errors.append("project name is %r" % cfg.get("name"))
 office_ports = {"5433", "8000", "3000"}
 for svc, spec in cfg.get("services", {}).items():
     for p in spec.get("ports") or []:
-        parts = str(p).split(":")
-        pub = str(p.get("published", "")) if isinstance(p, dict) else (parts[-2] if len(parts) > 1 else parts[0])
+        if isinstance(p, dict):
+            pub = str(p.get("published", ""))
+        else:
+            parts = str(p).split(":")
+            pub = parts[-2] if len(parts) > 1 else parts[0]
         if pub in office_ports:
             errors.append("service %s publishes office host port %s" % (svc, pub))
     if spec.get("image") == "appraisal-rag-backend":
@@ -83,7 +87,7 @@ for svc, spec in cfg.get("services", {}).items():
 vols = cfg.get("volumes", {})
 for key, v in vols.items():
     name = (v or {}).get("name", key)
-    if not name.startswith("'"$PROJECT"'_") or (v or {}).get("external"):
+    if not name.startswith(project + "_") or (v or {}).get("external"):
         errors.append("volume %s is %s" % (key, name))
 for svc, spec in cfg.get("services", {}).items():
     for v in spec.get("volumes") or []:
@@ -97,7 +101,7 @@ if errors:
     sys.exit(1)
 ports = sorted(str(p.get("published")) for s in cfg["services"].values() for p in (s.get("ports") or []))
 print("config-check ok: project %s, host ports %s, volumes %s" % (cfg["name"], ", ".join(ports), ", ".join(v["name"] for v in vols.values())))
-' || exit 1
+' "$PROJECT" || exit 1
 }
 
 cmd_up() {

@@ -156,16 +156,17 @@ def build_snapshot(message, answer: dict | None, diagnostics) -> dict:
     measurements = [s for s in answer.get("measurements") or [] if isinstance(s, dict)]
     values = [s for s in answer.get("values") or [] if isinstance(s, dict)]
     kept = {k: resolution[k] for k in ("timing", "requirements_trace", "item_ledger", "drafts", "decisions", "time") if k in resolution}
-    snap = {
+    doc_ids = (diagnostics.document_ids if diagnostics is not None else None) or []
+    limits = list(diagnostics.limits_hit or []) if diagnostics is not None else []
+    return {
         "version": SNAPSHOT_VERSION,
         "answer": structural(_pick(answer, ("kind", "status")) | (
             {"verification": answer["verification"]} if isinstance(answer.get("verification"), dict) else {}), "answer", 1),
         "cited_sources": [structural(_pick(s, _LOCATOR_KEYS)) for s in sources[:LIST_KEPT]],
         "cited_measurements": [structural(_pick(s, _LOCATOR_KEYS)) for s in measurements[:LIST_KEPT]],
         "cited_values": [structural(_pick(s, _LOCATOR_KEYS)) for s in values[:LIST_KEPT]],
-        "document_ids": sorted({str(d) for d in (diagnostics.document_ids if diagnostics is not None else None) or []
-                                if SAFE_CODE.match(str(d))}),
-        "limits_hit": structural(list(diagnostics.limits_hit or []) if diagnostics is not None else []),
+        "document_ids": sorted({str(d) for d in doc_ids if SAFE_CODE.match(str(d))}),
+        "limits_hit": structural(limits),
         "rounds": structural(rounds),
         "removed": structural(removed),
         "resolution": structural(kept) | ({"failure": _failure(resolution["failure"])} if "failure" in resolution else {}),
@@ -173,10 +174,8 @@ def build_snapshot(message, answer: dict | None, diagnostics) -> dict:
             "rounds": len(rounds), "problems": sum(len(r) for r in rounds if isinstance(r, list)), "removed": len(removed),
             "drafts": len(resolution.get("drafts") or []), "requirements": len(resolution.get("requirements_trace") or []),
             "sources": len(sources), "measurements": len(measurements), "values": len(values),
-            "document_ids": len(diagnostics.document_ids or []) if diagnostics is not None else 0,
-            "limits_hit": len(diagnostics.limits_hit or []) if diagnostics is not None else 0},
+            "document_ids": len(doc_ids), "limits_hit": len(limits)},
     }
-    return snap
 
 
 def _run_ids(message) -> tuple[str, dict]:
@@ -190,7 +189,7 @@ def _run_ids(message) -> tuple[str, dict]:
 
 
 class ReportBody(BaseModel):
-    category: Literal["wrong", "missing", "wrong_source", "wrong_property", "other"]
+    category: Literal[CATEGORIES]
     note: str = Field("", max_length=NOTE_MAX)
 
 
@@ -199,16 +198,17 @@ def report_message(message_id: str, body: ReportBody, ctx: TenantContext = Depen
     mid = parse_uuid(message_id)
     select = chat_api._SELECT + " WHERE m.id = :m AND m.role = 'assistant'"
     with tenant_tx(ctx) as conn:
-        r = conn.execute(text(select), {"m": mid}).first()   # row security: the owner's messages only
-        if r is None:
+        found = conn.execute(text("SELECT conversation_id FROM messages WHERE id = :m AND role = 'assistant'"),
+                             {"m": mid}).first()   # row security: the owner's messages only
+        if found is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
-        chat_api.lock_conversation(conn, r.conversation_id)   # the lock a retry holds: what it deletes is gone when this resumes
+        chat_api.lock_conversation(conn, found.conversation_id)   # the lock a retry holds: what it deletes is gone when this resumes
         # the row lock keeps a conversation delete (which takes no chat lock) from removing the message between this read and the insert
         r = conn.execute(text(select + " FOR SHARE OF m"), {"m": mid}).first()
         if r is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
-        stale = r.status in ("running", "cancelling") and r.age > chat_api._stale_after()
-        if r.status in ("running", "cancelling") and not stale:
+        stale = chat_api.is_stale(r)
+        if r.status in chat_api.IN_FLIGHT and not stale:
             raise HTTPException(status.HTTP_409_CONFLICT, "התשובה עדיין בעיבוד")
         message_status = "failed" if stale else r.status
         diagnostics = conn.execute(text("SELECT * FROM message_diagnostics WHERE message_id = :m"), {"m": mid}).first()
@@ -311,14 +311,20 @@ def list_reports(limit: int = Query(100, ge=1, le=LISTED), ctx: TenantContext = 
                              "message_exists": x.message_exists, "created_at": x.created_at.isoformat()} for x in found]}
 
 
-@router.get("/api/admin/answer-reports/{report_id}")
-def report_detail(report_id: str, ctx: TenantContext = Depends(require_admin)) -> dict:
-    """The report with its note and its structural snapshot, shown only with the documents the admin sees; the read is audited."""
+def _read_report(ctx: TenantContext, report_id: str, audit_action: str):
+    """A report row and its snapshot as the admin may see it; a read of another user's report is audited as ``audit_action``."""
     with tenant_tx(ctx) as conn:
         row = _report_row(conn, report_id)
         snapshot = _visible_snapshot(conn, row.snapshot)
         if row.user_id != ctx.user_id:
-            audit(conn, "answer_report.read", ctx.user_id, "answer_report", row.id, owner=str(row.user_id))
+            audit(conn, audit_action, ctx.user_id, "answer_report", row.id, owner=str(row.user_id))
+    return row, snapshot
+
+
+@router.get("/api/admin/answer-reports/{report_id}")
+def report_detail(report_id: str, ctx: TenantContext = Depends(require_admin)) -> dict:
+    """The report with its note and its structural snapshot, shown only with the documents the admin sees; the read is audited."""
+    row, snapshot = _read_report(ctx, report_id, "answer_report.read")
     return {"id": str(row.id), "reporter_id": str(row.user_id), "note": row.note, "updated_at": row.updated_at.isoformat(),
             "snapshot": snapshot} | _head(row)
 
@@ -327,11 +333,7 @@ def report_detail(report_id: str, ctx: TenantContext = Depends(require_admin)) -
 def report_export(report_id: str, ctx: TenantContext = Depends(require_admin)) -> JSONResponse:
     """What an office sends to the developer: the structural snapshot with the ids, without the note, shown only with the documents
     the admin sees; the export is audited."""
-    with tenant_tx(ctx) as conn:
-        row = _report_row(conn, report_id)
-        snapshot = _visible_snapshot(conn, row.snapshot)
-        if row.user_id != ctx.user_id:
-            audit(conn, "answer_report.export", ctx.user_id, "answer_report", row.id, owner=str(row.user_id))
+    row, snapshot = _read_report(ctx, report_id, "answer_report.export")
     body = {"report_id": str(row.id)} | _head(row) | {"snapshot": snapshot}
     return JSONResponse(body, headers={"Content-Disposition": f'attachment; filename="answer-report-{row.id}.json"',
                                        "Cache-Control": "no-store"})

@@ -247,11 +247,19 @@ def _stale_after() -> int:
     return get_settings().chat_turn_seconds * STALE_FACTOR + 60
 
 
+IN_FLIGHT = ("running", "cancelling")   # the statuses of an answer whose turn has not ended
+
+
+def is_stale(r) -> bool:
+    """An in-flight message (``IN_FLIGHT``) older than ``_stale_after()``: its process died. A row without an ``age`` is never stale."""
+    return r.status in IN_FLIGHT and bool(getattr(r, "age", 0)) and r.age > _stale_after()
+
+
 def _message_json(r, dv: int | None = None, sh: str | None = None, visible: set | None = None,
                   ctx: TenantContext | None = None) -> dict:
     status_ = r.status
     error = r.error
-    if status_ in ("running", "cancelling") and getattr(r, "age", 0) and r.age > _stale_after():
+    if is_stale(r):
         status_, error = "failed", "העיבוד הופסק (השרת הופעל מחדש או שהעבודה לא הסתיימה)."
     answer = r.answer
     content = r.content
@@ -510,7 +518,7 @@ def send_message(conversation_id: str, body: SendBody, ctx: TenantContext = Depe
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "מזהה הודעה לא תקין") from None
     with tenant_tx(ctx) as conn:
         conv = _conversation(conn, ctx, conversation_id)
-        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"chat:{conv.id}"})
+        lock_conversation(conn, conv.id)
         if client_id is not None:
             existing = conn.execute(text(_SELECT + " WHERE m.conversation_id = :c AND m.client_id = :k"),
                                     {"c": conv.id, "k": client_id}).first()
@@ -575,7 +583,7 @@ def retry_message(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> dic
         r = conn.execute(text(_SELECT + " WHERE m.id = :m AND m.role = 'assistant'"), {"m": parse_uuid(message_id)}).first()
         if r is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
-        if r.status in ("running", "cancelling") and r.age <= _stale_after():
+        if r.status in IN_FLIGHT and not is_stale(r):
             raise HTTPException(status.HTTP_409_CONFLICT, "התשובה עדיין בעיבוד")
         lock_conversation(conn, r.conversation_id)
         later = conn.execute(text("SELECT 1 FROM messages WHERE conversation_id = :c AND created_at > :t LIMIT 1"),
@@ -1414,7 +1422,7 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
         with tenant_tx(ctx) as conn:
             row = conn.execute(text("SELECT status, EXTRACT(EPOCH FROM (now() - updated_at)) AS age FROM messages"
                                     " WHERE id = :m"), {"m": message_id}).first()
-            if row is None or row.status not in ("running", "cancelling"):
+            if row is None or row.status not in IN_FLIGHT:
                 return  # deleted, or already ended
             if row.age > _stale_after():
                 # it waited so long that the user was told it failed (and may have moved on): never answer late

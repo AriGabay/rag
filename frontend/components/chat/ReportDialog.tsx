@@ -6,20 +6,27 @@ import {
   ApiError,
   chatApi,
   errorMessage,
+  REPORT_CATEGORY_VALUES,
   REPORT_NOTE_MAX,
   type AnswerReport,
   type AnswerReportResult,
   type ReportCategory,
 } from "@/lib/api";
+import { copyText } from "@/lib/clipboard";
 
-/** The five categories of a report, with the labels the dialog and the admin's list show (round 25 U5, R11). */
-export const REPORT_CATEGORIES: { value: ReportCategory; label: string }[] = [
-  { value: "wrong", label: "התשובה שגויה" },
-  { value: "missing", label: "חסר מידע בתשובה" },
-  { value: "wrong_source", label: "המקור שצוטט שגוי" },
-  { value: "wrong_property", label: "התשובה על נכס אחר" },
-  { value: "other", label: "אחר" },
-];
+const CATEGORY_LABELS: Record<ReportCategory, string> = {
+  wrong: "התשובה שגויה",
+  missing: "חסר מידע בתשובה",
+  wrong_source: "המקור שצוטט שגוי",
+  wrong_property: "התשובה על נכס אחר",
+  other: "אחר",
+};
+
+/** The five categories of a report (`REPORT_CATEGORY_VALUES`, in its order), with the labels the dialog and the admin's list show (round 25 U5, R11). */
+export const REPORT_CATEGORIES: { value: ReportCategory; label: string }[] = REPORT_CATEGORY_VALUES.map((value) => ({
+  value,
+  label: CATEGORY_LABELS[value],
+}));
 
 export function reportCategoryLabel(value: string): string {
   return REPORT_CATEGORIES.find((c) => c.value === value)?.label ?? value;
@@ -97,12 +104,7 @@ function ReportForm({
 
   const copyId = async () => {
     if (!done) return;
-    try {
-      await navigator.clipboard.writeText(done.id);
-      setCopied(true);
-    } catch {
-      setCopied(false);
-    }
+    setCopied(await copyText(done.id));
   };
 
   return (

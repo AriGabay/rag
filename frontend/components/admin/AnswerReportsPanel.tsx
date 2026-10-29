@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { reportCategoryLabel } from "@/components/chat/ReportDialog";
 import { ErrorAlert } from "@/components/ui";
 import { answerReportsApi, errorMessage, type AnswerReportDetail } from "@/lib/api";
+import { copyText } from "@/lib/clipboard";
 import { formatTimestamp } from "@/lib/format";
 import { useApi } from "@/lib/useApi";
 
@@ -33,13 +34,10 @@ export function AnswerReportsPanel() {
   }, []);
 
   const copy = async (id: string) => {
-    try {
-      await navigator.clipboard.writeText(id);
-      setCopied(id);
-    } catch {
-      setCopied(null);
-    }
+    setCopied((await copyText(id)) ? id : null);
   };
+
+  const snapshotText = useMemo(() => (open ? JSON.stringify(open.snapshot, null, 2) : ""), [open]);
 
   const reports = data?.reports ?? null;
   return (
@@ -123,7 +121,7 @@ export function AnswerReportsPanel() {
           <details>
             <summary>תמונת מצב מבנית של הריצה (קודים, זמנים ומיקומים בלבד)</summary>
             <pre dir="ltr" className="small" data-testid="report-snapshot">
-              {JSON.stringify(open.snapshot, null, 2)}
+              {snapshotText}
             </pre>
           </details>
           <div className="row">
