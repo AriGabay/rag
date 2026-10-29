@@ -116,7 +116,7 @@ A report's own subject line, or the letter opening that introduces it, starts a 
 
 ### Read and not used
 
-A part of the request that a passage the turn read states, with the exact quote checked against that passage, but that the answer left out. It is completed from that passage in the repair round, without a new search; if it still is not given, the answer says where it was read and that it was not used — never that it was not found. Opening a source is not enough: only a verified quote inside the asked appraisal counts.
+A part of the request that a passage the turn read states, with the exact quote checked against that passage, but that the answer left out. When the turn still has time for a repair round, it is completed there from that passage, without a new search; if no repair round runs or it still is not given, the answer says where it was read and that it was not used — never that it was not found. Opening a source is not enough: only a verified quote inside the asked appraisal counts.
 
 ### Item ledger
 
