@@ -284,6 +284,58 @@ def settle(components: list[Component] | None, user_texts: Iterable[str]) -> Ana
     return Analysis("ok" if items else "invalid", items or None, decisions=decisions)
 
 
+# --- which components ask for a SET (round 25 U2, KTD2, R5) ------------------------------------------------------------------------
+# Sibling rows, members and sentences of a read source count as asked only for a component that asks for a set: a list, every or each, a
+# breakdown, a comparison, or a period range. The cues are generic Hebrew request patterns, written from no customer's text. A request for ONE
+# total of several items is a single datum, and a plural noun inside a single-datum question does not make it a set.
+_NOT_LETTER_BEFORE, _NOT_LETTER_AFTER = r"(?<![א-ת])", r"(?![א-ת])"
+_TOTAL_PHRASE = re.compile(  # "the total", "the sum of all": one datum however many items it adds up; removed before the cues are read
+    rf"{_NOT_LETTER_BEFORE}(?:ה?סך(?:\s+ה?(?:כל|כול))?|סה[\"״']?כ|(?:ה?סכום\s+)?ה?כולל|במצטבר){_NOT_LETTER_AFTER}")
+_PLURAL_FORM = r"[א-ת]+(?:ים|ות)"
+_SET_CUES = re.compile("|".join([
+    # every / each: "כל" before a plural noun ("כל התנאים"), or before a singular unit of a series ("בכל שנה", "כל אחד מ…"); never "כל הנכס" (the whole)
+    rf"{_NOT_LETTER_BEFORE}[בלמ]?כל\s+ה?{_PLURAL_FORM}{_NOT_LETTER_AFTER}",
+    rf"{_NOT_LETTER_BEFORE}[בלמ]?כל\s+(?:אחד|אחת|שנה|חודש|רבעון|תקופה|רכיב|פריט|קומה|בניין|תא\s+שטח|שימוש|סוג|שורה|מגרש|יחידה|נכס)"
+    rf"{_NOT_LETTER_AFTER}",
+    rf"{_NOT_LETTER_BEFORE}כול[םן]{_NOT_LETTER_AFTER}",
+    # a list / a breakdown / the components
+    rf"{_NOT_LETTER_BEFORE}(?:פירוט|פרוט|פילוח|רשימ(?:ה|ת)|הרכב|בחלוקה|חלוקה\s+ל)",
+    rf"{_NOT_LETTER_BEFORE}[המ]?רכיב(?:י|ים){_NOT_LETTER_AFTER}",
+    rf"{_NOT_LETTER_BEFORE}(?:פרט|פרטו|מנה|רשום)\s+(?:לי\s+)?את{_NOT_LETTER_AFTER}",
+    rf"{_NOT_LETTER_BEFORE}ממה\s+מורכב|{_NOT_LETTER_BEFORE}מורכב(?:ת|ים|ות)?\s+מ",
+    rf"{_NOT_LETTER_BEFORE}לפי\s+ה?(?:רכיב|רכיבים|מרכיב|מרכיבים|שימוש|שימושים|סוג|סוגים|שנה|שנים|קטגוריה|קטגוריות|קומה|קומות|בניין|בניינים|"
+    rf"תא\s+שטח|תאי\s+שטח|פריט|פריטים|חלק|חלקים|תקופה|תקופות|נכס|נכסים){_NOT_LETTER_AFTER}",
+    # a comparison ("שווה" alone is "worth", not "compare")
+    rf"{_NOT_LETTER_BEFORE}(?:השווה|השוו|השוואה|השוואת|להשוות|בהשוואה|לעומת|ה?הבדל(?:ים)?\s+בין){_NOT_LETTER_AFTER}",
+    # a period range
+    rf"{_NOT_LETTER_BEFORE}(?:בין|לאורך)\s+ה?(?:שנים|שנות|תקופות){_NOT_LETTER_AFTER}",
+    rf"{_NOT_LETTER_BEFORE}ב?שנים{_NOT_LETTER_AFTER}",
+    rf"{_NOT_LETTER_BEFORE}השנים\s+האחרונות",
+    r"(?<![\d/.\-])(?:19|20)\d\d\s*[-–־]\s*(?:19|20)?\d\d(?![\d/.\-])",
+    rf"{_NOT_LETTER_BEFORE}(?:19|20)\d\d\s+(?:עד|ועד)\s+(?:שנת\s+)?(?:19|20)\d\d",
+    # "which" (plural): a choice among several
+    rf"{_NOT_LETTER_BEFORE}אילו{_NOT_LETTER_AFTER}",
+]))
+
+
+def asks_for_set(component: str, request: str = "") -> bool:
+    """Whether a component's words (and the request's, when the caller says the request is that one component) ask for a set (see above). A
+    total phrase is read out first: "the total of all the areas" is one datum, and "the total by component" still asks for the components."""
+    text = _TOTAL_PHRASE.sub(" ", _norm(f"{component} {request}"))
+    return bool(_SET_CUES.search(text))
+
+
+def set_components(items: Iterable[dict], request: str = "") -> set[str]:
+    """The ids of the frozen components that ask for a set: a parent that has children (the user named the members), and a component whose
+    own words carry a cue. The request's words count only when the turn asks one thing (one component with no children): with several, a
+    cue in the request belongs to one of them and is not each one's. An instruction is never a set of data."""
+    asked = [i for i in items if i.get("kind") != "instruction"]
+    parents = {i.get("parent") for i in asked if i.get("parent")}
+    leaves = [i for i in asked if i["id"] not in parents]
+    alone = request if len(leaves) <= 1 and not parents else ""
+    return {i["id"] for i in asked if i["id"] in parents or asks_for_set(i.get("text") or "", alone)}
+
+
 def _input(question: str) -> str:
     return "ההודעה של המשתמש:\n" + prompt_text(question)
 

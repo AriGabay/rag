@@ -366,3 +366,69 @@ def test_a_follow_up_whose_components_are_broken_keeps_the_rest_of_its_resolutio
 def test_an_older_resolution_without_components_is_valid_and_has_none():
     req, _ = _resolve(_resolution())
     assert req is not None and req.components is None and req.components_status == "empty"
+
+
+# --- round 25 U2 (KTD2, R5): which components ask for a SET (a list, every, a breakdown, a comparison, a period range) -----------
+# The cue list is written from generic Hebrew request patterns; every sentence below is invented.
+
+@pytest.mark.parametrize("text", [
+    "מהם רכיבי זכויות הבנייה בתכנית",                      # the components of ...
+    "פירוט שטחי השירות בבניין המערבי",                     # a breakdown noun
+    "פרט את ההתאמות שהשמאי יישם",                          # the imperative "itemize"
+    "תן רשימה של דמי השכירות לפי חוזה",                    # a list
+    "מהם כל התנאים לקבלת ההקלה",                            # every
+    "מהו שווי הקרקע בכל אחד מתאי השטח",                     # each one
+    "הצג את שיעורי ההיוון לפי שימוש",                       # per use
+    "מהו שטח הבנייה בחלוקה לקומות",                         # divided by floors
+    "השווה בין שני הערכים שנקבעו לחניון",                  # compare
+    "מה ההבדל בין שווי הדירה בשומה הראשונה לשנייה",         # the difference between two ... (a comparison)
+    "מהם דמי השכירות בין השנים 2019 עד 2022",              # a period range
+    "מהו הנטל בשנים 2018-2021",                             # a year range with a dash
+    "כמה עלה השכר בכל שנה מאז 2015",                       # each year
+    "אילו התאמות יושמו בשומה",                              # which (plural)
+    "מהו הסך הכול של זכויות הבנייה לפי רכיבים",             # a total WITH a breakdown asks for the breakdown
+])
+def test_a_component_that_asks_for_a_set_is_classified_as_a_set(text):
+    assert R.asks_for_set(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "מהו הסך הכול",
+    "מהו הסך הכול של זכויות הבנייה",
+    "מהו סך כל השטחים בנכס",                                # "every" inside a total phrase is one total
+    "מה סה\"כ שטח הבנייה",
+    "מהו שווי הדירות בבניין",                               # a plural noun inside a single-datum question
+    "מהו שטח החניות בנכס",
+    "מה הכתובת של הנכס",
+    "מהו שווי הקרקע",
+    "מהו שווי כל הנכס",                                     # "the whole property" is one datum
+    "מהו תאריך הביקור בנכס",
+    "מה התעריפים לשימוש בחניון",                            # plural noun, no cue
+    "מהו הסכום הכולל של הפיצוי",
+    "כמה עולה חניה ככל שמופיע בשומה",                       # "as far as it appears" is not "each"
+])
+def test_a_component_that_asks_for_one_datum_is_classified_as_single(text):
+    assert R.asks_for_set(text) is False
+
+
+def test_the_request_text_counts_for_a_turn_with_one_component_and_not_for_a_turn_with_several():
+    only = [{"id": "N1", "text": "זכויות הבנייה בנכס", "kind": "information", "parent": ""}]
+    assert R.set_components(only, "תפרט לי את זכויות הבנייה בנכס לפי רכיבים") == {"N1"}
+    assert R.set_components(only, "מהן זכויות הבנייה בנכס") == set()
+    two = [{"id": "N1", "text": "זכויות הבנייה בנכס", "kind": "information", "parent": ""},
+           {"id": "N2", "text": "שווי הקרקע", "kind": "information", "parent": ""}]
+    assert R.set_components(two, "פרט את זכויות הבנייה לפי רכיבים ואת שווי הקרקע") == set()  # a cue in the request is not each component's
+
+
+def test_a_parent_with_children_is_a_set_and_a_child_is_judged_by_its_own_words():
+    items = [{"id": "N1", "text": "נתוני התכנית", "kind": "information", "parent": ""},
+             {"id": "N1.1", "text": "ייעוד הקרקע", "kind": "information", "parent": "N1"},
+             {"id": "N1.2", "text": "פירוט הקומות", "kind": "information", "parent": "N1"},
+             {"id": "N2", "text": "פרט את כל הסעיפים", "kind": "instruction", "parent": ""}]
+    assert R.set_components(items, "") == {"N1", "N1.2"}  # the instruction is never a set of data
+
+
+def test_a_comparison_component_is_a_set_and_a_calculation_of_one_total_is_not():
+    items = [{"id": "N1", "text": "השוואה בין שווי הדירה בשתי השומות", "kind": "calculation", "parent": ""},
+             {"id": "N2", "text": "סך הכול שטח הבנייה", "kind": "calculation", "parent": ""}]
+    assert R.set_components(items, "") == {"N1"}

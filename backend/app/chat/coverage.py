@@ -115,6 +115,7 @@ from app.chat.tools import (
     reading_unclear,
     value_uncertain,
 )
+from app.config import get_settings
 from app.db import tenant_tx
 
 if TYPE_CHECKING:
@@ -245,6 +246,15 @@ GENERIC_LABEL = "הנתון המבוקש"
 ITEM_GAP_LINES = 8
 ITEM_NAME_CHARS = 80
 ITEM_REASON_CHARS = 160
+# round 25 U2 (KTD7; R7): why an item the answer leaves open was not completed, as a code and as the server's words. The line says that the item was read and
+# not completed for this cause; it never says the datum is absent, and never states the value. (The two causes of a completion that ran belong to U3.)
+CAUSE_TIME, CAUSE_STEPS, CAUSE_SETTLED, CAUSE_CONTEXT = "not_completed_time", "not_completed_steps", "not_completed_settled", "context_not_read"
+CAUSE_TEXT = {
+    CAUSE_TIME: "לא הושלם מחוסר זמן",
+    CAUSE_STEPS: "לא הושלם עקב מגבלת הצעדים של השאלה",
+    CAUSE_SETTLED: "לא הושלם כי לא נותר סבב תיקון נוסף",
+    CAUSE_CONTEXT: "ההקשר שלו לא נקרא במלואו ולכן לא הושלם",
+}
 # a model claim's status -> the reason it supports, once validated
 _KIND_OF_STATUS = {"not_found_search": "not_located", "source_partial": "region_not_read",
                    "section_checked_absent": "not_in_part_read", "sources_conflict": "sources_conflict"}
@@ -880,7 +890,25 @@ def _plain(text: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[:limit].rstrip() + "…"
 
 
-def item_line(ws: Workspace, state: dict, request: str = "") -> dict:
+def gap_cause(ws: Workspace, report, state: dict) -> str:
+    """Why the open item ``state`` was not completed (round 25 U2, KTD7), the first that holds: what the attempt that tried recorded for it
+    (``report.gap_causes``); the item's source read in part (``context_not_read``); what the repair gate refused for (the last refusal of the
+    turn: ``time``, ``steps``, or a requirement-only problem with no second round, ``settled`` / ``rounds_exhausted``); the limit the turn reached
+    (time, or the tool budget and the step limit); else time, the cause when no completion ran."""
+    if named := (getattr(report, "gap_causes", None) or {}).get(state["id"]):
+        return named
+    src = ws.sources.get(state["source"])
+    if src is not None and (src.unread_regions or src.status in ("has_unread_regions", "uncertain_reading")):
+        return CAUSE_CONTEXT
+    gate = next((g for g in reversed(ws.clock.repair_gate) if g.get("decision") == "refused"), None)
+    for name in (gate or {}).get("refused_by") or ():
+        if name in ("time", "steps", "settled", "rounds_exhausted"):
+            return {"time": CAUSE_TIME, "steps": CAUSE_STEPS}.get(name, CAUSE_SETTLED)
+    limit = _limit_of(ws)
+    return CAUSE_STEPS if limit in (STEP_LIMIT, TOOL_BUDGET) else CAUSE_TIME
+
+
+def item_line(ws: Workspace, state: dict, request: str = "", cause: str = "") -> dict:
     """The server's line for one item of the ledger the answer does not give (round 17 U3, KTD3, R8): it names the item, the place
     in the source it was read at (the document, the location, the S#) and the reason — still omitted: read there and not used,
     never "not found"; ``not_verifiable`` / ``not_applicable``: the reason the agent gave. {"id", "state", "text", "document_id",
@@ -900,7 +928,12 @@ def item_line(ws: Workspace, state: dict, request: str = "") -> dict:
     src = ws.sources.get(state["source"])
     title = (src.title if src is not None else "") or ""
     place = _read_at(title, src.location if src is not None else "", state["source"])
-    name = "«" + _plain(source_name(src, state["quote"]), ITEM_NAME_CHARS) + "»"
+    named = source_name(src, state["quote"])
+    if cause:  # round 25 U2 (KTD7): a line that names an open item and its cause never states the value, also when the item is a sentence or a member
+        from app.chat.items import without_value
+
+        named = without_value(state.get("value") or "", state["quote"], named) or GENERIC_LABEL
+    name = "«" + _plain(named, ITEM_NAME_CHARS) + "»"
     own = _own_context(src, state["quote"]) if src is not None else state["quote"]
     reason = _plain(state["reason"], ITEM_REASON_CHARS).rstrip(".")
     reason = reason if reason and words_stand_in(reason, own, request) else ""
@@ -923,9 +956,11 @@ def item_line(ws: Workspace, state: dict, request: str = "") -> dict:
         text = f"{name}: נקרא {place}, אך מה שנכתב עליו בתשובה הוסר באימות" + (", " + because if because else ".")
     else:
         text = f"{name}: נקרא {place}, ולא נעשה בו שימוש בתשובה."
+    if cause:  # an open item with the cause it was not completed for (round 25 U2); never the value
+        text = text.rstrip(".") + f"; {CAUSE_TEXT[cause]}."
     return {"id": state["id"], "state": state["state"], "text": text,
             "document_id": str(src.document_id) if src is not None and src.document_id is not None else None,
-            "title": title}
+            "title": title} | ({"cause": cause} if cause else {})
 
 
 def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict], states: Sequence[dict] | None = None) -> list[dict]:
@@ -951,6 +986,7 @@ def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict], states: Sequ
     # a candidate a component asked for is an item like an agent's (its line is built from the source's label and quote, ``item_line``);
     # and an item a sentence gives by attribution and value but not by its date is no item "read and not used" (the date is a note at most)
     lines: list[dict] = []
+    causes = get_settings().completeness_gap_lines  # round 25 U2 (KTD7, KTD8): the gap lines name the cause whenever a detection mechanism is on
     written: set[tuple[str, str]] = set()  # one evidence can fill several components (round 19 U3): its fills that read the same make one line
     for st in report.item_states() if states is None else states:
         # an item whose check could not be completed is stated whatever its origin (round 20 U5, KTD5, R18): its component is partial on it,
@@ -960,7 +996,8 @@ def item_gap_lines(ws: Workspace, report, outcomes: Sequence[dict], states: Sequ
                         or (st["state"] == ITEM_OMITTED and st["origin"] != ORIGIN_JUDGE_SUPPORT
                             and st["why"] != "date_not_stated"))):
             continue
-        line = item_line(ws, st, request)
+        cause = gap_cause(ws, report, st) if causes and st["state"] == ITEM_OMITTED else ""
+        line = item_line(ws, st, request, cause)
         if (mark := (st.get("evidence_id") or st["id"], line["text"])) not in written:
             written.add(mark)
             lines.append(line)

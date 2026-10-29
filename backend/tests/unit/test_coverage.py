@@ -4464,3 +4464,48 @@ def test_the_tables_of_the_coverage_note_come_in_id_order_whatever_the_process_h
     for md in (f"הערך 100 [{second}] והערך 200 [{first}].", f"הערך 200 [{first}] והערך 100 [{second}]."):
         got = [t["title"] for t in coverage.tables_presented(ws, md)]
         assert got == ["טבלת שווי א", "טבלת שווי ב"]
+
+
+# --- round 25 U2 (KTD7; R7): an open item's line names the cause it was not completed for, never the value -------------------------------------------
+
+def test_item_line_appends_the_cause_to_a_read_and_not_used_line_and_to_a_partly_given_one_and_never_the_value():
+    ws = _adj_file()
+    base = {"id": "I1", "state": "omitted", "source": "S2", "quote": "גיל הבניין | 2%", "reason": "", "outcome": "omitted", "missing": []}
+    plain = coverage.item_line(ws, base)
+    caused = coverage.item_line(ws, base, cause=coverage.CAUSE_STEPS)
+    assert caused["text"] == plain["text"].rstrip(".") + f"; {coverage.CAUSE_TEXT[coverage.CAUSE_STEPS]}." and caused["cause"] == coverage.CAUSE_STEPS
+    assert "cause" not in plain and "2%" not in caused["text"]
+    partial = coverage.item_line(ws, base | {"outcome": "partial", "missing": ["בכפוף לאישור התכנית"]}, cause=coverage.CAUSE_TIME)
+    assert "בחלקו" in partial["text"] and "בכפוף לאישור התכנית" in partial["text"] and partial["text"].endswith(coverage.CAUSE_TEXT[coverage.CAUSE_TIME] + ".")
+    assert not re.search(r"לא נמצא|לא אותר|לא מופיע", partial["text"] + caused["text"])
+
+
+def test_gap_cause_prefers_the_recorded_attempt_then_unread_context_then_the_gate_then_the_turns_limit_then_time():
+    ws = _adj_file()
+    state = {"id": "I1", "source": "S2"}
+
+    class Report:
+        gap_causes: dict = {}
+
+    report = Report()
+    assert coverage.gap_cause(ws, report, state) == coverage.CAUSE_TIME  # nothing known: no completion ran
+    _stopped_on(ws, "tool_budget")
+    assert coverage.gap_cause(ws, report, state) == coverage.CAUSE_STEPS
+    ws.clock.note_repair_gate({"decision": "repair", "refused_by": []})  # a gate that let a repair through says nothing
+    ws.clock.note_repair_gate({"decision": "refused", "refused_by": ["settled", "time"]})
+    assert coverage.gap_cause(ws, report, state) == coverage.CAUSE_SETTLED
+    ws.sources["S2"].unread_regions = ["R1"]
+    assert coverage.gap_cause(ws, report, state) == coverage.CAUSE_CONTEXT
+    report.gap_causes = {"I1": coverage.CAUSE_TIME}
+    assert coverage.gap_cause(ws, report, state) == coverage.CAUSE_TIME
+
+
+def test_item_line_with_a_cause_names_a_sentence_item_without_its_value_and_without_a_cause_as_before():
+    ws = _ws("שיעורי ההיוון שנקבעו בשומה:\nשיעור היוון למחסנים 9.1%\nשיעור היוון למשרדים 6.5%")
+    state = {"id": "I1", "state": "omitted", "source": "S1", "quote": "שיעור היוון למחסנים 9.1%", "value": "9.1%", "reason": "",
+             "outcome": "omitted", "missing": []}
+    assert "9.1%" in coverage.item_line(ws, state)["text"]  # the round-24 line names a sentence by its words
+    line = coverage.item_line(ws, state, cause=coverage.CAUSE_TIME)["text"]
+    assert line.startswith("«שיעור היוון למחסנים»") and "9.1" not in line
+    bare = coverage.item_line(ws, state | {"quote": "9.1%", "value": "9.1%"}, cause=coverage.CAUSE_TIME)["text"]
+    assert bare.startswith(f"«{coverage.GENERIC_LABEL}»") and "9.1" not in bare  # nothing but the value to name it by

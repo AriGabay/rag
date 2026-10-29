@@ -232,6 +232,7 @@ from app.chat.evidence import (
     select,
 )
 from app.chat.request import ID_PREFIX, Aspect, Kind
+from app.chat.request import set_components as request_set_components
 from app.config import get_settings
 from app.extraction.normalize_text import absence_spans, negation_form, states_absence
 from app.measurements.extract import VAT_TERM, stance_label
@@ -322,7 +323,12 @@ JUDGE_FIRST_CALL_MIN_SECONDS = 40
 # ``<row>`` and ``<other_rows>``) and a requirement answers each with ``applies`` (``applies``, ``not_applies`` or ``unknown``).
 # 23 (round 23 U4, KTD8): a source that holds a page-text row of numbers whose columns the stored word positions could not tell carries a
 # ``<column_binding>`` fact, and rule (36) reads it: a failure resting only on a column or cell mismatch of such a row is a mark.
+# 24 (round 25 U2, KTD1): with ``chat_sibling_anchors`` the requirements policy gains ``JUDGE_SIBLING_POLICY`` (a ``full`` vote still assigns candidates
+# of a component that asks for a set); the version is 23 while the setting is off (``judge_version``).
 JUDGE_VERSION = 23
+# round 25 U2 (KTD1): with ``chat_sibling_anchors`` on, the requirements call's policy gains ``JUDGE_SIBLING_POLICY`` and the contract's version is the
+# next one (``judge_version``); with it off the rendered prompt and every cache key are those of ``JUDGE_VERSION``
+JUDGE_VERSION_SIBLING = 24
 # the label of the facts the server holds about a cited source's unit and states beside its text (round 13 U9, KTD10, R13): the
 # stated valuation date of the unit that holds the passage, and why the server linked the appraisal to the property. Read
 # from the stored document, not from the passage: the judge takes them as evidence, never as a claim to check
@@ -593,6 +599,15 @@ JUDGE_REQUIREMENTS_POLICY = (
     "שלו כותבים אותן. מועמד שאף דרישה אינה מבקשת (שורה שהבקשה לא שאלה עליה) — אל תחזיר עליו רשומה, הוא לא התבקש. כשאינך בטוח "
     "אל תחזיר רשומה, ולעולם לא מילים שאינן בבקשה."
 )
+# round 25 U2 (KTD1; R2, R5): appended to the requirements policy only with ``chat_sibling_anchors``. A vote of ``full`` does not close the offer: the
+# server decides completeness from the items, and an assignment counts only from a call that sees the component's answer
+JUDGE_SIBLING_POLICY = (
+    "\nמועמדים גם לדרישה שציינת לה full: הציון נקבע לפי היחידות, והמועמדים בודקים את הבלוק שהתשובה נשענה עליו. דרישה שמבקשת קבוצה של פריטים "
+    "(רשימה, כל או כל אחד, פירוט לפי רכיבים, השוואה או טווח תקופות) ושבתשובה נתנה רק חלק מהם או רק את הסך הכול — החזר ב-candidates שלה את כל "
+    "מועמד שהיא מבקשת והתשובה אינה נותנת, גם כשהציון שלה full. אל תחזיר מועמד לדרישה שמבקשת נתון בודד (סך הכול אחד, ערך אחד, תאריך אחד): "
+    "השורות הסמוכות אליו לא נשאלו. כשאינך בטוח אל תחזיר רשומה."
+)
+
 # the judge's scores of a requirement in one call
 REQUIREMENT_STATUSES = ("full", "partial", "missing", "undeterminable")
 # a component's status in the verified answer (KTD3, R6): the judge's "undeterminable" is an evidence state
@@ -1767,7 +1782,7 @@ def datum_key(unit: Unit, text: str, ws: Workspace, digests: dict[str, str]) -> 
     """The identity of a claim's datum and source place (round 23 U5, R9): the numbers of its text and the ids its unit cites with the content of
     each - not its position, its unit's index, its claim id or the round it was judged in. What a decision on the claim (``Settled``) is kept
     under; the claim's wording is compared beside it (``VerdictCache.decided``). A changed number or a changed source is another datum."""
-    raw = json.dumps([sorted(numbers_in(text)), _evidence_digests(unit, ws, digests), JUDGE_VERSION], ensure_ascii=False)
+    raw = json.dumps([sorted(numbers_in(text)), _evidence_digests(unit, ws, digests), judge_version()], ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -1789,7 +1804,7 @@ def unit_key(unit: Unit, ws: Workspace, request: str, heading: str, digests: dic
     per id), its context (a table row's header row and the line before its table when that line names a scope — ``key_context``;
     the heading chain above it), the request and the judge contract's version (``JUDGE_VERSION``)."""
     evidence = _evidence_digests(unit, ws, digests)
-    key = [_norm(unit.text), evidence, key_context(unit), heading, unit.table_header, request, JUDGE_VERSION]
+    key = [_norm(unit.text), evidence, key_context(unit), heading, unit.table_header, request, judge_version()]
     if fact := ws.ownership_facts.get(_fact_key(unit)):  # the judge reads it beside the unit (rule 34)
         key.append(fact)
     raw = json.dumps(key, ensure_ascii=False)
@@ -2290,6 +2305,9 @@ class VerifyReport:
     item_ledger: Ledger | None = None
     item_ws: Workspace | None = None
     item_gaps: list[dict] = field(default_factory=list)
+    # round 25 U2 (KTD7): why an item left open was not completed, by item id (I#), when the attempt that tried says so (``coverage.gap_cause`` reads it
+    # first); empty for a turn whose attempt record is the repair gate's and the limits the turn reached
+    gap_causes: dict[str, str] = field(default_factory=dict)
     # the coverage decision the saved text was composed from (``VerifyReport.decision`` at the last compose pass, round 19 U4); None before
     # any compose. The diagnostics read it, so they describe the decision that drove the text and not a recomputation of it
     decided: list[dict] | None = None
@@ -2981,8 +2999,11 @@ class VerifyReport:
             return
         kept = []
         seen: set[tuple[str, str]] = set()
+        standing = self._standing(None) if get_settings().chat_sibling_anchors else None
         for r in self.requirements:
             for v in self.requirement_votes.get(r["id"], []):
+                if standing is not None and not any(i in standing and self.gives(v, i) for i in v.units):
+                    continue  # round 25 U2 (KTD2): a batch that cannot see a surviving unit of the component scored only its own units; its assignment caps nothing
                 for a in v.candidates:
                     c = self.candidate_pool.get(a.candidate)
                     if c is not None and (a.candidate, r["id"]) not in seen:
@@ -3026,6 +3047,8 @@ class VerifyReport:
 
     def _decisions(self, outcomes: list[dict], notes: dict[str, dict]) -> dict[str, dict]:
         out = {}
+        pointer = get_settings().completeness_gap_lines  # round 25 U2 (R1): the units that fill a component and the sources they cite
+        by_index = {u.index: u for u in self.units} if pointer else {}
         for o in outcomes:
             note = notes[o["id"]]
             rows = [self._score_row(v) for v in note["voters"]]
@@ -3035,6 +3058,9 @@ class VerifyReport:
                             "reused": bool(rows) and all(r["origin"] == CARRIED for r in rows), "rests_on": rows,
                             "caps": list(note["caps"]), "evidence": list(dict.fromkeys(ids))[:TRACE_PASSAGE_IDS],
                             "from_children": list(o["children"])}
+            if pointer:
+                out[o["id"]] |= {"units": list(o["units"]),
+                                 "cites": sorted({c for n in o["units"] if n in by_index for c in by_index[n].ids})}
         return out
 
     @property
@@ -3219,7 +3245,8 @@ class VerifyReport:
                 o["omitted_items"] = [i["id"] for i in omitted]
                 o["judge_items"] = [i["id"] for i in omitted if i["origin"] == ORIGIN_JUDGE_SUPPORT]
                 o["support"] += [{"id": i["source"], "quote": i["quote"]} for i in omitted
-                                 if (i["source"], SupportScope.flat(i["quote"])) not in have]
+                                 if (i["source"], SupportScope.flat(i["quote"])) not in have
+                                 and not i.get("condition_gap")]  # (round 25 U2: a value given without its condition is asked by the condition route)
             if kind == "instruction" and o["aspect"] == "citation":
                 o |= {"check": "citation", "uncited": uncited, "status": "not_answered" if uncited else "full",
                       "reason": ""}
@@ -5684,7 +5711,19 @@ def _check_conditions(report: VerifyReport, ws: Workspace, votes: list[JudgeRequ
     # the notes to write, by (unit, source, flat condition): the same condition missing from several items of one sentence is ONE note
     # (round 20 U9, F2), placed after the last of the data it is about (round 21 U2)
     pending: dict[tuple[int, str, str], list[tuple[dict, tuple[str, int], str, str, Applies]]] = {}
+    asked_again: set[tuple[str, str]] = set()
     for st in states:
+        if st.get("condition_gap") and st["state"] == ITEM_OMITTED:
+            # round 25 U2 (KTD3): the value is stated and the block leaves out the condition its own source gives it (``chat_condition_check``): the item is
+            # partial (it caps its component), and the same completion route as a missing condition asks for it next to the value, without tools
+            # and without removing anything. No server note: no sentence is decided to give the item
+            for clause in st["condition_gap"][:1]:
+                if (st["component"], _flat_quote(clause)) not in asked_again:
+                    asked_again.add((st["component"], _flat_quote(clause)))
+                    report.problems.append(Problem(Unit(-1, "", "", []), REQ_CONDITION_FOUND.format(
+                        name=_plain_label(st), where=f"{st['source']} «{prompt_text(clause)}»"), kind="requirement",
+                        component=st["component"], check=CONDITION_FOUND_CHECK))
+            continue
         verdict = said.get(st["id"])
         unit = units.get(st["condition_unit"])
         if st["condition_check"] == DECIDED_MISSING and st.get("condition_quote"):
@@ -9133,6 +9172,7 @@ class _Coverage:
         pool = {c["id"]: c for c in self.candidates}
         kind = next((requirement_kind(x) for x in self.turn.items if x["id"] == r.id), "information")
         known = frozenset().union(*(_loose_forms(w) for w in _missing_words(f"{texts.get(r.id, '')}\n{self.request}")))
+        sets = request_set_components(self.turn.items, self.request) if get_settings().chat_sibling_anchors else None
         out: dict[str, CandidateAssignment] = {}
         for a in r.candidates:
             cid, part = a.candidate.strip(), _norm(a.words or "")
@@ -9144,6 +9184,8 @@ class _Coverage:
                 why = "duplicate"
             elif kind not in SEARCHABLE_KINDS:
                 why = "not_a_datum"
+            elif sets is not None and r.id not in sets:
+                why = "not_a_set"  # round 25 U2 (KTD2, R5): a component that asks for one datum is held incomplete by that datum's own condition, never by a sibling
             elif not words or len(part) > MISSING_PART_CHARS or is_request_clause(part):
                 why = "no_words"
             elif not all(_loose_forms(w) & known for w in words):
@@ -9480,6 +9522,17 @@ def first_call_deadline(deadline: float | None) -> float | None:
     return deadline - JUDGE_RETRY_RESERVE_SECONDS
 
 
+def judge_version() -> int:
+    """The version of the judge's contract as the cache keys carry it: ``JUDGE_VERSION``, and the next one while ``chat_sibling_anchors`` changes the
+    requirements policy (round 25 U2, KTD1)."""
+    return JUDGE_VERSION_SIBLING if get_settings().chat_sibling_anchors else JUDGE_VERSION
+
+
+def requirements_policy() -> str:
+    """The requirements policy of a call that scores the turn's components: the round-24 text, plus ``JUDGE_SIBLING_POLICY`` with the setting on."""
+    return JUDGE_REQUIREMENTS_POLICY + (JUDGE_SIBLING_POLICY if get_settings().chat_sibling_anchors else "")
+
+
 def judge(provider: LLMProvider, batch: _Batch, rendered: str, usage: list[dict], deadline: float | None = None,
           coverage: _Coverage | None = None, *, policy: str = "", label: str = "verify"
           ) -> tuple[dict[int, JudgeVerdict], str, list[JudgeRequirement]]:
@@ -9489,7 +9542,7 @@ def judge(provider: LLMProvider, batch: _Batch, rendered: str, usage: list[dict]
     for this call (the re-read's); ``label``: the call's usage purpose (it is a ``verify`` call to the provider)."""
     provider = for_purpose(provider, Purpose.VERIFY)
     r = call_structured(provider, Purpose.VERIFY,
-                        JUDGE_POLICY + (JUDGE_REQUIREMENTS_POLICY if coverage else "") + policy,
+                        JUDGE_POLICY + (requirements_policy() if coverage else "") + policy,
                         rendered, JudgeCoverageOutput if coverage else JudgeOutput, deadline=deadline,
                         max_output_tokens=6000)
     usage.append(usage_entry(label, r, provider.model))
@@ -10177,6 +10230,22 @@ def _same_window(a: Source, b: Source) -> bool:
         return False
     ca, cb = set(a.contexts or ()), set(b.contexts or ())
     return ca == cb or bool(ca & cb)
+
+
+def same_block(a: Source, b: Source) -> bool:
+    """Whether two sources of the turn returned the same block, or an overlapping block range, of the same document version, reading and appraisal
+    unit (round 25 U2, KTD2): the same table returned under another S# and in another window. Matching goes by the stored block range alone, so a
+    read source of another part of the file is not one, nor is a source with no range, another reading or version, another unit, or a listing.
+    Narrower than ``_same_window`` (which accepts a shared appraisal context): it anchors the siblings of exactly the block the answer drew on."""
+    if a.document_id is None or a.version_id is None or a.document_id != b.document_id or a.version_id != b.version_id:
+        return False
+    if a.reading_id != b.reading_id or (a.unit or {}).get("id") != (b.unit or {}).get("id"):
+        return False
+    if None in (a.block_start, b.block_start):
+        return False
+    a_end = a.block_end if a.block_end is not None else a.block_start
+    b_end = b.block_end if b.block_end is not None else b.block_start
+    return a.block_start <= b_end and b.block_start <= a_end
 
 
 def _confirm_candidates(u: Unit, units: list[Unit], ws: Workspace, removed: Collection[int]) -> list[str]:

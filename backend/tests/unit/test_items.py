@@ -2770,3 +2770,70 @@ def test_round22_review_7_a_figure_before_a_prepositional_negation_stays_positiv
     assert not blanked.strip()  # the absence clause alone is still blanked
     beside = items.positive_text("הוצאות התחזוקה ללא פירוט נוסף. הארנונה 1,200 ₪.")
     assert "1,200" in beside and "פירוט" not in beside
+
+
+# --- round 25 U2 (KTD1-KTD3): the same block under another S#, the set gate of the offer, the condition a block must state ----------------------------
+
+def _blocked(ws: Workspace, sid: str, start: int | None, end: int | None, reading: str | None = "r1") -> None:
+    src = ws.sources[sid]
+    src.block_start, src.block_end, src.reading_id = start, end, reading
+
+
+def test_same_block_is_an_overlap_of_block_ranges_in_one_document_version_reading_and_unit():
+    from app.chat.verify import same_block
+
+    ws = _ws(RATE_TABLE, RATE_TABLE + "\nכניסה בחג | 20", "x\ny | 3", same_file=True)
+    a, b, c = (ws.sources[s] for s in ("S1", "S2", "S3"))
+    for sid, (start, end) in {"S1": (10, 12), "S2": (12, 15), "S3": (13, 15)}.items():
+        _blocked(ws, sid, start, end)
+    assert same_block(a, b) and same_block(b, a) and same_block(a, a)  # they meet at block 12
+    assert not same_block(a, c)  # 10-12 and 13-15 do not meet
+    _blocked(ws, "S3", 12, None)  # a point range is its start
+    assert same_block(a, c) and same_block(b, c)
+    _blocked(ws, "S3", None, None)
+    assert not same_block(a, c)
+    _blocked(ws, "S3", 12, 12, reading="r2")
+    assert not same_block(a, c)
+    _blocked(ws, "S3", 12, 12)
+    ws.sources["S3"].unit = {"id": "other"}
+    assert not same_block(a, c)
+    ws.sources["S3"].unit, ws.sources["S3"].version_id = None, uuid.uuid4()
+    assert not same_block(a, c)
+
+
+SET_RATES = [{"id": "N1", "text": "פירוט התעריפים לשימוש בחניון לפי סוג שימוש"}]
+
+
+def test_with_the_sibling_setting_on_the_offer_is_made_only_for_a_component_that_asks_for_a_set(monkeypatch):
+    from app.config import get_settings
+
+    ws = _ws(RATE_TABLE)
+    monkeypatch.setattr(get_settings(), "chat_sibling_anchors", False)
+    assert len(_offer(ws, RATE_ONE).candidates) == 3  # the plural noun is enough as before
+    monkeypatch.setattr(get_settings(), "chat_sibling_anchors", True)
+    assert _offer(ws, RATE_ONE).candidates == []  # "the rates for parking" is no list, no breakdown, no comparison
+    assert len(_offer(ws, RATE_ONE, SET_RATES).candidates) == 3
+    assert _offer(ws, RATE_ONE, [], request="פרט את התעריפים לשימוש בחניון").candidates == []  # no component: nothing asks for a set
+    assert len(_offer(ws, RATE_ONE, [{"id": "N1", "text": "התעריפים לשימוש בחניון"}], request="פרט את התעריפים לשימוש בחניון").candidates) == 3
+
+
+def test_a_block_that_states_the_value_without_the_condition_the_row_gives_it_is_partial_with_that_condition_missing(monkeypatch):
+    from app.config import get_settings
+
+    text = "\n".join(["תנאי הערכה", "פריט | סכום | הערה", "דמי חכירה | 240,000 | רק לתקופה של 25 שנה", "דמי ניהול | 18,000 |"])
+    ws = _ws(text)
+    row = _item(label="דמי חכירה", quote="דמי חכירה | 240,000 | רק לתקופה של 25 שנה", value="240,000")
+    for on in (False, True):
+        monkeypatch.setattr(get_settings(), "chat_condition_check", on)
+        ledger = items.Ledger()
+        ledger.merge([row])
+        (got,) = ledger.outcomes(_units("דמי החכירה הם 240,000 ₪ [S1]."), ws)
+        if not on:
+            assert got["state"] == "covered" and "condition_gap" not in got
+            continue
+        assert (got["state"], got["outcome"], got["why"]) == ("omitted", "partial", "condition_missing")
+        assert got["condition_gap"] == ["רק לתקופה של 25 שנה"] and got["missing"] == ["רק לתקופה של 25 שנה"]
+        (stated,) = ledger.outcomes(_units("דמי החכירה הם 240,000 ₪ רק לתקופה של 25 שנה [S1]."), ws)
+        assert stated["state"] == "covered"
+        (lead,) = ledger.outcomes(_units("התנאי: רק לתקופה של 25 שנה:\n\n- דמי החכירה הם 240,000 ₪ [S1]."), ws)
+        assert lead["state"] == "covered"  # a condition the lead-in states for the list is the item's too

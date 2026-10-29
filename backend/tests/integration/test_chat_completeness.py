@@ -322,7 +322,7 @@ THREE_RATES = ("שיעור היוון למשרדים 6.5% [S1].\nשיעור הי
 ALL_RATES = THREE_RATES + "\nשיעור היוון למחסנים 7.0% [S1]."
 
 
-def _rates_document(office) -> str:
+def _rates_document(office, paragraphs=None) -> str:
     import json as _json
 
     from sqlalchemy import text
@@ -334,7 +334,7 @@ def _rates_document(office) -> str:
     with tenant_tx(office.system) as conn:
         conn.execute(text("UPDATE document_versions SET page_count = 1, ingestion = CAST(:i AS jsonb) WHERE id = :v"),
                      {"v": ver, "i": _json.dumps({"reading_id": "reading-1"})})
-        blocks = [("heading", RATES_SECTION), *(("paragraph", t) for t in RATE_PARAGRAPHS)]
+        blocks = [("heading", RATES_SECTION), *(("paragraph", t) for t in (paragraphs or RATE_PARAGRAPHS))]
         for i, (kind, t) in enumerate(blocks):
             conn.execute(text(
                 "INSERT INTO document_blocks (office_id, document_id, version_id, block_index, kind, section,"
@@ -433,3 +433,73 @@ def test_a_part_the_repair_step_still_does_not_add_is_stated_as_read_and_not_use
     gap = a["markdown"][len(THREE_RATES):].strip()
     assert RATES_TITLE in gap and RATES_SECTION in gap and "[S1]" in gap and "לא נעשה בו שימוש" in gap
     assert "לא נמצא" not in gap and "לא אותר" not in gap
+
+
+# --- round 25 U2 (KTD1, KTD2, KTD7, KTD8): a `full` vote over a read list the answer gives in part, with the sibling check on -----------------------------
+
+SET_RATES_ASK = "פירוט שיעורי ההיוון שנקבעו לפי סוג שימוש"
+DISTINCT_RATES = [*RATE_PARAGRAPHS[:4], "שיעור היוון למחסנים 9.1%"]  # the fourth rate has a value of its own (one that repeats a stated value is stated by it)
+SET_RATES_QUESTION = "פרט את שיעורי ההיוון שנקבעו בשומה לפי סוג שימוש"
+
+
+def _sibling_judge(seen: list):
+    """Scores the one component ``full`` over the units shown (a lenient judge) and assigns every candidate it is offered to it."""
+    def judge(input: str) -> dict:
+        seen.append(input)
+        units = dict((int(i), t) for i, t in re.findall(r'<unit index="(\d+)" cites="[^"]*">\n(.*?)\n</unit>', input, re.S))
+        ids = re.findall(r'<requirement id="(N[\d.]+)"', input)
+        verdicts = [{"index": i, "verdict": "supported", "reason": "בדיקה"} for i in units]
+        if not ids:
+            return {"verdicts": verdicts}
+        asks = [{"candidate": cid, "words": "שיעורי היוון"} for cid in re.findall(r'<candidate id="(K\d+)"', input)]
+        return {"verdicts": verdicts, "requirements": [requirement(id=ids[0], units=list(units)) | {"candidates": asks}]}
+    return judge
+
+
+def _sibling_turn(client, office, monkeypatch, *, on: bool, ask: str = SET_RATES_ASK, question: str = SET_RATES_QUESTION):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "chat_sibling_anchors", on)
+    doc = _rates_document(office, DISTINCT_RATES)
+    steps = [[call("outline", document=doc)],
+             lambda items: [read(section=handle_of(_last_output(items), RATES_SECTION))],
+             *[final(THREE_RATES, documents=[doc])] * 4]
+    seen: list[str] = []
+    agent = ScriptedAgent(steps, judge=_sibling_judge(seen), request=[component(ask)])
+    cloud(monkeypatch, office, agent)
+    login(client, "admin-a@example.test")
+    return send(client, new_conversation(client), question), seen
+
+
+def test_ae1_a_full_vote_over_a_read_list_the_answer_gives_in_part_is_capped_and_the_open_member_is_named_with_its_cause(
+        client, office, monkeypatch):
+    m, seen = _sibling_turn(client, office, monkeypatch, on=True)
+    assert m["status"] == "done", m
+    a = m["answer"]
+    assert any("<candidates>" in s for s in seen)
+    assert a["status"] == "partial" and a["verification"]["completeness"]["status"] == "partial"
+    (c,) = a["components"]
+    assert c["status"] == "partial" and c["stated"] is False  # the member is stated by its own line, not by a component sentence
+    gap = a["markdown"][len(THREE_RATES):].strip()
+    (line,) = [ln for ln in gap.splitlines() if "למחסנים" in ln]
+    assert RATES_TITLE in line and "[S1]" in line and "לא נעשה בו שימוש" in line
+    assert line.rstrip(".").endswith("לא הושלם כי לא נותר סבב תיקון נוסף")  # a requirement-only problem the first repair round did not settle
+    assert "9.1%" not in line and not re.search(r"לא נמצא|לא אותר|לא מופיע", gap)
+    d = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()
+    pointer = d["requirements_trace"][-1]["components"][0]["decision"]
+    assert pointer["status"] == "partial" and pointer["caps"] == ["omitted_items"] and pointer["units"] and pointer["cites"] == ["S1"]
+
+
+def test_the_same_turn_for_a_component_that_asks_for_one_datum_offers_no_sibling_and_stays_full(client, office, monkeypatch):
+    m, seen = _sibling_turn(client, office, monkeypatch, on=True, ask="שיעור ההיוון למשרדים", question="מה שיעור ההיוון למשרדים לפי השומה?")
+    a = m["answer"]
+    assert not any("<candidates>" in s for s in seen)
+    assert a["status"] == "answered" and a["verification"]["completeness"] == {"status": "full", "requirements": 1, "missing": []}
+    assert "למחסנים" not in a["markdown"]
+
+
+def test_with_the_setting_off_the_open_member_keeps_the_round_24_line_without_a_cause(client, office, monkeypatch):
+    m, _ = _sibling_turn(client, office, monkeypatch, on=False)
+    gap = m["answer"]["markdown"][len(THREE_RATES):].strip()
+    (line,) = [ln for ln in gap.splitlines() if "למחסנים" in ln]
+    assert line.endswith("לא נעשה בו שימוש בתשובה.") and "לא הושלם" not in gap
