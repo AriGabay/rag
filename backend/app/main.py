@@ -6,7 +6,6 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from app.config import get_settings
 from app.db import get_engine
 
 logger = logging.getLogger("app")
@@ -36,11 +35,9 @@ def create_app() -> FastAPI:
         from app.db import check_database_locale
 
         check_database_locale()
-        settings = get_settings()
-        if settings.embedding_provider == "local":
-            from app.providers.embeddings import get_embedding_provider
+        from app.providers.embeddings import warm_up_embeddings
 
-            get_embedding_provider().warmup()
+        warm_up_embeddings()
 
     return app
 

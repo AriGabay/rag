@@ -1,53 +1,77 @@
-"""Content and combined answers (U10, R24, R25, R29, R34, R35)."""
+"""Shared pieces of the answering tools (U8, U9; KTD11): the provider of the office's mode, evidence built
+from authorized search hits, and the ``provider_usage`` log of every model call with its status.
+
+The search, locate and compare tools themselves run in ``turn`` (and ``compare``)."""
 
 from __future__ import annotations
 
-import logging
-import time
+from collections.abc import Iterable
 
 from sqlalchemy import Connection, text
 
-from app.answering.coverage import coverage
-from app.answering.verify import allowed_numbers, verify_answer
-from app.config import get_settings
-from app.db import TenantContext
+from app.answering.compose import Usage
 from app.platform.documents import source_file_url
-from app.platform.search import hybrid_search
-from app.providers.llm import LLMProvider, MockLLM, cloud_configured, get_cloud_provider
+from app.providers.llm import (
+    TOKEN_FIELDS,
+    CallStatus,
+    LLMProvider,
+    MockLLM,
+    get_selected_provider,
+    selected_provider_configured,
+    usage_cost,
+)
+from app.providers.status import Mode, ProviderState, office_provider_state
 
-logger = logging.getLogger(__name__)
-EVIDENCE_LIMIT = 6
-
-
-def effective_provider(conn: Connection) -> str:
-    """cloud | enabled_no_key | demo_mock | extractive (admin screen shows the same value)."""
-    enabled = conn.execute(text("SELECT cloud_llm_enabled FROM office_settings")).scalar_one_or_none()
-    if enabled and cloud_configured():
-        return "cloud"
-    if enabled:
-        return "enabled_no_key"
-    return "demo_mock" if get_settings().demo_mode else "extractive"
+EVIDENCE_LIMIT = 6  # admitted passages per content answer
 
 
-def select_provider(conn: Connection) -> tuple[LLMProvider | None, str]:
-    eff = effective_provider(conn)
-    if eff == "cloud":
-        return get_cloud_provider(), eff
-    if eff in ("demo_mock", "enabled_no_key") and get_settings().demo_mode:
-        return MockLLM(), "demo_mock"
-    return None, "extractive"
+def select_provider(conn: Connection) -> tuple[LLMProvider | None, ProviderState]:
+    """The provider for this office's mode (``providers.status``): the selected cloud provider in ``cloud``
+    mode, the labeled demo mock in ``demo`` mode, and none (sources only) in ``limited`` and ``error``."""
+    state = office_provider_state(conn, key_present=selected_provider_configured())
+    if state.mode == Mode.CLOUD:
+        return get_selected_provider(), state
+    if state.mode == Mode.DEMO:
+        return MockLLM(), state
+    return None, state
 
 
-def log_usage(conn: Connection, provider: LLMProvider, purpose: str, result, ok: bool) -> None:
+def log_usage(conn: Connection, provider: LLMProvider, purpose: str, result, ok: bool,
+              status: CallStatus | str | None = None) -> None:
+    """One ``provider_usage`` row: the model that served the call (the provider's when the result does not name
+    one), its token buckets, latency and estimated cost; ``status`` defaults to the result's own call status."""
+    status = status if status is not None else getattr(result, "status", None)
+    model = getattr(result, "model", None) or provider.model
+    tokens = {k: getattr(result, k, None) for k in TOKEN_FIELDS}
+    _insert(conn, provider.name, model, str(purpose), tokens, getattr(result, "latency_ms", None), ok,
+            str(status) if status is not None else None, usage_cost(model, **tokens))
+
+
+def log_usage_entries(conn: Connection, provider: LLMProvider, entries: Iterable[dict]) -> None:
+    """The ``provider_usage`` rows of a chat turn's calls, from their ``usage_entry`` records (priced at entry)."""
+    for u in entries:
+        tokens = {k: u.get(k) for k in TOKEN_FIELDS}
+        _insert(conn, provider.name, u.get("model") or provider.model, u["purpose"], tokens, u.get("latency_ms"),
+                u.get("status") == CallStatus.OK.value, u.get("status"), u.get("cost_usd"))
+
+
+def _insert(conn: Connection, provider: str, model: str | None, purpose: str, tokens: dict, latency_ms: int | None,
+            ok: bool, status: str | None, cost: float | None) -> None:
     conn.execute(
-        text("INSERT INTO provider_usage (office_id, provider, model, purpose, input_tokens, output_tokens,"
-             " latency_ms, ok) VALUES (app_office(), :p, :m, :pu, :i, :o, :l, :ok)"),
-        {"p": provider.name, "m": provider.model, "pu": purpose, "i": getattr(result, "input_tokens", None),
-         "o": getattr(result, "output_tokens", None), "l": getattr(result, "latency_ms", None), "ok": ok},
+        text("INSERT INTO provider_usage (office_id, provider, model, purpose, input_tokens, cached_input_tokens,"
+             " cache_write_tokens, output_tokens, latency_ms, ok, status, cost_usd) VALUES (app_office(), :p, :m,"
+             " :pu, :input_tokens, :cached_input_tokens, :cache_write_tokens, :output_tokens, :l, :ok, :s, :c)"),
+        {"p": provider, "m": model, "pu": purpose, **tokens, "l": latency_ms, "ok": ok, "s": status, "c": cost},
     )
 
 
-def _evidence(hits: list[dict], start: int) -> list[dict]:
+def log_usages(conn: Connection, provider: LLMProvider, usage: Iterable[Usage]) -> None:
+    """The ``provider_usage`` rows of a composed answer's calls (answer and judge)."""
+    for u in usage:
+        log_usage(conn, provider, u.purpose, u.result, u.ok, u.status)
+
+
+def evidence_from_hits(hits: list[dict], start: int) -> list[dict]:
     out = []
     for i, h in enumerate(hits, start=start):
         page = h["page_list"][0] if h["page_list"] else None
@@ -58,81 +82,3 @@ def _evidence(hits: list[dict], start: int) -> list[dict]:
             "url": source_file_url(h["document_id"], h["version_id"], page),
         })
     return out
-
-
-def _extractive(evidence: list[dict]) -> str:
-    lines = ["להלן הקטעים הרלוונטיים ביותר מתוך מסמכי המשרד:"]
-    for e in evidence[:4]:
-        where = f"עמ׳ {', '.join(map(str, e['page_list']))}" if e["page_list"] else (e["section"] or "")
-        lines.append(f"• {e['snippet']} [{e['evidence_id']}] ({e['title']}{', ' + where if where else ''})")
-    return "\n".join(lines)
-
-
-def answer_content(conn: Connection, ctx: TenantContext, question: str, c, route: str, numeric=None):
-    from app.answering.service import Outcome
-
-    query = question
-    if c is not None and (c.neighborhood or c.city) and numeric is not None:
-        query = f"{question} {c.neighborhood or ''} {c.city or ''}"
-    # Evidence needs at least one lexical or fuzzy term match; a purely semantic neighbour is not a basis.
-    hits = [h for h in hybrid_search(conn, query, EVIDENCE_LIMIT * 2) if h["lexical_support"]][:EVIDENCE_LIMIT]
-    base = numeric.answer if numeric is not None else None
-    start = len(base["sources"]) + 1 if base else 1
-    evidence = _evidence(hits, start)
-    cov = base["coverage"] if base else coverage(conn, None)
-    limitations = list(base["limitations"]) if base else []
-
-    if not evidence:
-        if base:
-            base["kind"] = "combined"
-            base["limitations"] = limitations + ["לא נמצאו קטעי הסבר רלוונטיים במסמכים המורשים."]
-            return numeric
-        answer = {"kind": "abstain", "provider": "template", "demo": False, "sources": [], "coverage": cov,
-                  "text": "לא נמצאו במסמכים שאתם מורשים לראות קטעים רלוונטיים לשאלה. לא ניתנה תשובה.",
-                  "limitations": ["החיפוש בוצע רק במסמכי המשרד שעובדו ושאתם מורשים לראות."]}
-        return Outcome(answer, c, c.intent if c else "explanation", route)
-
-    provider, provider_label = select_provider(conn)
-    calc = base["numeric"] if base else None
-    text_out, kind_provider, demo = None, "extractive", False
-    provider_failed = False
-    if provider is not None:
-        started = time.perf_counter()
-        try:
-            result = provider.answer(question, evidence, calc)
-            result.latency_ms = result.latency_ms or int((time.perf_counter() - started) * 1000)
-            allowed_ids = {e["evidence_id"] for e in evidence} | {s["evidence_id"] for s in (base["sources"] if base else [])}
-            numbers = allowed_numbers([e["text"] for e in evidence] + [s.get("snippet") or "" for s in (base["sources"] if base else [])], calc)
-            problems = [] if result.insufficient else verify_answer(result.text, result.used_ids, allowed_ids, numbers)
-            log_usage(conn, provider, "answer", result, not problems)
-            if result.insufficient:
-                limitations.append("לפי הראיות שנמצאו אין בסיס מספיק לתשובה מלאה; מוצגים הקטעים הרלוונטיים.")
-            elif problems:
-                logger.info("model answer rejected: %s", problems)
-                limitations.append("תשובת המודל לא עברה את בדיקות האימות, ולכן מוצגים הקטעים עצמם.")
-            else:
-                text_out, kind_provider, demo = result.text, ("mock" if provider.demo else "cloud"), provider.demo
-        except Exception:  # noqa: BLE001 - provider failure falls back, never leaks details
-            logger.warning("provider %s failed", provider.name)
-            log_usage(conn, provider, "answer", None, False)
-            limitations.append("ספק המודל לא היה זמין; מוצגים הקטעים הרלוונטיים.")
-            provider_failed = True
-    if text_out is None:
-        text_out = _extractive(evidence)
-    if provider_label == "extractive":
-        limitations.append("שליחת קטעים לספק מודל ענן כבויה במשרד; התשובה מורכבת מקטעי המקור עצמם.")
-
-    sources = (base["sources"] if base else []) + [{k: v for k, v in e.items() if k != "text"} for e in evidence]
-    if base:
-        answer = dict(base)
-        answer.update({"kind": "combined", "text": base["text"] + "\n\n" + text_out, "provider": kind_provider
-                       if kind_provider != "extractive" else "template", "demo": demo, "sources": sources,
-                       "limitations": limitations})
-    else:
-        answer = {"kind": "content", "text": text_out, "provider": kind_provider, "demo": demo, "sources": sources,
-                  "coverage": cov, "limitations": limitations, "numeric": None}
-    rows = (numeric.source_rows if numeric else []) + [
-        {"document_id": e["document_id"], "version_id": e["version_id"], "chunk_id": e["chunk_id"],
-         "page_list": e["page_list"]} for e in evidence]
-    return Outcome(answer, c, c.intent if c else "explanation", route, source_rows=rows,
-                   cacheable=not provider_failed)

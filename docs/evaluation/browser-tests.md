@@ -24,7 +24,20 @@ The config is `frontend/playwright.config.ts`: one worker, because the tests sha
   - Deleted copies still appear to admins with a "נמחק" badge, and the row locators skip them.
 - **Wrong-password test.** It uses `admin-b` and causes one failed login per run. The lockout is 10 failures in 15 minutes, and office A users are never touched.
 
-## Results
+## Round 7 (2026-10-06): full run after the review fixes, with the real model
+
+This round used the stack rebuilt from the branch head, `seed_demo.py` (now also seeding the held-out v2 documents K1–K8 into office A, group G4), and office A in cloud mode (OpenAI `gpt-5.4-mini`). The office's consent was re-acknowledged for OpenAI: the per-provider consent check correctly put the office in limited mode first. The new specs are `chat-races.spec.ts` and `facts-review-stale.spec.ts`. Both mock the API with `page.route`, apart from login.
+
+| run | result | notes |
+|---|---|---|
+| 1 | 28 passed, **2 failed**, 1 skipped | Two real defects, both fixed. **(a)** "אילו שומות מזכירות היתר בנייה?", asked while the data-kind clarification was open, was taken as the answer "שווי שנקבע בשומות": the model labeled it a reply, and the new structural check accepted it because the option shares the word "שומות". Now a question whose content words are not all words of the chosen option is a new question. **(b)** "ומה לגבי 2023?" in a new conversation fell to limited mode. A real-model replay planned `clarify` with no question in 2 of 3 runs, and the server rejected that as invalid. Now the server asks its own short question. Both have unit counter-tests |
+| 2 | **30 passed**, 0 failed, 1 skipped | Full suite on the fixed head, including the real-model conversations (`general-conversations.spec.ts`, `chat-messages.spec.ts`) |
+
+The skipped spec is "limited mode: the ממ״ד question…". It needs office A in limited mode. This stack runs with `DEMO_MODE=true`, so turning cloud off gives demo mode, not limited mode. A run with cloud briefly off confirmed the skip reason; cloud was then re-enabled. The limited path is covered by the API tests (`test_turns.py`, gate 7).
+
+One passing run does not show that the real-model conversations are stable. The failure in run 1 came from model variance (2 of 3 replays) meeting a rigid server rule, which is why both fixes are server rules with tests, not prompt changes.
+
+## Results (round 1, 2026-10-05)
 
 `npx playwright test`: **14 passed** (41 s). 12 tests pass outright. The other 2 are marked `test.fail()`: each one exposes a confirmed app bug, fails as expected, and Playwright reports it as passed. `npm run typecheck` and `npm run lint` are clean.
 

@@ -66,12 +66,22 @@ def make_user(
     return user_id
 
 
-def make_document(office: OfficeFixture, group_id: UUID, title: str = "מסמך", sha: str = "x" * 64) -> tuple[UUID, UUID]:
+def make_document(office: OfficeFixture, group_id: UUID, title: str = "מסמך", sha: str = "x" * 64,
+                  source_kind: str = "appraisal") -> tuple[UUID, UUID]:
+    """A document with one ready, current version. ``source_kind`` is stored only when it is not the default, so a
+    test that runs below migration 0019 (before the column exists) can still make a document."""
     with tenant_tx(office.ctx()) as conn:
-        doc_id = conn.execute(
-            text("INSERT INTO documents (office_id, group_id, title) VALUES (app_office(), :g, :t) RETURNING id"),
-            {"g": group_id, "t": title},
-        ).scalar_one()
+        if source_kind == "appraisal":
+            doc_id = conn.execute(
+                text("INSERT INTO documents (office_id, group_id, title) VALUES (app_office(), :g, :t) RETURNING id"),
+                {"g": group_id, "t": title},
+            ).scalar_one()
+        else:
+            doc_id = conn.execute(
+                text("INSERT INTO documents (office_id, group_id, title, source_kind)"
+                     " VALUES (app_office(), :g, :t, :k) RETURNING id"),
+                {"g": group_id, "t": title, "k": source_kind},
+            ).scalar_one()
         ver_id = conn.execute(
             text(
                 "INSERT INTO document_versions (office_id, document_id, version_no, sha256, filename, mime_type,"

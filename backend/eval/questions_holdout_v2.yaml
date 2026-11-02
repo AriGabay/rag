@@ -1,0 +1,1051 @@
+# Held-out general question set v2 (U12, KTD16): a NEW, SEPARATE evaluation on topics, documents and phrasings
+# that none of the earlier fixtures, question sets (eval/questions.yaml, eval/questions_general.yaml) or fixes
+# covered.
+#
+# PROVENANCE: written on 2026-10-06 against base commit 05df270, BEFORE any run of this set against the system
+# and without reading the answering code in backend/app (only backend/app/extraction/* and
+# backend/app/appraisal/extract.py were read, to make sure the documents create no records). Every expected
+# behavior below was fixed in advance. Do NOT use this set for tuning prompts, vocabulary or code; do not edit
+# an item's question or expected outcome after seeing results - add a new item instead. No code path routes by its
+# topic words.
+#
+# Truth: every expected value, page and coverage list is derived from tests/fixtures/holdout_v2_truth.yaml
+# (documents K1..K8 and K3v2 in tests/fixtures/holdout_v2/, office A, group G4 "ידע כללי ב", visible to
+# admin-a and dana, never to yossi or office B). That file has the same schema as ground_truth.yaml
+# `general_facts`; to score this set, eval/general.py reads it in place of `general_facts` (facts, documents,
+# conflicts, versions) and maps the K* file names to their ids. K3 is superseded by K3v2 and never counts as a
+# current document (the role H4 plays in the first set). D*/H* ids are the earlier fixtures; their sentences
+# on these topics are listed in holdout_v2_truth.yaml `existing_mentions` (D3 states noise and maintenance
+# without a figure; "צמוד"/"הצמדה בלעדית" in the H documents means attached, not CPI-linked).
+# tests/unit/test_fixtures_ground_truth.py recomputes every `result` from the truth file.
+#
+# Item fields: id, category, held_out (the item's topic word, listed in `terms`, occurs nowhere in backend/app),
+# terms, user (default admin-a@demo.test), cloud (on | off, default on), note, turns (one conversation).
+# Categories: explicit_text_fact, table_datum, locate, explanation, comparison, version_diff, conflict,
+# computation, unextracted_datum, missing_info, follow_up, topic_switch, clarification, negation.
+#
+# Expectations use exactly the keys of eval/questions_general.yaml and are scored the same way (see that file's
+# header): task_type, tool, relation, cleared, kept, pending_kept, outcome (answer | computation | comparison |
+# abstain | clarification), clarify_key, abstention_kind / abstention_kind_any_of, limited_mode, sources
+# (all_of / also_valid; page null = DOCX), values, result (scope, attribute, metric, value, unit, n, where,
+# facts), coverage (values_found, not_stated_includes, stated_absent, mentioned_without_value), sides,
+# incomplete, missing_side, labeled_by_version, changed, conflict, forbid, no_price_clarification,
+# allow_further_clarification.
+#
+# When the CORRECT behavior is a clarification, `outcome: clarification` with its `clarify_key` says so; an
+# answer that picks one referent is a failure. When the CORRECT behavior is a justified abstention,
+# `outcome: abstain` with the accepted kinds says so; a guessed figure is a failure. In every other item an
+# abstention or a clarification is a failure.
+#
+# Additions specific to this set (informational for the scorer, never needed to pass):
+#   value_words  a value the document writes only in words; the answer may give the digits or the word.
+#   result.metric also uses `max`; result units outside the scorer's unit map (ILS/month, ILS/m2/month,
+#                ILS/m2, score, dB) are not unit-checked.
+
+items:
+  # --- explicit text facts -------------------------------------------------------------------------------
+  - id: HV01
+    category: explicit_text_fact
+    held_out: true
+    terms: [שכירות]
+    note: the lease term is written only in words ("לתקופה של עשר שנים"); K3v2 is current, K3 says the same
+    turns:
+      - ask: "מה תקופת השכירות של החנות בסוקולוב 60 בהרצליה?"
+        expect:
+          task_type: answer
+          outcome: answer
+          no_price_clarification: true
+          sources: {all_of: [{doc: K3v2, page: 1}], also_valid: [{doc: K3, page: 1}]}
+          values: [{fact: K3v2-F02, value: 10, unit: year, value_words: [עשר]}]
+  - id: HV02
+    category: explicit_text_fact
+    held_out: true
+    terms: [דרך גישה]
+    note: written only in words ("ברוחב שישה מטרים")
+    turns:
+      - ask: "כמה רחבה דרך הגישה למגרש ברחוב הרצל 15 בחולון?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: K8, page: 1}]}
+          values: [{fact: K8-F02, value: 6, unit: m, value_words: [שישה, שש]}]
+  - id: HV03
+    category: explicit_text_fact
+    held_out: true
+    terms: [שוכר]
+    turns:
+      - ask: "כמה משלם השוכר למ״ר לחודש על קומת המשרדים בהברזל 31?"
+        expect:
+          task_type: answer
+          outcome: answer
+          no_price_clarification: true
+          sources: {all_of: [{doc: K1, page: 1}]}
+          values: [{fact: K1-F03, value: "85", unit: ILS/m2/month}]
+  - id: HV04
+    category: explicit_text_fact
+    held_out: true
+    terms: [עלות בניה]
+    note: spelling "בניה" (the document writes "בנייה"); the document states "7.2 אלף ₪" per m2 (= 7,200)
+    turns:
+      - ask: "מה עלות הבניה למ״ר שהונחה בשומת הקרקע ברחוב הרצל 15 בחולון?"
+        expect:
+          task_type: answer
+          outcome: answer
+          no_price_clarification: true
+          sources: {all_of: [{doc: K8, page: 1}]}
+          values: [{fact: K8-F09, value: "7.2", unit: thousand ILS/m2}]
+  - id: HV05
+    category: explicit_text_fact
+    held_out: true
+    terms: [דמי שכירות]
+    note: colloquial order; only the 2024 appraisal (K6, DOCX) states the rent - K5 (2023) says the building was not let
+    turns:
+      - ask: "דמי השכירות במבנה בהפלדה 12 בחולון - כמה הם היום לחודש?"
+        expect:
+          task_type: answer
+          outcome: answer
+          no_price_clarification: true
+          sources: {all_of: [{doc: K6, page: null}], also_valid: [{doc: K5, page: 1}]}
+          values: [{fact: K6-F05, value: "72000", unit: ILS/month}]
+  - id: HV06
+    category: explicit_text_fact
+    held_out: true
+    terms: [רעש]
+    turns:
+      - ask: "מה מפלס הרעש שנמדד מול החנות בביאליק 70 ברמת גן?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: K4, page: 1}]}
+          values: [{fact: K4-F01, value: "68", unit: dB}]
+  - id: HV07
+    category: explicit_text_fact
+    held_out: true
+    terms: [זיקת הנאה]
+    note: the city disambiguates the two "הרצל 15" documents
+    turns:
+      - ask: "האם רשומה זיקת הנאה על המגרש בהרצל 15 בפתח תקווה?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: K7, page: 1}]}
+          values: [{fact: K7-F11, value: true}]
+  - id: HV08
+    category: explicit_text_fact
+    held_out: false
+    note: abbreviations יח״ד (dwelling units) and פ״ת (Petah Tikva); "יח״ד" occurs in backend/app, so not held out
+    turns:
+      - ask: "כמה יח״ד יש בבניין בהרצל 15 בפ״ת?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: K7, page: 1}]}
+          values: [{fact: K7-F01, value: 24, unit: count}]
+  - id: HV09
+    category: explicit_text_fact
+    held_out: false
+    note: English term in a Hebrew question (cap rate = שיעור היוון); the rate is on page 2
+    turns:
+      - ask: "מה ה-cap rate בשומה של הסיבים 40?"
+        expect:
+          task_type: answer
+          outcome: answer
+          no_price_clarification: true
+          sources: {all_of: [{doc: K2, page: 2}]}
+          values: [{fact: K2-F11, value: "7.25", unit: percent}]
+
+  # --- table data ----------------------------------------------------------------------------------------
+  - id: HV10
+    category: table_datum
+    held_out: true
+    terms: [תפוסה]
+    turns:
+      - ask: "לפי טבלת הנתונים, מה התפוסה בבניין המשרדים ברחוב הברזל 31?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: K1, page: 1}]}
+          values: [{fact: K1-F06, value: "92", unit: percent}]
+  - id: HV11
+    category: table_datum
+    held_out: true
+    terms: [תחזוקה]
+    note: the 2024 appraisal of the same building (K6) has no maintenance score
+    turns:
+      - ask: "איזה ציון תחזוקה קיבל מבנה התעשייה בהפלדה 12 בשומה מ-2023?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: K5, page: 1}]}
+          values: [{fact: K5-F05, value: 3, unit: score}]
+  - id: HV12
+    category: table_datum
+    held_out: true
+    terms: [קו בניין]
+    turns:
+      - ask: "מה קו הבניין האחורי של הבניין בהרצל 15 בפתח תקווה?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: K7, page: 1}]}
+          values: [{fact: K7-F09, value: "5", unit: m}]
+  - id: HV13
+    category: table_datum
+    held_out: true
+    terms: [דירוג אנרגטי]
+    turns:
+      - ask: "איזה דירוג אנרגטי קיבל בניין המשרדים בהסיבים 40?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: K2, page: 1}]}
+          values: [{fact: K2-F09, value: "C"}]
+  - id: HV14
+    category: table_datum
+    held_out: true
+    terms: [שכירות]
+    turns:
+      - ask: "לכמה זמן נחתם חוזה השכירות של החנות בביאליק 70?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: K4, page: 1}]}
+          values: [{fact: K4-F05, value: 3, unit: year}]
+  - id: HV15
+    category: table_datum
+    held_out: true
+    terms: [אובדן הכנסות]
+    turns:
+      - ask: "כמה מנכים בגין אובדן הכנסות בשומה של הסיבים 40?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: K2, page: 1}]}
+          values: [{fact: K2-F07, value: "10", unit: percent}]
+
+  # --- locate --------------------------------------------------------------------------------------------
+  - id: HV16
+    category: locate
+    held_out: true
+    terms: [הערת אזהרה]
+    note: K7 states there is none (valid to cite as a contrast); the H documents' "ההערות הרשומות" is a generic
+      list of information sources, not a warning note, and must not be cited
+    turns:
+      - ask: "באילו שומות רשומה הערת אזהרה?"
+        expect:
+          task_type: locate
+          outcome: answer
+          sources: {all_of: [{doc: K2, page: 1}, {doc: K8, page: 1}], also_valid: [{doc: K7, page: 1}]}
+          values: [{fact: K2-F04}, {fact: K8-F07}]
+  - id: HV17
+    category: locate
+    held_out: true
+    terms: [דירוג אנרגטי]
+    turns:
+      - ask: "איפה מוזכר דירוג אנרגטי?"
+        expect:
+          task_type: locate
+          outcome: answer
+          sources: {all_of: [{doc: K1, page: 1}, {doc: K2, page: 1}, {doc: K7, page: 1}]}
+          values: [{fact: K1-F09}, {fact: K2-F09}, {fact: K7-F04}]
+  - id: HV18
+    category: locate
+    held_out: true
+    terms: [רעש, דציבלים]
+    note: D3 mentions street noise without a measurement (valid, not required)
+    turns:
+      - ask: "באילו שומות נמדד רעש בדציבלים?"
+        expect:
+          task_type: locate
+          outcome: answer
+          sources:
+            all_of: [{doc: K4, page: 1}, {doc: K7, page: 1}, {doc: K8, page: 1}]
+            also_valid: [{doc: D3, page: 1}]
+          values: [{fact: K4-F01}, {fact: K7-F06}, {fact: K8-F03}]
+  - id: HV19
+    category: locate
+    held_out: true
+    terms: [שיורית]
+    turns:
+      - ask: "איזו שומה נערכה בשיטה השיורית?"
+        expect:
+          task_type: locate
+          outcome: answer
+          sources: {all_of: [{doc: K8, page: 1}]}
+  - id: HV20
+    category: locate
+    held_out: true
+    terms: [קווי בניין]
+    note: K8 states setbacks in a sentence, not in a table (valid to mention, not required)
+    turns:
+      - ask: "באיזה מסמך יש טבלה של קווי בניין?"
+        expect:
+          task_type: locate
+          outcome: answer
+          sources: {all_of: [{doc: K7, page: 1}], also_valid: [{doc: K8, page: 1}]}
+
+  # --- explanation ---------------------------------------------------------------------------------------
+  - id: HV21
+    category: explanation
+    held_out: true
+    terms: [אובדן הכנסות]
+    note: the tenant announced it would scale down its activity in the branch
+    turns:
+      - ask: "למה בגרסה המעודכנת של השומה בסוקולוב 60 נוסף ניכוי בגין אובדן הכנסות?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: K3v2, page: 1}], also_valid: [{doc: K3, page: 1}]}
+          values: [{fact: K3v2-F05, value: "5", unit: percent}]
+  - id: HV22
+    category: explanation
+    held_out: true
+    terms: [דמי שכירות]
+    note: the rent is not CPI-linked, so a real erosion of the income was assumed
+    turns:
+      - ask: "מדוע השמאי לקח בחשבון שחיקה של דמי השכירות בחנות בביאליק 70?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: K4, page: 1}]}
+          values: [{fact: K4-F07, value: false}]
+  - id: HV23
+    category: explanation
+    held_out: true
+    terms: [פחת]
+    note: the building's age and the state of its systems; stated only in the 2023 appraisal (K5)
+    turns:
+      - ask: "על סמך מה נקבע פחת של 30% במבנה בהפלדה 12?"
+        expect:
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: K5, page: 1}], also_valid: [{doc: K6, page: null}]}
+          values: [{fact: K5-F08, value: "30", unit: percent}]
+
+  # --- comparison ----------------------------------------------------------------------------------------
+  - id: HV24
+    category: comparison
+    held_out: true
+    terms: [שיעור היוון]
+    note: K4 writes "7 אחוזים"; for סוקולוב 60 the current version K3v2 (7.25%) applies, not K3 (6.75%)
+    turns:
+      - ask: "השווה את שיעור ההיוון בין החנות בביאליק 70 לחנות בסוקולוב 60"
+        expect:
+          task_type: compare
+          tool: compare
+          outcome: comparison
+          sides:
+            - {doc: K4, page: 1, facts: [K4-F08]}
+            - {doc: K3v2, page: 1, facts: [K3v2-F06]}
+          values: [{fact: K4-F08, value: "7", unit: percent}, {fact: K3v2-F06, value: "7.25", unit: percent}]
+          sources: {all_of: [{doc: K4, page: 1}, {doc: K3v2, page: 1}], also_valid: [{doc: K3, page: 1}]}
+  - id: HV25
+    category: comparison
+    held_out: true
+    terms: [מושכר]
+    note: the same building - owner-occupied in 2023 (K5), fully let in 2024 (K6)
+    turns:
+      - ask: "השווה בין שתי השומות של הפלדה 12 בחולון: האם המבנה היה מושכר בכל אחת מהן?"
+        expect:
+          task_type: compare
+          tool: compare
+          outcome: comparison
+          sides:
+            - {doc: K5, page: 1, facts: [K5-F01]}
+            - {doc: K6, page: null, facts: [K6-F02]}
+          sources: {all_of: [{doc: K5, page: 1}, {doc: K6, page: null}]}
+  - id: HV26
+    category: comparison
+    held_out: true
+    terms: [דירוג אנרגטי]
+    note: K4 states no energy rating - the comparison is incomplete and must name K4 as the side without evidence
+    turns:
+      - ask: "השווה את הדירוג האנרגטי של בניין המשרדים בהברזל 31 ושל החנות בביאליק 70"
+        expect:
+          task_type: compare
+          tool: compare
+          outcome: comparison
+          incomplete: true
+          missing_side: K4
+          sides:
+            - {doc: K1, page: 1, facts: [K1-F09]}
+            - {doc: K4, page: 1, facts: []}
+          sources: {all_of: [{doc: K1, page: 1}], also_valid: [{doc: K4, page: 1}]}
+
+  # --- version diff --------------------------------------------------------------------------------------
+  - id: HV27
+    category: version_diff
+    held_out: true
+    terms: [שיעור היוון]
+    turns:
+      - ask: "מה שיעור ההיוון בשומה של החנות בסוקולוב 60?"
+        expect:
+          task_type: answer
+          outcome: answer
+          note: the current version K3v2 says 7.25%; giving only K3's 6.75% as the answer is wrong
+          sources: {all_of: [{doc: K3v2, page: 1}], also_valid: [{doc: K3, page: 1}]}
+          values: [{fact: K3v2-F06, value: "7.25", unit: percent}]
+      - ask: "ומה עוד השתנה בין הגרסאות?"
+        expect:
+          task_type: compare
+          tool: compare
+          relation: follow_up
+          outcome: comparison
+          labeled_by_version: true
+          sides:
+            - {doc: K3, page: 1, facts: [K3-F05, K3-F06]}
+            - {doc: K3v2, page: 1, facts: [K3v2-F05, K3v2-F06]}
+          changed: [vacancy_allowance, cap_rate]
+          sources: {all_of: [{doc: K3, page: 1}, {doc: K3v2, page: 1}]}
+  - id: HV28
+    category: version_diff
+    held_out: true
+    terms: [אובדן הכנסות]
+    note: none (K3, written as "לא הובא בחשבון ניכוי") -> 5% (K3v2)
+    turns:
+      - ask: "האם הניכוי בגין אובדן הכנסות שונה בין שתי הגרסאות של שומת סוקולוב 60?"
+        expect:
+          task_type: compare
+          tool: compare
+          outcome: comparison
+          labeled_by_version: true
+          sides:
+            - {doc: K3, page: 1, facts: [K3-F05]}
+            - {doc: K3v2, page: 1, facts: [K3v2-F05]}
+          values: [{fact: K3v2-F05, value: "5", unit: percent}]
+          sources: {all_of: [{doc: K3, page: 1}, {doc: K3v2, page: 1}]}
+
+  # --- conflicts -----------------------------------------------------------------------------------------
+  - id: HV29
+    category: conflict
+    held_out: true
+    terms: [שטח המגרש]
+    note: two appraisals of the same building disagree (2,400 m2 in 2023, 2,450 m2 "by an updated survey" in 2024);
+      both must be shown with their sources
+    turns:
+      - ask: "מה שטח המגרש של מבנה התעשייה בהפלדה 12 בחולון?"
+        expect:
+          task_type: answer
+          outcome: answer
+          conflict: true
+          sources: {all_of: [{doc: K5, page: 1}, {doc: K6, page: null}]}
+          values: [{fact: K5-F02, value: "2400", unit: m2}, {fact: K6-F01, value: "2450", unit: m2}]
+  - id: HV30
+    category: conflict
+    held_out: true
+    terms: [גודל המגרש]
+    turns:
+      - ask: "יש סתירה בין השומות של הפלדה 12 לגבי גודל המגרש?"
+        expect:
+          task_type: compare
+          outcome: comparison
+          conflict: true
+          sides:
+            - {doc: K5, page: 1, facts: [K5-F02]}
+            - {doc: K6, page: null, facts: [K6-F01]}
+          sources: {all_of: [{doc: K5, page: 1}, {doc: K6, page: null}]}
+
+  # --- computations --------------------------------------------------------------------------------------
+  - id: HV31
+    category: computation
+    held_out: true
+    terms: [שיעור היוון]
+    note: K3 (6.75%, superseded) never counts; K4's "7 אחוזים" counts as 7
+    turns:
+      - ask: "מה שיעור ההיוון הממוצע בשומות?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          no_price_clarification: true
+          result: {scope: all, attribute: cap_rate, metric: mean, value: "7.15", unit: percent, n: 5,
+                   facts: [K1-F10, K2-F11, K4-F08, K6-F08, K3v2-F06]}
+          values: [{fact: K1-F10, page: 1}, {fact: K2-F11, page: 2}, {fact: K4-F08, page: 1}, {fact: K6-F08, page: null},
+                   {fact: K3v2-F06, page: 1}]
+          coverage: {values_found: 5, not_stated_includes: [K5, K7, K8]}
+  - id: HV32
+    category: computation
+    held_out: true
+    terms: [דמי שכירות, מושכרים]
+    note: K2 states its rent per YEAR (1,450,800 = 120,900 a month); rent is not a transaction price - no
+      price-path clarification
+    turns:
+      - ask: "מה ממוצע דמי השכירות החודשיים בנכסים המושכרים?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          no_price_clarification: true
+          result: {scope: all, attribute: monthly_rent, metric: mean, value: "55490.00", unit: ILS/month, n: 5,
+                   facts: [K1-F05, K2-F10, K4-F03, K6-F05, K3v2-F03]}
+          values: [{fact: K1-F05, page: 1}, {fact: K2-F10, page: 1}, {fact: K4-F03, page: 1}, {fact: K6-F05, page: null},
+                   {fact: K3v2-F03, page: 1}]
+          coverage: {values_found: 5, not_stated_includes: [K5, K7, K8]}
+  - id: HV33
+    category: computation
+    held_out: true
+    terms: [שיעור היוון]
+    turns:
+      - ask: "בכמה שומות שיעור ההיוון גבוה מ-7%?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          note: 7.25 (K2), 7.25 (K3v2), 7.75 (K6); K4's 7 is not above 7
+          result: {scope: all, attribute: cap_rate, metric: count, value: "3", unit: count, n: 5, where: "> 7",
+                   facts: [K1-F10, K2-F11, K4-F08, K6-F08, K3v2-F06]}
+          values: [{fact: K2-F11, page: 2}, {fact: K6-F08, page: null}, {fact: K3v2-F06, page: 1}]
+          coverage: {values_found: 5, not_stated_includes: [K5, K7, K8]}
+  - id: HV34
+    category: computation
+    held_out: true
+    terms: [דרך גישה]
+    note: the narrowest is K8's "שישה מטרים" (words only); K7's "ברוחב 2 מ׳" is an easement strip, not a road
+    turns:
+      - ask: "מהי דרך הגישה הצרה ביותר שמופיעה בשומות?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: all, attribute: access_road_width, metric: min, value: "6", unit: m, n: 3,
+                   facts: [K2-F02, K5-F04, K8-F02]}
+          values: [{fact: K8-F02, page: 1}]
+          coverage: {values_found: 3, not_stated_includes: [K1, K4, K6, K7, K3v2]}
+  - id: HV35
+    category: computation
+    held_out: true
+    terms: [רעש, דציבל]
+    turns:
+      - ask: "איפה נמדד הרעש החזק ביותר, וכמה דציבל?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: all, attribute: noise_level, metric: max, value: "72", unit: dB, n: 3,
+                   facts: [K4-F01, K7-F06, K8-F03]}
+          values: [{fact: K8-F03, page: 1}]
+          coverage: {values_found: 3, not_stated_includes: [K1, K2, K5, K6, K3v2], mentioned_without_value: [D3]}
+  - id: HV36
+    category: computation
+    held_out: true
+    terms: [תחזוקה]
+    note: D3 says only "מצבו התחזוקתי סביר" (no score); H1/H3 speak of the public space, not the property
+    turns:
+      - ask: "מה ציון התחזוקה הממוצע של הנכסים?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: all, attribute: maintenance_score, metric: mean, value: "3.60", unit: score, n: 5,
+                   facts: [K1-F08, K2-F08, K4-F02, K5-F05, K7-F05]}
+          values: [{fact: K1-F08, page: 1}, {fact: K2-F08, page: 1}, {fact: K4-F02, page: 1}, {fact: K5-F05, page: 1},
+                   {fact: K7-F05, page: 1}]
+          coverage: {values_found: 5, not_stated_includes: [K6, K8, K3v2], mentioned_without_value: [D3]}
+  - id: HV37
+    category: computation
+    held_out: true
+    terms: [פחת]
+    note: the earlier fixtures' "הפחתה" (a deduction) is not depreciation
+    turns:
+      - ask: "מה שיעור הפחת הממוצע בשומות שנערכו בגישת העלות?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: all, attribute: depreciation_rate, metric: mean, value: "25.00", unit: percent, n: 2,
+                   facts: [K5-F08, K7-F13]}
+          values: [{fact: K5-F08, page: 1}, {fact: K7-F13, page: 1}]
+          coverage: {values_found: 2, not_stated_includes: [K1, K2, K4, K6, K8, K3v2]}
+  - id: HV38
+    category: computation
+    held_out: true
+    terms: [תפוסה]
+    note: negation in a computation. 92% (K1) and 75% (K2); K4 and K6 are fully let. K5 is owner-occupied - it has
+      no stated occupancy rate and must not be counted as 0%
+    turns:
+      - ask: "בכמה נכסים התפוסה אינה מלאה?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: all, attribute: occupancy_rate, metric: count, value: "2", unit: count, n: 4, where: "< 100",
+                   facts: [K1-F06, K2-F05, K4-F06, K6-F03]}
+          values: [{fact: K1-F06, page: 1}, {fact: K2-F05, page: 1}]
+          coverage: {values_found: 4, not_stated_includes: [K5, K7, K8, K3v2]}
+  - id: HV39
+    category: computation
+    held_out: true
+    terms: [שכירות]
+    note: K3v2's ten years are written in words; K1's 5-year option is not part of the term
+    turns:
+      - ask: "מה משך השכירות הממוצע בחוזים שמופיעים בשומות?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: all, attribute: lease_term, metric: mean, value: "6.25", unit: year, n: 4,
+                   facts: [K1-F02, K4-F05, K6-F04, K3v2-F02]}
+          values: [{fact: K1-F02, page: 1}, {fact: K4-F05, page: 1}, {fact: K6-F04, page: null}, {fact: K3v2-F02, page: 1}]
+          coverage: {values_found: 4, not_stated_includes: [K2, K5, K7, K8]}
+  - id: HV40
+    category: computation
+    held_out: true
+    terms: [תכסית]
+    note: K8's 45% is the maximum permitted coverage (a different measure from the existing coverage of K2, K5,
+      K7); values are listed, and a good answer says so
+    turns:
+      - ask: "אילו אחוזי תכסית מופיעים בשומות?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: all, attribute: building_coverage, metric: values, unit: percent, n: 4,
+                   facts: [K2-F03, K5-F03, K7-F03, K8-F04]}
+          values: [{fact: K2-F03, page: 1}, {fact: K5-F03, page: 1}, {fact: K7-F03, page: 1}, {fact: K8-F04, page: 1}]
+          coverage: {values_found: 4, not_stated_includes: [K1, K4, K6, K3v2]}
+  - id: HV41
+    category: computation
+    held_out: true
+    terms: [הערת אזהרה]
+    note: K2 has one note, K8 two; K7 states none (counts as an observation of 0)
+    turns:
+      - ask: "בכמה מהנכסים רשומה לפחות הערת אזהרה אחת?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: all, attribute: warning_notes, metric: count, value: "2", unit: count, n: 3, where: ">= 1",
+                   facts: [K2-F04, K7-F10, K8-F07]}
+          values: [{fact: K2-F04, page: 1}, {fact: K8-F07, page: 1}]
+          coverage: {values_found: 3, not_stated_includes: [K1, K4, K5, K6, K3v2]}
+  - id: HV42
+    category: computation
+    held_out: true
+    terms: [שכ״ד]
+    note: abbreviation שכ״ד (rent); scope = the two office documents (K1, K2)
+    turns:
+      - ask: "מה ממוצע השכ״ד למ״ר בבנייני המשרדים?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          no_price_clarification: true
+          result: {scope: {property_type: office}, attribute: rent_per_sqm, metric: mean, value: "73.50", unit: ILS/m2/month,
+                   n: 2, facts: [K1-F03, K2-F06]}
+          values: [{fact: K1-F03, page: 1}, {fact: K2-F06, page: 1}]
+          coverage: {values_found: 2}
+  - id: HV43
+    category: computation
+    held_out: true
+    terms: [עלות הקמה]
+    note: K8 states "7.2 אלף ₪" per m2 (= 7,200)
+    turns:
+      - ask: "מה עלות ההקמה הממוצעת למ״ר בשומות?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          no_price_clarification: true
+          result: {scope: all, attribute: construction_cost, metric: mean, value: "6066.67", unit: ILS/m2, n: 3,
+                   facts: [K5-F07, K7-F12, K8-F09]}
+          values: [{fact: K5-F07, page: 1}, {fact: K7-F12, page: 1}, {fact: K8-F09, page: 1}]
+          coverage: {values_found: 3, not_stated_includes: [K1, K2, K4, K6, K3v2]}
+
+  # --- attributes nobody extracted yet ------------------------------------------------------------------
+  - id: HV44
+    category: unextracted_datum
+    held_out: true
+    terms: [שיעור היוון]
+    cloud: "off"
+    note: limited mode - passages only, no number and no price clarification
+    turns:
+      - ask: "מה שיעור ההיוון הממוצע בשומות?"
+        expect:
+          task_type: compute
+          outcome: abstain
+          limited_mode: true
+          abstention_kind: not_extracted_or_verified
+          no_price_clarification: true
+          sources:
+            all_of: []
+            also_valid: [{doc: K1, page: 1}, {doc: K2, page: 2}, {doc: K4, page: 1}, {doc: K6, page: null},
+                         {doc: K3v2, page: 1}, {doc: K3, page: 1}]
+  - id: HV45
+    category: unextracted_datum
+    held_out: true
+    terms: [אובדן הכנסות]
+    note: K1 states explicitly that none was taken (0%), K2 10%, K3v2 5%; listed per document, never summed
+    turns:
+      - ask: "מה שיעור הניכוי בגין אובדן הכנסות בכל אחת מהשומות?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: all, attribute: vacancy_allowance, metric: values, unit: percent, n: 3,
+                   facts: [K1-F11, K2-F07, K3v2-F05]}
+          values: [{fact: K1-F11, page: 1}, {fact: K2-F07, page: 1}, {fact: K3v2-F05, page: 1}]
+          coverage: {values_found: 3, not_stated_includes: [K4, K5, K6, K7, K8]}
+
+  # --- missing information -------------------------------------------------------------------------------
+  - id: HV46
+    category: missing_info
+    held_out: true
+    terms: [דירוג אנרגטי]
+    turns:
+      - ask: "מה הדירוג האנרגטי של החנות בביאליק 70?"
+        expect:
+          task_type: answer
+          outcome: abstain
+          abstention_kind: not_stated
+          sources: {all_of: [], also_valid: [{doc: K4, page: 1}]}
+  - id: HV47
+    category: missing_info
+    held_out: true
+    terms: [דרך גישה]
+    turns:
+      - ask: "מה רוחב דרך הגישה לבניין בהברזל 31?"
+        expect:
+          task_type: answer
+          outcome: abstain
+          abstention_kind: not_stated
+          sources: {all_of: [], also_valid: [{doc: K1, page: 1}]}
+  - id: HV48
+    category: missing_info
+    held_out: true
+    terms: [שיעור היוון]
+    note: a land appraisal by the residual method has no capitalization rate
+    turns:
+      - ask: "מהו שיעור ההיוון בשומת הקרקע בהרצל 15 בחולון?"
+        expect:
+          task_type: answer
+          outcome: abstain
+          abstention_kind: not_stated
+          sources: {all_of: [], also_valid: [{doc: K8, page: 1}]}
+  - id: HV49
+    category: missing_info
+    held_out: true
+    terms: [דמי ניהול]
+    note: no document mentions management fees
+    turns:
+      - ask: "מה גובה דמי הניהול בבניין בהסיבים 40?"
+        expect:
+          task_type: answer
+          outcome: abstain
+          abstention_kind_any_of: [not_stated, not_found]
+          sources: {all_of: [], also_valid: [{doc: K2, page: 1}, {doc: K2, page: 2}]}
+  - id: HV50
+    category: missing_info
+    held_out: true
+    terms: [פחת]
+    note: the 2024 appraisal (K6) states no depreciation; the 2023 one (K5) states 30% and may be mentioned as such,
+      but it is not the 2024 figure
+    turns:
+      - ask: "מה שיעור הפחת במבנה בהפלדה 12 לפי השומה מ-2024?"
+        expect:
+          task_type: answer
+          outcome: abstain
+          abstention_kind: not_stated
+          sources: {all_of: [], also_valid: [{doc: K6, page: null}, {doc: K5, page: 1}]}
+  - id: HV51
+    category: missing_info
+    held_out: true
+    terms: [שיעור היוון]
+    user: yossi@demo.test
+    note: isolation - yossi sees only G2 (D4); no K* source may appear
+    turns:
+      - ask: "מה שיעור ההיוון הממוצע בשומות?"
+        expect:
+          outcome: abstain
+          abstention_kind_any_of: [not_found, not_stated, insufficient_permission_scope]
+          forbid: other_group
+          no_price_clarification: true
+  - id: HV52
+    category: missing_info
+    held_out: true
+    terms: [הערת אזהרה]
+    user: admin-b@demo.test
+    note: isolation - office B holds no v2 document
+    turns:
+      - ask: "באילו שומות רשומה הערת אזהרה?"
+        expect:
+          outcome: abstain
+          abstention_kind_any_of: [not_found, insufficient_permission_scope]
+          forbid: other_office
+
+  # --- follow-ups that change one condition --------------------------------------------------------------
+  - id: HV53
+    category: follow_up
+    held_out: true
+    terms: [עלות בנייה]
+    turns:
+      - ask: "מה עלות הבנייה הממוצעת למ״ר בשומות מחולון?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          no_price_clarification: true
+          result: {scope: {city: חולון}, attribute: construction_cost, metric: mean, value: "5700.00", unit: ILS/m2, n: 2,
+                   facts: [K5-F07, K8-F09]}
+          values: [{fact: K5-F07, page: 1}, {fact: K8-F09, page: 1}]
+          coverage: {values_found: 2, not_stated_includes: [K6]}
+      - ask: "ובפתח תקווה?"
+        expect:
+          relation: follow_up
+          task_type: compute
+          outcome: computation
+          kept: [attribute, metric]
+          result: {scope: {city: פתח תקווה}, attribute: construction_cost, metric: mean, value: "6800.00", unit: ILS/m2,
+                   n: 1, facts: [K7-F12]}
+          values: [{fact: K7-F12, page: 1}]
+          coverage: {values_found: 1, not_stated_includes: [K2]}
+      - ask: "ובלי הגבלה לעיר?"
+        expect:
+          relation: follow_up
+          task_type: compute
+          outcome: computation
+          kept: [attribute]
+          cleared: [city]
+          result: {scope: all, attribute: construction_cost, metric: mean, value: "6066.67", unit: ILS/m2, n: 3,
+                   facts: [K5-F07, K7-F12, K8-F09]}
+          values: [{fact: K5-F07, page: 1}, {fact: K7-F12, page: 1}, {fact: K8-F09, page: 1}]
+          coverage: {values_found: 3, not_stated_includes: [K1, K2, K4, K6, K3v2]}
+  - id: HV54
+    category: follow_up
+    held_out: true
+    terms: [תפוסה]
+    note: turn 2 changes only the metric (min -> max)
+    turns:
+      - ask: "מהו שיעור התפוסה הנמוך ביותר בנכסים?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: all, attribute: occupancy_rate, metric: min, value: "75", unit: percent, n: 4,
+                   facts: [K1-F06, K2-F05, K4-F06, K6-F03]}
+          values: [{fact: K2-F05, page: 1}]
+          coverage: {values_found: 4, not_stated_includes: [K5, K7, K8, K3v2]}
+      - ask: "והגבוה ביותר?"
+        expect:
+          relation: follow_up
+          task_type: compute
+          outcome: computation
+          kept: [attribute]
+          result: {scope: all, attribute: occupancy_rate, metric: max, value: "100", unit: percent, n: 4,
+                   facts: [K1-F06, K2-F05, K4-F06, K6-F03]}
+          values: [{fact: K4-F06, page: 1}, {fact: K6-F03, page: null}]
+          coverage: {values_found: 4, not_stated_includes: [K5, K7, K8, K3v2]}
+  - id: HV55
+    category: follow_up
+    held_out: true
+    terms: [דמי שכירות, צמודים למדד]
+    note: turn 1 is a negation (only K4 is NOT linked); turn 2 asks for the source in new words. The H documents'
+      "צמוד" means attached and must not be cited
+    turns:
+      - ask: "באילו נכסים דמי השכירות אינם צמודים למדד?"
+        expect:
+          task_type: locate
+          outcome: answer
+          sources:
+            all_of: [{doc: K4, page: 1}]
+            also_valid: [{doc: K1, page: 1}, {doc: K6, page: null}, {doc: K3v2, page: 1}, {doc: K3, page: 1}]
+          values: [{fact: K4-F07, value: false}]
+      - ask: "מאיפה המידע הזה?"
+        expect:
+          relation: meta_sources
+          tool: show_sources
+          outcome: answer
+          sources:
+            all_of: [{doc: K4, page: 1}]
+            also_valid: [{doc: K1, page: 1}, {doc: K6, page: null}, {doc: K3v2, page: 1}, {doc: K3, page: 1}]
+
+  # --- topic switch clears context -----------------------------------------------------------------------
+  - id: HV56
+    category: topic_switch
+    held_out: true
+    terms: [רעש, זיקת הנאה]
+    turns:
+      - ask: "מה מפלס הרעש הממוצע שנמדד בשומות?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: all, attribute: noise_level, metric: mean, value: "65.00", unit: dB, n: 3,
+                   facts: [K4-F01, K7-F06, K8-F03]}
+          values: [{fact: K4-F01, page: 1}, {fact: K7-F06, page: 1}, {fact: K8-F03, page: 1}]
+          coverage: {values_found: 3, not_stated_includes: [K1, K2, K5, K6, K3v2], mentioned_without_value: [D3]}
+      - ask: "נושא אחר לגמרי: באילו נכסים רשומה זיקת הנאה?"
+        expect:
+          relation: topic_change
+          task_type: locate
+          outcome: answer
+          cleared: [attribute]
+          note: K8 states there are none (valid to cite as a contrast)
+          sources: {all_of: [{doc: K5, page: 1}, {doc: K7, page: 1}], also_valid: [{doc: K8, page: 1}]}
+          values: [{fact: K5-F06, value: true}, {fact: K7-F11, value: true}]
+  - id: HV57
+    category: topic_switch
+    held_out: true
+    terms: [תחזוקה]
+    turns:
+      - ask: "מהו ציון התחזוקה הממוצע בשומות של פתח תקווה?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          result: {scope: {city: פתח תקווה}, attribute: maintenance_score, metric: mean, value: "3.50", unit: score, n: 2,
+                   facts: [K2-F08, K7-F05]}
+          values: [{fact: K2-F08, page: 1}, {fact: K7-F05, page: 1}]
+          coverage: {values_found: 2}
+      - ask: "שאלה חדשה: כמה יחידות משרד יש בבניין ברחוב הברזל 31?"
+        expect:
+          relation: topic_change
+          task_type: answer
+          outcome: answer
+          cleared: [city, attribute]
+          sources: {all_of: [{doc: K1, page: 1}]}
+          values: [{fact: K1-F07, value: 36, unit: count}]
+
+  # --- clarifications ------------------------------------------------------------------------------------
+  - id: HV58
+    category: clarification
+    held_out: true
+    terms: [שטח המגרש]
+    note: the address הרצל 15 is in two documents (פתח תקווה K7 with 1,150 m2; חולון K8 with 1.8 dunam) - asking
+      which one is the correct behavior; the free-text reply then resolves it
+    turns:
+      - ask: "מה שטח המגרש בהרצל 15?"
+        expect:
+          task_type: clarify
+          outcome: clarification
+          clarify_key: referent
+          no_price_clarification: true
+      - ask: "התכוונתי לזה שבחולון"
+        expect:
+          relation: answer_to_clarification
+          task_type: answer
+          outcome: answer
+          sources: {all_of: [{doc: K8, page: 1}]}
+          values: [{fact: K8-F01, value: "1.8", unit: dunam}]
+  - id: HV59
+    category: clarification
+    held_out: true
+    terms: [תכסית]
+    note: the documents of פתח תקווה state several percentages (coverage, capitalization, occupancy, vacancy
+      allowance, depreciation) - asking which one is the correct behavior; the free-text reply names coverage
+    turns:
+      - ask: "מה האחוז הממוצע בשומות של פתח תקווה?"
+        expect:
+          task_type: clarify
+          outcome: clarification
+          clarify_key: attribute
+          no_price_clarification: true
+      - ask: "התכוונתי לתכסית"
+        expect:
+          relation: answer_to_clarification
+          task_type: compute
+          outcome: computation
+          result: {scope: {city: פתח תקווה}, attribute: building_coverage, metric: mean, value: "37.50", unit: percent,
+                   n: 2, facts: [K2-F03, K7-F03]}
+          values: [{fact: K2-F03, page: 1}, {fact: K7-F03, page: 1}]
+          coverage: {values_found: 2}
+  - id: HV60
+    category: clarification
+    held_out: true
+    terms: [קו בניין, דמי שכירות]
+    note: an unrelated new question while the referent clarification is pending; the pending question is kept
+    turns:
+      - ask: "מה קו הבניין הקדמי בהרצל 15?"
+        expect:
+          task_type: clarify
+          outcome: clarification
+          clarify_key: referent
+      - ask: "רגע, שאלה אחרת: מה דמי השכירות החודשיים בחנות בביאליק 70?"
+        expect:
+          relation: new_question
+          task_type: answer
+          outcome: answer
+          pending_kept: true
+          no_price_clarification: true
+          sources: {all_of: [{doc: K4, page: 1}]}
+          values: [{fact: K4-F03, value: "21850", unit: ILS/month}]
+  - id: HV61
+    category: clarification
+    held_out: false
+    note: no referent - three documents in scope have versions (D1/D1v2, H4/H4v2, K3/K3v2)
+    turns:
+      - ask: "מה שונה בגרסה החדשה?"
+        expect:
+          task_type: clarify
+          outcome: clarification
+          clarify_key: referent
+
+  # --- negation ------------------------------------------------------------------------------------------
+  - id: HV62
+    category: negation
+    held_out: true
+    terms: [מושכר]
+    note: K5 (2023) states the building is not let; K6 (2024) says it was let since - valid to add, not required
+    turns:
+      - ask: "באיזה נכס המבנה אינו מושכר?"
+        expect:
+          task_type: locate
+          outcome: answer
+          sources: {all_of: [{doc: K5, page: 1}], also_valid: [{doc: K6, page: null}]}
+          values: [{fact: K5-F01, value: false}]
+  - id: HV63
+    category: negation
+    held_out: true
+    terms: [הערות אזהרה]
+    note: only K7 states that no warning note is registered; documents that do not mention the registry are not
+      evidence of "none"
+    turns:
+      - ask: "באילו נכסים לא רשומות הערות אזהרה?"
+        expect:
+          task_type: locate
+          outcome: answer
+          sources: {all_of: [{doc: K7, page: 1}], also_valid: [{doc: K2, page: 1}, {doc: K8, page: 1}]}
+          values: [{fact: K7-F10}]
+  - id: HV64
+    category: negation
+    held_out: true
+    terms: [זיקות הנאה]
+    turns:
+      - ask: "באיזו שומה כתוב במפורש שאין זיקות הנאה?"
+        expect:
+          task_type: locate
+          outcome: answer
+          sources: {all_of: [{doc: K8, page: 1}]}
+          values: [{fact: K8-F08, value: false}]
+  - id: HV65
+    category: negation
+    held_out: true
+    terms: [אובדן הכנסות]
+    note: K1 (current). K3 said the same but is superseded by K3v2 (5%) - citing K3 is allowed only as the old
+      version
+    turns:
+      - ask: "באילו שומות לא הובא בחשבון ניכוי בגין אובדן הכנסות?"
+        expect:
+          task_type: locate
+          outcome: answer
+          sources: {all_of: [{doc: K1, page: 1}], also_valid: [{doc: K3, page: 1}, {doc: K3v2, page: 1}]}
+          values: [{fact: K1-F11}]
+
+  # --- scope ---------------------------------------------------------------------------------------------
+  - id: HV66
+    category: computation
+    held_out: true
+    terms: [תחזוקה]
+    user: dana@demo.test
+    note: dana sees G1, G3 and G4 (not G2); the same figure as HV36
+    turns:
+      - ask: "מה ציון התחזוקה הממוצע של הנכסים?"
+        expect:
+          task_type: compute
+          tool: extract_and_compute
+          outcome: computation
+          forbid: other_group
+          result: {scope: all, attribute: maintenance_score, metric: mean, value: "3.60", unit: score, n: 5,
+                   facts: [K1-F08, K2-F08, K4-F02, K5-F05, K7-F05]}
+          values: [{fact: K1-F08, page: 1}, {fact: K2-F08, page: 1}, {fact: K4-F02, page: 1}, {fact: K5-F05, page: 1},
+                   {fact: K7-F05, page: 1}]
+          coverage: {values_found: 5, not_stated_includes: [K6, K8, K3v2], mentioned_without_value: [D3]}

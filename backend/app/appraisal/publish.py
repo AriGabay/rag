@@ -1,4 +1,5 @@
-"""Publish a processed version (U6): facts, validation, dedup, status, data version — one transaction.
+"""Publish a processed version (U6): facts, validation, dedup, the version's appraisal units (round 9 U7), status, data
+version — one transaction. A document that is not an appraisal skips the first three (round 10 U3).
 
 Runs under the worker's ``system`` context. Idempotent: prior facts of this version are removed
 first, so a retried job publishes exactly one set. The office advisory lock serializes dedup
@@ -17,6 +18,7 @@ from app.appraisal.dedup import TxnFacts, attach_transaction, delete_orphans, fi
 from app.appraisal.extract import RecordDraft, as_date, as_decimal, extract_records
 from app.appraisal.validate import Validation, validate
 from app.db import bump_data_version
+from app.platform.source_kinds import APPRAISAL, source_kind_of
 
 OCC_FIELDS = (
     "city", "neighborhood", "address", "block", "parcel", "sub_parcel", "property_type", "rooms",
@@ -141,21 +143,9 @@ def refresh_version_status(conn: Connection, version_id: UUID) -> str:
     return status
 
 
-def publish_version(conn: Connection, version_id: UUID, document_id: UUID, extraction_version: str) -> str:
-    lock_office(conn)
-    clear_version_facts(conn, version_id)
-    version_no = conn.execute(text("SELECT version_no FROM document_versions WHERE id = :v"),
-                              {"v": version_id}).scalar_one()
-    newer = conn.execute(
-        text("SELECT 1 FROM document_versions WHERE document_id = :d AND version_no > :n"
-             " AND status IN ('ready', 'needs_review')"),
-        {"d": document_id, "n": version_no},
-    ).first()
-    if newer:  # a later version already published: this one finished late and must not replace it
-        conn.execute(text("UPDATE document_versions SET status = 'superseded', is_current = false,"
-                          " processed_at = now() WHERE id = :v"), {"v": version_id})
-        return "superseded"
-
+def derive_records(conn: Connection, version_id: UUID, document_id: UUID, extraction_version: str) -> int:
+    """The version's records and transactions, from its stored pages and tables (no file): the appraisal stage of
+    publishing, which a professional document skips (round 10 U3). Returns the number of records."""
     pages = conn.execute(
         text("SELECT page_no, text, method FROM pages WHERE version_id = :v ORDER BY page_no"), {"v": version_id}
     ).all()
@@ -168,6 +158,36 @@ def publish_version(conn: Connection, version_id: UUID, document_id: UUID, extra
         [{"index": t.table_index, **t.structure} for t in tables],
         {p.page_no for p in pages if p.method == "ocr"},
     )
+    for idx, rec in enumerate(drafts):
+        val = validate(rec)
+        facts = facts_of(rec, val.computed_ppsqm, val.calc_definition)
+        txn_id = attach_transaction(conn, facts)
+        insert_occurrence(conn, version_id, document_id, idx, rec, val, txn_id, extraction_version)
+        find_uncertain(conn, txn_id, facts, version_id)
+    return len(drafts)
+
+
+def publish_version(conn: Connection, version_id: UUID, document_id: UUID, extraction_version: str) -> str:
+    """Make a processed version current. A document that is not an appraisal (a standard, a professional document)
+    skips the appraisal stages — facts and records, transactions and the version's units (round 10 U3: R3, KTD9) —
+    and is published as before otherwise: the earlier version retired, this one current, its status and the data
+    version moved. Measurement extraction is queued by the caller, which skips it for the same documents."""
+    lock_office(conn)
+    appraisal = source_kind_of(conn, document_id, lock=True) == APPRAISAL
+    if appraisal:
+        clear_version_facts(conn, version_id)
+    version_no = conn.execute(text("SELECT version_no FROM document_versions WHERE id = :v"),
+                              {"v": version_id}).scalar_one()
+    newer = conn.execute(
+        text("SELECT 1 FROM document_versions WHERE document_id = :d AND version_no > :n"
+             " AND status IN ('ready', 'needs_review')"),
+        {"d": document_id, "n": version_no},
+    ).first()
+    if newer:  # a later version already published: this one finished late and must not replace it
+        conn.execute(text("UPDATE document_versions SET status = 'superseded', is_current = false,"
+                          " processed_at = now() WHERE id = :v"), {"v": version_id})
+        return "superseded"
+
     # Retire earlier versions first, so look-alike checks only compare against current documents.
     conn.execute(
         text(
@@ -176,17 +196,42 @@ def publish_version(conn: Connection, version_id: UUID, document_id: UUID, extra
         ),
         {"d": document_id, "v": version_id, "n": version_no},
     )
-    for idx, rec in enumerate(drafts):
-        val = validate(rec)
-        facts = facts_of(rec, val.computed_ppsqm, val.calc_definition)
-        txn_id = attach_transaction(conn, facts)
-        insert_occurrence(conn, version_id, document_id, idx, rec, val, txn_id, extraction_version)
-        find_uncertain(conn, txn_id, facts, version_id)
+    if appraisal:
+        derive_records(conn, version_id, document_id, extraction_version)
 
     conn.execute(
         text("UPDATE document_versions SET is_current = true, processed_at = now(), status_reason = NULL WHERE id = :v"),
         {"v": version_id},
     )
+    if appraisal:
+        from app.chat import identity, units  # imported here: the chat package imports the appraisal package
+
+        units.replace(conn, version_id)  # a ready version always has units (round 9 U7, KTD4)
+        identity.derive_at_publish(conn, version_id, document_id)  # and its identification facts (round 12 U5, KTD15)
     status = refresh_version_status(conn, version_id)
     bump_data_version(conn)
     return status
+
+
+def run_skipped_stages(conn: Connection, document_id: UUID, extraction_version: str) -> list[UUID]:
+    """The appraisal stages a document skipped while it was a standard or a professional document, run now that it is
+    an appraisal (round 10 U3: KTD8; R1, R3), for its current readable version, from the stored reading: records and
+    transactions from the stored pages and tables, units from the stored blocks, the version's counts and status.
+    Nothing reads the file, and nothing is deleted: a version that still holds records from before the kind changed
+    keeps them, and units of the current reading stay (``units.ensure`` replaces only those of an older reading). The
+    caller has already stored the new kind, which the unit builder checks. Returns the versions that now want
+    measurement extraction, which the caller queues when the office allows the model."""
+    from app.chat import identity, units  # imported here: the chat package imports the appraisal package
+
+    lock_office(conn)
+    versions = conn.execute(
+        text("SELECT id FROM document_versions WHERE document_id = :d AND is_current"
+             " AND status IN ('ready', 'needs_review') ORDER BY version_no"), {"d": document_id}).scalars().all()
+    for version_id in versions:
+        if not conn.execute(text("SELECT 1 FROM occurrences WHERE version_id = :v LIMIT 1"),
+                            {"v": version_id}).first():
+            derive_records(conn, version_id, document_id, extraction_version)
+        units.ensure(conn, version_id)
+        identity.derive_at_publish(conn, version_id, document_id)   # the identification facts (round 12 U5, KTD15)
+        refresh_version_status(conn, version_id)
+    return list(versions)

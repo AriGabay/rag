@@ -2,7 +2,8 @@
 
 import { useEffect, useId, useRef, useState } from "react";
 import { api, errorMessage, fileUrl } from "@/lib/api";
-import type { Group, UploadResult } from "@/lib/types";
+import { DEFAULT_KIND, SOURCE_KIND_LABEL, SOURCE_KINDS } from "@/lib/format";
+import type { Group, SourceKind, UploadResult } from "@/lib/types";
 import { useSession } from "./AppShell";
 import { ErrorAlert } from "./ui";
 
@@ -77,6 +78,8 @@ export function UploadPanel({
   const inputRef = useRef<HTMLInputElement>(null);
   const [groups, setGroups] = useState<Group[]>(me?.groups ?? []);
   const [groupId, setGroupId] = useState<string>(me?.groups[0]?.id ?? "");
+  const [kind, setKind] = useState<SourceKind>(DEFAULT_KIND);
+  const kindName = useId();
   const [files, setFiles] = useState<File[]>([]);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -126,7 +129,7 @@ export function UploadPanel({
     setBusy(true);
     setError(null);
     try {
-      const res = await api.upload(files, groupId);
+      const res = await api.upload(files, groupId, undefined, kind);
       setResults(res.results);
       setFiles([]);
       if (inputRef.current) inputRef.current.value = "";
@@ -159,6 +162,28 @@ export function UploadPanel({
           </select>
         </div>
       </div>
+      <div className="field" role="radiogroup" aria-labelledby={`${inputId}-kind`} aria-describedby={`${inputId}-kind-hint`}>
+        <span id={`${inputId}-kind`} className="field-label">
+          סוג המסמכים (חל על כל הקבצים בהעלאה)
+        </span>
+        <div className="row kind-choices">
+          {SOURCE_KINDS.map((value) => (
+            <label key={value} className="checkbox">
+              <input
+                type="radio"
+                name={kindName}
+                value={value}
+                checked={kind === value}
+                onChange={() => setKind(value)}
+              />
+              {SOURCE_KIND_LABEL[value]}
+            </label>
+          ))}
+        </div>
+        <span id={`${inputId}-kind-hint`} className="small muted">
+          הסוג נקבע כאן ואינו נלמד משם הקובץ.
+        </span>
+      </div>
       <div
         className={`dropzone${dragging ? " active" : ""}`}
         onDragOver={(e) => {
@@ -190,7 +215,10 @@ export function UploadPanel({
       {files.length > 0 && (
         <div>
           <p>
-            נבחרו <bdi>{files.length}</bdi> קבצים:
+            נבחרו <bdi>{files.length}</bdi> קבצים{" "}
+            <span data-testid="upload-kind-summary">
+              (סוג: <strong>{SOURCE_KIND_LABEL[kind]}</strong>):
+            </span>
           </p>
           <ul>
             {files.map((f, i) => (

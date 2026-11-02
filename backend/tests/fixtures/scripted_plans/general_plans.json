@@ -1,0 +1,3452 @@
+{
+ "provenance": {
+  "source": "live real-model sample: cd backend && uv run python scripts/eval.py --set general --real-sample",
+  "model": "gpt-5.4-mini",
+  "provider": "openai",
+  "date": "2026-10-06 08:59 UTC",
+  "commit": "8b5e629",
+  "office": "office A of the seeded demo stack (synthetic documents only)",
+  "note": "'recorded' plans are the validated TurnPlan the real model returned for that question (before the server policy), copied from questions.plan. 'synthetic' plans are hand-written where the recorded plan did not follow the answer key's task; 'reason' says what the real model did. Plans that came from the rules fast path are not scripted (no model call). Extracted-attribute handles are replaced by their description when replayed (tests/acceptance/test_gate8_generality.py). Entries with 'recorded_with' were re-recorded after the TurnPlan gained value_filter and attribute.value_type (the earlier recorded or synthetic plan could not express a value condition); 'replaces' names the origin of the entry they replaced."
+ },
+ "plans": {
+  "מה שטח הממ״ד בדירה ברחוב האירוסים 12 ברמת גן?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": "מ״ר",
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      },
+      {
+       "tool": "extract_and_compute",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      }
+     ],
+     "topic": "שטח הממ״ד בדירה ברחוב האירוסים 12 ברמת גן",
+     "metric": "none",
+     "entities": [
+      "רחוב האירוסים 12",
+      "רמת גן",
+      "דירה"
+     ],
+     "attribute": {
+      "handle": "A5",
+      "description": "גודל ממ״ד",
+      "unit_dimension": "area"
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": "רמת גן",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "רחוב האירוסים 12 רמת גן דירה ממ״ד גודל ממ״ד",
+      "אירוסים 12 רמת גן ממ״ד שטח",
+      "דירה ברחוב האירוסים 12 רמת גן ממ״ד"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ01",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "safe_room_area"
+   }
+  ],
+  "כמה מקומות חניה צמודים לדירה בשינקין 18 בגבעתיים?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "extract_and_compute",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "מספר מקומות חניה צמודים לדירה",
+     "metric": "none",
+     "entities": [
+      "שינקין 18",
+      "גבעתיים"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "מספר מקומות חניה צמודים לדירה",
+      "unit_dimension": "count"
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": "גבעתיים",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "שינקין 18 גבעתיים מספר מקומות חניה צמודים לדירה",
+      "שינקין 18 גבעתיים חניה צמודה דירה",
+      "גבעתיים שינקין 18 חניות לדירה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ02",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "parking_spaces"
+   }
+  ],
+  "מה גובה התקרה בדירה ברחוב בן יהודה 140 בתל אביב?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "גובה התקרה בדירה ברחוב בן יהודה 140 בתל אביב",
+     "metric": "none",
+     "entities": [
+      "רחוב בן יהודה 140 בתל אביב",
+      "דירה"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "גובה התקרה",
+      "unit_dimension": null
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": "תל אביב-יפו",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "גובה התקרה דירה בן יהודה 140 תל אביב",
+      "בן יהודה 140 תל אביב גובה תקרה",
+      "תקרה גובה דירה רחוב בן יהודה תל אביב"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ03",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "ceiling_height"
+   }
+  ],
+  "באיזו שנה שופץ המטבח בדירה ברחוב המעגל 7?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "שיפוץ המטבח בדירה ברחוב המעגל 7",
+     "metric": "none",
+     "entities": [
+      "רחוב המעגל 7"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "שנת שיפוץ המטבח",
+      "unit_dimension": null
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "\"רחוב המעגל 7\" מטבח שופץ",
+      "\"רחוב המעגל 7\" שיפוץ מטבח",
+      "\"מעגל 7\" מטבח שנה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ04",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "renovation"
+   }
+  ],
+  "מה ייעוד המגרש בשומה של רחוב המאבק 25 בגבעתיים?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "ייעוד מגרש",
+     "metric": "none",
+     "entities": [
+      "רחוב המאבק 25",
+      "גבעתיים"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "ייעוד המגרש",
+      "unit_dimension": null
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": "גבעתיים",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "ייעוד מגרש בשומה רחוב המאבק 25 גבעתיים",
+      "שומה רחוב המאבק 25 גבעתיים ייעוד מגרש",
+      "המאבק 25 גבעתיים ייעוד הקרקע"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ05",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "zoning"
+   }
+  ],
+  "האם לדירה בהירדן 30 צמודה חצר, ומה שטחה?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": "מ\"ר",
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A6"
+      },
+      {
+       "tool": "extract_and_compute",
+       "source_handles": [],
+       "attribute_handle": "A6"
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": "A6"
+      }
+     ],
+     "topic": "דירה בהירדן 30",
+     "metric": "none",
+     "entities": [
+      "דירה בהירדן 30"
+     ],
+     "attribute": {
+      "handle": "A6",
+      "description": "צמודה חצר; שטח החצר",
+      "unit_dimension": "area"
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": "גבעתיים",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "הירדן 30 חצר שטח",
+      "הירדן 30 צמודה חצר",
+      "הירדן 30 דירה חצר"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ06",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "yard_area"
+   }
+  ],
+  "מה שטח הממד בדירה בשינקין 18?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": "מ״ר",
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      },
+      {
+       "tool": "extract_and_compute",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      }
+     ],
+     "topic": "גודל ממ״ד בדירה בשינקין 18",
+     "metric": "none",
+     "entities": [
+      "שינקין 18"
+     ],
+     "attribute": {
+      "handle": "A5",
+      "description": "גודל ממ״ד",
+      "unit_dimension": "area"
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": "תל אביב-יפו",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": "הצפון הישן",
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "שינקין 18 גודל ממ״ד דירה",
+      "שינקין 18 ממ״ד שטח",
+      "שינקין 18 דירה גודל ממ״ד"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ07",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "safe_room_area"
+   }
+  ],
+  "מה שטח המרחב המוגן לפי טבלת נתוני היחידה בשומה של המעגל 7?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A8"
+      },
+      {
+       "tool": "extract_and_compute",
+       "source_handles": [],
+       "attribute_handle": "A8"
+      }
+     ],
+     "topic": "טבלת נתוני היחידה בשומה של המעגל 7",
+     "metric": "none",
+     "entities": [
+      "המעגל 7"
+     ],
+     "attribute": {
+      "handle": "A8",
+      "description": "שטח המרחב המוגן",
+      "unit_dimension": "area"
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "מעגל 7 טבלת נתוני היחידה שומה שטח המרחב המוגן",
+      "המעגל 7 שומה נתוני היחידה מרחב מוגן",
+      "שטח המרחב המוגן טבלת נתוני היחידה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ08",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "safe_room_area"
+   }
+  ],
+  "כמה מעליות יש בבניין ברחוב האירוסים 12?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "מספר מעליות בבניין ברחוב האירוסים 12",
+     "metric": "none",
+     "entities": [
+      "רחוב האירוסים 12"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "מספר המעליות בבניין",
+      "unit_dimension": "count"
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "רחוב האירוסים 12 מעליות",
+      "האירוסים 12 מספר מעליות",
+      "בניין אירוסים 12 מעלית"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ09",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "elevator_count"
+   }
+  ],
+  "מה שנת הבנייה של הבניין ברחוב המאבק 25 לפי טבלת מאפייני הנכס?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "שנת הבנייה של הבניין ברחוב המאבק 25",
+     "metric": "none",
+     "entities": [
+      "רחוב המאבק 25"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "שנת הבנייה של הבניין",
+      "unit_dimension": null
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "רחוב המאבק 25 שנת בנייה טבלת מאפייני הנכס",
+      "המאבק 25 שנת הבנייה של הבניין",
+      "מאפייני הנכס המאבק 25 שנת בנייה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ10",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "year_built"
+   }
+  ],
+  "האם לדירה ברחוב המאבק 25 יש מחסן?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "האם לדירה ברחוב המאבק 25 יש מחסן",
+     "metric": "none",
+     "entities": [
+      "רחוב המאבק 25"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "מחסן",
+      "unit_dimension": null
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "דירה ברחוב המאבק 25 מחסן",
+      "רחוב המאבק 25 מחסן צמוד",
+      "המאבק 25 דירה מחסן"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ11",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "storage_present"
+   }
+  ],
+  "אילו שומות מזכירות היתר בנייה?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "היתר בנייה",
+     "metric": "values",
+     "entities": [],
+     "attribute": null,
+     "task_type": "locate",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "היתר בנייה שומה",
+      "מזכירה היתר בנייה",
+      "היתר בנייה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ12",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "building_permit"
+   }
+  ],
+  "באילו מסמכים מוזכר ממ\"ד?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      },
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A8"
+      }
+     ],
+     "topic": "ממ\"ד",
+     "metric": "none",
+     "entities": [],
+     "attribute": {
+      "handle": null,
+      "description": "ממ\"ד",
+      "unit_dimension": null
+     },
+     "task_type": "locate",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "ממ\"ד",
+      "גודל ממ\"ד",
+      "שטח המרחב המוגן"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ13",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "איפה כתוב שהבניין ברחוב הירדן 30 אינו כולל מעלית?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "מעלית בבניין ברחוב הירדן 30",
+     "metric": "none",
+     "entities": [
+      "רחוב הירדן 30"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "האם הבניין כולל מעלית",
+      "unit_dimension": null
+     },
+     "task_type": "locate",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "\"רחוב הירדן 30\" מעלית",
+      "\"הירדן 30\" \"אין מעלית\"",
+      "\"הירדן 30\" מעלית בניין"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ14",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "elevator_present"
+   }
+  ],
+  "באיזו שומה יש טבלה עם עמודה של שטח ממ״ד?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      },
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      }
+     ],
+     "topic": "שומות שבהן מופיעה עמודה של שטח ממ״ד",
+     "metric": "none",
+     "entities": [],
+     "attribute": {
+      "handle": "A5",
+      "description": "גודל ממ״ד",
+      "unit_dimension": "area"
+     },
+     "task_type": "locate",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "שומה עם עמודה של שטח ממ״ד",
+      "טבלה בעמודה שטח ממ״ד בשומה",
+      "גודל ממ״ד בשומה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ15",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "באילו שומות מוזכר מקלט משותף?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "מקלט משותף",
+     "metric": "none",
+     "entities": [],
+     "attribute": {
+      "handle": null,
+      "description": "מקלט משותף",
+      "unit_dimension": null
+     },
+     "task_type": "locate",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "מקלט משותף בשומות",
+      "שומה מקלט משותף",
+      "מוזכר מקלט משותף בשומה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ16",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "למה השמאית הפחיתה מהשווי בגלל סגירת המרפסת בדירה ברחוב המאבק 25?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "הסיבה להפחתת שווי בגלל סגירת מרפסת",
+     "metric": "none",
+     "entities": [
+      "הדירה ברחוב המאבק 25"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "הסיבה להפחתה בשווי בגלל סגירת המרפסת",
+      "unit_dimension": null
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": "גבעתיים",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": "appraised_value",
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "שמאות דירה ברחוב המאבק 25 סגירת מרפסת הפחתה בשווי",
+      "סגירת מרפסת בדירה רחוב המאבק 25 נימוק להפחתת שווי",
+      "הפחתת שווי בשל סגירת מרפסת בשמאות דירה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ17",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "מדוע בשומה של המעגל 7 ייחסו ליתרת זכויות הבנייה תרומה מוגבלת לשווי?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "explain_previous",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "הסבר לשומת המעגל 7 ולתרומת יתרת זכויות הבנייה",
+     "metric": "none",
+     "entities": [
+      "המעגל 7"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "מדוע ייחסו ליתרת זכויות הבנייה תרומה מוגבלת לשווי",
+      "unit_dimension": null
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "שומה \"המעגל 7\" יתרת זכויות בנייה תרומה מוגבלת לשווי",
+      "הסבר בשומה יתרת זכויות הבנייה תרומה מוגבלת",
+      "מעגל 7 זכויות בנייה שווי מוגבל"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ18",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "unused_rights"
+   }
+  ],
+  "השווה את מספר המרפסות ושטחן בין הדירה באירוסים 12 לדירה בשינקין 18": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "compare",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "מרפסות",
+     "metric": "none",
+     "entities": [
+      "אירוסים 12",
+      "שינקין 18"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "מספר המרפסות ושטחן",
+      "unit_dimension": "count/area"
+     },
+     "task_type": "compare",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "אירוסים 12 מרפסות שטח דירה",
+      "שינקין 18 מרפסות שטח דירה",
+      "מספר מרפסות שטחן דירה אירוסים 12 שינקין 18"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ19",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "השווה את גובה התקרה בין שתי השומות של הדירה בבן יהודה 140": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "compare",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "גובה התקרה",
+     "metric": "none",
+     "entities": [
+      "בן יהודה 140",
+      "הדירה"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "גובה התקרה",
+      "unit_dimension": null
+     },
+     "task_type": "compare",
+     "conditions": {
+      "city": "תל אביב-יפו",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": "הצפון הישן",
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "בן יהודה 140 שומה גובה תקרה דירה",
+      "בן יהודה 140 גובה תקרה בשומה",
+      "בן יהודה 140 שתי שומות דירה גובה תקרה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ20",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "מה ההבדל בין השיפוץ שבוצע בדירה בארלוזורוב 88 לבין השיפוץ בדירה ברחוב המעגל 7?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "compare",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "שיפוץ בדירות בארלוזורוב 88 וברחוב המעגל 7",
+     "metric": "none",
+     "entities": [
+      "ארלוזורוב 88",
+      "רחוב המעגל 7"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "השיפוץ",
+      "unit_dimension": null
+     },
+     "task_type": "compare",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "שיפוץ ארלוזורוב 88 דירה",
+      "שיפוץ רחוב המעגל 7 דירה",
+      "תיאור שיפוץ בדירה ארלוזורוב 88 מול המעגל 7"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ21",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "מה נכתב בשומה של שינקין 18 בגבעתיים על התכנית לתוספת קומה?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "שומה של שינקין 18 בגבעתיים",
+     "metric": "none",
+     "entities": [
+      "שינקין 18",
+      "גבעתיים"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "התכנית לתוספת קומה",
+      "unit_dimension": null
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": "גבעתיים",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "שינקין 18 גבעתיים תוספת קומה שומה",
+      "שומה שינקין 18 גבעתיים תכנית לתוספת קומה",
+      "גבעתיים שינקין 18 תוספת קומה בשומה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ22",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "planning_status"
+   }
+  ],
+  "אילו הנחות השתנו בין הגרסאות?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "compare",
+       "source_handles": [
+        "S1",
+        "S2",
+        "S3"
+       ],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "שומה של שינקין 18 בגבעתיים",
+     "metric": "none",
+     "entities": [
+      "שינקין 18",
+      "גבעתיים"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "הנחות",
+      "unit_dimension": null
+     },
+     "task_type": "compare",
+     "conditions": {
+      "city": "גבעתיים",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "follow_up",
+     "search_queries": [
+      "השוואת גרסאות בשומה של שינקין 18 בגבעתיים הנחות",
+      "אילו הנחות השתנו בין הגרסאות בשומה שינקין 18 גבעתיים",
+      "גרסאות שומה שינקין 18 גבעתיים הנחות"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ22",
+    "turn": 2,
+    "state_empty": false,
+    "answer_key_attribute": null
+   },
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "compare",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "הנחות בין גרסאות",
+     "metric": "values",
+     "entities": [],
+     "attribute": null,
+     "task_type": "compare",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "הנחות בגרסה קודמת מול גרסה עדכנית",
+      "שינויים בהנחות בין גרסאות",
+      "השוואת הנחות במסמכים בין גרסאות"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ23",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "האם שיעור ההתאמה בגין פוטנציאל התוספת השתנה בין גרסאות השומה של שינקין 18?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "compare",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "שיעור התאמה בגין פוטנציאל התוספת בין גרסאות שומה של שינקין 18",
+     "metric": "none",
+     "entities": [
+      "שינקין 18"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "שיעור ההתאמה בגין פוטנציאל התוספת",
+      "unit_dimension": null
+     },
+     "task_type": "compare",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "שינקין 18 שומה גרסה שיעור התאמה פוטנציאל התוספת",
+      "שינקין 18 פוטנציאל התוספת התאמה שומה",
+      "שינקין 18 גרסאות שומה התאמה בגין פוטנציאל התוספת"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ24",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "adjustment_rate"
+   }
+  ],
+  "מה השתנה במצב התכנוני בין הגרסה הראשונה לגרסה השנייה של השומה בשינקין 18?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "compare",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "המצב התכנוני בין גרסאות שומה",
+     "metric": "none",
+     "entities": [
+      "שינקין 18"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "המצב התכנוני",
+      "unit_dimension": null
+     },
+     "task_type": "compare",
+     "conditions": {
+      "city": "תל אביב-יפו",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": "הצפון הישן",
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "שינקין 18 שומה גרסה ראשונה גרסה שנייה מצב תכנוני",
+      "שינקין 18 שינוי במצב התכנוני בין גרסאות שומה",
+      "שינקין 18 שומה עדכון תכנוני"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ25",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "באיזו שנה נבנה הבניין ברחוב בן יהודה 140 בתל אביב?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "שנת בניית הבניין",
+     "metric": "none",
+     "entities": [
+      "רחוב בן יהודה 140, תל אביב"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "שנת הבנייה של הבניין",
+      "unit_dimension": "count"
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": "תל אביב-יפו",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "שנת בניית הבניין בן יהודה 140 תל אביב",
+      "בן יהודה 140 תל אביב שנת בנייה",
+      "בניין ברחוב בן יהודה 140 תל אביב נבנה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ26",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "year_built"
+   }
+  ],
+  "האם יש סתירה בין השומות לגבי שנת הבנייה של הבניין בבן יהודה 140?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "compare",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "שנת הבנייה של הבניין בבן יהודה 140",
+     "metric": "none",
+     "entities": [
+      "בן יהודה 140"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "שנת הבנייה של הבניין",
+      "unit_dimension": null
+     },
+     "task_type": "compare",
+     "conditions": {
+      "city": "תל אביב-יפו",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": "הצפון הישן",
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "בן יהודה 140 שנת בנייה שומה",
+      "בן יהודה 140 שנת הבנייה של הבניין",
+      "בן יהודה 140 שומות שנת בנייה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ27",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "מה גודל ממ״ד ממוצע ברמת גן?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": "מ״ר",
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      },
+      {
+       "tool": "extract_and_compute",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      }
+     ],
+     "topic": "גודל ממ״ד",
+     "metric": "mean",
+     "entities": [
+      "רמת גן"
+     ],
+     "attribute": {
+      "handle": "A5",
+      "description": "גודל ממ״ד",
+      "unit_dimension": "area"
+     },
+     "task_type": "compute",
+     "conditions": {
+      "city": "רמת גן",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "ממוצע גודל ממ״ד ברמת גן",
+      "גודל ממ״ד רמת גן",
+      "שטח ממ״ד ברמת גן"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ28",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "safe_room_area"
+   }
+  ],
+  "מה שטח המרפסות הממוצע בדירות שנישומו בגבעתיים?": [
+   {
+    "origin": "synthetic",
+    "reason": "real model planned compute_explain",
+    "plan": {
+     "task_type": "compute",
+     "turn_relation": "new_question",
+     "topic": null,
+     "entities": [],
+     "conditions": {
+      "city": "גבעתיים",
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": {
+      "handle": null,
+      "description": "שטח המרפסות",
+      "unit_dimension": "area"
+     },
+     "metric": "mean",
+     "unit": null,
+     "search_queries": [],
+     "steps": [
+      {
+       "tool": "extract_and_compute",
+       "attribute_handle": null,
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null
+    },
+    "item": "GQ29",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "balcony_area"
+   }
+  ],
+  "מה גובה התקרה הממוצע בכל השומות?": [
+   {
+    "origin": "synthetic",
+    "reason": "real model planned compute_explain",
+    "plan": {
+     "task_type": "compute",
+     "turn_relation": "new_question",
+     "topic": null,
+     "entities": [],
+     "conditions": {
+      "city": null,
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": {
+      "handle": null,
+      "description": "גובה התקרה",
+      "unit_dimension": "length"
+     },
+     "metric": "mean",
+     "unit": null,
+     "search_queries": [],
+     "steps": [
+      {
+       "tool": "extract_and_compute",
+       "attribute_handle": null,
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null
+    },
+    "item": "GQ30",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "ceiling_height"
+   }
+  ],
+  "כמה מקומות חניה צמודים יש בממוצע לדירות שנישומו בגבעתיים?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": "מקומות חניה לדירה",
+     "steps": [
+      {
+       "tool": "extract_and_compute",
+       "source_handles": [],
+       "attribute_handle": "A7"
+      },
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A7"
+      },
+      {
+       "tool": "compute_records",
+       "source_handles": [],
+       "attribute_handle": "A7"
+      }
+     ],
+     "topic": "מקומות חניה צמודים לדירות שנישומו בגבעתיים",
+     "metric": "mean",
+     "entities": [
+      "דירות",
+      "גבעתיים"
+     ],
+     "attribute": {
+      "handle": "A7",
+      "description": "מספר מקומות חניה צמודים לדירה",
+      "unit_dimension": "count"
+     },
+     "task_type": "compute",
+     "conditions": {
+      "city": "גבעתיים",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": "appraised_value",
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "דירות נישומו בגבעתיים מספר מקומות חניה צמודים לדירה",
+      "גבעתיים שומה דירה מקומות חניה צמודים",
+      "מספר מקומות חניה צמודים לדירה בגבעתיים"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ31",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "parking_spaces"
+   }
+  ],
+  "מה שטח המחסן הממוצע בשומות?": [
+   {
+    "origin": "synthetic",
+    "reason": "real model planned compute_explain",
+    "plan": {
+     "task_type": "compute",
+     "turn_relation": "new_question",
+     "topic": null,
+     "entities": [],
+     "conditions": {
+      "city": null,
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": {
+      "handle": null,
+      "description": "שטח המחסן",
+      "unit_dimension": "area"
+     },
+     "metric": "mean",
+     "unit": null,
+     "search_queries": [],
+     "steps": [
+      {
+       "tool": "extract_and_compute",
+       "attribute_handle": null,
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null
+    },
+    "item": "GQ32",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "storage_area"
+   }
+  ],
+  "מהו הבניין הוותיק ביותר מבין השומות, ומתי נבנה?": [
+   {
+    "origin": "synthetic",
+    "reason": "real model planned an answer with metric none and the attribute 'הבניין הוותיק ביותר'",
+    "plan": {
+     "task_type": "compute",
+     "turn_relation": "new_question",
+     "topic": null,
+     "entities": [],
+     "conditions": {
+      "city": null,
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": {
+      "handle": null,
+      "description": "שנת בנייה",
+      "unit_dimension": "year"
+     },
+     "metric": "min",
+     "unit": null,
+     "search_queries": [],
+     "steps": [
+      {
+       "tool": "extract_and_compute",
+       "attribute_handle": null,
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null
+    },
+    "item": "GQ33",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "year_built"
+   }
+  ],
+  "בכמה מהשומות ברמת גן הבניין נבנה אחרי 2010?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "task_type": "compute",
+     "turn_relation": "new_question",
+     "topic": "שנת בניית הבניין",
+     "entities": [],
+     "conditions": {
+      "city": "רמת גן",
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": {
+      "handle": null,
+      "description": "שנת בניית הבניין",
+      "unit_dimension": null,
+      "value_type": "date"
+     },
+     "metric": "count",
+     "unit": null,
+     "search_queries": [
+      "שנת בניית הבניין רמת גן",
+      "נבנה אחרי 2010 רמת גן שומה",
+      "שנת בניית הבניין בשומות רמת גן"
+     ],
+     "steps": [
+      {
+       "tool": "search",
+       "attribute_handle": null,
+       "source_handles": []
+      },
+      {
+       "tool": "compute_records",
+       "attribute_handle": null,
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null,
+     "value_filter": {
+      "op": ">",
+      "value": "2010"
+     }
+    },
+    "item": "GQ34",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "year_built",
+    "recorded_with": "interpreter probe 2026-10-06: one interpret call, empty conversation state, office A registry and gazetteer of the live demo stack; prompt interpret-v4 before its last two sentences (event years, full dates) were added",
+    "replaces": "synthetic"
+   }
+  ],
+  "באילו דירות ברמת גן יש ממ״דים קטנים מ-11 מ״ר?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "task_type": "compute",
+     "turn_relation": "new_question",
+     "topic": "גודל ממ״ד בדירות ברמת גן",
+     "entities": [],
+     "conditions": {
+      "city": "רמת גן",
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": "apartment",
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": {
+      "handle": "A5",
+      "description": "גודל ממ״ד",
+      "unit_dimension": "area",
+      "value_type": "numeric"
+     },
+     "metric": "values",
+     "unit": "מ״ר",
+     "search_queries": [
+      "דירות ברמת גן גודל ממ״ד",
+      "ממ״ד קטן מ-11 מ״ר ברמת גן",
+      "גודל ממ״ד דירה רמת גן"
+     ],
+     "steps": [
+      {
+       "tool": "search",
+       "attribute_handle": "A5",
+       "source_handles": []
+      },
+      {
+       "tool": "compute_records",
+       "attribute_handle": "A5",
+       "source_handles": []
+      },
+      {
+       "tool": "extract_and_compute",
+       "attribute_handle": "A5",
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null,
+     "value_filter": {
+      "op": "<",
+      "value": "11"
+     }
+    },
+    "item": "GQ35",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "safe_room_area",
+    "recorded_with": "interpreter probe 2026-10-06: one interpret call, empty conversation state, office A registry and gazetteer of the live demo stack; prompt interpret-v4 before its last two sentences (event years, full dates) were added",
+    "replaces": "synthetic"
+   }
+  ],
+  "כמה מרפסות יש בממוצע לדירה בשומות מגבעתיים?": [
+   {
+    "origin": "synthetic",
+    "reason": "real model chose the balcony AREA attribute for a count question",
+    "plan": {
+     "task_type": "compute",
+     "turn_relation": "new_question",
+     "topic": null,
+     "entities": [],
+     "conditions": {
+      "city": "גבעתיים",
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": {
+      "handle": null,
+      "description": "מספר מרפסות",
+      "unit_dimension": "count"
+     },
+     "metric": "mean",
+     "unit": null,
+     "search_queries": [],
+     "steps": [
+      {
+       "tool": "extract_and_compute",
+       "attribute_handle": null,
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null
+    },
+    "item": "GQ36",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "balcony_count"
+   }
+  ],
+  "מה שטח החצר הממוצע בדירות הגן שבתיק?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": "area",
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A6"
+      },
+      {
+       "tool": "extract_and_compute",
+       "source_handles": [],
+       "attribute_handle": "A6"
+      },
+      {
+       "tool": "compute_records",
+       "source_handles": [],
+       "attribute_handle": "A6"
+      }
+     ],
+     "topic": "שטח החצר הממוצע בדירות גן",
+     "metric": "mean",
+     "entities": [],
+     "attribute": {
+      "handle": "A6",
+      "description": "שטח החצר",
+      "unit_dimension": "area"
+     },
+     "task_type": "compute",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": "garden_apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "דירות גן שטח חצר",
+      "צמודה חצר שטח החצר בדירות גן",
+      "דירות גן בתיק שטח חצר"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ38",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "yard_area"
+   }
+  ],
+  "מה היקף יתרת זכויות הבנייה שטרם נוצלו בכל אחת מהשומות?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "task_type": "compute",
+     "turn_relation": "new_question",
+     "topic": "היקף יתרת זכויות הבנייה שטרם נוצלו",
+     "entities": [],
+     "conditions": {
+      "city": null,
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": {
+      "handle": "A13",
+      "description": "היקף יתרת זכויות הבנייה שטרם נוצלו",
+      "unit_dimension": null,
+      "value_type": "text"
+     },
+     "metric": "values",
+     "unit": null,
+     "search_queries": [
+      "היקף יתרת זכויות הבנייה שטרם נוצלו",
+      "יתרת זכויות בנייה שלא נוצלו",
+      "זכויות בנייה שטרם נוצלו"
+     ],
+     "steps": [
+      {
+       "tool": "search",
+       "attribute_handle": "A13",
+       "source_handles": []
+      },
+      {
+       "tool": "extract_and_compute",
+       "attribute_handle": "A13",
+       "source_handles": []
+      },
+      {
+       "tool": "show_sources",
+       "attribute_handle": "A13",
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null,
+     "value_filter": null
+    },
+    "item": "GQ39",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "unused_rights",
+    "recorded_with": "interpreter probe 2026-10-06: one interpret call, empty conversation state, office A registry and gazetteer of the live demo stack; prompt interpret-v4 before its last two sentences (event years, full dates) were added",
+    "replaces": "synthetic"
+   }
+  ],
+  "בכמה מהשומות מצוין שיפוץ שבוצע בדירה משנת 2020 ואילך?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "task_type": "compute",
+     "turn_relation": "new_question",
+     "topic": "שיפוץ שבוצע בדירה",
+     "entities": [],
+     "conditions": {
+      "city": null,
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": "apartment",
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": {
+      "handle": "A14",
+      "description": "שיפוץ שבוצע בדירה",
+      "unit_dimension": null,
+      "value_type": "date"
+     },
+     "metric": "count",
+     "unit": null,
+     "search_queries": [
+      "שיפוץ שבוצע בדירה 2020 ואילך",
+      "שיפוץ בדירה משנת 2020",
+      "שיפוץ שבוצע בדירה"
+     ],
+     "steps": [
+      {
+       "tool": "search",
+       "attribute_handle": "A14",
+       "source_handles": []
+      },
+      {
+       "tool": "compute_records",
+       "attribute_handle": "A14",
+       "source_handles": []
+      },
+      {
+       "tool": "show_sources",
+       "attribute_handle": "A14",
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null,
+     "value_filter": {
+      "op": ">=",
+      "value": "2020"
+     }
+    },
+    "item": "GQ40",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "renovation",
+    "recorded_with": "interpreter probe 2026-10-06: one interpret call, empty conversation state, office A registry and gazetteer of the live demo stack; prompt interpret-v4",
+    "replaces": "recorded"
+   }
+  ],
+  "מה גובה התקרה בדירה ברחוב המעגל 7?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A10"
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": "A10"
+      }
+     ],
+     "topic": "גובה התקרה בדירה ברחוב המעגל 7",
+     "metric": "none",
+     "entities": [
+      "רחוב המעגל 7"
+     ],
+     "attribute": {
+      "handle": "A10",
+      "description": "גובה התקרה",
+      "unit_dimension": null
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "גובה התקרה ברחוב המעגל 7 דירה",
+      "רחוב המעגל 7 גובה התקרה",
+      "מעגל 7 דירה גובה תקרה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ41",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "מה שטח הממ״ד בדירה ברחוב הירדן 30?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": "מ״ר",
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      }
+     ],
+     "topic": "שטח ממ״ד בדירה ברחוב הירדן 30",
+     "metric": "none",
+     "entities": [
+      "רחוב הירדן 30"
+     ],
+     "attribute": {
+      "handle": "A5",
+      "description": "גודל ממ״ד",
+      "unit_dimension": "area"
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "רחוב הירדן 30 דירה ממ״ד גודל ממ״ד",
+      "רחוב הירדן 30 שטח ממ״ד",
+      "הירדן 30 ממ״ד שטח"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ42",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "מה נכתב על בריכה בבניין ברחוב שינקין 18?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "בריכה בבניין ברחוב שינקין 18",
+     "metric": "none",
+     "entities": [
+      "רחוב שינקין 18"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "בריכה בבניין",
+      "unit_dimension": null
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": "תל אביב-יפו",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "בריכה בבניין ברחוב שינקין 18",
+      "שינקין 18 בריכה",
+      "בריכה בבניין שינקין תל אביב"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ43",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "באיזו שנה בוצע שיפוץ בדירה בשינקין 18?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A14"
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "שיפוץ בדירה",
+     "metric": "none",
+     "entities": [
+      "שינקין 18"
+     ],
+     "attribute": {
+      "handle": "A14",
+      "description": "שיפוץ שבוצע בדירה",
+      "unit_dimension": null
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": "תל אביב-יפו",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "שינקין 18 דירה שיפוץ בוצע באיזו שנה",
+      "שינקין 18 תל אביב-יפו שיפוץ בדירה שנה",
+      "דירה בשינקין 18 שיפוץ שבוצע בדירה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ44",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "מה גובה התקרה הממוצע ברמת גן?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "extract_and_compute",
+       "source_handles": [],
+       "attribute_handle": "A10"
+      },
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A10"
+      }
+     ],
+     "topic": "גובה התקרה",
+     "metric": "mean",
+     "entities": [
+      "רמת גן"
+     ],
+     "attribute": {
+      "handle": "A10",
+      "description": "גובה התקרה",
+      "unit_dimension": null
+     },
+     "task_type": "compute",
+     "conditions": {
+      "city": "רמת גן",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "גובה התקרה ברמת גן",
+      "גובה תקרה ממוצע רמת גן",
+      "רמת גן גובה התקרה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ48",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "ceiling_height"
+   }
+  ],
+  "ומה לגבי גבעתיים?": [
+   {
+    "origin": "synthetic",
+    "reason": "real model planned an answer",
+    "plan": {
+     "task_type": "compute",
+     "turn_relation": "follow_up",
+     "topic": null,
+     "entities": [],
+     "conditions": {
+      "city": "גבעתיים",
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": null,
+     "metric": "mean",
+     "unit": null,
+     "search_queries": [],
+     "steps": [
+      {
+       "tool": "extract_and_compute",
+       "attribute_handle": null,
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null
+    },
+    "item": "GQ48",
+    "turn": 2,
+    "state_empty": false,
+    "answer_key_attribute": "ceiling_height"
+   }
+  ],
+  "ובתל אביב?": [
+   {
+    "origin": "synthetic",
+    "reason": "real model planned an answer",
+    "plan": {
+     "task_type": "compute",
+     "turn_relation": "follow_up",
+     "topic": null,
+     "entities": [],
+     "conditions": {
+      "city": "תל אביב-יפו",
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": null,
+     "metric": "mean",
+     "unit": null,
+     "search_queries": [],
+     "steps": [
+      {
+       "tool": "extract_and_compute",
+       "attribute_handle": null,
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null
+    },
+    "item": "GQ48",
+    "turn": 3,
+    "state_empty": false,
+    "answer_key_attribute": "ceiling_height"
+   }
+  ],
+  "מה שטחי המרפסות בדירות שנישומו בגבעתיים?": [
+   {
+    "origin": "synthetic",
+    "reason": "real model planned an answer with metric values",
+    "plan": {
+     "task_type": "compute",
+     "turn_relation": "new_question",
+     "topic": null,
+     "entities": [],
+     "conditions": {
+      "city": "גבעתיים",
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": {
+      "handle": null,
+      "description": "שטח המרפסות",
+      "unit_dimension": "area"
+     },
+     "metric": "values",
+     "unit": null,
+     "search_queries": [],
+     "steps": [
+      {
+       "tool": "extract_and_compute",
+       "attribute_handle": null,
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null
+    },
+    "item": "GQ49",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "balcony_area"
+   }
+  ],
+  "עכשיו בנושא אחר: אילו שומות מזכירות היתר בנייה?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "היתר בנייה",
+     "metric": "values",
+     "entities": [],
+     "attribute": {
+      "handle": null,
+      "description": "היתר בנייה",
+      "unit_dimension": null
+     },
+     "task_type": "locate",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "topic_change",
+     "search_queries": [
+      "שומות שמזכירות היתר בנייה",
+      "היתר בנייה בשומות",
+      "מופיע היתר בנייה בשומה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ49",
+    "turn": 2,
+    "state_empty": false,
+    "answer_key_attribute": null
+   }
+  ],
+  "באילו שומות כתוב שבבניין אין מעלית?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "שומות שבהן מצוין שאין מעלית בבניין",
+     "metric": "none",
+     "entities": [],
+     "attribute": {
+      "handle": null,
+      "description": "אין מעלית בבניין",
+      "unit_dimension": null
+     },
+     "task_type": "locate",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "שומה אין מעלית בבניין",
+      "בשומה מצוין שאין מעלית",
+      "בניין ללא מעלית שומה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ50",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "מה שטח המחסן בדירה ברחוב האירוסים 12?": [
+   {
+    "origin": "synthetic",
+    "reason": "real model read it as a change of the pending clarification",
+    "plan": {
+     "task_type": "answer",
+     "turn_relation": "new_question",
+     "topic": null,
+     "entities": [],
+     "conditions": {
+      "city": null,
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": {
+      "handle": null,
+      "description": "שטח המחסן",
+      "unit_dimension": "area"
+     },
+     "metric": "none",
+     "unit": null,
+     "search_queries": [
+      "שטח המחסן האירוסים 12"
+     ],
+     "steps": [
+      {
+       "tool": "search",
+       "attribute_handle": null,
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null
+    },
+    "item": "GQ52",
+    "turn": 2,
+    "state_empty": false,
+    "answer_key_attribute": "storage_area"
+   }
+  ],
+  "מה הגודל הממוצע ברמת גן?": [
+   {
+    "origin": "synthetic",
+    "reason": "real model mapped it to the whole property area (records path, price clarification)",
+    "plan": {
+     "task_type": "clarify",
+     "turn_relation": "new_question",
+     "topic": null,
+     "entities": [],
+     "conditions": {
+      "city": null,
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": null,
+     "metric": "none",
+     "unit": null,
+     "search_queries": [],
+     "steps": [],
+     "clarification": {
+      "key": "attribute",
+      "question": "לאיזה גודל הכוונה?",
+      "options": []
+     },
+     "clarification_answer": null
+    },
+    "item": "GQ53",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null
+   }
+  ],
+  "השווה בין שתי השומות": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "task_type": "clarify",
+     "turn_relation": "new_question",
+     "topic": "השוואה בין שתי שומות",
+     "entities": [],
+     "conditions": {
+      "city": null,
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": null,
+     "metric": "none",
+     "unit": null,
+     "search_queries": [],
+     "steps": [
+      {
+       "tool": "compare",
+       "attribute_handle": null,
+       "source_handles": []
+      }
+     ],
+     "clarification": {
+      "key": "referent",
+      "question": "לאילו שתי שומות התכוונת? אפשר לציין כתובות, גוש/חלקה, או שמות/מזהים של המסמכים.",
+      "options": [
+       {
+        "value": "כתובות",
+        "label": "שתי כתובות"
+       },
+       {
+        "value": "מסמכים",
+        "label": "שני מסמכים"
+       },
+       {
+        "value": "גוש_חלקה",
+        "label": "גוש/חלקה"
+       }
+      ]
+     },
+     "clarification_answer": null,
+     "value_filter": null
+    },
+    "item": "GQ54",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": null,
+    "recorded_with": "interpreter probe 2026-10-06: one interpret call, empty conversation state, office A registry and gazetteer of the live demo stack; prompt interpret-v4 before its last two sentences (event years, full dates) were added",
+    "replaces": "synthetic"
+   }
+  ],
+  "מה שטח הממ״ד בדירה ברחוב האירוסים 12?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": "מ\"ר",
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      },
+      {
+       "tool": "extract_and_compute",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": "A5"
+      }
+     ],
+     "topic": "שטח ממ״ד בדירה ברחוב האירוסים 12",
+     "metric": "none",
+     "entities": [
+      "דירה ברחוב האירוסים 12"
+     ],
+     "attribute": {
+      "handle": "A5",
+      "description": "גודל ממ״ד",
+      "unit_dimension": "area"
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "דירה ברחוב האירוסים 12 ממ\"ד גודל ממ\"ד",
+      "אירוסים 12 שטח ממ\"ד",
+      "רחוב האירוסים 12 ממ\"ד"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ55",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "safe_room_area"
+   }
+  ],
+  "עכשיו משהו אחר לגמרי: מה ייעוד המגרש בשומה של ארלוזורוב 88?": [
+   {
+    "origin": "synthetic",
+    "reason": "real model marked the relation change_clarification",
+    "plan": {
+     "task_type": "answer",
+     "turn_relation": "topic_change",
+     "topic": null,
+     "entities": [],
+     "conditions": {
+      "city": null,
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": {
+      "handle": null,
+      "description": "ייעוד המגרש",
+      "unit_dimension": null
+     },
+     "metric": "none",
+     "unit": null,
+     "search_queries": [
+      "ייעוד המגרש ארלוזורוב 88"
+     ],
+     "steps": [
+      {
+       "tool": "search",
+       "attribute_handle": null,
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null
+    },
+    "item": "GQ55",
+    "turn": 2,
+    "state_empty": false,
+    "answer_key_attribute": "zoning"
+   }
+  ],
+  "אילו ייעודי קרקע מופיעים בשומות של רמת גן?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "task_type": "answer",
+     "turn_relation": "new_question",
+     "topic": "ייעודי קרקע",
+     "entities": [
+      "רמת גן"
+     ],
+     "conditions": {
+      "city": "רמת גן",
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": {
+      "handle": "A15",
+      "description": "ייעודי קרקע",
+      "unit_dimension": null,
+      "value_type": "text"
+     },
+     "metric": "values",
+     "unit": null,
+     "search_queries": [
+      "ייעודי קרקע בשומות רמת גן",
+      "שומות רמת גן ייעודי קרקע",
+      "רמת גן ייעודי קרקע"
+     ],
+     "steps": [
+      {
+       "tool": "search",
+       "attribute_handle": "A15",
+       "source_handles": []
+      },
+      {
+       "tool": "locate",
+       "attribute_handle": "A15",
+       "source_handles": []
+      },
+      {
+       "tool": "show_sources",
+       "attribute_handle": "A15",
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null,
+     "value_filter": null
+    },
+    "item": "GQ56",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "zoning",
+    "recorded_with": "interpreter probe 2026-10-06: one interpret call, empty conversation state, office A registry and gazetteer of the live demo stack; prompt interpret-v4 before its last two sentences (event years, full dates) were added",
+    "replaces": "synthetic"
+   }
+  ],
+  "באיזו שומה נסגרה מרפסת בלי היתר?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A9"
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": "A9"
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": "A9"
+      }
+     ],
+     "topic": "מרפסת שנסגרה בלי היתר",
+     "metric": "none",
+     "entities": [],
+     "attribute": {
+      "handle": "A9",
+      "description": "שטח המרפסות",
+      "unit_dimension": "area"
+     },
+     "task_type": "locate",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "שומה שבה נסגרה מרפסת בלי היתר",
+      "מרפסת שנסגרה ללא היתר בשומה",
+      "סגירת מרפסת ללא היתר בדוח שומה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ57",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "building_permit"
+   }
+  ],
+  "מה מצב התכנית גב/600 לפי הגרסה העדכנית של השומה בשינקין 18?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": null
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": null
+      }
+     ],
+     "topic": "התכנית גב/600 בשומה העדכנית",
+     "metric": "none",
+     "entities": [
+      "שינקין 18"
+     ],
+     "attribute": {
+      "handle": null,
+      "description": "מצב התכנית גב/600",
+      "unit_dimension": null
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": "גבעתיים",
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": "בורוכוב",
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "שינקין 18 גב/600 שומה עדכנית מצב תכנית",
+      "גב/600 שומה שינקין 18",
+      "מצב התכנית גב/600 בשומה"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ58",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "planning_status"
+   }
+  ],
+  "האם הדירה ברחוב האירוסים 12 שופצה מאז האכלוס?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A14"
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": "A14"
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": "A14"
+      }
+     ],
+     "topic": "שיפוץ בדירה",
+     "metric": "none",
+     "entities": [
+      "הדירה ברחוב האירוסים 12"
+     ],
+     "attribute": {
+      "handle": "A14",
+      "description": "שיפוץ שבוצע בדירה",
+      "unit_dimension": null
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": "apartment",
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "האם הדירה ברחוב האירוסים 12 שופצה מאז האכלוס",
+      "שיפוץ שבוצע בדירה ברחוב האירוסים 12",
+      "האכלוס והשיפוץ בדירה ברחוב האירוסים 12"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ59",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "renovation"
+   }
+  ],
+  "באילו שומות מופיע גובה תקרה של יותר מ-2.70 מטר?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "task_type": "compute",
+     "turn_relation": "new_question",
+     "topic": "גובה התקרה",
+     "entities": [],
+     "conditions": {
+      "city": null,
+      "neighborhood": null,
+      "year_from": null,
+      "year_to": null,
+      "relative_year_offset": null,
+      "date_field": null,
+      "data_kind": null,
+      "property_type": null,
+      "area_type": null,
+      "vat_basis": null,
+      "clear": []
+     },
+     "attribute": {
+      "handle": "A10",
+      "description": "גובה התקרה",
+      "unit_dimension": null,
+      "value_type": "numeric"
+     },
+     "metric": "values",
+     "unit": "מטר",
+     "search_queries": [
+      "גובה תקרה 2.70",
+      "גובה התקרה שומות",
+      "תקרה מעל 2.70 מטר"
+     ],
+     "steps": [
+      {
+       "tool": "extract_and_compute",
+       "attribute_handle": "A10",
+       "source_handles": []
+      }
+     ],
+     "clarification": null,
+     "clarification_answer": null,
+     "value_filter": {
+      "op": ">",
+      "value": "2.70"
+     }
+    },
+    "item": "GQ60",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "ceiling_height",
+    "recorded_with": "interpreter probe 2026-10-06: one interpret call, empty conversation state, office A registry and gazetteer of the live demo stack; prompt interpret-v4 before its last two sentences (event years, full dates) were added",
+    "replaces": "synthetic"
+   }
+  ],
+  "מה ייעוד המגרש שעליו בנוי הבניין ברחוב האירוסים 12?": [
+   {
+    "origin": "recorded",
+    "plan": {
+     "unit": null,
+     "steps": [
+      {
+       "tool": "search",
+       "source_handles": [],
+       "attribute_handle": "A15"
+      },
+      {
+       "tool": "locate",
+       "source_handles": [],
+       "attribute_handle": "A15"
+      },
+      {
+       "tool": "show_sources",
+       "source_handles": [],
+       "attribute_handle": "A15"
+      }
+     ],
+     "topic": "ייעוד המגרש שעליו בנוי הבניין",
+     "metric": "none",
+     "entities": [
+      "רחוב האירוסים 12"
+     ],
+     "attribute": {
+      "handle": "A15",
+      "description": "ייעודי קרקע",
+      "unit_dimension": null
+     },
+     "task_type": "answer",
+     "conditions": {
+      "city": null,
+      "clear": [],
+      "year_to": null,
+      "area_type": null,
+      "data_kind": null,
+      "vat_basis": null,
+      "year_from": null,
+      "date_field": null,
+      "neighborhood": null,
+      "property_type": null,
+      "relative_year_offset": null
+     },
+     "clarification": null,
+     "turn_relation": "new_question",
+     "search_queries": [
+      "ייעוד הקרקע של המגרש ברחוב האירוסים 12",
+      "הבניין ברחוב האירוסים 12 ייעוד מגרש",
+      "ייעודי קרקע האירוסים 12"
+     ],
+     "clarification_answer": null
+    },
+    "item": "GQ61",
+    "turn": 1,
+    "state_empty": true,
+    "answer_key_attribute": "zoning"
+   }
+  ]
+ }
+}

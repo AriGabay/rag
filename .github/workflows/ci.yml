@@ -23,6 +23,8 @@ jobs:
     env:
       EMBEDDING_PROVIDER: hash
       ANTHROPIC_API_KEY: ""
+      OPENAI_KEY: ""
+      OPENAI_API_KEY: ""
     steps:
       - uses: actions/checkout@v4
       - name: Create roles and databases (same script the Compose stack runs)

@@ -4,6 +4,8 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useState } from "react";
 import { DedupView } from "@/components/review/DedupView";
+import { FactsReview } from "@/components/review/FactView";
+import { MeasurementsReview } from "@/components/review/MeasurementsReview";
 import { RecordView } from "@/components/review/RecordView";
 import { B, ErrorAlert, Notice } from "@/components/ui";
 import { api, errorMessage } from "@/lib/api";
@@ -51,7 +53,7 @@ function QueueItem({ item, selected, onSelect }: { item: ReviewItem; selected: b
   );
 }
 
-function ReviewInner() {
+function RecordsReview() {
   const params = useSearchParams();
   const documentId = params.get("document_id") ?? undefined;
   const fetchQueue = useCallback(() => api.reviewQueue(documentId), [documentId]);
@@ -84,15 +86,12 @@ function ReviewInner() {
 
   return (
     <div className="stack">
-      <div className="row">
-        <h1 style={{ margin: 0 }}>בדיקת נתונים</h1>
-        {documentId && (
-          <>
-            <span className="badge badge-info">מסונן למסמך אחד</span>
-            <Link href="/review">הצג את כל התור</Link>
-          </>
-        )}
-      </div>
+      {documentId && (
+        <div className="row">
+          <span className="badge badge-info">מסונן למסמך אחד</span>
+          <Link href="/review">הצג את כל התור</Link>
+        </div>
+      )}
       {notice && <Notice kind="ok">{notice}</Notice>}
       <div className="split">
         <aside className="card stack" aria-label="תור הבדיקה">
@@ -145,6 +144,64 @@ function ReviewInner() {
           )}
         </section>
       </div>
+    </div>
+  );
+}
+
+type ReviewTab = "measurements" | "records" | "facts";
+
+function ReviewInner() {
+  const params = useSearchParams();
+  const initial = params.get("tab");
+  const [tab, setTab] = useState<ReviewTab>(initial === "facts" || initial === "records" ? initial : "measurements");
+  return (
+    <div className="stack">
+      <h1 style={{ margin: 0 }}>בדיקת נתונים</h1>
+      <div className="tabs" role="tablist" aria-label="סוג הבדיקה">
+        <button
+          type="button"
+          role="tab"
+          id="tab-measurements"
+          aria-selected={tab === "measurements"}
+          aria-controls="panel-measurements"
+          onClick={() => setTab("measurements")}
+        >
+          נתונים כמותיים
+        </button>
+        <button
+          type="button"
+          role="tab"
+          id="tab-records"
+          aria-selected={tab === "records"}
+          aria-controls="panel-records"
+          onClick={() => setTab("records")}
+        >
+          רשומות עסקה
+        </button>
+        <button
+          type="button"
+          role="tab"
+          id="tab-facts"
+          aria-selected={tab === "facts"}
+          aria-controls="panel-facts"
+          onClick={() => setTab("facts")}
+        >
+          עובדות (מנוע קודם)
+        </button>
+      </div>
+      {tab === "measurements" ? (
+        <div role="tabpanel" id="panel-measurements" aria-labelledby="tab-measurements">
+          <MeasurementsReview />
+        </div>
+      ) : tab === "records" ? (
+        <div role="tabpanel" id="panel-records" aria-labelledby="tab-records">
+          <RecordsReview />
+        </div>
+      ) : (
+        <div role="tabpanel" id="panel-facts" aria-labelledby="tab-facts">
+          <FactsReview />
+        </div>
+      )}
     </div>
   );
 }

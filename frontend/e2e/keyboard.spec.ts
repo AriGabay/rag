@@ -1,7 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
-import { answerCards, deleteOfficeBDocsByTitle, fixture, PASSWORD, USERS } from "./helpers";
+import { deleteOfficeBDocsByTitle, fixture, PASSWORD, USERS } from "./helpers";
 
-// Keyboard-only paths (R37): upload through the file input (office B) and asking with Enter (office A, read-only).
+// Keyboard-only paths (R37): upload through the file input and writing in the chat with Enter (office B).
 const FILE = "BAD_synthetic_encrypted.pdf";
 const TITLE = "BAD synthetic encrypted";
 
@@ -24,7 +24,7 @@ async function keyboardLogin(page: Page, email: string): Promise<void> {
   await page.keyboard.press("Tab");
   await page.keyboard.type(PASSWORD);
   await page.keyboard.press("Enter");
-  await expect(page.getByRole("navigation", { name: "ניווט ראשי" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "שיחה חדשה" }).first()).toBeVisible();
 }
 
 test.describe("keyboard only", () => {
@@ -57,33 +57,19 @@ test.describe("keyboard only", () => {
     await expect(panel.getByRole("status", { name: "סטטוס: נכשל" })).toBeVisible({ timeout: 120_000 });
   });
 
-  test("ask with Enter and answer the clarification with the keyboard (office A, read-only)", async ({ page }) => {
-    await keyboardLogin(page, USERS.dana);
-    await expect(page).toHaveURL(/\/chat$/);
-    await tabUntil(page, (el) => el.textContent?.trim() === "שיחה חדשה" && el.tagName === "BUTTON");
+  test("start a chat and send with the keyboard; Shift+Enter adds a line (office B)", async ({ page }) => {
+    await keyboardLogin(page, USERS.adminB);
+    await expect(page).toHaveURL(/\/chat/);
+    await tabUntil(page, (el) => el.textContent?.trim().endsWith("שיחה חדשה") === true && el.tagName === "BUTTON");
     await page.keyboard.press("Enter");
-    await expect(answerCards(page)).toHaveCount(0);
-
-    await tabUntil(page, (el) => el.id === "question");
-    await page.keyboard.type("מה מחיר למ״ר ברמת גן בשכונת חרוזים בשנת 2024?");
-    await page.keyboard.press("Enter");
-    await expect(answerCards(page)).toHaveCount(1);
-    // Focus moves to the new answer so screen-reader and keyboard users land on it.
-    await expect(answerCards(page).nth(0)).toBeFocused();
-    await expect(answerCards(page).nth(0)).toContainText("לאיזה נתון הכוונה?");
-
-    await tabUntil(page, (el) => el.textContent?.trim() === "מחירי עסקאות" && el.tagName === "BUTTON");
-    await page.keyboard.press("Enter");
-    await expect(answerCards(page)).toHaveCount(2);
-    await expect(answerCards(page).nth(1)).toBeFocused();
-    await expect(answerCards(page).nth(1)).toContainText("לפי איזה תאריך לסנן את השנה?");
-
-    // Shift+Enter inserts a newline instead of sending.
-    await tabUntil(page, (el) => el.id === "question");
+    await tabUntil(page, (el) => el.getAttribute("aria-label") === "הודעה");
     await page.keyboard.type("שורה ראשונה");
     await page.keyboard.press("Shift+Enter");
     await page.keyboard.type("שורה שנייה");
-    await expect(page.getByRole("textbox", { name: "שאלה" })).toHaveValue("שורה ראשונה\nשורה שנייה");
-    await expect(answerCards(page)).toHaveCount(2);
+    await expect(page.getByRole("textbox", { name: "הודעה" })).toHaveValue("שורה ראשונה\nשורה שנייה");
+    await expect(page.locator(".msg")).toHaveCount(0);
+    await page.keyboard.press("Enter");
+    await expect(page.locator(".msg-user")).toHaveCount(1);
+    await expect(page.locator(".msg-user")).toContainText("שורה שנייה");
   });
 });
