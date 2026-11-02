@@ -850,3 +850,37 @@ def test_the_input_shows_the_lists_and_the_date_field_the_follow_up_refers_to():
     assert "date_field" in text and "valuation" in text
     assert "date_field" not in resolve._input(RENT_FOCUS, [], "ומה לגבי המועד?", [])
     assert "date_field" in resolve.POLICY and "המועד" in resolve.POLICY
+
+
+# --- round 26 U3: the relations of a reply to a structured clarification, and a narrowing that never re-offers the whole list ---
+
+CHOICES = [{"id": "opt-a", "label": "שומה - הנרקיס 4 עין ורד", "detail": "", "ref": {}},
+           {"id": "opt-b", "label": "שומה - הנרקיס 4 כפר גפן", "detail": "", "ref": {}}]
+
+
+@pytest.mark.parametrize("relation", ["clarification_help", "cancel", "correction_of_choice"])
+def test_the_new_relations_of_a_reply_to_a_clarification_are_valid_and_kept_on_the_request(relation):
+    req = validate(_resolved(relation=relation), RENT_FOCUS, "לא יודע", authorized, TITLES, None,
+                   focus_titles=[CORPUS[DOC][0]], options=CHOICES)
+    assert req.relation == relation and req.kind == resolve.KIND_OF_RELATION[relation]
+
+
+def test_the_options_the_parse_chose_are_kept_only_when_they_are_the_clarifications():
+    r = _resolved(relation="clarification_answer", chosen_options=["opt-b", "invented", "opt-b"])
+    req = validate(r, RENT_FOCUS, "כפר גפן", authorized, TITLES, None, options=CHOICES)
+    assert req.chosen_options == ["opt-b"]
+    assert validate(r, RENT_FOCUS, "כפר גפן", authorized, TITLES, None).chosen_options == []  # no clarification: nothing to choose
+
+
+def test_a_reply_that_names_some_of_the_candidates_narrows_the_offer_to_those_and_not_to_the_whole_list():
+    third = "d-6"
+    offered = [{"document_id": NARKIS_A, "title": "שומה - הנרקיס 4 עין ורד"}, {"document_id": NARKIS_B, "title": "שומה - הנרקיס 4 כפר גפן"},
+               {"document_id": third, "title": "שומה - האורן 9 כפר גפן"}]
+    global VISIBLE
+    VISIBLE = VISIBLE | {third}
+    try:
+        req = _validate(_resolved(relation="clarification_answer"), RENT_FOCUS, "כפר גפן", candidates=offered)
+    finally:
+        VISIBLE = VISIBLE - {third}
+    assert {c["document_id"] for c in req.offered} == {NARKIS_B, third} and NARKIS_A not in {c["document_id"] for c in req.offered}
+    assert req.document_ids == []

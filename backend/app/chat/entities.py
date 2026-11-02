@@ -585,6 +585,18 @@ def names_several(candidates: list[dict], reply: str, authorized: set[str]) -> b
     return any(sum(1 for v in vocab if v & set(forms)) >= 2 for forms in _scope_terms(reply))
 
 
+def narrowed(candidates: list[dict], reply: str, authorized: set[str]) -> Outcome | None:
+    """The candidates a reply that names several of them fits, as an ambiguous outcome of exactly those (round 26 U3, cause 4: the offer
+    narrows, it is never the whole list again); None when the reply fits none, or all of them (it tells nothing more than the list)."""
+    cands = [Candidate(str(c["document_id"]), c["title"], unit=c.get("unit"), file_title=c.get("file_title") or "")
+             for c in candidates if str(c["document_id"]) in authorized]
+    vocab = {id(c): _candidate_words(c) for c in cands}
+    forms = [set(f) for f in _scope_terms(reply)]
+    telling = [f for f in forms if 0 < sum(1 for v in vocab.values() if v & f) < len(cands)]
+    kept = [c for c in cands if telling and all(vocab[id(c)] & f for f in telling)]
+    return Outcome("ambiguous", kept, reply) if 1 < len(kept) < len(cands) else None
+
+
 def _unit_names(conn) -> list[str]:
     """The titles and aliases of the units of the readable documents' current readings (an appendix or a comparables
     part names no document): the names a document states for the appraisals in it, which a follow-up may use

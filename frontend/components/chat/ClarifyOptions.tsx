@@ -40,7 +40,7 @@ export function ClarifyOptions({
   const open = clarify.state === "open";
   const disabled = !open || busy;
   const answered = clarify.state === "answered";
-  const chosen = clarify.chosen_option_id ?? null;
+  const chosen = clarify.chosen ?? null;
   const choices = [
     ...clarify.options.map((o) => ({ id: o.id, label: o.label, detail: o.detail })),
     ...(clarify.allow_all ? [{ id: ALL_OPTION_ID, label: ALL_LABEL, detail: "" }] : []),

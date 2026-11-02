@@ -20,10 +20,16 @@ is not a document of the message, so a later professional answer is not hidden b
   and it expires when the property changes or the new question states time (round 22 U12, R21);
 - ``sources``: what the answer cited - ``{document_id, source_kind, standard, section}``, the kind and the identity (number, name,
   edition, effective date, section) as the cited source carried them (round 10 U8);
-- ``pending``: ``{kind, payload, asked_at}`` - the clarification this answer asked (``candidates`` or ``parameter``). It lives exactly one
-  message: each turn writes only its own, so a pending one that the next message did not answer is simply not carried.
+- ``pending``: ``{kind, payload, asked_at}`` - the clarification this answer asked: ``clarification`` (round 26 U3, schema version 3: the record
+  of a structured or text clarification - id, question, kind, options with their references, the original question, the time it ran under,
+  the choices that stand, the reads to reopen - beside the ``candidates`` a reply is resolved among), ``candidates`` (a version-2 row) or
+  ``parameter``. It lives exactly one message: each turn writes only its own, so a pending one that the next message did not answer is simply
+  not carried;
+- ``answered``: the clarification this answer continued, with the choices made (``{record, chosen}``), for the next message only: a
+  correction of the choice ("לא, התכוונתי ל...") re-answers the original question with a sibling option, and a later message finds none.
 
-A context of version 1 (``topic.items``) is read as one list (``upgrade_v1``); an answer stored before the slots has none and is read by
+A context of version 1 (``topic.items``) is read as one list (``upgrade_v1``), and one of version 2 as it is, with its pending as it was
+(``upgrade_v2``; no migration); an answer stored before the slots has none and is read by
 ``api._legacy_context``, the only caller of the Markdown extractor (``legacy_lists``).
 
 Everything here is pure: the functions take and return plain data, so the slots are tested without a database.
@@ -38,7 +44,7 @@ from dataclasses import dataclass, field
 
 from app.extraction.normalize_text import FINALS
 
-VERSION = 2
+VERSION = 3
 MAX_LISTS = 3
 LIST_AGE = 3  # an answer's lists are carried while it is one of the last three answers (the last six messages)
 MAX_LIST_ITEMS = 40
@@ -565,7 +571,8 @@ def stamp(lists: Iterable[dict], message_id: str | None) -> list[dict]:
 
 def carry(previous: dict | None, *, intent: str, property: dict | None = None, params: dict | None = None,
           topic: str = "", lists: Iterable[dict] = (), message_id: str | None = None,
-          sources: Iterable[dict] = (), pending: dict | None = None, period: dict | None = None) -> dict:
+          sources: Iterable[dict] = (), pending: dict | None = None, period: dict | None = None,
+          answered: dict | None = None) -> dict:
     """The context this answer stores (KTD4, KTD14), from the previous one and this turn's: the property found (``property``,
     ``params``), the requested period (``period``), the topic text, the lists it printed (``lists_of`` at compose time), what it cited and
     what it asks. A professional turn leaves the previous property, parameters and period unchanged - dormant, not dropped; every other turn
@@ -587,7 +594,22 @@ def carry(previous: dict | None, *, intent: str, property: dict | None = None, p
             "lists": [*stamp(lists, message_id), *older][:MAX_LISTS],
             "tombstones": list(prev.get("tombstones") or [])[-MAX_TOMBSTONES:],
             "property": prop, "params": prm, "period": new_period or None,
-            "sources": [dict(s) for s in sources][:MAX_SOURCES], "pending": pending}
+            "sources": [dict(s) for s in sources][:MAX_SOURCES], "pending": pending,
+            **({"answered": answered} if answered else {})}
+
+
+def clarification_of(context: dict | None) -> dict | None:
+    """The record of the structured clarification a context holds as its pending slot, or None (no pending, a parameter, or the candidates of
+    a version-2 row)."""
+    pending = (context or {}).get("pending")
+    if isinstance(pending, dict) and pending.get("kind") == "clarification" and isinstance(pending.get("payload"), dict):
+        return pending["payload"]
+    return None
+
+
+def upgrade_v2(stored: dict) -> dict:
+    """A context of version 2 read as version 3: the same slots, its pending (``candidates`` or ``parameter``) as it was."""
+    return stored | {"version": VERSION}
 
 
 def upgrade_v1(stored: dict) -> dict:

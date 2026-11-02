@@ -44,7 +44,7 @@ function clarifyAnswer(opts: ClarifyOpts): { answer: Json; clarify: Json } {
   );
   const clarify = {
     id: "cl-1", question: QUESTION, reason: REASON, kind: "unit", options, allow_all: opts.allowAll === true,
-    state: opts.state ?? "open", chosen_option_id: opts.chosen ?? null,
+    state: opts.state ?? "open", chosen: opts.chosen ?? null,
   };
   return { answer, clarify };
 }
@@ -68,7 +68,7 @@ async function mockStack(page: Page, opts: ClarifyOpts = {}): Promise<Mock> {
     { completeness: { status: "full", requirements: 1, missing: [] } });
   const listed = (): Json[] => [
     message("m1", "user", "מה שטח המגרש בכלנית 6?", null),
-    message("m2", "assistant", String(answer.markdown), answer, { clarify: { ...clarify, state: server.state, chosen_option_id: server.chosen } }),
+    message("m2", "assistant", String(answer.markdown), answer, { clarify: { ...clarify, state: server.state, chosen: server.chosen } }),
     ...items,
   ];
   await page.route("**/api/**", async (route: Route) => {

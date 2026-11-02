@@ -117,7 +117,7 @@ import logging
 import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -588,6 +588,12 @@ class TurnInput:
     # what the conversation knows about the clarifications already asked for the question this turn continues (round 26 U2, KTD2, R10):
     # the kinds the user resolved, how many were asked in a row, and the options a narrowing reply matched; None: none
     clarification_state: clarify.ClarificationState | None = None
+    # round 26 U3 (KTD3, KTD4): the open structured clarification the user's message may answer (the stored record, its reads already
+    # filtered to the documents the user still sees), the reply already recorded on the user's row (a click, or a retried turn's:
+    # ``{clarification_id, option_id, outcome}``), and the clarification the previous answer continued (for a correction of the choice)
+    clarification: dict | None = None
+    reply: dict | None = None
+    answered: dict | None = None
 
 
 @dataclass
@@ -632,6 +638,11 @@ class TurnOutcome:
     # or the buttons withheld (``clarify.Verdict.check``; no content), for the diagnostics
     clarification: dict | None = None
     clarification_check: dict = field(default_factory=dict)
+    # round 26 U3: how the user's message answered the open clarification, as the user's row records it
+    # (``{clarification_id, option_id, outcome}``; ``Continuation.outcome``), and - when a choice was applied - the clarification and the
+    # choices that stand, kept for a correction in the next message (``slots.carry(answered=...)``)
+    reply: dict | None = None
+    continued: dict | None = None
     # per verification round, what the requirements judge returned for each component and what the server did with its support
     # (``VerifyReport.requirements_trace``); diagnostics only, [{"round": the number in ``rounds``, "version": the answer version, "components": [...]}]
     requirements_trace: list[dict] = field(default_factory=list)
@@ -663,13 +674,15 @@ def usage_summary(usage: list[dict], **extra) -> dict:
 
 def _context_message(inp: TurnInput, request: resolve.Request | None = None, binding: dict | None = None,
                      unit_handle: str | None = None, candidates: str = "",
-                     intent: intent_mod.Intent | None = None, time_mode: timeframe.TimeMode | None = None) -> str:
+                     intent: intent_mod.Intent | None = None, time_mode: timeframe.TimeMode | None = None,
+                     cont: clarify.Continuation | None = None) -> str:
     """The turn's first message. ``intent``: a first turn's settled intent, when it is known by now (a follow-up's is on
     its ``request``). A professional request carries no focus block: the conversation's property is not its subject
     (round 10 KTD7). ``time_mode``: the turn's time decision (round 11 U7, KTD2, KTD5); its block follows the request
     block, only when the mode is ``recent`` or ``explicit`` (``none``: no block), and never touches the focus above.
     ``candidates``: the candidates block (``resolve.candidates_block``, round 15 U6, KTD1) — the last item, data the model
-    weighs and never a scope rule."""
+    weighs and never a scope rule. ``cont``: a bound reply to a clarification (round 26 U3): the new message is the user's own words and
+    the block that follows the request is the stored original question with the choice; the conversation's older focus is not shown."""
     parts = []
     if inp.summary:
         parts.append("סיכום השיחה עד כה (לא מקור עובדתי):\n" + prompt_text(inp.summary))
@@ -690,7 +703,7 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None, bin
     settled = request.intent if request is not None else intent
     professional = settled is not None and settled.professional
     moved = professional or (request is not None and (request.kind == "new_topic" or request.entity_changed))
-    if inp.focus and not moved:
+    if inp.focus and not moved and cont is None:
         f = inp.focus
         def label(labels: dict, key: str) -> str:
             value = f.get(key)
@@ -706,24 +719,27 @@ def _context_message(inp: TurnInput, request: resolve.Request | None = None, bin
             f"- {k}: {prompt_text(v)}" for k, v in fields if v)
             + "\nאם ההודעה החדשה מתקנת את התור הקודם, שנה רק את מה שתוקן ושמור את כל השאר מהרשימה הזו "
               "(אותו נכס, אותם מסמכים, אותה יחידה — למשל ערך למ\"ר נשאר ערך למ\"ר).")
-    if inp.focus_documents and not moved:
+    if inp.focus_documents and not moved and cont is None:
         parts.append("מסמכים שהשיחה עסקה בהם:\n" + "\n".join(
             f"- document_id={d['document_id']} | {prompt_text(d['title'])}" for d in inp.focus_documents))
     if inp.prior_refs and not moved:
-        parts.append("הפניות למקורות שצוטטו בתשובה הקודמת (יש לפתוח מחדש עם read, source=P#, לפני שימוש):\n"
+        parts.append(("הפניות למקורות שנקראו בתור ההבהרה (יש לפתוח מחדש עם read, source=P#, לפני שימוש):\n" if cont is not None
+                      else "הפניות למקורות שצוטטו בתשובה הקודמת (יש לפתוח מחדש עם read, source=P#, לפני שימוש):\n")
                      + "\n".join(
             f"- {pid}: {prompt_text(r.get('title') or '')} — {prompt_text(r.get('location') or '')}"
             + (f" — «{prompt_text(r['excerpt'])}»" if r.get("excerpt") else "")
             + (" — נקרא בתור הקודם רק בחלקו (הפתיחה מחדש מציעה המשך)" if r.get("resume") else "")
             for pid, r in inp.prior_refs.items()))
-    parts.append("ההודעה החדשה של המשתמש:\n" + prompt_text(inp.question))
+    parts.append("ההודעה החדשה של המשתמש:\n" + prompt_text(cont.reply_text if cont is not None else inp.question))
     if binding is not None:
         parts.append(resolve.pending_block(binding))
     if request is not None:
         parts.append(resolve.requested_block(request, unit_handle))
         if request.components:
             parts.append(request_analysis.block(request.components))
-    elif professional:  # a first turn that read its intent: the one line a follow-up's requested block carries
+    if cont is not None:
+        parts.append(cont.block())
+    if request is None and professional:  # a first turn that read its intent: the one line a follow-up's requested block carries
         parts.append("הבקשה כפי שהובנה:\n" + resolve.PROFESSIONAL_NOTE)
     if time_mode is not None and (time_block := timeframe.block(time_mode)):
         parts.append(time_block)
@@ -808,7 +824,11 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     # round 23 U0 (KTD11): each verification round's report with its slot in ``rounds``, so the stored round shows what was repaired
     report_slots: list[tuple[VerifyReport, int]] = []
     answer_seconds = 0.0  # how long the step that wrote the last answer took
-    progress("understand", "מבין את הבקשה")
+    cont: clarify.Continuation | None = _bound_reply(inp)  # a reply bound to its clarification without a model call (round 26 U3)
+    if cont is not None:
+        progress("continue", clarify.MSG_PROGRESS_CONTINUE)
+    else:
+        progress("understand", "מבין את הבקשה")
     request = None
     titles = functools.cache(lambda: entities.titles_of(ctx))  # every title the user may see: read once, when needed
     first_turn = not (inp.history or inp.focus)
@@ -830,6 +850,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         """The first turn's intent from the analysis (None: it gave none in time), settled against the question, with
         the decisions kept for the diagnostics."""
         nonlocal turn_intent
+        if request is not None:
+            return  # a continuation's request already settled the intent
         turn_intent = intent_mod.settle(analysis.intent if analysis is not None else None, inp.question, titles())
         ws.intent = turn_intent.value
         first_decisions["intent"] = turn_intent.value + (" (late)" if late else "")
@@ -874,32 +896,59 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                            _summary(usage, rounds, reused, turn), final_digest=text_digest(answer.answer_markdown),
                            timing=ws.clock.summary(), server_asked=True)
 
+    def acknowledged(cancel: clarify.Continuation, asking: resolve.Request) -> TurnOutcome:
+        """The turn that ends in the user's cancel of the clarification (round 26 U3, G17): the server's one line, no model call; an answered
+        message with no claims, and the conversation's property left as it was."""
+        answer = FinalAnswer(status="answered", items=[], answer_markdown=clarify.MSG_CANCELLED, claims=[], clarification_question="",
+                             missing_info="", referenced_document_ids=[], scope_kind="focused", scope_query="", omitted=[], focus=None,
+                             requested=[], parts=[])
+        return TurnOutcome(answer, ws, VerifyReport([], judged=True, judge_status="no_claims"), steps, usage, {}, rounds,
+                           asking.as_dict(), _with_time(_with_notes(asking.resolution, notes), ws.time),
+                           _summary(usage, rounds, reused, turn), final_digest=text_digest(answer.answer_markdown),
+                           timing=ws.clock.summary(), server_asked=True, reply=cancel.outcome())
+
     # a reply to a clarification that asked for a parameter: bound to it before anything else (round 7 KTD9) — and kept
     # only when the reply answers it (below)
-    binding = resolve.bind_pending(inp.pending, inp.question)
-    if inp.history or inp.focus:
+    if cont is not None:
+        inp = _continue(ctx, ws, inp, cont)  # the stored original question, the time it ran under, the reads to reopen
+    binding = resolve.bind_pending(inp.pending, inp.question) if cont is None else None
+    asked = _asked_record(inp)  # the structured clarification a reply that is not bound yet is read against, open or answered
+    if inp.history or inp.focus or cont is not None:
         # a follow-up is resolved in its context, and validated, before anything is searched. Three document sets
         # stay apart: the conversation's documents (context), the documents the user may see (the database decides,
         # under the user's permissions) and the documents the new request names (looked up the same way)
         focus_ids = {d["document_id"] for d in inp.focus_documents} | set((inp.focus or {}).get("document_ids") or [])
-        prior_units = entities.units_of_documents(ctx, inp.clarified_documents) if not inp.candidates else []
+        prior_units = entities.units_of_documents(ctx, inp.clarified_documents) if not inp.candidates and cont is None else []
         topic_slot = (inp.slots or {}).get("topic") or {}
-        request = resolve.resolve(
-            provider, inp.focus, inp.history, inp.question, inp.focus_documents,
-            lambda ids: entities.authorized(ctx, ids), titles, usage, deadline,
-            lookup=lambda words: entities.lookup(ctx, words, focus_ids, titles), candidates=inp.candidates or None,
-            prior_units=prior_units or None, lists=(inp.slots or {}).get("lists") or None, listing=inp.listing or None,
-            topic=topic_slot.get("text") or "")
+        if cont is not None:
+            request = _continuation_request(cont, None)
+        else:
+            request = resolve.resolve(
+                provider, inp.focus, inp.history, inp.question, inp.focus_documents,
+                lambda ids: entities.authorized(ctx, ids), titles, usage, deadline,
+                lookup=lambda words: entities.lookup(ctx, words, focus_ids, titles), candidates=inp.candidates or None,
+                prior_units=prior_units or None, lists=(inp.slots or {}).get("lists") or None, listing=inp.listing or None,
+                topic=topic_slot.get("text") or "",
+                options=(asked or {}).get("options") or None, answered=inp.clarification is None and asked is not None)
         if cancelled():
             raise TurnCancelled
+        if cont is None and asked is not None and (inp.reply or {}).get("outcome") != "abandoned":
+            # the relation call read the reply against the clarification's options: it may be help, a cancel, a choice or a
+            # correction of the earlier choice (round 26 U3, KTD3)
+            cont = _related_reply(inp, request)
+            if cont is not None:
+                progress("continue", clarify.MSG_PROGRESS_CONTINUE)
+                inp = _continue(ctx, ws, inp, cont)
+                request = _continuation_request(cont, request)
+                binding = None
         if request is not None:
             ws.intent = request.intent.value
             if request.intent.value == "document":  # a document question reads the documents it names (U8, KTD12)
                 ws.named_documents = tuple(str(d) for d in request.document_ids)
         if request is not None and request.located_unit:
             _settle_unit(ctx, ws, request)
-        if (request is not None and request.relation != "new_question" and request.scope != "set" and not request.entity_changed
-                and not request.intent.professional):
+        if (request is not None and cont is None and request.relation != "new_question" and request.scope != "set"
+                and not request.entity_changed and not request.intent.professional):
             # an explicit period the previous question stated carries to a follow-up that names no time and keeps the same property
             # (round 22 U12, KTD14, R21); the slot's period was dropped with its property if that is no longer visible
             ws.time = timeframe.carried(ws.time, (inp.slots or {}).get("period"))
@@ -921,6 +970,9 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             turn.adopt([binding["component"]], "clarification_answer")
         else:
             turn.fall_back("resolve_failed" if request is None else request.components_status)
+        if inp.clarification is not None:
+            notes["clarification"] = (f"bound: {cont.mode}" if cont is not None
+                                      else "abandoned: the message is no answer to the open clarification")
         # a model's clarification has nothing to verify against, so one that states a figure is not used; the
         # server's names only titles the user may see and the user's own words
         if request is not None and request.clarify and (request.server_clarify or not re.search(r"\d", request.clarify)):
@@ -1006,6 +1058,17 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             if final.clarify is not None:  # the options are the candidates a reply binds to; the focus's units are the old form
                 offered = verdict.offered_units
             shown_documents = sorted(set(shown_documents) | set(verdict.shown_documents))
+            clarification = clarify.stamp(clarification, original_question=inp.question, time_mode=inp.time_preference,
+                                          state=inp.clarification_state, cont=cont,
+                                          request=request.as_dict() if request is not None else None)
+        if cont is not None and cont.mode == clarify.HELP and cont.record.get("options"):
+            # a help reply keeps the clarification open once: the same options under a new id (KTD3)
+            clarification, clarification_check = clarify.reemit(cont.record), {"fallback": None, "dropped": [], "violation": None, "help": True}
+            offered = clarify.candidates_of(clarification)
+            shown_documents = sorted(set(shown_documents) | {d for o in clarification["options"] if (d := clarify.option_document(o))})
+        reply_record = (cont.outcome() if cont is not None else
+                        {"clarification_id": inp.clarification["id"], "option_id": None, "outcome": "abandoned"}
+                        if inp.clarification is not None else None)
         report.completeness = coverage.completeness(outcomes, report.unbound_data())
         try:  # round 23 U0 (KTD11): the read cursors the turn was given and never followed, in the timing (diagnostics only)
             ws.clock.note_unfollowed(ws.unfollowed_cursors())
@@ -1025,7 +1088,9 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                            _pending(ws, turn, final), composed.spans, done.digest, done.stats, ws.clock.summary(),
                            unit, offered_units=offered, shown_documents=shown_documents, requirements_trace=traces,
                            item_ledger=report.item_diagnostics(), drafts=drafts, lists=composed.lists,
-                           clarification=clarification, clarification_check=clarification_check)
+                           clarification=clarification, clarification_check=clarification_check, reply=reply_record,
+                           continued=({"record": cont.record, "chosen": cont.chosen()}
+                                      if cont is not None and cont.mode in (clarify.CHOICE, clarify.ALL) else None))
 
     def adopt_analysis() -> None:
         """The collected analysis as the turn's requirements: its components frozen and appended as one item, or the
@@ -1069,9 +1134,12 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     ws.binding = binding  # an ``assume`` of the bound number records the parameter it fills (KTD9)
     items: list = [{"role": "user", "content": _context_message(
         inp, request, binding, ws.unit_focus["handle"] if ws.unit_focus else None,
-        _candidates_text(ctx, ws, request, inp.question, ranked), turn_intent, ws.time)}]
-    if request is None and first_turn:
-        # a first turn: the request is analysed beside the first step (no added latency), within the reading time
+        _candidates_text(ctx, ws, request, inp.question, ranked), turn_intent, ws.time, cont)}]
+    if cont is not None and cont.mode == clarify.CANCEL:
+        return acknowledged(cont, request)
+    if request is None and first_turn or (cont is not None and request is not None and request.components is None):
+        # a first turn: the request is analysed beside the first step (no added latency), within the reading time. So is a
+        # continuation: the stored original question's components are not stored, and the judge would only derive them
         start_analysis()
     while True:
         if cancelled():
@@ -1440,6 +1508,151 @@ def draft_record(ws: T.Workspace, markdown: str, round_no: int, version: int) ->
     cited = coverage.cited_ids_ordered(markdown)
     sources = {sid: loc for sid in cited if (loc := _locator_of(ws, sid)) is not None}
     return {"round": round_no, "version": version, "markdown": markdown, "sources": sources}
+
+
+# --- round 26 U3: a reply bound to its clarification, and the continuation of the stored original question ---------------------------
+
+
+def _asked_record(inp: TurnInput) -> dict | None:
+    """The structured clarification the user's message is read against: the open one, else the one the previous answer continued (a
+    correction of the choice)."""
+    if inp.clarification is not None and inp.clarification.get("options"):
+        return inp.clarification
+    return (inp.answered or {}).get("record")
+
+
+def _bound_reply(inp: TurnInput) -> clarify.Continuation | None:
+    """The reply bound to the open clarification without a model call: the click or outcome already recorded on the user's row, else the
+    reply's own words (``clarify.match_reply``: a number, an ordinal, a name, "all", help, cancel). None: the words decide nothing (the relation
+    call reads them) or the recorded outcome was that the message was no answer."""
+    record = inp.clarification
+    if record is None or not record.get("options"):
+        return None
+    options = {o["id"]: o for o in record["options"]}
+    helped = int(record.get("help_count") or 0) >= 1
+    text = inp.question
+    stored = inp.reply if inp.reply and inp.reply.get("clarification_id") == record["id"] else None
+    if stored is not None:
+        outcome, oid = stored.get("outcome"), stored.get("option_id")
+        if outcome == "answered" and oid == clarify.ALL_ID and record.get("allow_all"):
+            return clarify.Continuation(record, clarify.ALL, list(options.values()), reply_text=text)
+        if outcome == "answered" and oid in options:
+            return clarify.Continuation(record, clarify.CHOICE, [options[oid]], reply_text=text)
+        if outcome == "answered" and oid is None:
+            return clarify.Continuation(record, clarify.FREE, free_text=text, reply_text=text)
+        if outcome == "narrowed":
+            return clarify.Continuation(record, clarify.NARROW, [options[i] for i in stored.get("option_ids") or [] if i in options],
+                                        reply_text=text)
+        if outcome in ("help", "cancelled"):
+            return clarify.Continuation(record, clarify.CANCEL if outcome == "cancelled" else
+                                        clarify.ASSUMPTIONS if helped else clarify.HELP, reply_text=text)
+        return None
+    m = clarify.match_reply(record, text)
+    mode = {"one": clarify.CHOICE, "several": clarify.NARROW, "all": clarify.ALL, "cancel": clarify.CANCEL,
+            "help": clarify.ASSUMPTIONS if helped else clarify.HELP}.get(m.kind)
+    return clarify.Continuation(record, mode, m.options, reply_text=text) if mode else None
+
+
+def _related_reply(inp: TurnInput, request: resolve.Request | None) -> clarify.Continuation | None:
+    """What the relation call made of a reply that no words bound (KTD3): help, a cancel, the option(s) it chose, free text for the
+    original question, or - beside an answered clarification - a correction of the choice. None: a new question, which closes the clarification."""
+    if request is None:
+        return None
+    text, rel = inp.question, request.relation
+    if inp.clarification is None:
+        answered = inp.answered or {}
+        record = answered.get("record")
+        if record is None or rel != "correction_of_choice":
+            return None
+        standing = answered.get("chosen") or []
+        current = next((c["id"] for c in standing if c["kind"] == record["kind"]), None)
+        new = [i for i in request.chosen_options if i != current]
+        if len(new) != 1:
+            request.relation = "correction"  # no sibling named: the ordinary correction
+            return None
+        option = next(o for o in record["options"] if o["id"] == new[0])
+        return clarify.Continuation(record, clarify.CHOICE, [option], reply_text=text, correction=True,
+                                    earlier=[c for c in standing if c["kind"] != record["kind"]])
+    record = inp.clarification
+    helped = int(record.get("help_count") or 0) >= 1
+    if rel == "clarification_help":
+        return clarify.Continuation(record, clarify.ASSUMPTIONS if helped else clarify.HELP, reply_text=text)
+    if rel == "cancel":
+        return clarify.Continuation(record, clarify.CANCEL, reply_text=text)
+    if rel != "clarification_answer":
+        return None
+    options = record["options"]
+    ids = request.chosen_options or _picked_options(options, request)
+    if len(ids) == 1:
+        return clarify.Continuation(record, clarify.CHOICE, [o for o in options if o["id"] == ids[0]], reply_text=text)
+    if 1 < len(ids) < len(options):
+        return clarify.Continuation(record, clarify.NARROW, [o for o in options if o["id"] in ids], reply_text=text)
+    return clarify.Continuation(record, clarify.FREE, free_text=text, reply_text=text)  # new information for the original question
+
+
+def _picked_options(options: list[dict], request: resolve.Request) -> list[str]:
+    """The options the older candidate binder picked: the unit or the document the request now names, or - when the reply fits some of the
+    candidates - the ones it narrowed the offer to (``request.offered``)."""
+    def ref(o):
+        return o.get("ref") or {}
+
+    if request.located_unit:
+        return [o["id"] for o in options if ref(o).get("unit") and entities.same_unit(ref(o)["unit"], request.located_unit)]
+    if len(request.document_ids) == 1:
+        return [o["id"] for o in options if not ref(o).get("unit") and str(ref(o).get("document_id")) == request.document_ids[0]]
+    offered = {json.dumps(clarify.ref_identity(d), sort_keys=True) for d in request.offered}
+    return [o["id"] for o in options if offered and json.dumps(clarify.ref_identity(ref(o)), sort_keys=True) in offered]
+
+
+def _continue(ctx: TenantContext, ws: T.Workspace, inp: TurnInput, cont: clarify.Continuation) -> TurnInput:
+    """The turn's input when it continues a clarification (KTD4): the stored original question, the time mode and anchor date it ran under
+    (an explicit period the user chose beats the switch, which a click never changes), what the clarifications already settled, and the reads of
+    the clarifying turn as the references the model reopens - no candidates and no pending to bind again."""
+    prior = cont.prior()
+    time = timeframe.resolve(cont.original_question or inp.question, cont.time_mode or inp.time_preference)
+    for chosen in cont.chosen():
+        if chosen["kind"] == clarify.PERIOD and chosen["id"] != clarify.ALL_ID and chosen.get("ref"):
+            time = timeframe.TimeMode("explicit", "clarification", time.anchor, clarify.requested_of(chosen["ref"], chosen["label"]),
+                                      time.prefer_recent)
+    ws.time = time
+    ws.prior.clear()
+    ws.prior.update(prior)
+    return replace(inp, question=cont.original_question or inp.question, time_preference=cont.time_mode or inp.time_preference,
+                   clarification_state=cont.state(), candidates=[], clarified_documents=[], prior_refs=prior, pending=None)
+
+
+def _continuation_request(cont: clarify.Continuation, old: resolve.Request | None) -> resolve.Request:
+    """The request of a continuation (KTD4): the datum the clarifying turn resolved, with the chosen constraint applied - the unit(s) as the
+    scope, no candidate lookup. ``old``: the relation call's request, whose diagnostics are kept."""
+    base = cont.record.get("request") or {}
+    value = base.get("intent") if base.get("intent") in ("property", "mixed", "document") else "property"
+    req = resolve.Request(
+        "clarification_answer", base.get("standalone_question") or cont.original_question, metric_kind=base.get("metric_kind", "unknown"),
+        unit=base.get("unit", "unknown"), period=base.get("period", "unknown"), area_basis=base.get("area_basis", ""),
+        vat=base.get("vat", "unknown"), subject=base.get("subject", ""), relation="clarification_answer", by_choice=True,
+        topic=base.get("topic", ""), intent=intent_mod.Intent(value=value, claimed=value, reference="clarification"))
+    if cont.mode != clarify.CANCEL:
+        req.document_ids = [str(d) for d in base.get("document_ids") or []]
+        req.located_unit = base.get("located_unit")
+        units = [c for c in cont.chosen() if c["kind"] == clarify.UNIT]
+        group = cont.options if cont.mode in (clarify.ALL, clarify.NARROW) and cont.kind == clarify.UNIT else []
+        for c in units:
+            if c["id"] == clarify.ALL_ID:
+                group = group or c.get("options") or []
+            elif c.get("ref"):
+                ref = c["ref"]
+                unit = ref.get("unit")
+                req.located_unit = unit or None
+                req.document_ids = [str((unit or {}).get("document_id") or ref["document_id"])]
+                req.subject = ref.get("title") or c["label"]
+                group = []
+        if group:
+            req.document_ids, req.located_unit = [], None
+            req.offered = [(o.get("ref") or o) | {"basis": entities.BASIS_ALIKE} for o in group]
+    req.resolution = dict(old.resolution) if old is not None else {}
+    req.resolution.setdefault("decisions", {})["clarification"] = (
+        f"continued: {cont.mode} ({cont.kind})" + (" - a correction of the earlier choice" if cont.correction else ""))
+    return req
 
 
 def _unit_pinned(ws: T.Workspace, request: resolve.Request | None, ranked: entities.Ranked | None) -> bool:

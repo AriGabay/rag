@@ -243,7 +243,7 @@ def test_the_items_of_a_numbered_answer_are_stored_as_labels(world):
     ctx = _context(world, m)
     (entry,) = ctx["lists"]
     assert _labels(ctx) == APPROACHES and entry["message_id"] == m["id"] and entry["id"] == f"{m['id']}#1" and entry["total"] == 3
-    assert _context(world, m)["version"] == 2 and _context(world, m)["pending"] is None
+    assert _context(world, m)["version"] == 3 and _context(world, m)["pending"] is None
     assert {s["document_id"] for s in _context(world, m)["sources"]} == {world.guide}
 
 
@@ -350,7 +350,7 @@ def _clarification(world) -> dict:
 def test_a_model_clarification_stores_the_units_it_offered_as_the_pending_slot(world):
     m = _clarification(world)
     pending = _context(world, m)["pending"]
-    assert pending["kind"] == "candidates" and pending["asked_at"]
+    assert pending["kind"] == "clarification" and pending["asked_at"]  # round 26 U3: the record, with the candidates beside it
     assert [c["unit"]["unit_no"] for c in pending["payload"]["candidates"]] == [1, 2]
     inp = _next_input(world)
     assert [c["unit"]["unit_no"] for c in inp.candidates] == [1, 2]
@@ -400,16 +400,56 @@ def test_after_a_chosen_candidate_a_reply_of_all_of_them_asks_nothing_again(worl
     assert m["answer"]["status"] != "clarification" and agent.seen
 
 
-def test_a_reply_that_names_two_candidates_reaches_the_model_again_when_the_model_calls_it_an_answer(world):
+def test_a_clarification_that_offered_no_option_keeps_the_files_its_turn_touched_as_the_pool_a_reply_is_looked_up_in(world):
+    """Round 26 U3 (KTD2, R9): ``_context`` stored ``clarified=[]`` for every new answer, so the files a text question touched were lost and
+    a typed unique name had no pool; only a message stored before the slots kept them."""
+    asked = "באיזה נכס מדובר?"
+    m, _ = _turn(world, "מה דמי השכירות?", [
+        [call("search", query="דמי השכירות", document_ids=[world.rent, world.jasmine], limit=None)],
+        final(asked, "clarification", clarification=asked)], None, intent="property")
+    pending = _context(world, m)["pending"]
+    assert pending["kind"] == "clarification" and pending["payload"]["options"] == []
+    assert {world.rent, world.jasmine} <= set(pending["payload"]["clarified"])
+    assert {world.rent, world.jasmine} <= set(_next_input(world).clarified_documents)
+
+
+def test_a_reply_that_names_all_the_candidates_tells_nothing_more_and_reaches_the_model(world):
+    """"הגפן" is in both names: the reply narrows nothing, so the two candidates the reply names are the model's to weigh (and to ask
+    about, in its words). It is not a choice, and nothing re-offers a list in its place."""
     _clarification(world)
     again = "הגפן קיים בשני מתחמים. התכוונת לא או לב?"
     m, agent = _turn(world, "הגפן", [final(again, "clarification", clarification=again,
                                            focus=_focus(world.file, "", "unknown", units=[]))],
                      _resolution(relation="clarification_answer", standalone_question="הגפן",
                                  intent=intent_part("property", "clarification")))
-    # the server asks nothing: the two candidates the reply names are the model's to weigh (and to ask about, in its words)
     assert m["answer"]["markdown"] == again and len(agent.seen) == 1
     assert not m["answer"]["request"]["candidates"] and m["answer"]["request"]["located_unit"] is None
+
+
+def test_a_reply_that_names_some_of_the_candidates_narrows_the_offer_to_those_and_never_re_asks_the_whole_list(world):
+    """Round 26 U3 (cause 4 of the repeated candidate list): the shared word of two of three candidates used to bring the same full list
+    back. The model now sees exactly the two the reply fits, and the third is no longer offered."""
+    from tests.integration.test_chat_clarification import handle_of
+
+    names = ["מגדל הגפן א", "מגדל הגפן ב", "מגדל הרימון"]
+    towers, _ = unit_file(world, world.default_group_id, "קובץ מגדלים סינתטי", [
+        {"title": t, "aliases": [t], "blocks": [f"{t}, שומת מקרקעין", f"שווי הנכס {v} ₪."]}
+        for t, v in zip(names, VALUES, strict=True)], sha="t" * 64)
+    asked = "בקובץ שלושה מגדלים. לאיזה התכוונת?"
+
+    def ask_between(items):
+        return final(asked, "clarification", clarification=asked, focus=_focus(towers, "", "unknown", units=[
+            handle_of(items, n) for n in names]))
+
+    first, _ = _turn(world, "מה שווי הנכס במגדל?", [ask_between], None, intent="property")
+    assert first["answer"]["status"] == "clarification" and len(_context(world, first)["pending"]["payload"]["candidates"]) == 3
+    again = "שני מגדלי הגפן מתאימים. לאיזה התכוונת?"
+    m, agent = _turn(world, "הגפן", [lambda items: final(again, "clarification", clarification=again, focus=_focus(
+        towers, "", "unknown", units=[handle_of(items, n) for n in names[:2]]))], _resolution(
+        relation="clarification_answer", standalone_question="הגפן", intent=intent_part("property", "clarification")))
+    shown = agent.seen[0][0]["content"]
+    assert "מגדל הגפן א" in shown and "מגדל הגפן ב" in shown and "מגדל הרימון" not in shown
+    assert m["answer"]["status"] == "clarification" and [c["unit"]["display"] for c in m["answer"]["offered_units"]] == names[:2]
 
 
 def test_ae7_a_new_question_holding_a_year_is_not_bound_as_the_pending_parameter(client, office, monkeypatch):

@@ -142,7 +142,12 @@ SCHEMA_VERSION = 2
 
 KIND_OF_RELATION = {"new_question": "new_topic", "same_datum": "follow_up", "correction": "correction",
                     "metric_change": "follow_up", "scale_change": "follow_up",
-                    "clarification_answer": "clarification_answer"}
+                    "clarification_answer": "clarification_answer",
+                    # round 26 U3: the replies to a structured clarification that is not a choice of one of its options
+                    "clarification_help": "clarification_answer", "cancel": "clarification_answer", "correction_of_choice": "correction"}
+# the relations that only mean something beside a structured clarification: without one (no open clarification, or no answered one) a
+# reply with such a relation is read as the ordinary relation next to it
+_WITHOUT_OPTIONS = {"clarification_help": "new_question", "cancel": "new_question", "correction_of_choice": "correction"}
 
 
 def _choice(*keys: str):
@@ -160,7 +165,7 @@ class ChangedField(_Strict):
 
 class ResolvedRequest(_Strict):
     relation: Literal["new_question", "same_datum", "correction", "metric_change", "scale_change",
-                      "clarification_answer"]
+                      "clarification_answer", "clarification_help", "cancel", "correction_of_choice"]
     scope: Literal["entity", "set"]
     standalone_question: str
     changed_fields: list[ChangedField]
@@ -173,6 +178,9 @@ class ResolvedRequest(_Strict):
     subject: str
     document_ids: list[str]
     ambiguity: str  # the one question to ask when the correction can be read two ways that change the answer; ""
+    # round 26 U3: the ids of the structured clarification's options the reply chooses (the open clarification's for a
+    # clarification_answer, the answered one's for a correction_of_choice); [] when it chooses none
+    chosen_options: list[str] = Field(default_factory=list)
     # the request's typed components (KTD1); None when they did not validate (the rest of the parse still stands)
     components: list[request_analysis.Component] = Field(default_factory=list)
     # what the request is about (round 10 KTD1); None when it did not validate (the rest of the parse still stands:
@@ -193,7 +201,9 @@ POLICY = """אתה מפענח בקשות בשיחה של משרד שמאות. ק
 - relation — היחס לתור הקודם: new_question — שאלה חדשה (נושא, נכס או מדד אחר, בלי קשר לנתון הקודם); same_datum —
   המשך על אותו נתון (מקור, הסבר, מע"מ שלו...); correction — המשתמש מתקן את מה שהבנת ("התכוונתי ל...", "לא, ה...",
   "טעיתי"); metric_change — שאלת המשך על מדד אחר באותו נכס; scale_change — מעבר בין נתון ליחידת שטח לסכום כולל
-  (או להפך) באותו נכס; clarification_answer — תשובה לשאלת הבהרה ששאלת.
+  (או להפך) באותו נכס; clarification_answer — תשובה לשאלת הבהרה ששאלת; clarification_help — המשתמש לא יודע או מבקש הסבר
+  לשאלת ההבהרה; cancel — המשתמש מבטל את שאלת ההבהרה או את הבקשה; correction_of_choice — המשתמש מתקן את האפשרות שבחר בשאלת
+  הבהרה שכבר נענתה ("לא, התכוונתי ל...").
 - scope: entity — נכס, יחידה או מסמך אחד; set — ספירה, רשימה או השוואה על קבוצת מסמכים ("כמה שומות יש לנו ב...").
 - changed_fields: רק השדות שהמשתמש שינה במילים שלו, ולכל אחד user_words — המילים המדויקות מההודעה החדשה שמשנות
   אותו. scale — המילים שמבקשות ליחידת שטח או סכום כולל ("לכל ה...", "בסך הכול", "למ"ר"). subject — המילים שמזהות
@@ -203,6 +213,9 @@ POLICY = """אתה מפענח בקשות בשיחה של משרד שמאות. ק
   לא השווי הכולל. תקופה, מע"מ ובסיס שטח של המדד הקודם אינם עוברים למדד החדש: unknown או ריק, אלא אם המשתמש אמר
   אותם. כשהמשתמש מחליף נכס או מסמך — document_ids ריק (השרת מאתר את המסמך החדש).
 - standalone_question: השאלה המלאה בעברית, עם הנכס/המסמך, המדד, היחידה והתקופה כפי שהם עכשיו.
+- chosen_options: כשהקלט כולל אפשרויות של שאלת הבהרה (מזהים בסוגריים), מזהי האפשרויות שההודעה בוחרת (clarification_answer: אחת או
+  כמה שההודעה מתאימה להן; correction_of_choice: האפשרות החדשה); אחרת []. הודעה שהיא שאלה חדשה או מידע חופשי שאינו אחת האפשרויות —
+  clarification_answer עם [] רק אם היא עונה על שאלת ההבהרה, אחרת new_question.
 - ambiguity: רק אם לתיקון שתי קריאות סבירות שמשנות את התשובה — שאלת הבהרה קצרה אחת; אחרת "".
 - """ + intent_mod.FOLLOW_UP_POLICY.removeprefix("- ") + """
 - רכיבי הבקשה החדשה כפי שהיא עכשיו בהקשר השיחה (השאלה העצמאית, לא רק מילות ההודעה):
@@ -231,6 +244,10 @@ class Request:
     approved: list[str] = field(default_factory=list)  # dimensions the answer is held to: "metric", "scale"
     entity_changed: bool = False  # the documents are the ones the user's words named, not the focus's
     server_clarify: bool = False  # the clarification is the server's (titles the user may see, the user's words)
+    # round 26 U3: the ids of a structured clarification's options the reply chose, validated against its options; the request of a
+    # continuation (the stored original question with the user's choice) is ``by_choice``
+    chosen_options: list[str] = field(default_factory=list)
+    by_choice: bool = False
     candidates: list[dict] = field(default_factory=list)  # the documents a server clarification named
     # round 15 U6 (KTD1, R2): what a lookup that is not one document or unit reaches the model as. ``offered``: the
     # candidates (``Candidate.as_dict``, units with their anchors) an ambiguous lookup found, or the file's appraisals when
@@ -382,8 +399,10 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
              lookup: Callable[[str], entities.Outcome] | None = None,
              candidates: list[dict] | None = None, focus_titles: list[str] | None = None,
              user_texts: list[str] | None = None, prior_units: list[dict] | None = None,
-             lists: list[dict] | None = None, listing: list[dict] | None = None, topic: str = "") -> Request:
-    """``titles``: every title the user may see (the words that can name a document), or a provider of them, read
+             lists: list[dict] | None = None, listing: list[dict] | None = None, topic: str = "",
+             options: list[dict] | None = None) -> Request:
+    """``options``: the structured clarification's options the reply is read against (open, or answered for a correction of the choice):
+    ``chosen_options`` keeps only their ids. ``titles``: every title the user may see (the words that can name a document), or a provider of them, read
     only when needed; ``focus_titles``: the titles of the documents the conversation was about; ``user_texts``: what
     the user wrote in the conversation (the message alone when not given), which a parameter given by the user
     quotes; ``prior_units``: the units of the files the previous turn touched, when that turn was the model's own
@@ -404,6 +423,8 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
         else:
             decisions.setdefault(c.field, "rejected: " + why)
     relation = resolved.relation
+    if not options and relation in _WITHOUT_OPTIONS:
+        relation = _WITHOUT_OPTIONS[relation]  # no clarification to help, cancel or correct: the ordinary relation next to it
     # consistency: the same datum changes no metric, unit or scale
     inconsistent: set[str] = set()
     if relation == "same_datum":
@@ -429,6 +450,8 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
     new_question = relation == "new_question"
     out = Request(kind, resolved.standalone_question, relation=relation, scope=resolved.scope, changed=sorted(ok),
                   rejected=rejected, intent=settled)
+    known = {o["id"] for o in options or ()}
+    out.chosen_options = list(dict.fromkeys(i for i in resolved.chosen_options if i in known))
     _bind_references(out, resolved, settled, topic, decisions)
     f = focus or {}
     if new_question or not focus or professional:
@@ -493,7 +516,7 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
         out.approved.append("metric")
     if SCALE_FIELDS & ok or decisions.get("scale", "").startswith("set per_area"):
         out.approved.append("scale")
-    elif relation == "correction" and "metric_kind" in ok and out.per_area is not None:
+    elif relation in ("correction", "correction_of_choice") and "metric_kind" in ok and out.per_area is not None:
         out.approved.append("scale")  # a correction keeps the scale of what it corrects
     # documents: the focus, unless the user's words name another entity, or the question is over a set
     focus_ids = list(f.get("document_ids") or [])
@@ -527,9 +550,12 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
             allowed = authorized([c["document_id"] for c in pool])
             if candidates and (relation == "clarification_answer" or entities.ordinal_reply(message)):
                 got = entities.among(candidates, message, allowed)
-                if got.kind == "resolved" or (relation == "clarification_answer"
-                                              and entities.names_several(candidates, message, allowed)):
+                if got.kind == "resolved":
                     picked = got
+                elif relation == "clarification_answer" and entities.names_several(candidates, message, allowed):
+                    # a reply that fits some of the candidates narrows the offer to those, never to the whole list again (round 26 U3,
+                    # cause 4); one that fits them all tells nothing more and reaches the model as it did
+                    picked = entities.narrowed(candidates, message, allowed) or got
             else:
                 picked = entities.named_unit(pool, message, allowed)
             decisions["pending"] = ("bound: candidate" if picked is not None
@@ -579,7 +605,7 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
     # selected by a title word, and the old property is not silently kept either — its documents are no filter, and the
     # tools search for what the user named (round 10 KTD2(b))
     if (not professional and resolved.scope != "set" and picked is None and "lookup" not in out.resolution
-            and relation == "correction" and "subject" in ok and _names_something(said)):
+            and relation in ("correction", "correction_of_choice") and "subject" in ok and _names_something(said)):
         out.document_ids, out.located_unit, out.entity_changed = [], None, True
         out.subject = said.strip()
         decisions["subject"] = "released the focus: the user named another property without hard evidence"
@@ -592,7 +618,7 @@ def validate(resolved: ResolvedRequest, focus: dict | None, message: str,
                          and entities.same_unit(focus_unit, out.located_unit))
     if "subject" in rejected and not out.entity_changed:
         decisions.setdefault("subject", "rejected")
-    if resolved.ambiguity.strip() and relation == "correction" and not out.clarify:
+    if resolved.ambiguity.strip() and relation in ("correction", "correction_of_choice") and not out.clarify:
         out.clarify = resolved.ambiguity.strip()
     _note_two_lists(out, settled, candidates, listing, decisions)
     # the components apart from the rest: what is wrong with them never undoes the resolution
@@ -729,8 +755,18 @@ def _lists_block(lists: list[dict]) -> str:
             "המזהה והמספר שלהם):\n" + "\n\n".join(out))
 
 
+def _options_block(options: list[dict], answered: bool) -> str:
+    """The structured clarification's options, numbered, each with its id (round 26 U3): what a reply's ``chosen_options`` names."""
+    head = ("בתור הקודם נענתה שאלת הבהרה; המשתמש בחר באחת מהאפשרויות האלה (למקרה שהוא מתקן את בחירתו):" if answered
+            else "בתור הקודם נשאלה שאלת הבהרה עם האפשרויות האלה:")
+    return head + "\n" + "\n".join(
+        f"{n}. ({o['id']}) {prompt_text(o['label'])}" + (f" - {prompt_text(o['detail'])}" if o.get("detail") else "")
+        for n, o in enumerate(options, 1))
+
+
 def _input(focus: dict | None, history: list, message: str, documents: list[dict],
-           candidates: list[dict] | None = None, lists: list[dict] | None = None, topic: str = "") -> str:
+           candidates: list[dict] | None = None, lists: list[dict] | None = None, topic: str = "",
+           options: list[dict] | None = None, answered: bool = False) -> str:
     parts = []
     if focus:
         def label(labels: dict, key: str) -> str:
@@ -753,6 +789,8 @@ def _input(focus: dict | None, history: list, message: str, documents: list[dict
     if candidates:
         parts.append("בתור הקודם נשאלה שאלת הבהרה בין המסמכים האלה:\n" + "\n".join(
             f"- {prompt_text(entities.candidate_label(c))}" for c in candidates))
+    if options:
+        parts.append(_options_block(options, answered))
     if topic:
         parts.append("הנושא המקצועי שהשיחה עסקה בו:\n" + prompt_text(topic))
     if lists:
@@ -772,15 +810,17 @@ def resolve(provider: LLMProvider, focus: dict | None, history: list, message: s
             usage: list[dict],
             deadline: float | None = None, lookup: Callable[[str], entities.Outcome] | None = None,
             candidates: list[dict] | None = None, prior_units: list[dict] | None = None,
-            lists: list[dict] | None = None, listing: list[dict] | None = None, topic: str = "") -> Request | None:
+            lists: list[dict] | None = None, listing: list[dict] | None = None, topic: str = "",
+            options: list[dict] | None = None, answered: bool = False) -> Request | None:
     """The validated request of a follow-up, or None when the call failed (the turn then goes on as before).
     ``documents``: the documents the conversation was about; ``authorized`` and ``titles``: what the user may see;
     ``lookup``: the documents the user's words name; ``candidates``: what the previous clarification offered;
     ``prior_units``: the units the model's own previous question may have been between (see ``validate``);
-    ``lists``, ``listing`` and ``topic``: the conversation's slots a reference can bind to (see ``validate``)."""
+    ``lists``, ``listing`` and ``topic``: the conversation's slots a reference can bind to (see ``validate``); ``options``: the options of
+    the structured clarification the reply is read against (``answered``: one that was already answered, for a correction of the choice)."""
     provider = for_purpose(provider, Purpose.RESOLVE)
     r = call_structured(provider, Purpose.RESOLVE, POLICY,
-                        _input(focus, history, message, documents, candidates, lists, topic),
+                        _input(focus, history, message, documents, candidates, lists, topic, options, answered),
                         ResolvedRequest, max_output_tokens=RESOLVE_OUTPUT_TOKENS, deadline=deadline)
     usage.append(usage_entry("resolve", r, provider.model))
     if r.status != CallStatus.OK or r.parsed is None:
@@ -788,7 +828,7 @@ def resolve(provider: LLMProvider, focus: dict | None, history: list, message: s
     users = [m.content for m in history if getattr(m, "role", None) == "user"]
     return validate(r.parsed, focus, message, authorized, titles, lookup, candidates,
                     focus_titles=[d["title"] for d in documents], user_texts=[*users, message],
-                    prior_units=prior_units, lists=lists, listing=listing, topic=topic)
+                    prior_units=prior_units, lists=lists, listing=listing, topic=topic, options=options)
 
 
 _REPLY_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
@@ -890,6 +930,7 @@ def requested_block(req: Request, unit_handle: str | None = None) -> str:
         lines.append(f"- יחידה בקובץ: {unit_handle} «{prompt_text(u.get('display') or MSG_NO_TITLE)}»"
                      + (f" ({prompt_text(where)})" if where else "")
                      + (" — היחידה שהשיחה כבר עוסקת בה; שינוי מדד או חישוב אינו מעביר שומה" if req.unit_kept
+                        else " — השומה שהמשתמש בחר בשאלת ההבהרה" if req.by_choice
                         else " — השומה שהשרת התאים לשם שהמשתמש ציין")
                      + f". זו הכוונה ולא נעילה: אם זו השומה שנשאלה, חפש וקרא בתוכה (search ו-outline עם unit={unit_handle},"
                        f" read עם pages ו-document={unit_handle}) והצהר עליה ב-focus.units; ערך משומה אחרת בקובץ אינו של"

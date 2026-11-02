@@ -1047,7 +1047,7 @@ export interface ChatClarify {
   /** "All" is offered: a send with the reserved option id `ALL_OPTION_ID`. */
   allow_all: boolean;
   state: ClarifyState;
-  chosen_option_id?: string | null;
+  chosen?: string | null;
 }
 
 /** The reserved option id of "all" (only when `allow_all`). */

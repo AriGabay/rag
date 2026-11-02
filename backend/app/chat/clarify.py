@@ -21,8 +21,10 @@ with no buttons (R10). A clarification the question did not need - the time pref
 is already pinned, or no source writes the phrases it offers - is a violation of the same kind (R2, R3): it is never shown as a text
 question, the one re-prompt tells the model what decides, and only a model that insists keeps the text. Option ids are stable hashes of the kind and the option's identity (``option_id``), not of its place.
 
-Nothing here calls a model. The pending slot, the reply binding and the continuation are the next unit's (round 26 U3): it supplies
-the state (``ClarificationState``) and stores the record."""
+Nothing here calls a model. The pending slot, the reply binding and the continuation are round 26 U3's, and the second half of this module
+is theirs: the record's public form (``public``) and its state (``state_of``), the deterministic binder of a reply (``match_reply``) that runs
+before any model call, and the ``Continuation`` the engine runs when a reply is bound - the stored original question with the chosen
+constraint, as a block the model reads (``Continuation.block``)."""
 
 from __future__ import annotations
 
@@ -38,7 +40,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-from app.chat import contexts, entities, timeframe
+from app.chat import contexts, entities, slots, timeframe
 from app.chat import tools as T
 from app.db import TenantContext
 from app.platform import dates
@@ -510,3 +512,305 @@ def validate(ctx: TenantContext, ws, offer: ClarifyOffer | None, *, question: st
               "reason": "" if _VALUE.search(reason) else reason, "kind": kind, "options": options,
               "allow_all": bool(offer is not None and offer.allow_all and len(options) >= MIN_OPTIONS)}
     return Verdict(record, check, offered, sorted(documents), why, offer, question, override)
+
+
+# === round 26 U3: the public form, the state, the binding of a reply and the continuation ===================================================
+
+CHOICE, ALL, NARROW, FREE, HELP, ASSUMPTIONS, CANCEL = "choice", "all", "narrow", "free", "help", "assumptions", "cancel"
+ALL_ID = "all"  # the reserved option id of "all of them": valid only when the record's ``allow_all`` is true
+MAX_READS = 6  # the clarifying turn's reads that a continuation reopens (by recency)
+
+MSG_CONTINUE_HEAD = "המשך לשאלה המקורית (המשתמש ענה לשאלת ההבהרה שלך):"
+MSG_PROGRESS_CONTINUE = "ממשיך את הבקשה המקורית"
+MSG_STALE = "השאלה כבר לא פתוחה"
+MSG_UNAVAILABLE = "אי אפשר להמשיך את השאלה עם בחירה כשניתוח התשובות כבוי במשרד."
+MSG_NO_LONGER = "הנכס שבחרת אינו זמין לך עוד, ולכן אין נתונים להציג. אפשר לשאול שוב."
+MSG_CANCELLED = "בסדר, ביטלתי את שאלת ההבהרה. אפשר לשאול שאלה חדשה."
+MSG_ALL = "כולן"
+MSG_USER_ASSUMPTION = "הנחת המשתמש"
+MSG_ALL_RULE = ("ענה לכל אפשרות בנפרד, עם הנתון והמקור של כל אחת; אל תחשב ממוצע או סכום משותף בלי הצדקה מהמסמכים או בקשה מפורשת "
+                "של המשתמש.")
+MSG_HELP = ("המשתמש לא יודע או ביקש הסבר: הסבר בקצרה במה האפשרויות נבדלות ומה היה משתנה בתשובה בכל אחת, והצג את הקריאות בקצרה עם "
+            "מקורות אם אפשר. אל תשאל שאלה חדשה: השרת יציג שוב את האפשרויות.")
+MSG_ASSUMPTIONS = ("המשתמש עדיין לא הכריע ושאלת ההבהרה נוצלה: ענה עכשיו על השאלה המקורית עם הנחות מוצהרות - אמור במפורש איזו קריאה "
+                   "בחרת ומה היה משתנה בקריאה האחרת. אל תשאל שאלה נוספת.")
+MSG_NARROW = ("תשובת המשתמש מתאימה רק לאפשרויות האלה (אל תציע אחרות). אם עדיין אי אפשר להכריע ביניהן - שאל שוב רק ביניהן; "
+              "אחרת ענה:")
+MSG_FREE = ("המשתמש ענה בטקסט חופשי שאינו אחת האפשרויות: זה מידע חדש לשאלה המקורית. החל אותו עליה וענה; אם הוא מתאים ליותר מקריאה אחת "
+            "- הצג את הקריאות בקצרה.")
+KIND_RULES = {
+    UNIT: "זו השומה או הנכס שהשאלה עליהם: אל תציג נתונים משומה אחרת.",
+    PERIOD: "המועד או התקופה האלה גוברים על העדפת הנתונים העדכניים: ענה עליהם תחילה.",
+    AREA_BASIS: f"זו {MSG_USER_ASSUMPTION}, לא עובדה מהמסמכים: אמור בתשובה במפורש שהנתון ניתן לפי בחירת המשתמש.",
+    METHOD: f"זו {MSG_USER_ASSUMPTION}, לא עובדה מהמסמכים: אמור בתשובה במפורש שהחישוב נעשה לפי בחירת המשתמש.",
+}
+
+# --- the public form and the state ----------------------------------------------------------------------------------------------------
+
+
+def public(record: dict | None) -> dict | None:
+    """The clarification as the client receives it (the references stay on the server), or None when it offers no options: a text
+    question has no buttons and the existing lead line stays."""
+    if not record or not record.get("options"):
+        return None
+    return {"id": record["id"], "question": record.get("question") or "", "reason": record.get("reason") or "",
+            "kind": record.get("kind"), "allow_all": bool(record.get("allow_all")),
+            "options": [{"id": o["id"], "label": o["label"], "detail": o.get("detail") or ""} for o in record["options"]]}
+
+
+def state_of(clarification_id: str, *, next_user: bool, reply: dict | None, in_flight: bool = False, current: bool = True) -> dict:
+    """The one function that says where a clarification stands (KTD3, KTD5), computed from the conversation's rows on every list and
+    poll: ``open`` - nobody replied and it is the latest assistant message; ``answered`` - the next user message carries a recorded choice
+    (even when its continuation failed: a retry restores it), with the option marked in ``chosen``; ``closed`` - a reply recorded that it
+    did not choose (help, cancel, a new question, a narrowing), or a reply whose turn is still running; ``stale`` - anything else: a later
+    message with no recorded outcome, or a failed or cancelled message after it."""
+    if not next_user:
+        return {"state": "open" if current else "stale", "chosen": None}
+    if reply is not None and reply.get("clarification_id") == clarification_id:
+        if reply.get("outcome") == "answered":
+            return {"state": "answered", "chosen": reply.get("option_id")}
+        return {"state": "closed", "chosen": None}
+    return {"state": "closed" if in_flight else "stale", "chosen": None}
+
+
+def reemit(record: dict) -> dict:
+    """A help reply keeps the clarification open once: the same options under a new id, the help counted (KTD3)."""
+    return {**record, "id": new_id(), "help_count": int(record.get("help_count") or 0) + 1}
+
+
+# --- the deterministic binder of a reply -----------------------------------------------------------------------------------------------
+
+
+class Match(NamedTuple):
+    """What a reply is, read from its words alone: ``one`` - names one option; ``several`` - fits some options but not all (a narrowing);
+    ``all`` - asks for every option (only when offered); ``help`` and ``cancel`` - the whole message says so; ``none`` - the words decide
+    nothing and the relation call reads the reply."""
+
+    kind: str
+    options: list
+
+
+_NONE = Match("none", [])
+_PLACE = re.compile(r"(?:מספר|אפשרות|#)?\s*(\d{1,2})\s*[.)]?")
+_FILLER = frozenset({"התכוונתי", "התכוונת", "אני", "רוצה", "מתכוון", "מתכוונת", "בחרתי", "את", "ה", "של", "זה", "זו", "הזה", "הזאת",
+                     "בבקשה", "תודה", "כן", "נכון", "אותה", "אותו", "עם", "ל", "ב", "ו", "ש"})
+_ALL_WORDS = frozenset({"כולן", "כולם", "את כולן", "את כולם", "הכל", "הכול", "שניהם", "שתיהן", "שתיהם", "גם וגם", "כל האפשרויות"})
+_HELP_WORDS = frozenset({"לא יודע", "לא יודעת", "אני לא יודע", "אני לא יודעת", "אין לי מושג", "לא בטוח", "לא בטוחה", "תסביר",
+                         "תסבירי", "הסבר", "תסביר לי", "מה ההבדל", "מה ההבדל ביניהם", "אפשר הסבר"})
+_CANCEL_WORDS = frozenset({"ביטול", "בטל", "תבטל", "עזוב", "עזוב את זה", "עזבי", "עזבי את זה", "שכח מזה", "תשכח מזה"})
+
+
+def _variants(token: str) -> set[str]:
+    """A word and the word with its Hebrew prefix letters removed (one or two)."""
+    out = {token}
+    if len(token) >= 4 and token[0] in _PREFIXES:
+        out.add(token[1:])
+        if len(token) >= 5 and token[1] in _PREFIXES:
+            out.add(token[2:])
+    return out
+
+
+def _option_tokens(option: dict) -> set[str]:
+    return {v for t in _flat(f"{option.get('label') or ''} {option.get('detail') or ''}").split() for v in _variants(t)}
+
+
+def match_reply(record: dict | None, text: str) -> Match:
+    """A reply read against a clarification's options, with no model (KTD3): help and cancel when that is the whole message; "all"
+    when it was offered; a place (a bare number or an ordinal, only as the whole message) or the option the words tell apart. A reply
+    holds a word no option has, or one every option has, decides nothing: it is no deterministic choice (the relation call reads it, and
+    a question that merely names a property is a new question). A reply that fits some options but not all narrows to exactly those."""
+    options = list((record or {}).get("options") or [])
+    flat = " ".join(_flat(text).split())
+    if not options or not flat:
+        return _NONE
+    if flat in _HELP_WORDS:
+        return Match("help", [])
+    if flat in _CANCEL_WORDS:
+        return Match("cancel", [])
+    if flat in _ALL_WORDS and record.get("allow_all"):
+        return Match("all", options)
+    place = _PLACE.fullmatch(flat)
+    if place and 1 <= int(place.group(1)) <= len(options):
+        return Match("one", [options[int(place.group(1)) - 1]])
+    if entities.ordinal_reply(text):
+        found = slots.ordinal_numbers(text, len(options))
+        return Match("one", [options[next(iter(found)) - 1]]) if len(found) == 1 and 1 <= next(iter(found)) <= len(options) else _NONE
+    held = [_option_tokens(o) for o in options]
+    words = [w for w in flat.split() if w not in _FILLER]
+    holders = []
+    for w in words:
+        who = {n for n, tokens in enumerate(held) if _variants(w) & tokens}
+        if not who:
+            return _NONE  # a word about something else: not a reply to the options
+        holders.append(who)
+    telling = [who for who in holders if len(who) < len(options)]
+    if not telling:
+        return _NONE
+    matched = set.intersection(*telling)
+    if not matched:
+        return _NONE
+    chosen = [options[n] for n in sorted(matched)]
+    return Match("one" if len(chosen) == 1 else "several", chosen)
+
+
+# --- the continuation -------------------------------------------------------------------------------------------------------------------
+
+
+def chosen_entry(kind: str, option: dict) -> dict:
+    return {"kind": kind, "id": option["id"], "label": option["label"], "detail": option.get("detail") or "", "ref": option.get("ref") or {}}
+
+
+def option_document(option: dict) -> str | None:
+    """The document an option of a unit stands for (the unit's file, or the appraisal itself)."""
+    ref = option.get("ref") or {}
+    unit = ref.get("unit") or {}
+    found = unit.get("document_id") or ref.get("document_id")
+    return str(found) if found else None
+
+
+@dataclass
+class Continuation:
+    """A bound reply: the clarification (``record``) and what the user answered. ``mode``: ``choice`` (``options`` holds the one chosen),
+    ``all``, ``narrow`` (``options`` the ones the reply fits), ``free`` (``free_text``), ``help``, ``assumptions`` (a second help), or ``cancel``.
+    ``reply_text`` is the user's message as stored; ``correction`` marks a choice that replaces an earlier one."""
+
+    record: dict
+    mode: str
+    options: list = field(default_factory=list)
+    free_text: str = ""
+    reply_text: str = ""
+    correction: bool = False
+    earlier: list | None = None  # the choices that stand before this reply (a correction drops the replaced kind's)
+
+    @property
+    def original_question(self) -> str:
+        return self.record.get("original_question") or ""
+
+    @property
+    def kind(self) -> str:
+        return self.record.get("kind") or TEXT
+
+    @property
+    def time_mode(self) -> dict | None:
+        return self.record.get("time_mode") or None
+
+    def standing(self) -> list[dict]:
+        return list(self.earlier if self.earlier is not None else self.record.get("chosen") or [])
+
+    def chosen(self) -> list[dict]:
+        """Every choice that stands for the question after this reply, in the order they were made."""
+        mine = self.standing()
+        if self.mode == CHOICE and self.options:
+            mine = [c for c in mine if c["kind"] != self.kind] + [chosen_entry(self.kind, self.options[0])]
+        elif self.mode == ALL:
+            mine = [c for c in mine if c["kind"] != self.kind] + [
+                {"kind": self.kind, "id": ALL_ID, "label": MSG_ALL, "detail": "", "ref": {}, "options": [chosen_entry(self.kind, o) for o in self.options]}]
+        return mine
+
+    def notes(self) -> list[str]:
+        out = list(self.record.get("notes") or [])
+        return [*out, self.free_text] if self.mode == FREE and self.free_text else out
+
+    def state(self) -> ClarificationState:
+        """What the new turn knows about the question's clarifications (R10): the kinds resolved with the label chosen, how many were asked
+        in a row, and the options a narrowing reply fits."""
+        resolved = dict(self.record.get("resolved") or {})
+        if self.mode in (CHOICE, ALL) and self.options:
+            resolved[self.kind] = MSG_ALL if self.mode == ALL else self.options[0]["label"]
+        return ClarificationState(resolved, int(self.record.get("round") or 1),
+                                  frozenset(o["id"] for o in self.options) if self.mode == NARROW else frozenset())
+
+    def outcome(self) -> dict:
+        """The reply as the user's row records it (the state function reads it back)."""
+        base = {"clarification_id": self.record["id"], "option_id": None, "outcome": "answered"}
+        if self.mode in (CHOICE, ALL):
+            return base | {"option_id": ALL_ID if self.mode == ALL else self.options[0]["id"]}
+        if self.mode == FREE:
+            return base
+        return base | {"outcome": {HELP: "help", ASSUMPTIONS: "help", CANCEL: "cancelled", NARROW: "narrowed"}[self.mode],
+                       **({"option_ids": [o["id"] for o in self.options]} if self.mode == NARROW else {})}
+
+    def option_documents(self) -> set[str]:
+        """The documents of the unit options this reply chose or narrowed to, with the unit choices that stand: where the reads that are
+        reopened are looked for. Empty: every read stands."""
+        if self.kind != UNIT and not any(c["kind"] == UNIT for c in self.chosen()):
+            return set()
+        if self.mode in (CHOICE, ALL, NARROW) and self.kind == UNIT:
+            docs = {d for o in self.options if (d := option_document(o))}
+        else:
+            docs = set()
+        for c in self.chosen():
+            if c["kind"] == UNIT:
+                docs |= {d for o in c.get("options") or [c] if (d := option_document(o))}
+        return docs
+
+    def prior(self) -> dict[str, dict]:
+        """The clarifying turn's reads that this continuation reopens, as the turn's ``P#`` references (renumbered from P1)."""
+        docs = self.option_documents()
+        reads = [r for r in self.record.get("reads") or [] if not docs or str(r.get("document_id")) in docs]
+        return {f"P{n}": {k: v for k, v in r.items() if k != "document_id"} for n, r in enumerate(reads[:MAX_READS], 1)}
+
+    def block(self) -> str:
+        """The model's task: the stored original question with the chosen constraint (KTD4). Document-derived labels pass through
+        ``prompt_text`` and are data, never instructions."""
+        lines = [MSG_CONTINUE_HEAD, f"- השאלה המקורית: {prompt_text(self.original_question)}"]
+        if self.record.get("question"):
+            lines.append(f"- שאלת ההבהרה שנשאלה: {prompt_text(self.record['question'])}")
+        for c in self.standing() if self.mode not in (CHOICE, ALL) else [c for c in self.chosen() if c["kind"] != self.kind]:
+            lines.append(f"- בחירה קודמת של המשתמש ({KIND_WORDS.get(c['kind'], '')}): «{prompt_text(c['label'])}»"
+                         + (f" ({prompt_text(c['detail'])})" if c.get("detail") else ""))
+        if self.mode == CHOICE and self.options:
+            o = self.options[0]
+            lines.append(f"- בחירת המשתמש ({KIND_WORDS.get(self.kind, '')}): «{prompt_text(o['label'])}»"
+                         + (f" ({prompt_text(o['detail'])})" if o.get("detail") else ""))
+            lines.append(f"  {KIND_RULES.get(self.kind, '')}".rstrip())
+        elif self.mode in (ALL, NARROW):
+            lines.append(f"- המשתמש בחר בכל האפשרויות ({KIND_WORDS.get(self.kind, '')}). {MSG_ALL_RULE}" if self.mode == ALL
+                         else f"- {MSG_NARROW}")
+            lines += [f"  - «{prompt_text(o['label'])}»" + (f" ({prompt_text(o['detail'])})" if o.get("detail") else "")
+                      + (f" document_id={o['ref']['document_id']}" if (o.get("ref") or {}).get("document_id") else "")
+                      for o in self.options]
+        elif self.mode == FREE:
+            lines.append(f"- {MSG_FREE}\n  תשובת המשתמש: «{prompt_text(self.free_text)}»")
+        elif self.mode == HELP:
+            lines.append(f"- {MSG_HELP}")
+            lines += [f"  - «{prompt_text(o['label'])}»" + (f" ({prompt_text(o['detail'])})" if o.get("detail") else "")
+                      for o in self.record.get("options") or []]
+        elif self.mode == ASSUMPTIONS:
+            lines.append(f"- {MSG_ASSUMPTIONS}")
+        for note in self.notes():
+            if not (self.mode == FREE and note == self.free_text):
+                lines.append(f"- מידע נוסף שהמשתמש נתן: «{prompt_text(note)}»")
+        lines.append("ענה על השאלה המקורית עם מה שהמשתמש בחר. אל תשאל שוב על עניין שהוכרע, ואל תחפש מחדש מה שכבר נקרא: הפניות P# "
+                     "למקורות שנקראו בתור ההבהרה מופיעות למעלה; פתח אותן עם read.")
+        return "\n".join(lines)
+
+
+def candidates_of(record: dict) -> list[dict]:
+    """The units a unit clarification's options stand for, as the candidates a reply is resolved among (the option references are
+    candidate-shaped: ``{document_id, title, unit?, file_title?}``)."""
+    return [o["ref"] for o in record.get("options") or [] if record.get("kind") == UNIT and o.get("ref")]
+
+
+def request_summary(request: dict | None) -> dict:
+    """The part of the clarifying turn's resolved request that the continuation starts from (KTD4): the datum asked for, the subject and
+    the scope, no more."""
+    r = request or {}
+    keep = ("standalone_question", "metric_kind", "unit", "period", "area_basis", "vat", "subject", "topic", "document_ids", "located_unit")
+    out = {k: r[k] for k in keep if r.get(k) not in (None, "")}
+    if (r.get("intent") or {}).get("value"):
+        out["intent"] = r["intent"]["value"]
+    return out
+
+
+def stamp(record: dict, *, original_question: str, time_mode: dict | None, state: ClarificationState | None, cont: Continuation | None,
+          request: dict | None) -> dict:
+    """The clarification record with what a reply needs to continue the question (KTD3): the original question and the time it ran under,
+    how many were asked in a row and the kinds resolved, the choices that stand and the user's free-text answers, the datum the turn
+    resolved. ``reads`` and the clarifying turn's visibility are the API's."""
+    state = cont.state() if cont is not None else state
+    return record | {"original_question": original_question, "time_mode": time_mode, "round": (state.consecutive if state else 0) + 1,
+                     "resolved": dict(state.resolved) if state else {}, "chosen": cont.chosen() if cont is not None else [],
+                     "notes": cont.notes() if cont is not None else [], "help_count": 0,
+                     "request": request_summary(request) if request else (cont.record.get("request") if cont is not None else {}),
+                     "reads": list(cont.record.get("reads") or []) if cont is not None else []}

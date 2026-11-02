@@ -67,7 +67,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
 from app.audit import audit
-from app.chat import anchors, coverage, decisions, engine, slots, timeframe, timeline, verify
+from app.chat import anchors, clarify, coverage, decisions, engine, slots, timeframe, timeline, verify
 from app.chat.compose import SERVER_SPANS_FIELD, history_notes, stand_in, strip_server_spans, text_digest
 from app.chat.timeframe import JERUSALEM
 from app.config import get_settings
@@ -231,11 +231,22 @@ def delete_conversation(conversation_id: str, ctx: TenantContext = Depends(get_c
 
 # --- messages --------------------------------------------------------------------------------------------
 
+class ClarificationChoice(BaseModel):
+    """A click on an option of a structured clarification (round 26 U3, KTD3): the clarification's id and the option's id (or the reserved
+    ``all``, valid only when the clarification offered it)."""
+
+    id: str = Field(min_length=1, max_length=64)
+    option_id: str = Field(min_length=1, max_length=64)
+
+
 class SendBody(BaseModel):
     content: str = Field(min_length=1, max_length=4000)
     client_id: str | None = None
     # absent: the conversation's value; present: recorded on this message and saved on the conversation (round 11 U5)
     prefer_recent: bool | None = None
+    # a click on an option of the open clarification: the server checks it against the conversation's rows, stores the user's message from
+    # the stored option (``content`` is the label the client showed and is never trusted), and runs the original question with the choice
+    clarification: ClarificationChoice | None = None
 
 
 def lock_conversation(conn: Connection, conversation_id) -> None:
@@ -256,7 +267,9 @@ def is_stale(r) -> bool:
 
 
 def _message_json(r, dv: int | None = None, sh: str | None = None, visible: set | None = None,
-                  ctx: TenantContext | None = None) -> dict:
+                  ctx: TenantContext | None = None, clarify_state: dict | None = None) -> dict:
+    """``clarify_state``: the state of the clarification this message asks (``_clarify_states``), computed from the conversation's rows on every
+    list and poll and added to its ``clarify`` (round 26 U3, KTD5)."""
     status_ = r.status
     error = r.error
     if is_stale(r):
@@ -264,8 +277,12 @@ def _message_json(r, dv: int | None = None, sh: str | None = None, visible: set 
     answer = r.answer
     content = r.content
     stale = False
+    if r.role == "user":  # a user row's answer holds the server's binding of the reply to a clarification: never sent
+        answer = None
     if answer and "context" in answer:  # the slots are the server's: nothing of them reaches the client (KTD4)
         answer = {k: v for k, v in answer.items() if k != "context"}
+    if answer and clarify_state is not None and isinstance(answer.get("clarify"), dict):
+        answer = answer | {"clarify": answer["clarify"] | clarify_state}
     if answer and isinstance(answer.get("verification"), dict):
         answer = answer | {"verification": public_verification(answer["verification"])}
     if answer and r.role == "assistant" and status_ == "done":
@@ -447,6 +464,31 @@ def _visible_ids(conn: Connection, ids) -> set[str]:
 _SELECT = ("SELECT m.*, EXTRACT(EPOCH FROM (now() - m.updated_at)) AS age FROM messages m")
 
 
+def _clarify_states(conn: Connection, rows) -> dict[str, dict]:
+    """The state of each clarification among ``rows`` (``clarify.state_of``), derived from the conversation's rows: the next user message
+    after it, the outcome recorded on that row, whether its turn is still running, and whether the clarification is still the latest assistant
+    message. Never stored, so a list and a poll agree (KTD5)."""
+    out: dict[str, dict] = {}
+    for r in rows:
+        clar = r.answer.get("clarify") if r.role == "assistant" and r.status == "done" and isinstance(r.answer, dict) else None
+        if not isinstance(clar, dict):
+            continue
+        key = {"c": r.conversation_id, "t": r.created_at, "i": r.id}
+        nxt = conn.execute(text("SELECT id, answer FROM messages WHERE conversation_id = :c AND role = 'user'"
+                                " AND (created_at, id) > (:t, :i) ORDER BY created_at, id LIMIT 1"), key).first()
+        current = conn.execute(text("SELECT 1 FROM messages WHERE conversation_id = :c AND role = 'assistant'"
+                                    " AND (created_at, id) > (:t, :i) LIMIT 1"), key).first() is None
+        in_flight = False
+        if nxt is not None:
+            turn = conn.execute(text("SELECT status FROM messages WHERE reply_to = :u AND role = 'assistant'"
+                                     " ORDER BY created_at DESC LIMIT 1"), {"u": nxt.id}).first()
+            in_flight = turn is not None and turn.status in IN_FLIGHT
+        out[str(r.id)] = clarify.state_of(clar["id"], next_user=nxt is not None,
+                                          reply=(nxt.answer or {}).get("clarification_reply") if nxt is not None else None,
+                                          in_flight=in_flight, current=current)
+    return out
+
+
 @router.get("/conversations/{conversation_id}/messages")
 def list_messages(conversation_id: str, before: str | None = None, limit: int = Query(PAGE, ge=1, le=100),
                   ctx: TenantContext = Depends(get_ctx)) -> dict:
@@ -467,9 +509,10 @@ def list_messages(conversation_id: str, before: str | None = None, limit: int = 
         rows = list(reversed(rows[:limit]))
         dv = current_data_version(conn)
         visible = _visible_documents(conn, rows)
+        states = _clarify_states(conn, rows)
     sh = scope_hash(ctx)
-    return {"conversation": _conv_json(conv), "messages": [_message_json(r, dv, sh, visible, ctx) for r in rows],
-            "has_more": more}
+    return {"conversation": _conv_json(conv),
+            "messages": [_message_json(r, dv, sh, visible, ctx, states.get(str(r.id))) for r in rows], "has_more": more}
 
 
 @router.get("/messages/{message_id}")
@@ -480,7 +523,8 @@ def get_message(message_id: str, ctx: TenantContext = Depends(get_ctx)) -> dict:
             raise HTTPException(status.HTTP_404_NOT_FOUND, NOT_FOUND)
         dv = current_data_version(conn)
         visible = _visible_documents(conn, [r])
-    return _message_json(r, dv, scope_hash(ctx), visible, ctx)
+        states = _clarify_states(conn, [r])
+    return _message_json(r, dv, scope_hash(ctx), visible, ctx, states.get(str(r.id)))
 
 
 @router.get("/messages/{message_id}/diagnostics")
@@ -526,22 +570,31 @@ def send_message(conversation_id: str, body: SendBody, ctx: TenantContext = Depe
                 reply = conn.execute(text(_SELECT + " WHERE m.reply_to = :u ORDER BY m.created_at DESC LIMIT 1"),
                                      {"u": existing.id}).first()
                 visible = _visible_documents(conn, [reply] if reply else [])
+                states = _clarify_states(conn, [reply] if reply else [])
                 return {"user": _message_json(existing, ctx=ctx),
-                        "assistant": _message_json(reply, visible=visible, ctx=ctx) if reply else None}
+                        "assistant": (_message_json(reply, visible=visible, ctx=ctx, clarify_state=states.get(str(reply.id)))
+                                      if reply else None)}
         busy = conn.execute(text("SELECT 1 FROM messages WHERE conversation_id = :c AND role = 'assistant'"
                                  " AND status IN ('running', 'cancelling') AND updated_at > now() - make_interval(secs => :s)"),
                             {"c": conv.id, "s": _stale_after()}).first()
         if busy is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, "התשובה הקודמת עדיין בעיבוד. אפשר לעצור אותה או להמתין.")
+        choice = _open_choice(conn, ctx, conv, body.clarification) if body.clarification is not None else None
+        if choice is not None:
+            # a click continues the question the clarification was asked for: its text is the stored option's, never the client's, and
+            # the time it ran under stands - the click changes neither that nor the conversation's switch (round 26 U3, G6)
+            content = clarify.MSG_ALL if choice.option is None else choice.option["label"]
         # the state this message is produced with: the body's value, else the conversation's (KTD1)
-        prefer_recent = conv.prefer_recent if body.prefer_recent is None else body.prefer_recent
-        time_state = _time_state(prefer_recent)
+        prefer_recent = conv.prefer_recent if body.prefer_recent is None or choice is not None else body.prefer_recent
+        time_state = (choice.record.get("time_mode") if choice is not None else None) or _time_state(prefer_recent)
+        reply = ({"clarification_reply": {"clarification_id": choice.record["id"], "option_id": clarify.ALL_ID if choice.option is None
+                                          else choice.option["id"], "outcome": "answered"}} if choice is not None else None)
         user = conn.execute(text(
             "INSERT INTO messages (office_id, conversation_id, user_id, role, content, status, client_id, created_at,"
-            " time_preference) VALUES (app_office(), :c, :u, 'user', :t, 'done', :k, clock_timestamp(),"
-            " CAST(:tp AS jsonb)) RETURNING *, 0 AS age"),
-            {"c": conv.id, "u": ctx.user_id, "t": content, "k": client_id,
-             "tp": json.dumps(time_state)}).one()
+            " time_preference, answer) VALUES (app_office(), :c, :u, 'user', :t, 'done', :k, clock_timestamp(),"
+            " CAST(:tp AS jsonb), CAST(:ans AS jsonb)) RETURNING *, 0 AS age"),
+            {"c": conv.id, "u": ctx.user_id, "t": content, "k": client_id, "tp": json.dumps(time_state),
+             "ans": json.dumps(reply) if reply is not None else None}).one()
         assistant = _new_assistant(conn, ctx, conv.id, user.id, time_state)
         if conv.title in (None, NEW_TITLE):
             conn.execute(text("UPDATE conversations SET title = :t WHERE id = :c"),
@@ -550,6 +603,46 @@ def send_message(conversation_id: str, body: SendBody, ctx: TenantContext = Depe
                      {"c": conv.id, "p": prefer_recent})
     _start(ctx, conv.id, assistant.id, user.id)
     return {"user": _message_json(user, ctx=ctx), "assistant": _message_json(assistant, ctx=ctx)}
+
+
+class _Choice(NamedTuple):
+    record: dict  # the open clarification's stored record
+    option: dict | None  # the option clicked; None: "all"
+
+
+def _stale_choice() -> HTTPException:
+    return HTTPException(status.HTTP_409_CONFLICT, {"code": "clarification_stale", "message": clarify.MSG_STALE})
+
+
+def _open_choice(conn: Connection, ctx: TenantContext, conv, choice: ClarificationChoice) -> _Choice:
+    """The click's clarification, checked under the conversation's lock (round 26 U3, KTD3, R11): it must be the open clarification of this
+    conversation - the latest assistant message of any status, done, with no user message after it - with the option clicked among its
+    options (or ``all``, when it offered it), and the user must still see every document behind it. Anything else is 409
+    ``clarification_stale``; an office that cannot send to the cloud model cannot apply a choice (409 ``clarification_unavailable``)."""
+    from app.providers.status import Mode, office_provider_state
+
+    latest = conn.execute(text(_SELECT + " WHERE m.conversation_id = :c AND m.role = 'assistant'"
+                               " ORDER BY m.created_at DESC, m.id DESC LIMIT 1"), {"c": conv.id}).first()
+    record = (slots.clarification_of(latest.answer.get("context")) if latest is not None and latest.status == "done"
+              and isinstance(latest.answer, dict) else None)
+    if record is None or record.get("id") != choice.id or not record.get("options"):
+        raise _stale_choice()
+    if conn.execute(text("SELECT 1 FROM messages WHERE conversation_id = :c AND role = 'user' AND created_at > :t LIMIT 1"),
+                    {"c": conv.id, "t": latest.created_at}).first() is not None:
+        raise _stale_choice()  # answered, or closed by a later message
+    if _hidden(latest, _visible_documents(conn, [latest])):
+        raise _stale_choice()
+    if choice.option_id == clarify.ALL_ID:
+        option = None
+        if not record.get("allow_all"):
+            raise _stale_choice()
+    else:
+        option = next((o for o in record["options"] if o["id"] == choice.option_id), None)
+        if option is None:
+            raise _stale_choice()
+    if office_provider_state(conn).mode != Mode.CLOUD:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": "clarification_unavailable", "message": clarify.MSG_UNAVAILABLE})
+    return _Choice(record, option)
 
 
 def _new_assistant(conn: Connection, ctx: TenantContext, conversation_id: UUID, user_message_id: UUID,
@@ -628,7 +721,7 @@ def _cancel_requested(ctx: TenantContext, message_id: UUID) -> bool:
 
 def _finish(ctx: TenantContext, message_id: UUID, status_: str, *, content: str = "", answer: dict | None = None,
             error: str | None = None, usage: list | None = None, model: str | None = None,
-            diagnostics: dict | None = None) -> str:
+            diagnostics: dict | None = None, reply: dict | None = None) -> str:
     """Record the end of a turn, and return the status it was recorded with. An answer is written only while no
     cancellation was asked for: a stop that lands after the turn's last check still ends the turn as cancelled,
     never with the answer shown. It is written only while the user still sees every document it cites, refers to
@@ -654,6 +747,9 @@ def _finish(ctx: TenantContext, message_id: UUID, status_: str, *, content: str 
                                   " messages WHERE id = :m)"), {"m": message_id})
                 if diagnostics is not None:
                     _store_diagnostics(conn, ctx, message_id, diagnostics)
+                if reply is not None:  # how the user's message answered the open clarification, on its row (round 26 U3)
+                    conn.execute(text("UPDATE messages SET answer = CAST(:a AS jsonb) WHERE id = (SELECT reply_to FROM messages"
+                                      " WHERE id = :m)"), {"a": json.dumps({"clarification_reply": reply}), "m": message_id})
                 return status_
             status_, content, answer, error = "cancelled", "", None, "העיבוד נעצר לבקשתך."
         conn.execute(text(
@@ -775,7 +871,7 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
         # rebuilt after the turn from what the user may see now; the old text is never used again
         conn.execute(text("UPDATE conversations SET summary_meta = COALESCE(summary_meta, '{}'::jsonb)"
                           " || '{\"invalid\": true}'::jsonb WHERE id = :c"), {"c": conversation_id})
-    user = conn.execute(text("SELECT content, created_at, time_preference FROM messages WHERE id = :m"),
+    user = conn.execute(text("SELECT content, created_at, time_preference, answer FROM messages WHERE id = :m"),
                         {"m": user_message_id}).one()
     rows = conn.execute(text(
         "SELECT id, role, content, answer, status FROM messages WHERE conversation_id = :c AND created_at < :t"
@@ -783,6 +879,10 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
         {"c": conversation_id, "t": user.created_at, "n": HISTORY_MESSAGES}).all()
     rows = list(reversed(rows))
     visible = _visible_documents(conn, rows)
+    # the pending clarification lives on the latest assistant message of ANY status (round 26 U3, KTD3, cause 5 of the repeated list): when a
+    # failed or cancelled message sits after it, it is stale, and the older one is never revived
+    latest_any = conn.execute(text("SELECT id FROM messages WHERE conversation_id = :c AND role = 'assistant' AND created_at < :t"
+                                   " ORDER BY created_at DESC, id DESC LIMIT 1"), {"c": conversation_id, "t": user.created_at}).first()
     # the slots come from the latest assistant answer, chosen BEFORE the hidden filter: when it is hidden the turn gets no
     # slot at all (no pending clarification, topic, property, parameters or sources), and an older message's are never
     # revived (R15, KTD4)
@@ -824,9 +924,13 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
     clarified: list[str] = []
     pending = None
     listing: list[dict] = []
+    clarification = answered = None
+    current = last is not None and latest_any is not None and latest_any.id == last.id
     if last is not None:
         context, notes = _authorize_context(conn, _read_context(last.answer))
-        if (asked := context.get("pending")) is not None:
+        if not current and context.get("pending") is not None:
+            notes["pending"] = "expired: a failed or cancelled message came after the clarification"
+        if current and (asked := context.get("pending")) is not None:
             payload = asked.get("payload") or {}
             # the documents a server clarification offered: the reply is resolved among them
             candidates = list(payload.get("candidates") or [])
@@ -838,14 +942,46 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
             # kept are reopened through the references above
             if asked.get("kind") == "parameter" and isinstance(payload.get("parameter"), dict):
                 pending = _pending_refs(payload["parameter"], prior_ids)
+            if (record := slots.clarification_of(context)) is not None and record.get("options"):
+                clarification = _visible_record(conn, record)
+        if current and (done := context.get("answered")) and isinstance(done.get("record"), dict) and done["record"].get("options"):
+            answered = done | {"record": _visible_record(conn, done["record"])}
         listing = _listing(conn, last.answer)
+    reply = (user.answer or {}).get("clarification_reply") if isinstance(user.answer, dict) else None
+    if (isinstance(reply, dict) and reply.get("outcome") == "answered" and reply.get("option_id")
+            and not _choice_available(conn, clarification, reply)):
+        raise _ChoiceGone  # the user chose, and the clarification or a document of the choice is no longer theirs to use
     return engine.TurnInput(question=user.content, history=history, summary=summary, focus=slots.join_focus(context),
                             focus_documents=[{"document_id": k, "title": v} for k, v in list(focus.items())[-8:]],
                             prior_refs=prior, candidates=candidates, clarified_documents=clarified,
                             pending=pending, slots=context, listing=listing, slot_notes=notes,
+                            clarification=clarification, answered=answered, reply=reply if isinstance(reply, dict) else None,
                             # the state recorded on the user row, never the conversation's current switch (R14, KTD1)
                             time_preference=_recorded_state(user.time_preference, user.created_at)), \
         _user_message_ids(rows, user_message_id)
+
+
+class _ChoiceGone(Exception):
+    """A user's choice cannot be continued: its clarification is no longer the open one, or a document of the choice is no longer visible."""
+
+
+def _visible_record(conn: Connection, record: dict) -> dict:
+    """The clarification record with the reads it kept narrowed to the documents the user sees now: a preloaded read of a document that was
+    revoked is dropped silently, and the answer never cites it (round 26 U3, KTD4)."""
+    docs = {str(r["document_id"]) for r in record.get("reads") or [] if r.get("document_id")}
+    seen = _visible_ids(conn, docs) if docs else set()
+    return record | {"reads": [r for r in record.get("reads") or [] if not r.get("document_id") or str(r["document_id"]) in seen]}
+
+
+def _choice_available(conn: Connection, record: dict | None, reply: dict) -> bool:
+    """Whether the clarification a recorded choice names is the one the turn found open, and every document of the chosen option(s) is
+    visible now."""
+    if record is None or record.get("id") != reply.get("clarification_id"):
+        return False
+    chosen = (record["options"] if reply["option_id"] == clarify.ALL_ID
+              else [o for o in record["options"] if o["id"] == reply["option_id"]])
+    docs = {d for o in chosen if (d := clarify.option_document(o))}
+    return bool(chosen) and docs <= _visible_ids(conn, docs)
 
 
 def _read_context(answer: dict) -> dict:
@@ -854,6 +990,8 @@ def _read_context(answer: dict) -> dict:
     stored = answer.get("context")
     if isinstance(stored, dict) and stored.get("version") == slots.VERSION:
         return stored
+    if isinstance(stored, dict) and stored.get("version") == 2:
+        return slots.upgrade_v2(stored)
     if isinstance(stored, dict) and stored.get("version") == 1:
         return slots.upgrade_v1(stored)
     return _legacy_context(answer)
@@ -887,9 +1025,15 @@ def _clarified_documents(answer: dict) -> list[str]:
 
 
 def _pending_slot(parameter: dict | None, candidates: list[dict], named: list[str], clarified: list[str],
-                  asked_at: str | None) -> dict | None:
-    """The pending slot of a clarification: the parameter it asked for, else the candidates it offered (or, with none,
-    the files it touched). None when it offered nothing a reply could bind to (the server's question between two lists)."""
+                  asked_at: str | None, record: dict | None = None) -> dict | None:
+    """The pending slot of a clarification: the parameter it asked for, else - round 26 U3, schema version 3 - the record of the model's
+    clarification (its options, the original question, the time it ran under; with no options when fewer than two survived) beside the
+    candidates its units stand for and the files it touched, else the candidates it offered (or, with none, the files it touched). None when
+    it offered nothing a reply could bind to (the server's question between two lists)."""
+    if parameter is None and record is not None:
+        payload = record | {"candidates": list(candidates), "named_document_ids": list(named),
+                            "clarified": [] if candidates else clarified}
+        return {"kind": "clarification", "payload": payload, "asked_at": asked_at}
     if parameter is None and not (candidates or named or clarified):
         return None
     if parameter is not None:
@@ -1119,6 +1263,9 @@ def _answer_payload(outcome: engine.TurnOutcome, user_ids: list[str] | None = No
         # a clarification between units: the units it offered (``focus.units``, validated), which the reply binds to (round
         # 15 U6, KTD1); a hidden one hides the message like any candidate the answer names
         "offered_units": list(outcome.offered_units), "shown_documents": list(outcome.shown_documents),
+        # the structured clarification the client shows as buttons (its state is computed from the rows on every read): present only
+        # with options; the stored ``clarification`` string keeps its meaning (round 26 U3, KTD5)
+        **({"clarify": public} if (public := clarify.public(outcome.clarification)) is not None else {}),
         # each requested datum with the status the turn's actions support (found, or how it was not found)
         "requested": coverage.validate_requested(ws, a.requested),
         # round 7 U3 (KTD3, KTD4): each component of the request with its status, reason and evidence (the detail
@@ -1174,16 +1321,48 @@ def _context(outcome: engine.TurnOutcome, payload: dict, previous: dict | None, 
             cited.append({"document_id": src["document_id"], "source_kind": src.get("source_kind") or "appraisal",
                           "standard": src.get("standard"), "section": src.get("section")})
     asked = None
-    if a.status == "clarification":
-        # the reply binds to the units the clarification declared it offered (``focus.units``, validated; round 15 U6, KTD1) or
-        # to the candidates of a server clarification; one that declared none binds nothing — the model reads the reply
-        # from the history, so the files the turn touched are no longer a pool a reply is looked up in
+    record = getattr(outcome, "clarification", None)  # (a test's outcome may be a stand-in without it)
+    if record is not None or a.status == "clarification":
+        # the reply binds to the options of the structured clarification (round 26 U3), whose units are the candidates it offered
+        # (``focus.units`` or the options, validated; round 15 U6, KTD1), or to the candidates of a server clarification. A clarification
+        # that offered no options stores the files its turn touched, where a reply that states a unit's complete name is looked up
+        if record is not None:
+            reads = _reads_of(ws)
+            record = record | {"reads": [*reads, *[r for r in record.get("reads") or [] if r not in reads]][:clarify.MAX_READS]}
         asked = _pending_slot(payload.get("pending"), request.get("candidates") or payload.get("offered_units") or [],
-                              request.get("named_document_ids") or [], [], datetime.now(UTC).isoformat(timespec="seconds"))
+                              request.get("named_document_ids") or [], _clarified_documents(payload),
+                              datetime.now(UTC).isoformat(timespec="seconds"), record)
     if prop is not None and (date_field := _date_field(payload)):
         params = (params or {}) | {"date_field": date_field}  # what "ומה לגבי המועד" refers to: the date of this datum
     return slots.carry(previous, intent=intent, property=prop, params=params, topic=topic, lists=lists,
-                       message_id=message_id, sources=cited, pending=asked, period=period)
+                       message_id=message_id, sources=cited, pending=asked, period=period, answered=getattr(outcome, "continued", None))
+
+
+def _read_entry(src: dict) -> dict:
+    """A public source as the locator a later turn reopens (a ``P#`` reference), with its document: what a clarification keeps of what its
+    turn read."""
+    return {"document_id": src.get("document_id"), "version_id": src["version_id"], "block_start": src.get("block_start"),
+            "block_end": src.get("block_end"), "table_index": src.get("table_index"), "chunk_id": src.get("chunk_id"),
+            "title": src.get("title"), "location": src.get("location"), "excerpt": " ".join((src.get("text") or "").split())[:160],
+            "reading_id": src.get("reading_id"), "resume": src.get("more") if isinstance(src.get("more"), dict) else None}
+
+
+def _reads_of(ws) -> list[dict]:
+    """What the turn read, newest first, at most ``clarify.MAX_READS``: the passages (never a listing, never a source the server made for its
+    own checks) a clarifying turn hands to the turn that continues it. A clarification cites nothing, so its answer's sources cannot serve."""
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for src in reversed(list(ws.sources.values())):
+        if src.is_listing or src.server_made or not src.version_id:
+            continue
+        entry = json.loads(json.dumps(_read_entry(_public_source(src)), default=str))
+        key = (entry["version_id"], entry["block_start"], entry["block_end"], entry["table_index"])
+        if key not in seen:
+            seen.add(key)
+            out.append(entry)
+        if len(out) >= clarify.MAX_READS:
+            break
+    return out
 
 
 def _date_field(payload: dict) -> str:
@@ -1413,6 +1592,13 @@ def _limited_answer(ctx: TenantContext, question: str, reason: str, time_prefere
             "coverage": [], "clarification": None, "missing": None}
 
 
+def _unavailable_answer() -> dict:
+    """The answer to a choice that cannot be continued: one sentence, no source, value or title (round 26 U3, G8)."""
+    return {"kind": "rag", "status": "not_found", "markdown": clarify.MSG_NO_LONGER, "claims": [], "sources": [],
+            "measurements": [], "computations": [], "values": [], "documents": [], "verification": None, "searches": [],
+            "coverage": [], "clarification": None, "missing": None, "offered_units": [], "shown_documents": []}
+
+
 def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, user_message_id: UUID) -> None:
     from app.providers.llm import get_selected_provider
     from app.providers.status import Mode, office_provider_state
@@ -1431,7 +1617,16 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
                 raise engine.TurnCancelled  # stopped before it started: cancelled now, not after the stale bound
             conn.execute(text("UPDATE messages SET updated_at = now() WHERE id = :m"), {"m": message_id})
             state = office_provider_state(conn)
-            inp, user_ids = _turn_input(conn, ctx, conversation_id, user_message_id)
+            try:
+                inp, user_ids = _turn_input(conn, ctx, conversation_id, user_message_id)
+            except _ChoiceGone:
+                inp = None
+        if inp is None:
+            # the user's choice cannot be continued (its clarification or a document of it is gone): nothing is searched and no data is shown
+            if _cancel_requested(ctx, message_id):
+                raise engine.TurnCancelled
+            _finish(ctx, message_id, "done", content=clarify.MSG_NO_LONGER, answer=_unavailable_answer())
+            return
         if state.mode != Mode.CLOUD:
             reason = state.limitation() or "שליחת קטעים לספק מודל ענן כבויה במשרד."
             reason = reason.split(";")[0].rstrip(".") + "."
@@ -1448,7 +1643,7 @@ def run_message(ctx: TenantContext, conversation_id: UUID, message_id: UUID, use
         payload = _answer_payload(outcome, user_ids, removals, previous=inp.slots, message_id=str(message_id))
         recorded = _finish(ctx, message_id, "done", content=outcome.answer.answer_markdown, answer=payload,
                            usage=outcome.usage, model=provider.model,
-                           diagnostics=_diagnostics(outcome, payload, removals))
+                           diagnostics=_diagnostics(outcome, payload, removals), reply=outcome.reply)
     # every exit logs the calls the turn made: a cancelled, failed or broken turn was still billed for them
     except engine.TurnCancelled as e:
         usage = _log_turn_usage(ctx, provider, getattr(e, "usage", None))

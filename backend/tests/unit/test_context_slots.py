@@ -142,7 +142,7 @@ PRINTED = [{"title": "שלוש הגישות", "kind": "גישת", "items": [{"la
 
 def test_a_property_turn_writes_the_property_and_its_parameters():
     out = slots.carry(None, intent="property", property=PROPERTY, params=PARAMS, sources=[SOURCE], message_id="m-1")
-    assert out["version"] == slots.VERSION == 2
+    assert out["version"] == slots.VERSION == 3
     assert out["property"] == PROPERTY and out["params"] == PARAMS and out["sources"] == [SOURCE]
     assert out["topic"] is None and out["pending"] is None and out["lists"] == [] and out["period"] is None
 
@@ -216,7 +216,7 @@ def test_a_context_of_version_one_is_read_as_one_list():
     old = {"version": 1, "topic": {"text": "גישות השומה", "items": ITEMS, "message_id": "m-1"}, "property": None, "params": None,
            "sources": [SOURCE], "pending": None}
     out = slots.upgrade_v1(old)
-    assert out["version"] == 2 and out["period"] is None and out["topic"] == {"text": "גישות השומה", "message_id": "m-1"}
+    assert out["version"] == slots.VERSION and out["period"] is None and out["topic"] == {"text": "גישות השומה", "message_id": "m-1"}
     (entry,) = out["lists"]
     assert [i["label"] for i in entry["items"]] == ITEMS and entry["document_ids"] == ["d-1"] and entry["id"] == "m-1#1"
     assert slots.upgrade_v1(old | {"topic": None})["lists"] == []

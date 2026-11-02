@@ -28,7 +28,7 @@ from tests.support.scripted_agent import final, offer
 
 pytestmark = pytest.mark.db
 
-world, no_models = base.world, base.no_models  # the fixtures of the clarification tests, as they are
+world = base.world  # the fixtures of the clarification tests, as they are
 
 
 # --- cause 1: the clarification stored no candidates ---------------------------------------------------------------------
@@ -97,3 +97,48 @@ def test_cause2_the_candidates_carry_the_details_that_tell_the_units_apart(world
     assert first["details"]["date"] == "01/02/2023" and second["details"]["date"] == "20/06/2024"
     assert first["details"]["pages"] == "עמוד 2" and second["details"]["pages"] == "עמוד 3"
     assert first["details"]["file_title"] == BOUND_TITLE
+
+
+# --- causes 3, 4 and 5 (round 26 U3): the reply's binding, the re-offer after a pick, the stale pending ---------------------------
+# They run through the API, because the binding lives in the conversation's rows. Each failed on bed9e93 (U2 only).
+
+from app.providers.llm import CallStatus  # noqa: E402
+from tests.integration import test_chat_clarification_continuation as cont  # noqa: E402
+from tests.integration.test_chat_context import _resolution  # noqa: E402
+from tests.support.scripted_agent import intent_part, read  # noqa: E402
+
+cw = cont.cw  # the conversation world of the continuation tests
+no_models = cont.no_models  # the models off, and the turns run inline
+
+
+def test_cause3_a_failed_relation_call_still_binds_a_reply_that_names_one_option(cw):
+    """The reply "שכונת הגבעה" is no ordinal: it bound only when the small relation call said it answered the clarification, and a
+    failed call bound nothing -- the reply became a new question and the candidates were listed again."""
+    cont.ask(cw)
+    done, agent = cont.turn(cw, "שכונת הגבעה", [[read(source="P1")], cont.ANSWER])  # the resolve call is unscripted: it fails
+    shown = cont.first_message(agent)
+    assert done["answer"]["request"] is not None and done["answer"]["request"]["document_ids"] == [cw.hill]
+    assert cont.QUESTION in shown and "יחידות מועמדות" not in shown and cont.BROOK_TITLE not in shown
+
+
+def test_cause4_a_reply_that_matches_several_options_narrows_to_them_and_does_not_list_all_of_them_again(cw):
+    """"הנחל" names two of the three appraisals. It re-offered the same full list, the appraisal the user did not mean included."""
+    cont.ask(cw, ("hill", "brook", "north"))
+    again = "יש שתי שומות בשכונת הנחל. לאיזו התכוונת?"
+    done, agent = cont.turn(cw, "הנחל", [final(again, "clarification", clarification=again, clarify=offer(
+        "unit", again, (cont.BROOK_TITLE, cw.brook), (cont.NORTH_TITLE, cw.north)))], resolve=_resolution(
+        relation="clarification_answer", standalone_question="הנחל", intent=intent_part("property", "clarification")))
+    shown = cont.first_message(agent)
+    assert cont.HILL_TITLE not in shown and cw.hill not in shown
+    assert [o["label"] for o in done["answer"]["clarify"]["options"]] == [cont.BROOK_TITLE, cont.NORTH_TITLE]
+
+
+def test_cause5_a_failed_turn_after_the_clarification_makes_it_stale_so_an_older_one_is_not_resurrected(cw):
+    """Clarification, then a reply whose turn failed, then the reply again: the failed message sat between, and the latest DONE assistant
+    message was still the clarification -- so "השנייה" bound its candidates a second time."""
+    cont.ask(cw)
+    failed, _ = cont.turn(cw, "מה זה שווי שוק?", [CallStatus.ERROR])
+    assert failed["status"] == "failed"
+    done, agent = cont.turn(cw, "השנייה", [final("בדיקה.", "not_found")], resolve=_resolution(
+        relation="clarification_answer", standalone_question="השנייה", intent=intent_part("property", "clarification")))
+    assert not (done["answer"].get("request") or {}).get("document_ids")

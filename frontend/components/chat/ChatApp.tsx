@@ -97,7 +97,7 @@ function shownClarify(
   if (!c) return null;
   const note = local?.note ?? null;
   if (c.state !== "open") return { clarify: c, note };
-  if (local?.state === "answered") return { clarify: { ...c, state: "answered", chosen_option_id: local.chosen ?? null }, note };
+  if (local?.state === "answered") return { clarify: { ...c, state: "answered", chosen: local.chosen ?? null }, note };
   if (local?.state === "stale") return { clarify: { ...c, state: "stale" }, note };
   if (m.id !== lastAssistantId) return { clarify: { ...c, state: "closed" }, note };
   return { clarify: c, note };
