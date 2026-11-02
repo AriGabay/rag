@@ -687,6 +687,36 @@ def unit_key(version_id: str, reading_id: str | None, number: int, tag: str | No
     return f"{base}@{tag}" if tag else base
 
 
+# the subject fields of a unit's identity card that tell units apart for a person (round 26 U2, R6): the first quote of each, in the
+# words the document wrote
+CARD_DETAIL_FIELDS = ("name", "address", "city", "block_parcel", "property_type", "date_text")
+CARD_DETAIL_CHARS = 80
+
+
+def card_details(fields: Iterable[dict]) -> dict[str, str]:
+    """The first quote of each field type a unit's identity card holds (``CARD_DETAIL_FIELDS``), whitespace collapsed and cut to
+    ``CARD_DETAIL_CHARS``: what a clarification shows beside a unit that has no title of its own. Only fields the card verified as
+    the property's own reach it (``cards.verify_fields``); a type the card holds no quote for is not in the result."""
+    out: dict[str, str] = {}
+    for f in fields:
+        kind, quote = f.get("field"), " ".join(str(f.get("quote") or "").split())[:CARD_DETAIL_CHARS]
+        if kind in CARD_DETAIL_FIELDS and quote and kind not in out:
+            out[kind] = quote
+    return out
+
+
+def untitled_label(details: dict) -> str:
+    """What names a unit that has no title (round 26 U2, cause 2 of the repeated candidate list): its card's name, else its address
+    (with the city, when the address does not say it), else its block and parcel; "" when the card holds none of them. Never the
+    words «ללא כותרת», which tell two such units apart from nothing."""
+    if details.get("name"):
+        return details["name"]
+    if details.get("address"):
+        city = details.get("city")
+        return f"{details['address']}, {city}" if city and city not in details["address"] else details["address"]
+    return details.get("block_parcel") or ""
+
+
 def unit_row(u, document_id, version_id, reading_id: str | None, tag: str | None, **extra) -> dict:
     """A stored unit (a ``units.Unit``, or a ``document_units`` row with the same columns) as the unit row dict the lookups,
     the candidates and the clarifications carry: the file, the version and reading it is in, its stable id under the

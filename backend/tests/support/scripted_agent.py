@@ -43,10 +43,10 @@ def read(**locator) -> dict:
 def final(markdown: str, status: str = "answered", claims: list | None = None, clarification: str = "",
           missing: str = "", documents: list[str] | None = None, scope: str = "focused", scope_query: str = "",
           omitted: list | None = None, focus: dict | None = None, requested: list | None = None,
-          parts: list | None = None, items: list | None = None) -> dict:
+          parts: list | None = None, items: list | None = None, clarify: dict | None = None) -> dict:
     # the strict schema has the model send every field: an answer that lists no items says ``items: []`` (round 17 U2)
     return {"final": {"status": status, "items": items or [], "answer_markdown": markdown, "claims": claims or [],
-                      "clarification_question": clarification, "missing_info": missing,
+                      "clarification_question": clarification, "clarify": clarify, "missing_info": missing,
                       "referenced_document_ids": documents or [], "scope_kind": scope, "scope_query": scope_query,
                       "omitted": omitted or [],
                       # the strict schema has the model send every field: a focus that declares no unit says ``units: []``
@@ -54,6 +54,13 @@ def final(markdown: str, status: str = "answered", claims: list | None = None, c
                       # the strict schema has the model send every field: a claim tied to no component says ""
                       "requested": [{"component": ""} | r if isinstance(r, dict) else r for r in requested or []],
                       "parts": parts or []}}
+
+
+def offer(kind: str, question: str, *options: tuple[str, str], reason: str = "", allow_all: bool = False) -> dict:
+    """A structured clarification as the model sends it (round 26 U2, KTD1): ``options`` are ``(label, ref)`` pairs; the key of
+    each is its place in the list."""
+    return {"question": question, "reason": reason, "kind": kind, "allow_all": allow_all,
+            "options": [{"key": str(n), "label": label, "ref": ref} for n, (label, ref) in enumerate(options, 1)]}
 
 
 def requirement(text: str = "", status: str = "full", units: list | None = None, related: list | None = None,

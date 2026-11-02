@@ -122,10 +122,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from app.chat import contexts, coverage, entities, resolve, timeframe
+from app.chat import clarify, contexts, coverage, entities, resolve, timeframe
 from app.chat import intent as intent_mod
 from app.chat import request as request_analysis
 from app.chat import tools as T
+from app.chat.clarify import ClarifyOffer
 from app.chat.compose import CITATION, ServerSpan, text_digest
 from app.chat.final_check import FinalCheckError, finalize
 from app.chat.items import Ledger as ItemLedger
@@ -281,9 +282,24 @@ POLICY = """אתה עוזר שיחה מקצועי של משרד שמאות מק�
   (read עם source=P#) או חפש שוב. אם המשתמש מתקן אותך ("התכוונתי לשווי, לא לשכירות") — עבור למה שביקש ושמור על שאר
   ההגדרות של השאלה הקודמת (אותו נכס, אותה יחידה: אם נשאלת על ערך למ"ר, התיקון מתייחס לערך למ"ר). אם הוא מחליף
   נושא — אל תגרור תנאים מהנושא הקודם. "זה" בשאלת המשך מתייחס לנתון שבמרכז השאלה והתשובה הקודמות, לא לפרט צדדי.
-- בקש הבהרה (status=clarification) כשיש עמימות שמשנה את התשובה ושנובעת מהשאלה ומהמקורות (למשל שני מסמכים
-  מתאימים לכתובת שנשאלה), או כשחסר פרמטר מהותי לחישוב שלא המשתמש ולא המסמכים נתנו (ראה חישוב). שאלת הבהרה שומרת
-  את הנתונים שכבר נמצאו עם מראי המקום שלהם ושואלת שאלה אחת. בעמימות אחרת — ענה עם הסתייגות ברורה.
+- בקש הבהרה (status=clarification) רק כשנשארות שתי קריאות סבירות או יותר לשאלה, אחרי שבדקת את ההודעה, את ההיסטוריה, את מה
+  שהמשתמש כבר בחר ואת המקורות שמצאת, והן מובילות לתשובות שונות מהותית (למשל שני מסמכים מתאימים לכתובת שנשאלה, מועד קובע או
+  בסיס שטח שמשנים את המספר, שיטת ממוצע), או כשחסר פרמטר מהותי לחישוב שלא המשתמש ולא המסמכים נתנו (ראה חישוב). שאלה ברורה — ענה
+  עליה ישירות. כששתי הקריאות נכנסות בתשובה קצרה עם מקורות — הצג את שתיהן במקום לשאול. דבר שהמשתמש אמר במפורש (נכס, תאריך או
+  טווח) גובר על ברירת מחדל ואינו נשאל שוב: תאריך שהמשתמש ציין, או מתג העדפת הנתונים העדכניים כשהוא דולק, כבר מכריעים איזה
+  מועד להציג.
+- אל תשאל איזה ערך נכון: לא בחילוץ לא ודאי, לא כשהמקורות סותרים ולא כשהחיפוש לא הושלם. קרא את המקור הנכון; ואם עדיין יש שני
+  ערכים — הצג את שניהם עם מקומם ואמור מה לא הוכרע. שאלת הבהרה אינה מסתירה כשל בחיפוש, בקריאה, בחישוב או באימות.
+- צורת שאלת ההבהרה: שאלה אחת קצרה (clarification_question) ובשדה clarify סיבה קצרה (reason), סוג (clarify.kind) ו-
+  שתיים עד ארבע אפשרויות קצרות ושונות, כל אחת מהעמימות עצמה. unit — איזה נכס או שומה (ref: U# שהוצג, נקרא או נמצא בתור הזה, או document_id
+  מלא של מסמך שומה אחד שהתור מצא); period — איזה מועד או טווח (ref: תאריך ISO, או start/end, שמופיע במקורות שקראת); area_basis —
+  בסיס שטח; method — שיטת ממוצע (ref: הביטוי כפי שמקור שקראת כותב אותו). אין סוג של בחירת ערך. אפשרות של נכס חייבת פרט מבחין
+  מהמקורות (שם, כתובת, תאריך או טווח עמודים): השרת ממלא אותם מהמסמכים, ואל תציע רשימה של יחידות «ללא כותרת». allow_all=true רק
+  כשאיחוד האפשרויות הגיוני; כשהמשתמש בוחר "כולן" נותנים כל אחת בנפרד, בלי ממוצע משותף בלי הצדקה. אפשר תמיד לענות גם בטקסט
+  חופשי. עמימות מסוג אחר — ענה עם שתי הקריאות בקצרה ובמקורותיהן במקום לשאול.
+- אל תשאל שוב על עניין שהמשתמש כבר הכריע בו בשאלה הזו; שאלה נוספת על אותה שאלה אומרת מה חדש בה. לכל היותר
+  שתי שאלות הבהרה רצופות, ואז ענה עם הנחות מוצהרות. שאלת הבהרה שומרת את הנתונים שכבר נמצאו עם מראי המקום שלהם. בעמימות אחרת — ענה עם
+  הסתייגות ברורה.
 - אל תכתוב בתשובה שנתון או חלק של הבקשה "לא נמצא", "לא מופיע" או "לא נבדק": השרת מציין כל פער פעם אחת, אחרי
   התשובה, עם הסיבה לפי מה שהתור עשה בפועל. במקום זה הצהר על כל רכיב בשדות המובנים:
 - items: פנקס הפריטים. נכתב לפני answer_markdown, מתוך הקטעים שקראת, והתשובה נכתבת מהפריטים included שבו. לכל רכיב של
@@ -491,6 +507,10 @@ class FinalAnswer(_Strict):
     answer_markdown: str
     claims: list[Claim]
     clarification_question: str
+    # round 26 U2 (KTD1): the structured form of a clarification (``app.chat.clarify``): a reason, a kind and two to four options the
+    # server validates and grounds in the sources. None for any other answer; the default is for code that builds an answer - the
+    # schema the model gets lists it as required, like every field
+    clarify: ClarifyOffer | None = None
     missing_info: str
     referenced_document_ids: list[str]
     scope_kind: Literal["focused", "set"]
@@ -501,7 +521,17 @@ class FinalAnswer(_Strict):
     parts: list[Part]
 
 
-FINAL_SCHEMA = FinalAnswer.model_json_schema()
+def _final_schema() -> dict:
+    """The schema of the model's final answer: every property required (strict structured output; ``clarify`` has a default only for
+    code that builds an answer) and at most ``clarify.MAX_OPTIONS`` options."""
+    schema = FinalAnswer.model_json_schema()
+    schema["properties"]["clarify"].pop("default", None)
+    schema["required"] = list(schema["properties"])
+    schema["$defs"]["ClarifyOffer"]["properties"]["options"]["maxItems"] = clarify.MAX_OPTIONS
+    return schema
+
+
+FINAL_SCHEMA = _final_schema()
 
 
 class TurnCancelled(Exception):
@@ -555,6 +585,9 @@ class TurnInput:
     # the time preference the user's message was recorded with (round 11 U5, KTD1): {"version", "prefer_recent",
     # "anchor_date"}; a message from before round 11 arrives as the switch off. None: a caller that gives none (tests)
     time_preference: dict | None = None
+    # what the conversation knows about the clarifications already asked for the question this turn continues (round 26 U2, KTD2, R10):
+    # the kinds the user resolved, how many were asked in a row, and the options a narrowing reply matched; None: none
+    clarification_state: clarify.ClarificationState | None = None
 
 
 @dataclass
@@ -593,6 +626,12 @@ class TurnOutcome:
     # the documents of the candidates the model was shown, for a clarification only: its text may name any of them, so the
     # message is hidden when the user loses access to one (``api._answer_documents``)
     shown_documents: list[str] = field(default_factory=list)
+    # a clarification's validated record (round 26 U2, KTD2): ``{id, question, reason, kind, options[{id, label, detail, ref}],
+    # allow_all}`` - with no options when fewer than two survived, and kind ``text`` when the model offered none - which the
+    # conversation stores as the pending clarification; None for any other answer. ``clarification_check``: why options were dropped
+    # or the buttons withheld (``clarify.Verdict.check``; no content), for the diagnostics
+    clarification: dict | None = None
+    clarification_check: dict = field(default_factory=dict)
     # per verification round, what the requirements judge returned for each component and what the server did with its support
     # (``VerifyReport.requirements_trace``); diagnostics only, [{"round": the number in ``rounds``, "version": the answer version, "components": [...]}]
     requirements_trace: list[dict] = field(default_factory=list)
@@ -749,6 +788,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
     compute_ok = False  # the step may call the compute tools only (the tool budget is spent, there is time left)
     compute_steps = 0  # such steps taken so far
     mixed_asked = False  # a mixed question's answer was already asked for its professional part (once per turn)
+    reprompted = False  # the model was already told once, in this turn, that it asked again about what the user resolved (R10)
+    clarification_verdict: clarify.Verdict | None = None  # the validated clarification of the last clarification answer
     pre_mixed = None  # the first answer of a mixed question, kept while that extra round runs (round 13 U14)
     rounds: list[list[dict]] = []
     traces: list[dict] = []  # the requirements trace of each verification round (diagnostics only)
@@ -914,6 +955,14 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         """What the repair gate decided after a verification round and why (round 23 U0, KTD11, R15), kept in the turn's timing; diagnostics only."""
         ws.clock.note_repair_gate({"attempt": attempt, "decision": decision, "steps": steps, **fields})
 
+    def check_clarification(answer: FinalAnswer, refuse: bool = False) -> clarify.Verdict:
+        """The answer's clarification, validated and grounded in what the turn showed and read (``clarify.validate``, round 26 U2)."""
+        return clarify.validate(
+            ctx, ws, answer.clarify, question=answer.clarification_question or answer.answer_markdown,
+            state=inp.clarification_state, pinned_unit=_unit_pinned(ws, request, ranked),
+            extra_documents=_offered_documents(ws, request, ranked),
+            parameter=_pending(ws, turn, answer) is not None, refuse=refuse)
+
     def finish(answer: FinalAnswer, report: VerifyReport) -> TurnOutcome:
         # removals; each component recomputed from the surviving units; the absences the server states removed; one
         # gap paragraph after the answer (round 7 U3) — then the limits reached and the coverage ledger. Each decision
@@ -945,6 +994,18 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         shown_documents = (sorted({str(ws.handles[h]["document_id"]) for h in ws.offered_units if h in ws.handles}
                                   | {str(d["document_id"]) for d in (request.offered if request is not None else [])})
                            if final.status == "clarification" else [])
+        clarification, clarification_check = None, {}
+        if final.status == "clarification":
+            # the structured clarification (round 26 U2, KTD2): the record the conversation stores, its options grounded in the
+            # sources. The check made when the answer arrived stands unless a repair round changed the clarification
+            verdict = (clarification_verdict if clarification_verdict is not None and clarification_verdict.offer == final.clarify
+                       else check_clarification(final, refuse=True))
+            clarification, clarification_check = verdict.record, verdict.check
+            if final.clarification_question.strip():
+                clarification["question"] = final.clarification_question.strip()
+            if final.clarify is not None:  # the options are the candidates a reply binds to; the focus's units are the old form
+                offered = verdict.offered_units
+            shown_documents = sorted(set(shown_documents) | set(verdict.shown_documents))
         report.completeness = coverage.completeness(outcomes, report.unbound_data())
         try:  # round 23 U0 (KTD11): the read cursors the turn was given and never followed, in the timing (diagnostics only)
             ws.clock.note_unfollowed(ws.unfollowed_cursors())
@@ -963,7 +1024,8 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                            _summary(usage, rounds, reused, turn),
                            _pending(ws, turn, final), composed.spans, done.digest, done.stats, ws.clock.summary(),
                            unit, offered_units=offered, shown_documents=shown_documents, requirements_trace=traces,
-                           item_ledger=report.item_diagnostics(), drafts=drafts, lists=composed.lists)
+                           item_ledger=report.item_diagnostics(), drafts=drafts, lists=composed.lists,
+                           clarification=clarification, clarification_check=clarification_check)
 
     def adopt_analysis() -> None:
         """The collected analysis as the turn's requirements: its components frozen and appended as one item, or the
@@ -1113,12 +1175,36 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
         if not restored:
             answer_seconds = time.monotonic() - step_started
             ws.clock.add("compose", answer_seconds)
+            declared_before = (ws.declared_units, ws.declared_handles)
             _declare_units(ctx, ws, answer)  # the units it declares, validated (round 15 U6, KTD7)
             if pending is not None or held is not None:
                 settle_analysis()  # the first step answered: the requirements are frozen before verification
+            if answer.status == "clarification" and not answer.clarification_question.strip() and answer.clarify is not None:
+                answer.clarification_question = answer.clarify.question  # the structured form carries the question too
             if answer.status == "clarification" and answer.clarification_question.strip() and not answer.answer_markdown.strip():
                 answer.answer_markdown = answer.clarification_question
             pre_mixed = None  # an answer that arrived: the extra round is over
+            if answer.status == "clarification":
+                # the clarification is validated against what the turn showed and read (round 26 U2, KTD2). One that asks again about
+                # a kind the user resolved, or past two in a row, gets one re-prompt step - the only extra model call the contract
+                # adds - and, if the model insists, keeps its question as text with no buttons (R10)
+                clarification_verdict = check_clarification(answer)
+                if clarification_verdict.violation is not None:
+                    if (not reprompted and steps + 1 < bound
+                            and time.monotonic() < deadline - max(REPAIR_MIN_SECONDS, REPAIR_TIME_FACTOR * answer_seconds)):
+                        reprompted = True
+                        ws.declared_units, ws.declared_handles = declared_before  # the refused clarification declared nothing
+                        progress("repair", clarify.MSG_PROGRESS)
+                        items.append({"role": "user", "content": clarify.reprompt(
+                            clarification_verdict.violation, answer.clarify.kind if answer.clarify is not None else clarify.TEXT,
+                            inp.clarification_state)})
+                        continue
+                    clarification_verdict = check_clarification(answer, refuse=True)
+                if (new := clarification_verdict.question_override) is not None:
+                    # the model's question listed an option the server dropped: the user reads the server's neutral words (R6)
+                    old = clarification_verdict.question
+                    answer.answer_markdown = answer.answer_markdown.replace(old, new) if old.strip() in answer.answer_markdown else answer.answer_markdown
+                    answer.clarification_question = new
         if (attempt == 0 and not mixed_asked and answer.status in ("answered", "partial") and steps + 1 < bound
                 and time.monotonic() < deadline - max(REPAIR_MIN_SECONDS, REPAIR_TIME_FACTOR * answer_seconds)
                 and (notice := _professional_gap(ws, answer.answer_markdown, not last)) is not None):
@@ -1354,6 +1440,26 @@ def draft_record(ws: T.Workspace, markdown: str, round_no: int, version: int) ->
     cited = coverage.cited_ids_ordered(markdown)
     sources = {sid: loc for sid in cited if (loc := _locator_of(ws, sid)) is not None}
     return {"round": round_no, "version": version, "markdown": markdown, "sources": sources}
+
+
+def _unit_pinned(ws: T.Workspace, request: resolve.Request | None, ranked: entities.Ranked | None) -> bool:
+    """Whether the message or the conversation already pins the appraisal (round 26 U2, G14): the conversation's unit is kept or
+    named, a follow-up keeps its one document, or the question states the complete name or address of exactly one candidate. A
+    clarification between appraisals is then not material."""
+    if ws.unit_focus is not None or (request is not None and request.located_unit):
+        return True
+    if (request is not None and request.relation != "new_question" and not request.entity_changed
+            and len(request.document_ids) == 1):
+        return True
+    hard = [c for c in (ranked.cards if ranked is not None else []) if c.basis in (entities.BASIS_NAME, entities.BASIS_IDENTIFIER)]
+    return len(hard) == 1
+
+
+def _offered_documents(ws: T.Workspace, request: resolve.Request | None, ranked: entities.Ranked | None) -> set[str]:
+    """The documents the model was shown outside its tools: the candidate cards' and the lookup's."""
+    return ({str(c.row["document_id"]) for c in (ranked.cards if ranked is not None else [])}
+            | {str(d["document_id"]) for d in (request.offered if request is not None else [])}
+            | {str(ws.handles[h]["document_id"]) for h in ws.offered_units if h in ws.handles})
 
 
 def _settle_unit(ctx: TenantContext, ws: T.Workspace, request: resolve.Request) -> None:

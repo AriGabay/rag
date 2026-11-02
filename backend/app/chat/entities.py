@@ -161,13 +161,16 @@ def focus_text(anchor: dict) -> str:
 
 
 def candidate_label(c: dict) -> str:
-    """How a clarification names a candidate: a document by its title; a unit by its title (or that it has none), its
-    pages, its identifiers and the file."""
+    """How a clarification names a candidate: a document by its title; a unit by its title (or, with none, what its identity card
+    names it by - ``contexts.untitled_label``, round 26 U2 - and only then that it has none), its pages, its identifiers, the date its
+    details give and the file."""
     unit = c.get("unit")
     if not unit:
         return f"«{c['title']}»"
-    parts = [p for p in (unit_pages(unit), " · ".join(unit.get("identifiers") or ())) if p]
-    return (f"«{unit.get('display') or contexts.MSG_NO_TITLE}» ({'; '.join(parts)}{'; ' if parts else ''}"
+    details = c.get("details") or {}
+    name = unit.get("display") or contexts.untitled_label(details) or contexts.MSG_NO_TITLE
+    parts = [p for p in (unit_pages(unit), " · ".join(unit.get("identifiers") or ()), details.get("date")) if p]
+    return (f"«{name}» ({'; '.join(parts)}{'; ' if parts else ''}"
             f"בקובץ «{c.get('file_title') or c['title']}»)")
 
 
@@ -1027,20 +1030,75 @@ def cards_of_units(ctx: TenantContext, items: list[tuple[dict, str]]) -> list[Un
     return cards
 
 
-def offered_candidates(ctx: TenantContext, places: list[tuple[str, str | None, int]]) -> list[dict]:
-    """The units a model's clarification offered, as the candidates a reply is resolved among (``Candidate.as_dict``), in
-    the order given. ``places``: (document id, reading id, unit number) of each, from the handles the model declared. A unit
-    whose document is not readable now, is one unit, or was read again since (the reading differs) is left out."""
-    out: list[dict] = []
+def _valuation_text(conn, version_id, block_index: int, cache: dict) -> str | None:
+    """The valuation date a version states for the unit that holds ``block_index``, as the document wrote it, or None (none stated,
+    in conflict, or the dates could not be read: a detail that is not there is not shown)."""
+    from app.chat import dates as chat_dates
+
+    try:
+        with conn.begin_nested():
+            valuation = chat_dates.unit_valuation(conn, version_id, block_index, cache=cache)
+    except Exception:  # noqa: BLE001 - no date: the other details tell the candidates apart
+        return None
+    return valuation.date.written if valuation.status == "stated" and valuation.date is not None else None
+
+
+def candidate_details(ctx: TenantContext, places: list[tuple[str, str | None, int]]) -> list[dict | None]:
+    """``offered_candidates`` with one slot per place, in order: the candidate, or None for a place that is no longer one (its document
+    is not readable now, is one unit, or was read again since). A candidate carries ``details`` (round 26 U2, KTD2, R6): what tells
+    the unit apart for a person, from the sources - its title (or None), the name, address, city, parcel and type its identity card
+    quotes, the valuation date it states (else the card's date as written), its pages and its file's title."""
+    found: list[tuple[dict, str] | None] = []
     with tenant_tx(ctx) as conn:
         current = _current_by_doc(conn)
         for doc, reading_id, number in places:
-            found = current(doc)
-            if found is None or len(found[3]) < 2 or (reading_id or None) != (found[2] or None):
+            units = current(doc)
+            row = (_subject_row(units[3], number)
+                   if units is not None and len(units[3]) >= 2 and (reading_id or None) == (units[2] or None) else None)
+            found.append((row, units[0]) if row is not None else None)
+        fields = _card_fields(conn, [item[0] for item in found if item is not None])
+        cache: dict = {}
+        valuations = {(str(item[0]["version_id"]), item[0]["unit_no"]):
+                      _valuation_text(conn, item[0]["version_id"], item[0]["block_first"], cache)
+                      for item in found if item is not None}
+    out: list[dict | None] = []
+    for item in found:
+        if item is None:
+            out.append(None)
+            continue
+        row, file_title = item
+        card = contexts.card_details(_fields_of(fields, row))
+        details = {"title": row.get("title") or None, "name": card.get("name"), "address": card.get("address"),
+                   "city": card.get("city"), "parcel": card.get("block_parcel"), "type": card.get("property_type"),
+                   "date": valuations[(str(row["version_id"]), row["unit_no"])] or card.get("date_text"),
+                   "pages": contexts.pages_text(row.get("page_first"), row.get("page_last")), "file_title": file_title}
+        out.append(unit_candidate(row, file_title).as_dict() | {"details": details})
+    return out
+
+
+def offered_candidates(ctx: TenantContext, places: list[tuple[str, str | None, int]]) -> list[dict]:
+    """The units a model's clarification offered, as the candidates a reply is resolved among (``Candidate.as_dict``, with their
+    ``details``), in the order given. ``places``: (document id, reading id, unit number) of each, from the handles the model
+    declared. A unit whose document is not readable now, is one unit, or was read again since (the reading differs) is left out."""
+    return [c for c in candidate_details(ctx, places) if c is not None]
+
+
+def document_candidates(ctx: TenantContext, ids: list[str]) -> list[dict | None]:
+    """The documents a clarification offered between (round 26 U2, KTD2): one slot per id, in order - ``{"document_id", "title",
+    "details"}`` (the title and the valuation date the document states), or None when it is not readable now, is no appraisal, or is
+    a file of several appraisals (there the unit is the option, never the file)."""
+    out: list[dict | None] = []
+    with tenant_tx(ctx) as conn:
+        current = _current_by_doc(conn)
+        cache: dict = {}
+        for doc in ids:
+            units = current(doc)
+            if units is None or len(units[3]) > 1:
+                out.append(None)
                 continue
-            row = _subject_row(found[3], number)
-            if row is not None:
-                out.append(unit_candidate(row, found[0]).as_dict())
+            title, version_id, _, rows = units
+            date = _valuation_text(conn, version_id, rows[0]["block_first"] if rows else 0, cache)
+            out.append({"document_id": str(doc), "title": title, "details": {"title": title, "date": date}})
     return out
 
 
