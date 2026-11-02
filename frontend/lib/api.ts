@@ -19,7 +19,7 @@ import type {
   SourceKind,
   UploadResult,
 } from "./types";
-import type { ChatConversation, ChatDiagnostics, ChatMessage, SourceBlocks } from "./chatTypes";
+import type { ChatConversation, ChatDiagnostics, ChatMessage, ClarificationChoice, SourceBlocks } from "./chatTypes";
 // Facts review (U11)
 import type { FactDetail, FactReviewGroup, FactStatus } from "./types";
 
@@ -33,9 +33,13 @@ export const NETWORK_ERROR = "אין חיבור לשרת. בדקו את החיב
 
 export class ApiError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  /** Round 26 U5: the machine code of an error whose `detail` is an object (`{code, message}`), for example
+   * `clarification_stale`; null for a plain-text detail. */
+  readonly code: string | null;
+  constructor(status: number, message: string, code: string | null = null) {
     super(message);
     this.status = status;
+    this.code = code;
   }
   get isServerError(): boolean {
     return this.status >= 500 || this.status === 0;
@@ -69,25 +73,33 @@ export function redirectToLogin(): void {
   window.location.href = "/login";
 }
 
-async function readDetail(res: Response): Promise<string | null> {
+async function readDetail(res: Response): Promise<{ message: string | null; code: string | null }> {
   try {
     const data: unknown = await res.json();
     if (data && typeof data === "object" && "detail" in data) {
       const detail = (data as { detail: unknown }).detail;
-      if (typeof detail === "string") return detail;
+      if (typeof detail === "string") return { message: detail, code: null };
+      // an object detail: `{code, message}` (round 26 U5: clarification_stale, clarification_unavailable)
+      if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+        const { code, message } = detail as { code?: unknown; message?: unknown };
+        return {
+          message: typeof message === "string" ? message : null,
+          code: typeof code === "string" ? code : null,
+        };
+      }
       // FastAPI validation errors arrive as a list; show the first message when present.
       if (Array.isArray(detail) && detail.length > 0) {
         const first: unknown = detail[0];
         if (first && typeof first === "object" && "msg" in first) {
           const msg = (first as { msg: unknown }).msg;
-          if (typeof msg === "string") return msg;
+          if (typeof msg === "string") return { message: msg, code: null };
         }
       }
     }
   } catch {
     // Non-JSON body.
   }
-  return null;
+  return { message: null, code: null };
 }
 
 export async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
@@ -120,7 +132,7 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
   if (!res.ok) {
     const detail = await readDetail(res);
     if (res.status >= 500) throw new ApiError(res.status, SERVER_ERROR);
-    throw new ApiError(res.status, detail ?? GENERIC_ERROR);
+    throw new ApiError(res.status, detail.message ?? GENERIC_ERROR, detail.code);
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
@@ -303,12 +315,13 @@ export const chatApi = {
     ),
   /** `preferRecent`: the switch's current value, recorded on the message (round 11); left out when unknown, so the
    * server falls back to the conversation's own value. */
-  send: (id: string, content: string, clientId: string, preferRecent?: boolean) =>
+  send: (id: string, content: string, clientId: string, preferRecent?: boolean, clarification?: ClarificationChoice) =>
     request<{ user: ChatMessage; assistant: ChatMessage | null }>(
       `/api/chat/conversations/${encodeURIComponent(id)}/messages`,
       {
         method: "POST",
-        body: { content, client_id: clientId, prefer_recent: preferRecent }, // undefined is left out of the JSON
+        // undefined is left out of the JSON; `clarification` (round 26 U5) is a click on an option of the open clarification
+        body: { content, client_id: clientId, prefer_recent: preferRecent, clarification },
       },
     ),
   message: (id: string, signal?: AbortSignal) =>

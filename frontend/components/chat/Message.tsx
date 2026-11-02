@@ -10,6 +10,7 @@ import type {
   ChatBreakdownBlock,
   ChatBreakdownRow,
   ChatAssumption,
+  ChatClarify,
   ChatComponent,
   ChatComponentContext,
   ChatComputation,
@@ -55,6 +56,7 @@ import { type CitationTarget, Markdown, citationOrder, plainAnswer } from "./Mar
 import { assumptionText, citedSource, citedTarget, standardChipTitle, valueStatusOf } from "./cited";
 import { ActionLines, type CutFocus, type ExpandAll, NO_PARTIALS, type PartialFocus, RemovalsSection } from "./Changes";
 import { documentAnchor } from "./SourceViewer";
+import { ClarifyOptions } from "./ClarifyOptions";
 
 export interface CitedItem {
   /** A passage, or the document passage behind a measurement or computation input. */
@@ -206,6 +208,15 @@ interface AssistantProps {
   report?: AnswerReport | null;
   /** Opens the report dialog. Without it the answer has no report action. */
   onReport?: (message: ChatMessage) => void;
+  /** Round 26 U5: the clarification as shown now (the server's state with the tab's own answer or stale mark applied); absent:
+   * the message's own. */
+  clarify?: ChatClarify | null;
+  /** A turn runs or a send is in flight: the clarification's buttons wait. */
+  clarifyBusy?: boolean;
+  /** The inline text next to the buttons (the 409 "השאלה כבר לא פתוחה"). */
+  clarifyNote?: string | null;
+  /** A click on an option of the clarification (`optionId` and the label the send carries as its text). */
+  onChoose?: (message: ChatMessage, clarify: ChatClarify, optionId: string, label: string) => void;
 }
 
 /** "דווח על תשובה" (round 25 U5): on a finished, failed or cancelled answer, whether or not it is the last. Never on a running one. */
@@ -252,7 +263,20 @@ export function progressLines(progress: ChatProgressStep[]): ChatProgressStep[] 
   return lines;
 }
 
-export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onOpenSource, report, onReport }: AssistantProps) {
+export function AssistantMessage({
+  message,
+  isLast,
+  onCite,
+  onRetry,
+  onStop,
+  onOpenSource,
+  report,
+  onReport,
+  clarify: shownClarify,
+  clarifyBusy = false,
+  clarifyNote = null,
+  onChoose,
+}: AssistantProps) {
   const [copied, setCopied] = useState(false);
   const answer = message.answer;
   // a hidden answer keeps only its kind: it has no text or sources to cite
@@ -386,6 +410,10 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
   }
 
   const timeNote = timePreferenceNote(message, answer);
+  // round 26 U5: a clarification with options is a block of buttons that replaces the "נדרשת הבהרה" lead line; with none (the text
+  // fallback) the old line stays
+  const clarify = shownClarify === undefined ? message.clarify ?? null : shownClarify;
+  const clarifyButtons = clarify !== null && clarify.options.length > 0;
   const renderMarkdown = (markdown: string) => (
     <Markdown
       markdown={markdown}
@@ -440,7 +468,16 @@ export function AssistantMessage({ message, isLast, onCite, onRetry, onStop, onO
           renderMarkdown(linked?.whole ?? "")
         )}
       </div>
-      <AnswerQuality answer={answer} />
+      {clarify && clarifyButtons && (
+        <ClarifyOptions
+          clarify={clarify}
+          busy={clarifyBusy}
+          showQuestion={!sameText(answer.markdown, clarify.question)}
+          note={clarifyNote}
+          onChoose={(optionId, label) => onChoose?.(message, clarify, optionId, label)}
+        />
+      )}
+      <AnswerQuality answer={answer} hideClarificationLead={clarifyButtons} />
       <Timeline groups={answer.time?.timeline} onCite={cite} />
       <Breakdown blocks={answer.time?.breakdown} onCite={cite} onOpenContext={onOpenSource ? openContext : undefined} />
       <CoverageNote coverage={answer.time?.coverage} />
@@ -965,6 +1002,13 @@ function dominantKind(removals: ChatRemoval[]): string {
   return best;
 }
 
+/** The same text up to whitespace: the answer's body already says the clarification's question (it is then not shown twice). */
+function sameText(markdown: string, question: string): boolean {
+  const norm = (t: string) => t.replace(/\s+/g, " ").trim();
+  const q = norm(question);
+  return q !== "" && norm(markdown).includes(q);
+}
+
 /** The detail a clarification waits for: the components needing it, else what the answer says is missing. */
 function pendingDetail(answer: ChatAnswer): string {
   const waiting = (answer.components ?? []).filter((c) => c.status === "needs_clarification").map((c) => c.text);
@@ -976,15 +1020,17 @@ function pendingDetail(answer: ChatAnswer): string {
  * shows the status only; one short notice says how many claims verification removed and mostly why (no draft text);
  * a clarification shows what it waits for instead of the partial-answer wording. Answers stored before any of these
  * show what they showed. */
-function AnswerQuality({ answer }: { answer: ChatAnswer }) {
+function AnswerQuality({ answer, hideClarificationLead = false }: { answer: ChatAnswer; hideClarificationLead?: boolean }) {
   const verification = answer.verification;
-  const clarification = answer.status === "clarification";
+  // the lead line, unless the clarification's own block of option buttons replaces it (round 26 U5)
+  const asking = answer.status === "clarification";
+  const clarification = asking && !hideClarificationLead;
   const completeness = verification?.completeness;
   const correctness = verification?.correctness;
   const removals = verification?.removals ?? [];
   // what changed the text (removed, cut, rewritten, withheld); qualified and cited claims appear in the details only
   const affected = sum(contentCounts(verification));
-  const incomplete = !clarification && completeness && completeness.status !== "full";
+  const incomplete = !asking && completeness && completeness.status !== "full";
   // claims only removed (none partly supported): the removal notice says it, with its kind, instead of the
   // generic correctness line
   const onlyRemoved = correctness === "partial" && affected > 0 && !verification?.partial;

@@ -1027,6 +1027,38 @@ export interface ChatAnswer {
 
 export type ChatMessageStatus = "running" | "cancelling" | "cancelled" | "done" | "failed";
 
+/** Round 26 U5 (KTD5): a structured, grounded clarification the assistant message carries; the server computes `state` from the
+ * conversation's rows on every list and poll. `options` may be empty (the text fallback: the old "נדרשת הבהרה" line). */
+export type ClarifyKind = "unit" | "period" | "area_basis" | "method" | "text";
+export type ClarifyState = "open" | "answered" | "closed" | "stale";
+
+export interface ClarifyOption {
+  id: string;
+  label: string;
+  detail: string;
+}
+
+export interface ChatClarify {
+  id: string;
+  question: string;
+  reason: string;
+  kind: ClarifyKind;
+  options: ClarifyOption[];
+  /** "All" is offered: a send with the reserved option id `ALL_OPTION_ID`. */
+  allow_all: boolean;
+  state: ClarifyState;
+  chosen_option_id?: string | null;
+}
+
+/** The reserved option id of "all" (only when `allow_all`). */
+export const ALL_OPTION_ID = "all";
+
+/** The body of a send that answers an option by click (`content` is the option's label). */
+export interface ClarificationChoice {
+  id: string;
+  option_id: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -1045,6 +1077,8 @@ export interface ChatMessage {
   /** Round 14 U7 (KTD9): the viewer may open this message's diagnostics (its owner, or an office admin). Only then is a "verified
    * in part" mark a button; absent or false, it stays text. A diagnostics 404 can still happen. */
   can_view_diagnostics?: boolean;
+  /** Round 26 U5: the assistant message's structured clarification (null or absent: none). */
+  clarify?: ChatClarify | null;
 }
 
 export interface SourceBlock {

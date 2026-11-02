@@ -4,7 +4,14 @@ import Link from "next/link";
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useSession } from "@/components/AppShell";
 import { type AnswerReport, api, ApiError, chatApi, errorMessage, isAbortError, newTurnId } from "@/lib/api";
-import type { ChatAnswer, ChatConversation, ChatMessage, ViewerNav } from "@/lib/chatTypes";
+import type {
+  ChatAnswer,
+  ChatClarify,
+  ChatConversation,
+  ChatMessage,
+  ClarificationChoice,
+  ViewerNav,
+} from "@/lib/chatTypes";
 import { type AnswerOrigin, AssumptionView, CalculationView } from "./CalculationView";
 import { AssistantMessage, UserMessage, citedView } from "./Message";
 import { ReportDialog } from "./ReportDialog";
@@ -62,9 +69,39 @@ interface Thread {
   error: string | null;
   /** Errors of messages this tab failed to send, by client id. */
   sendErrors: Record<string, string>;
+  /** Round 26 U5: what this tab knows about a clarification beyond the server's last view, by clarification id. */
+  clarifyLocal: Record<string, ClarifyLocal>;
 }
 
-const EMPTY_THREAD: Thread = { messages: [], hasMore: false, loading: false, error: null, sendErrors: {} };
+/** The tab's own mark on a clarification (KTD5): `answered` at once on a click (with the chosen option), `stale` after a 409; `note`
+ * is the inline text beside the buttons. A state counts only while the server's last view still says `open`. */
+interface ClarifyLocal {
+  state?: "answered" | "stale";
+  chosen?: string | null;
+  note?: string | null;
+}
+
+const EMPTY_THREAD: Thread = { messages: [], hasMore: false, loading: false, error: null, sendErrors: {}, clarifyLocal: {} };
+
+/** The text beside the buttons when a click met a clarification that is no longer open (the 409 `clarification_stale`). */
+export const CLARIFY_STALE_NOTE = "השאלה כבר לא פתוחה";
+
+/** The clarification as the thread shows it: the tab's own mark over an `open` server view, and an `open` one that is not on the
+ * conversation's latest assistant message is no longer open (a later reply closed it; the server says so on the next list). */
+function shownClarify(
+  m: ChatMessage,
+  lastAssistantId: string | null,
+  local: ClarifyLocal | undefined,
+): { clarify: ChatClarify; note: string | null } | null {
+  const c = m.clarify;
+  if (!c) return null;
+  const note = local?.note ?? null;
+  if (c.state !== "open") return { clarify: c, note };
+  if (local?.state === "answered") return { clarify: { ...c, state: "answered", chosen_option_id: local.chosen ?? null }, note };
+  if (local?.state === "stale") return { clarify: { ...c, state: "stale" }, note };
+  if (m.id !== lastAssistantId) return { clarify: { ...c, state: "closed" }, note };
+  return { clarify: c, note };
+}
 
 function readLocal(key: string): string | null {
   try {
@@ -132,6 +169,9 @@ export default function ChatApp() {
   const afterUnwind = useRef<(() => void) | null>(null);
   const [theme, setTheme] = useState<Theme>("system");
   const [sending, setSending] = useState(false);
+  // set synchronously, so two clicks in one frame (a double click on an option) send once
+  const sendingRef = useRef(false);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const [composerText, setComposerText] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   // the user's own reports of answers (round 25 U5), by message id; `reportTarget` is the answer whose dialog is open
@@ -310,6 +350,7 @@ export default function ChatApp() {
           updateThread(conversation, (t) => ({ ...t, messages: t.messages.map((x) => (x.id === m.id ? m : x)) }));
           if (!RUNNING.has(m.status)) {
             setConversations((cur) => cur.map((c) => (c.id === conversation ? { ...c, updated_at: new Date().toISOString() } : c)));
+            void refreshClarifications(conversation);
           }
         } catch (err) {
           if (isAbortError(err)) return;
@@ -328,10 +369,41 @@ export default function ChatApp() {
   // --- sending ---------------------------------------------------------------------------------------------
   const busy = runningIds.length > 0 || sending;
 
+  /** Sets (or, with null, clears) the tab's own mark on a clarification of a conversation. */
+  const setClarifyLocal = useCallback(
+    (conversation: string, clarifyId: string, value: ClarifyLocal | null) => {
+      updateThread(conversation, (t) => {
+        const rest = Object.fromEntries(Object.entries(t.clarifyLocal).filter(([k]) => k !== clarifyId));
+        return { ...t, clarifyLocal: value ? { ...rest, [clarifyId]: value } : rest };
+      });
+    },
+    [updateThread],
+  );
+
+  /** Takes the server's current view of the clarifications into the loaded messages (their `state` follows the conversation's
+   * later rows), after a send or a finished answer. Only the clarification of a message already shown is replaced. */
+  const refreshClarifications = useCallback(
+    async (conversation: string) => {
+      try {
+        const res = await chatApi.messages(conversation);
+        const fresh = new Map(res.messages.filter((m) => m.clarify).map((m) => [m.id, m.clarify as ChatClarify]));
+        if (fresh.size === 0) return;
+        updateThread(conversation, (t) => ({
+          ...t,
+          messages: t.messages.map((m) => (m.clarify && fresh.has(m.id) ? { ...m, clarify: fresh.get(m.id) } : m)),
+        }));
+      } catch {
+        // a convenience: the next list or a 409 on a click says the same
+      }
+    },
+    [updateThread],
+  );
+
   const send = useCallback(
-    async (text: string, clientId: string = newTurnId()) => {
+    async (text: string, clientId: string = newTurnId(), clarification?: ClarificationChoice) => {
       const content = text.trim();
-      if (!content || sending) return;
+      if (!content || sending || sendingRef.current) return;
+      sendingRef.current = true;
       setSending(true);
       setNotice(null);
       const optimistic: ChatMessage = {
@@ -358,6 +430,10 @@ export default function ChatApp() {
         client_id: null,
       };
       let conversationId = activeRef.current;
+      // a click on an option: the clarification is answered here at once, with the chosen option marked
+      if (clarification && conversationId) {
+        setClarifyLocal(conversationId, clarification.id, { state: "answered", chosen: clarification.option_id });
+      }
       // every send carries the switch's current value; an existing conversation whose value is not loaded yet sends
       // none, and the server falls back to the conversation's own
       const preferRecent: boolean | undefined = conversationId ? prefsRef.current[conversationId] : draftPreferRef.current;
@@ -381,7 +457,7 @@ export default function ChatApp() {
             sendErrors: Object.fromEntries(Object.entries(t.sendErrors).filter(([k]) => k !== clientId)),
           }));
         }
-        const res = await chatApi.send(conversationId, content, clientId, preferRecent);
+        const res = await chatApi.send(conversationId, content, clientId, preferRecent, clarification);
         const cid = conversationId;
         if (preferRecent !== undefined) storedPrefs.current[cid] = preferRecent;
         updateThread(cid, (t) => ({
@@ -397,9 +473,24 @@ export default function ChatApp() {
             c.id === cid && c.title === "שיחה חדשה" ? { ...c, title: content.slice(0, 80), updated_at: new Date().toISOString() } : c,
           ),
         );
+        void refreshClarifications(cid);
       } catch (err) {
         const msg = errorMessage(err);
-        if (conversationId) {
+        if (clarification && conversationId) {
+          // a failed click leaves no bubble and no "resend as text" (the text would not carry the choice): the buttons say
+          // what happened. Stale: the clarification is no longer open. Anything else: the buttons are usable again.
+          const cid = conversationId;
+          const stale = err instanceof ApiError && err.status === 409 && err.code === "clarification_stale";
+          updateThread(cid, (t) => ({
+            ...t,
+            messages: t.messages.filter((m) => m.id !== optimistic.id && m.id !== pending.id),
+          }));
+          setClarifyLocal(
+            cid,
+            clarification.id,
+            stale ? { state: "stale", note: CLARIFY_STALE_NOTE } : { note: msg },
+          );
+        } else if (conversationId) {
           const cid = conversationId;
           updateThread(cid, (t) => ({
             ...t,
@@ -412,11 +503,21 @@ export default function ChatApp() {
           setComposerText(content);
         }
       } finally {
+        sendingRef.current = false;
         setSending(false);
         createdHere.current = null; // from now on, coming back to it loads it from the server like any other
       }
     },
-    [sending, touchConversation, updateThread],
+    [sending, touchConversation, updateThread, setClarifyLocal, refreshClarifications],
+  );
+
+  /** A click on an option of a clarification: the option's label is the message, the ids are the choice; focus goes to the message box. */
+  const choose = useCallback(
+    (_m: ChatMessage, clarify: ChatClarify, optionId: string, label: string) => {
+      void send(label, undefined, { id: clarify.id, option_id: optionId });
+      composerRef.current?.focus();
+    },
+    [send],
   );
 
   /** The switch: a draft only changes the draft; an existing conversation shows the new value at once and PATCHes it,
@@ -804,6 +905,8 @@ export default function ChatApp() {
           onRetry={retry}
           onStop={stop}
           onResend={(m) => void send(m.content, m.client_id ?? undefined)}
+          onChoose={choose}
+          busy={busy}
           reports={reports}
           onReport={openReport}
         />
@@ -822,6 +925,7 @@ export default function ChatApp() {
           value={composerText}
           onChange={setComposerText}
           busy={busy}
+          inputRef={composerRef}
           running={runningIds.length > 0}
           prefer={activeId ? prefs[activeId] ?? null : draftPrefer}
           preferLocked={sending}
@@ -1047,6 +1151,8 @@ function ThreadView({
   onRetry,
   onStop,
   onResend,
+  onChoose,
+  busy,
   reports,
   onReport,
 }: {
@@ -1059,10 +1165,17 @@ function ThreadView({
   onRetry: (m: ChatMessage) => void;
   onStop: (m: ChatMessage) => void;
   onResend: (m: ChatMessage) => void;
+  onChoose: (m: ChatMessage, clarify: ChatClarify, optionId: string, label: string) => void;
+  /** A turn runs or a send is in flight: the clarifications' buttons wait. */
+  busy: boolean;
   reports: Record<string, AnswerReport>;
   onReport: (m: ChatMessage) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const lastAssistantId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) if (messages[i].role === "assistant") return messages[i].id;
+    return null;
+  }, [messages]);
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
   const prevHeight = useRef(0);
@@ -1117,8 +1230,9 @@ function ThreadView({
             </button>
           )}
           {thread?.error && <div className="alert alert-error">{thread.error}</div>}
-          {messages.map((m, i) =>
-            m.role === "user" ? (
+          {messages.map((m, i) => {
+            const shown = m.role === "assistant" ? shownClarify(m, lastAssistantId, thread?.clarifyLocal[m.clarify?.id ?? ""]) : null;
+            return m.role === "user" ? (
               <UserMessage
                 key={m.id}
                 message={m}
@@ -1136,9 +1250,13 @@ function ThreadView({
                 onStop={onStop}
                 report={reports[m.id] ?? null}
                 onReport={onReport}
+                clarify={shown ? shown.clarify : null}
+                clarifyNote={shown ? shown.note : null}
+                clarifyBusy={busy}
+                onChoose={onChoose}
               />
-            ),
-          )}
+            );
+          })}
         </div>
       </div>
       {!atBottom && (
@@ -1154,6 +1272,7 @@ function Composer({
   value,
   onChange,
   busy,
+  inputRef,
   running,
   prefer,
   preferLocked,
@@ -1164,6 +1283,8 @@ function Composer({
   value: string;
   onChange: (v: string) => void;
   busy: boolean;
+  /** The message box, so a click on a clarification's option can move focus to it. */
+  inputRef: React.RefObject<HTMLTextAreaElement | null>;
   running: boolean;
   /** The time-preference switch: null while an existing conversation's value is not loaded yet. */
   prefer: boolean | null;
@@ -1173,20 +1294,19 @@ function Composer({
   onSend: (text: string) => void;
   onStop: () => void;
 }) {
-  const ref = useRef<HTMLTextAreaElement>(null);
   const composing = useRef(false);
   const preferDesc = useId();
 
   useLayoutEffect(() => {
-    const el = ref.current;
+    const el = inputRef.current;
     if (!el) return;
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 220)}px`;
-  }, [value]);
+  }, [value, inputRef]);
 
   useEffect(() => {
-    ref.current?.focus();
-  }, []);
+    inputRef.current?.focus();
+  }, [inputRef]);
 
   const submit = () => {
     if (busy || !value.trim()) return;
@@ -1222,7 +1342,7 @@ function Composer({
         }}
       >
         <textarea
-          ref={ref}
+          ref={inputRef}
           rows={1}
           dir="auto"
           value={value}

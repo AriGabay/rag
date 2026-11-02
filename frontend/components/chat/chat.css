@@ -1725,3 +1725,123 @@ button.cut-marker:focus-visible {
   white-space: pre-line;
   overflow-wrap: anywhere;
 }
+
+/* --- a clarification's question, reason and option buttons (round 26 U5, KTD5) ---------------------------- */
+
+.clarify {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--chat-border);
+  border-radius: 12px;
+  background: var(--primary-soft);
+  font-size: 14px;
+  min-width: 0;
+}
+
+.clarify p {
+  margin: 0 0 6px;
+  overflow-wrap: anywhere;
+}
+
+.clarify-question {
+  font-weight: 600;
+}
+
+.clarify-reason {
+  color: var(--chat-muted);
+}
+
+.clarify-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.clarify-option {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex: 1 1 14rem;
+  min-width: 0;
+  max-width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--chat-border);
+  border-radius: 10px;
+  background: var(--chat-bg);
+  color: var(--chat-text);
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.clarify-option:hover:not(:disabled) {
+  border-color: var(--chat-accent);
+}
+
+.clarify-option:focus-visible {
+  outline: 2px solid var(--chat-accent);
+  outline-offset: 2px;
+}
+
+.clarify-option:disabled {
+  cursor: default;
+}
+
+.clarify-option[data-dimmed="true"]:disabled {
+  opacity: 0.55;
+}
+
+.clarify-option[data-chosen="true"] {
+  border-color: var(--chat-accent);
+  box-shadow: inset 0 0 0 1px var(--chat-accent);
+  opacity: 1;
+}
+
+.clarify-num {
+  flex: 0 0 auto;
+  min-width: 1.4em;
+  height: 1.4em;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--chat-bubble);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.clarify-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
+}
+
+.clarify-label {
+  font-weight: 600;
+}
+
+.clarify-detail {
+  color: var(--chat-muted);
+  font-size: 13px;
+}
+
+.clarify-check {
+  flex: 0 0 auto;
+  color: var(--chat-accent);
+}
+
+.clarify .clarify-state {
+  margin: 6px 0 0;
+  font-size: 12.5px;
+  color: var(--chat-muted);
+}
+
+.clarify .clarify-note {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--danger);
+}
