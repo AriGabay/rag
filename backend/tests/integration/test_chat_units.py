@@ -449,7 +449,7 @@ def test_after_the_models_clarification_between_units_the_reply_that_is_the_full
     assert _task_unit(agent) == "מתחם הגפן ב"
 
 
-def test_after_a_models_clarification_that_declared_no_unit_a_full_name_reply_is_an_ordinary_lookup_with_the_named_unit_first(
+def test_after_a_models_clarification_that_declared_no_unit_a_full_name_reply_binds_the_named_unit(
         client, office, monkeypatch):
     doc, _ = ingest(office, R9B)
     asked = "בקובץ שני מתחמים: מתחם הגפן א ומתחם הגפן ב. לאיזה התכוונת?"
@@ -459,13 +459,13 @@ def test_after_a_models_clarification_that_declared_no_unit_a_full_name_reply_is
     cid = new_conversation(client)
     m = send(client, cid, "מה דמי השכירות החודשיים?")
     assert m["answer"]["status"] == "clarification" and not m["answer"].get("offered_units")
-    # a clarification that offered no unit binds nothing (KTD1): the reply is read as a new message, whose words the lookup
-    # cannot tell apart ("מתחם הגפן ב" - the one letter is no search term), so both units reach the model, the named one first
+    # round 26 U3 (R9) replaces round 15's "a clarification that offered no unit binds nothing": the files its turn touched are the pool,
+    # so a reply that states one unit's complete name binds that unit, whatever the reading of the reply, and is not asked about again
     agent, m = _reply_turn(client, monkeypatch, cid, "מתחם הגפן ב", "new_question")
     req = m["answer"]["request"]
-    assert req["located_unit"] is None and req["document_ids"] == [] and req["candidates"] == []
-    content = agent.seen[0][0]["content"]
-    assert _card_titles(content) == ["מתחם הגפן ב", "מתחם הגפן א"] and entities.BASIS_NAME in content
+    assert req["located_unit"]["display"] == "מתחם הגפן ב" and req["document_ids"] == [doc]
+    diag = client.get(f"/api/chat/messages/{m['id']}/diagnostics").json()["resolution"]
+    assert diag["decisions"]["pending"] == "bound: candidate"
 
 
 def test_a_reply_after_the_models_clarification_that_names_no_unit_in_full_is_not_looked_up(

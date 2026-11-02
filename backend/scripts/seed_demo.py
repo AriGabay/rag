@@ -34,6 +34,7 @@ from sqlalchemy import create_engine, text
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # the guard beside it, also when loaded by path (the acceptance suite)
 
 from seed_guard import guard_seed_target  # noqa: E402  (round 25 U6: target guard, same directory)
 

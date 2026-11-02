@@ -596,7 +596,9 @@ def _clarification(world) -> tuple[str, Turn]:
                                                    focus=_focus(doc, "", "unknown") | {"units": ["U1", "U2"]})],
              None, intent="property")
     assert t.answer["status"] == "clarification" and len(t.agent.seen) == 1, t.answer
-    assert t.context["pending"]["kind"] == "candidates"
+    # since round 26 U3 (slot version 3) a model's clarification is stored as its record, the units it offered beside it
+    assert t.context["pending"]["kind"] == "clarification"
+    assert [c["unit"]["unit_no"] for c in t.context["pending"]["payload"]["candidates"]] == [1, 2]
     assert [c["unit"]["unit_no"] for c in t.answer["offered_units"]] == [1, 2]
     return cid, t
 
