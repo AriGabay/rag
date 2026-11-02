@@ -1,0 +1,139 @@
+# Round 26 - development cases for grounded clarifications (synthetic, public).
+# Documents: backend/tests/fixtures/clarify_v1 (truth.yaml) + the eval office C documents.
+# kind: ambiguous (asking or a short answer with both readings is acceptable; the final answer after the reply must give `expect`),
+#       clear (must not ask), twin (the ambiguous case with the choice stated in the question; its answer is the reference for the pair).
+# expect: numbers (any number form) the final answer must state; forbid: numbers the final answer must not state as an answer.
+# typed_equivalent: what the base arm (no buttons) types for a click.
+set: clarify_v1_dev
+cases:
+  - id: D01
+    kind: ambiguous
+    pair: D01T
+    turns:
+      - ask: "מה שטח המגרש בהנרקיס 9 בקריית אלון?"
+      - reply: "click:הגבעה"
+        typed_equivalent: "בשכונת הגבעה"
+    expect: ["530"]
+    forbid: ["910"]
+  - id: D01T
+    kind: twin
+    turns:
+      - ask: "מה שטח המגרש בהנרקיס 9 בשכונת הגבעה בקריית אלון?"
+    expect: ["530"]
+  - id: D02
+    kind: ambiguous
+    pair: D02T
+    turns:
+      - ask: "מה שווי הנכס בהנרקיס 9?"
+      - reply: "text:זה שבשכונת הנחל"
+    expect: ["8,100,000"]
+    forbid: ["5,300,000"]
+  - id: D02T
+    kind: twin
+    turns:
+      - ask: "מה שווי הנכס בהנרקיס 9 בשכונת הנחל?"
+    expect: ["8,100,000"]
+  - id: D03
+    kind: ambiguous
+    pair: D03T
+    turns:
+      - ask: "מה הממוצע של המחיר למ\"ר בעסקאות ההשוואה בשומה של השקד 8?"
+      - reply: "click:משוקלל"
+        typed_equivalent: "ממוצע משוקלל לפי שטח"
+    expect: ["10,117"]
+    note: "area-weighted mean 10,116.79 (any rounding to the shekel or to tens); a simple mean 12,033 alone is wrong for this reply"
+  - id: D03T
+    kind: twin
+    turns:
+      - ask: "מה הממוצע המשוקלל לפי שטח של המחיר למ\"ר בעסקאות ההשוואה בשומה של השקד 8?"
+    expect: ["10,117"]
+  - id: D04
+    kind: ambiguous
+    pair: D04T
+    turns:
+      - ask: "מה שטח המגרש בשומה שנמצאת בקובץ השומות הכרוכות?"
+      - reply: "click:האיריס"
+        typed_equivalent: "השומה של שדרות האיריס 18"
+    expect: ["1,150"]
+    forbid: ["640", "820"]
+    note: "two of the three appraisals have no title; options must name address or date, never 'ללא כותרת'"
+  - id: D04T
+    kind: twin
+    turns:
+      - ask: "מה שטח המגרש בשומה של שדרות האיריס 18 בנווה צור?"
+    expect: ["1,150"]
+  - id: D05
+    kind: ambiguous
+    turns:
+      - ask: "מה שטח המגרש בהנרקיס 9?"
+      - reply: "all"
+    expect: ["530", "910"]
+    forbid_average: true
+    note: "per property, no joint average"
+  - id: D06
+    kind: ambiguous
+    turns:
+      - ask: "מה שווי הנכס בהנרקיס 9 בקריית אלון?"
+      - reply: "dont_know"
+      - reply: "click:הנחל"
+        typed_equivalent: "שכונת הנחל"
+    expect: ["8,100,000"]
+  - id: D07
+    kind: ambiguous
+    turns:
+      - ask: "מה שטח המגרש בהנרקיס 9 בקריית אלון?"
+      - reply: "new_question:מה ההבדל בין שווי שוק לשווי שימוש?"
+    expect_last: "professional answer, no property data"
+    stale_check: true
+  - id: D08
+    kind: ambiguous
+    turns:
+      - ask: "מה שטח המגרש בהנרקיס 9 בקריית אלון?"
+      - reply: "click:הגבעה"
+        typed_equivalent: "בשכונת הגבעה"
+      - reply: "correction:לא, התכוונתי לזה שבשכונת הנחל"
+    expect: ["910"]
+  - id: D09
+    kind: ambiguous
+    turns:
+      - ask: "מה שטח המגרש בהנרקיס 9 בקריית אלון?"
+      - reply: "click:הנחל"
+        typed_equivalent: "בשכונת הנחל"
+      - ask: "ומה המועד הקובע?"
+    expect: ["09.01.2025"]
+    keep_property: true
+  - id: D10
+    kind: clear
+    turns:
+      - ask: "מה היה השווי של הרימון 5 בגבעת התאנה בשנת 2022?"
+    expect: ["12,400,000"]
+  - id: D11
+    kind: clear
+    turns:
+      - ask: "מה השווי של הרימון 5 בגבעת התאנה?"
+    expect: ["14,950,000"]
+    note: "time preference on (default): the latest appraisal first; earlier one may follow with its date"
+  - id: D12
+    kind: clear
+    turns:
+      - ask: "מה דמי השכירות למ\"ר לחנות בהזמיר 4 בקריית אלון?"
+    expect: ["210", "235"]
+    note: "conflicting values: both with their places, never a question asking which is correct"
+  - id: D13
+    kind: clear
+    turns:
+      - ask: "מה שטח המגרש בהכלנית 6 בנווה אשחר?"
+    expect: ["1,860"]
+  - id: D14
+    kind: clear
+    turns:
+      - ask: "מהו מקדם היוון ולמה משתמשים בו בשומה?"
+    expect_last: "professional answer"
+  - id: D15
+    kind: ambiguous
+    turns:
+      - ask: "כמה שווה מ\"ר בבניין התכלת 22?"
+      - reply: "click:ברוטו"
+        typed_equivalent: "לפי השטח ברוטו"
+    expect: ["11,025"]
+    note: "the document gives 12,600 per net sqm and the total value; answering 12,600 net with the basis stated is also acceptable before the reply"
