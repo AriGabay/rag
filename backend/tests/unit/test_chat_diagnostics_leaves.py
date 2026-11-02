@@ -14,7 +14,7 @@ DOC_V, DOC_M, DOC_S = "11111111-1111-1111-1111-111111111111", "22222222-2222-222
 def _outcome(drafts: list[dict]) -> NS:
     ws = NS(sources={"S9": NS(document_id=DOC_S)}, values={"V1": NS(document_id=DOC_V)}, measurements={"M1": NS(document_id=DOC_M)},
             clock=NS(summary=lambda: {}), registration_log=[], limits_hit=[])
-    return NS(resolution=None, workspace=ws, report=None, requirements_trace=[], item_ledger={}, drafts=drafts, rounds=[], timing={})
+    return NS(resolution=None, workspace=ws, report=None, requirements_trace=[], item_ledger={}, drafts=drafts, rounds=[], timing={}, clarification_check={})
 
 
 def _diagnose(drafts: list[dict]) -> dict:

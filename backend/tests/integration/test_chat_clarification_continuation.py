@@ -429,6 +429,49 @@ def test_a_correction_in_the_next_message_reanswers_the_original_question_for_th
     assert done["answer"]["request"]["document_ids"] == [cw.brook]
 
 
+def _corrected(cw):
+    """A conversation that asked, was answered by a click on the first appraisal and corrected in text to the second: the correction's answer."""
+    m = ask(cw)
+    clicked(cw, m, 0)
+    done, _ = turn(cw, "לא, התכוונתי לשכונת הנחל", [[read(source="P1")], BROOK_ANSWER], resolve=_resolution(
+        relation="correction_of_choice", standalone_question="לא, התכוונתי לשכונת הנחל", chosen_options=[option_id(m, 1)],
+        intent=intent_part("property", "clarification")))
+    assert done["status"] == "done" and done["answer"]["status"] == "answered"
+    return m, done
+
+
+def _retry(cw, message_id: str) -> tuple[dict, ScriptedAgent]:
+    """Regenerates a done answer with a fresh scripted model (the model reads the preloaded source and answers for the second appraisal)."""
+    agent = ScriptedAgent([[read(source="P1")], BROOK_ANSWER], intent="property")
+    cw.mp.setattr("app.providers.llm.get_selected_provider", lambda: agent)
+    r = cw.client.post(f"/api/chat/messages/{message_id}/retry")
+    assert r.status_code == 200, r.text
+    return cw.client.get(f"/api/chat/messages/{r.json()['id']}").json(), agent
+
+
+def test_regenerating_the_answer_of_a_correction_reanswers_for_the_corrected_appraisal_not_no_longer_available(cw):
+    """Review #3: the retry finds no open clarification (the click's answer continued it), so the recorded correction is checked against the
+    record it names, and the continuation is rebuilt from the answered slot - no relation call, the corrected appraisal again."""
+    _, done = _corrected(cw)
+    again, agent = _retry(cw, done["id"])
+    assert again["status"] == "done" and again["answer"]["status"] == "answered" and again["content"] != clarify.MSG_NO_LONGER
+    shown = first_message(agent)
+    assert QUESTION in shown and BROOK_TITLE in shown and clarify.MSG_CONTINUE_HEAD in shown
+    assert HILL_TITLE not in shown.split(clarify.MSG_CONTINUE_HEAD, 1)[1]  # the task names the corrected choice only (the history still shows the click)
+    assert again["answer"]["request"]["document_ids"] == [cw.brook]
+    assert not relation_calls(agent)  # the stored reply bound the continuation, as a retried click does
+
+
+def test_regenerating_a_correction_whose_corrected_appraisal_was_revoked_is_still_refused(cw):
+    """Negative control for the above: the permission check on the target record is never skipped."""
+    _, done = _corrected(cw)
+    with tenant_tx(cw.system) as conn:
+        conn.execute(text("UPDATE documents SET deleted_at = now() WHERE id = :d"), {"d": cw.brook})
+    again, agent = _retry(cw, done["id"])
+    assert again["status"] == "done" and again["answer"]["status"] == "not_found" and again["content"] == clarify.MSG_NO_LONGER
+    assert agent.seen == [] and BROOK_TITLE not in json.dumps(again, ensure_ascii=False)
+
+
 def test_a_correction_two_messages_later_is_the_ordinary_correction_not_a_rebinding(cw):
     m = ask(cw)
     clicked(cw, m, 0)
@@ -482,6 +525,114 @@ def test_an_area_basis_or_method_choice_is_labelled_the_users_assumption(cw, kin
     shown = first_message(agent)
     assert "שטח נטו" in shown and clarify.MSG_USER_ASSUMPTION in shown and "מה שטח הנכס?" in shown
     assert done["answer"]["status"] == "answered"
+
+
+# --- a read of a document the user lost after the clarification is dropped from the continuation (review #4, KTD4) ------------------------
+
+
+def _ask_reading_three(cw) -> dict:
+    """A clarification that offers two appraisals but whose turn also read a third (a search over all three): its reads outlive the options."""
+    docs = docs_of(cw, ("hill", "brook"))
+    m, _ = turn(cw, QUESTION, [[call(SEARCH, query="שטח המגרש", document_ids=[cw.hill, cw.brook, cw.north], limit=None)],
+                               final(ASKED, "clarification", clarification=ASKED, clarify=offer("unit", ASKED, *docs, reason="יש כמה שומות באותה כתובת"))])
+    assert m["answer"]["status"] == "clarification" and len(m["answer"]["clarify"]["options"]) == 2
+    return m
+
+
+def _revoke(cw, document_id: str) -> None:
+    with tenant_tx(cw.system) as conn:
+        conn.execute(text("UPDATE documents SET deleted_at = now() WHERE id = :d"), {"d": document_id})
+
+
+def test_a_second_help_reply_after_a_read_document_was_lost_offers_no_reference_to_it_and_still_offers_the_others(cw):
+    """The carried-forward path: a first help re-emits the clarification (a new message, so the original is the only one that names the
+    third document's read); the read then lives in the re-emitted record alone, which the user's permissions narrow at the next reply."""
+    for revoke in (False, True):  # the control first: nothing revoked, all three documents' reads are offered
+        _ask_reading_three(cw)
+        first, _ = turn(cw, "לא יודע", [final("הסבר.", "answered")])
+        assert first["answer"]["clarify"]["state"] == "open"
+        if revoke:
+            _revoke(cw, cw.north)
+        done, agent = turn(cw, "לא יודע", [final("עניתי עם הנחה מוצהרת.", "answered")])
+        shown = first_message(agent)
+        assert clarify.MSG_ASSUMPTIONS in shown and done["status"] == "done"
+        assert "שטח המגרש הוא 612 מ״ר" in shown and "שטח המגרש הוא 540 מ״ר" in shown and "P1:" in shown  # the others' references stay
+        assert ("הנחל הצפוני" in shown and "700 מ״ר" in shown) is not revoke  # the revoked document's title and excerpt never reach the model
+
+
+def test_an_area_basis_choice_on_a_re_emitted_clarification_drops_the_reads_of_a_document_lost_since(cw):
+    asked = "באיזה בסיס שטח?"
+    steps = [[call(SEARCH, query="שטח ברוטו נטו", document_ids=[cw.bases, cw.hill], limit=None)],
+             final(asked, "clarification", clarification=asked, clarify=offer("area_basis", asked, ("שטח ברוטו", "שטח ברוטו"), ("שטח נטו", "שטח נטו")))]
+    m, _ = turn(cw, "מה שטח הנכס?", steps)
+    first, _ = turn(cw, "לא יודע", [final("הסבר.", "answered")])  # re-emitted under a new id; the original no longer names the read documents alone
+    _revoke(cw, cw.hill)
+    done, agent = clicked(cw, first, 1, steps=[[read(source="P1")], BASES_ANSWER])
+    shown = first_message(agent)
+    assert done["status"] == "done" and clarify.MSG_USER_ASSUMPTION in shown
+    assert HILL_TITLE not in shown and "612 מ״ר" not in shown
+    assert "שומה - שטחי הדגמה" in shown and "P1:" in shown  # the other document's read is still offered
+
+
+# --- the continuation keeps the intent the clarifying turn settled (review #8) -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("intent", ["mixed", "document"])
+def test_a_clarification_asked_on_a_mixed_or_document_turn_continues_with_that_intent_after_a_click(cw, intent):
+    m = ask(cw, intent=intent)
+    done, _ = clicked(cw, m, 1, steps=[[read(source="P1")], BROOK_ANSWER])
+    assert done["status"] == "done" and done["answer"]["status"] == "answered"
+    assert done["answer"]["request"]["intent"]["value"] == intent  # not coerced to a property question (the pools follow the intent)
+    with tenant_tx(cw.system) as conn:  # the stored record carries the intent a first turn settled (a first turn has no request to stamp)
+        stored = conn.execute(text("SELECT answer->'context'->'pending'->'payload'->'request'->>'intent' FROM messages WHERE id = :m"),
+                              {"m": m["id"]}).scalar()
+    assert stored == intent
+
+
+def test_control_a_property_turn_still_continues_as_a_property_question(cw):
+    m = ask(cw)
+    done, _ = clicked(cw, m, 0)
+    assert done["answer"]["request"]["intent"]["value"] == "property"
+
+
+# --- the clarification's own check reaches the diagnostics, content-free (review: TurnOutcome.clarification_check) ------------------------------
+
+
+def _check_of(cw, m: dict) -> dict | None:
+    r = cw.client.get(f"/api/chat/messages/{m['id']}/diagnostics")
+    assert r.status_code == 200, r.text
+    return (r.json()["resolution"] or {}).get("clarification_check")
+
+
+def test_a_clarification_whose_option_was_dropped_records_why_in_the_diagnostics_and_never_the_option_text(cw):
+    docs = docs_of(cw, ("hill", "brook"))
+    never_read = (NORTH_TITLE, cw.north)  # the turn searched two documents only: this option is not one the model was shown
+    m, _ = turn(cw, QUESTION, [[call(SEARCH, query="שטח המגרש", document_ids=[cw.hill, cw.brook], limit=None)],
+                               final(ASKED, "clarification", clarification=ASKED, clarify=offer("unit", ASKED, *docs, never_read))])
+    assert len(m["answer"]["clarify"]["options"]) == 2
+    assert _check_of(cw, m) == {"dropped": [{"key": "3", "reason": "unit_not_offered"}]}
+    # a model's key is its own string: a key that is words (a label in disguise) is not stored, and neither is any label
+    wordy = offer("unit", ASKED, *docs, never_read)
+    wordy["options"][2]["key"] = NORTH_TITLE
+    m2, _ = turn(cw, QUESTION, [[call(SEARCH, query="שטח המגרש", document_ids=[cw.hill, cw.brook], limit=None)],
+                                final(ASKED, "clarification", clarification=ASKED, clarify=wordy)])
+    check = _check_of(cw, m2)
+    assert check == {"dropped": [{"key": None, "reason": "unit_not_offered"}]}
+    stored = json.dumps(check, ensure_ascii=False)
+    assert all(t not in stored for t in (NORTH_TITLE, HILL_TITLE, BROOK_TITLE, "הנחל"))
+
+
+def test_a_clean_clarification_and_a_plain_answer_record_no_clarification_check(cw):
+    m = ask(cw)
+    assert _check_of(cw, m) is None
+    done, _ = clicked(cw, m, 0)
+    assert _check_of(cw, done) is None
+
+
+def test_a_help_reply_records_that_the_clarification_was_re_emitted(cw):
+    ask(cw)
+    helped, _ = turn(cw, "לא יודע", [final("הסבר.", "answered")])
+    assert _check_of(cw, helped) == {"help": True}
 
 
 # --- retry keeps the choice (G1) -----------------------------------------------------------------------------------------------------------------

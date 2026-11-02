@@ -943,9 +943,14 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
             answered = done | {"record": _visible_record(conn, done["record"])}
         listing = _listing(conn, last.answer)
     reply = (user.answer or {}).get("clarification_reply") if isinstance(user.answer, dict) else None
-    if (isinstance(reply, dict) and reply.get("outcome") == clarify.OUT_ANSWERED and reply.get("option_id")
-            and not _choice_available(conn, clarification, reply)):
-        raise _ChoiceGone  # the user chose, and the clarification or a document of the choice is no longer theirs to use
+    if isinstance(reply, dict) and reply.get("outcome") == clarify.OUT_ANSWERED and reply.get("option_id"):
+        # the choice is checked against the record it names: the open clarification, or - a correction of the earlier choice, regenerated
+        # (the previous answer continued the clarification, so none is open; review #3) - the record the answered slot kept. The
+        # documents of the chosen option are checked against the user's permissions either way, never skipped.
+        named = (clarification if clarification is not None and clarification.get("id") == reply.get("clarification_id")
+                 else (answered or {}).get("record"))
+        if not _choice_available(conn, named, reply):
+            raise _ChoiceGone  # the user chose, and the clarification or a document of the choice is no longer theirs to use
     return engine.TurnInput(question=user.content, history=history, summary=summary, focus=slots.join_focus(context),
                             focus_documents=[{"document_id": k, "title": v} for k, v in list(focus.items())[-8:]],
                             prior_refs=prior, candidates=candidates, clarified_documents=clarified,
@@ -1509,9 +1514,35 @@ def _diagnostics(outcome: engine.TurnOutcome, payload: dict, removals: _Removals
                 and getattr(holder, "document_id", None)}
     checked |= documents_of(leaves)
     return {"rounds": outcome.rounds, "removed": removed,
-            "resolution": (resolution or {}) | {"timing": timing} | registrations | trace | item_ledger | drafted,
+            "resolution": ((resolution or {}) | {"timing": timing} | registrations | trace | item_ledger | drafted
+                           | _clarification_check(outcome.clarification_check)),
             "document_ids": _answer_documents(payload) | found | checked,
             "limits_hit": list(outcome.workspace.limits_hit)}
+
+
+_CODE = re.compile(r"[a-z][a-z_]{0,40}")
+_KEY = re.compile(r"[A-Za-z]?[0-9]{0,3}")  # the place of an option in the model's list ("1", "b", "a2"); anything longer is the model's words
+
+
+def _clarification_check(check: dict | None) -> dict:
+    """The clarification's own check for the diagnostics (``clarify.check_clarification``): why it has no buttons, which options were dropped
+    and why, the repeat or cap that refused it, and that it was a help re-emit. Content-free: the reasons are the server's codes and an
+    option is named by its place in the model's list, never by its label, reference or any text (an option key that is words is not kept).
+    No key at all when the turn asked nothing or nothing was dropped or refused."""
+    check = check or {}
+    out: dict = {}
+    if isinstance(fallback := check.get("fallback"), str) and _CODE.fullmatch(fallback):
+        out["fallback"] = fallback
+    dropped = [{"key": k if isinstance(k := d.get("key"), str) and _KEY.fullmatch(k) and k else None,
+                "reason": d["reason"] if isinstance(d.get("reason"), str) and _CODE.fullmatch(d["reason"]) else None}
+               for d in check.get("dropped") or [] if isinstance(d, dict)]
+    if dropped:
+        out["dropped"] = dropped
+    if isinstance(violation := check.get("violation"), str) and _CODE.fullmatch(violation):
+        out["violation"] = violation
+    if check.get("help") is True:
+        out["help"] = True
+    return {"clarification_check": out} if out else {}
 
 
 SEARCH_ONLY_APPRAISALS, SEARCH_ONLY_PROFESSIONALS = 5, 3  # passages per group of a search-only answer (KTD11)

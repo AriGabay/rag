@@ -164,3 +164,10 @@ def test_scripts_pass_the_guard_for_an_isolated_target(name, monkeypatch, capsys
     with pytest.raises(Reached):  # past the guard, into the first request
         module.main()
     assert "localhost:18000" in capsys.readouterr().out
+
+
+def test_the_eval_office_seed_lists_the_clarification_set_and_every_folder_holds_documents_with_distinct_names():
+    module = _load("seed_eval_office")
+    assert {f.name for f in module.FOLDERS} == {"eval_v5", "eval_v6", "eval_v8", "clarify_v1"}
+    names = [p.name for folder in module.FOLDERS for p in folder.glob("*.docx")]
+    assert all(any(folder.glob("*.docx")) for folder in module.FOLDERS) and len(names) == len(set(names))

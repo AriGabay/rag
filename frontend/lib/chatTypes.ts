@@ -1023,6 +1023,9 @@ export interface ChatAnswer {
   time?: ChatAnswerTime | null;
   /** Where the server wrote in `markdown` (the removal note among them); absent on older answers. */
   server_spans?: ChatServerSpan[];
+  /** Round 26 U5: the answer's structured clarification (null or absent: none). The server sends it inside `answer` (docs/api-contract.md,
+   * `answer.clarify`) and merges the live `state` and `chosen` into it on every list. */
+  clarify?: ChatClarify | null;
 }
 
 export type ChatMessageStatus = "running" | "cancelling" | "cancelled" | "done" | "failed";
@@ -1077,8 +1080,6 @@ export interface ChatMessage {
   /** Round 14 U7 (KTD9): the viewer may open this message's diagnostics (its owner, or an office admin). Only then is a "verified
    * in part" mark a button; absent or false, it stays text. A diagnostics 404 can still happen. */
   can_view_diagnostics?: boolean;
-  /** Round 26 U5: the assistant message's structured clarification (null or absent: none). */
-  clarify?: ChatClarify | null;
 }
 
 export interface SourceBlock {

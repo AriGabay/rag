@@ -68,7 +68,8 @@ async function mockStack(page: Page, opts: ClarifyOpts = {}): Promise<Mock> {
     { completeness: { status: "full", requirements: 1, missing: [] } });
   const listed = (): Json[] => [
     message("m1", "user", "מה שטח המגרש בכלנית 6?", null),
-    message("m2", "assistant", String(answer.markdown), answer, { clarify: { ...clarify, state: server.state, chosen: server.chosen } }),
+    // as the backend sends it: inside `answer` (api._message_json merges the live state and the chosen option into answer.clarify)
+    message("m2", "assistant", String(answer.markdown), { ...answer, clarify: { ...clarify, state: server.state, chosen: server.chosen } }),
     ...items,
   ];
   await page.route("**/api/**", async (route: Route) => {

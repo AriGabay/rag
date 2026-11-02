@@ -118,7 +118,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import BaseModel, ConfigDict
 
@@ -1060,7 +1060,9 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             shown_documents = sorted(set(shown_documents) | set(verdict.shown_documents))
             clarification = clarify.stamp(clarification, original_question=inp.question, time_mode=inp.time_preference,
                                           state=inp.clarification_state, cont=cont,
-                                          request=request.as_dict() if request is not None else None)
+                                          # a first turn has no request: the intent it settled is stamped on its own, so the continuation
+                                          # reads the pools the clarifying turn used (review #8)
+                                          request=request.as_dict() if request is not None else {"intent": {"value": ws.intent}})
         if cont is not None and cont.mode == clarify.HELP and cont.record.get("options"):
             # a help reply keeps the clarification open once: the same options under a new id (KTD3)
             clarification, clarification_check = clarify.reemit(cont.record), {"fallback": None, "dropped": [], "violation": None, "help": True}
@@ -1527,7 +1529,7 @@ def _bound_reply(inp: TurnInput) -> clarify.Continuation | None:
     call reads them) or the recorded outcome was that the message was no answer."""
     record = inp.clarification
     if record is None or not record.get("options"):
-        return None
+        return _stored_correction(inp)
     options = {o["id"]: o for o in record["options"]}
     text = inp.question
     stored = inp.reply if inp.reply and inp.reply.get("clarification_id") == record["id"] else None
@@ -1550,6 +1552,24 @@ def _bound_reply(inp: TurnInput) -> clarify.Continuation | None:
     mode = {"one": clarify.CHOICE, "several": clarify.NARROW, "all": clarify.ALL, "cancel": clarify.CANCEL,
             "help": clarify.help_mode(record)}.get(m.kind)
     return clarify.Continuation(record, mode, m.options, reply_text=text) if mode else None
+
+
+def _stored_correction(inp: TurnInput) -> clarify.Continuation | None:
+    """A regenerated correction of the choice (review #3): no clarification is open (the previous answer continued it), but the user's row
+    records the choice the correction made, against the record the answered slot kept. The continuation is rebuilt as the correction
+    first built it (``_related_reply``): the same record, the recorded sibling option, the earlier choices of the other kinds."""
+    answered, stored = inp.answered or {}, inp.reply
+    record = answered.get("record")
+    if not record or not record.get("options") or not stored or stored.get("clarification_id") != record.get("id"):
+        return None
+    oid = stored.get("option_id")
+    if stored.get("outcome") != clarify.OUT_ANSWERED or oid in (None, clarify.ALL_ID):
+        return None
+    option = next((o for o in record["options"] if o["id"] == oid), None)
+    if option is None:
+        return None
+    return clarify.Continuation(record, clarify.CHOICE, [option], reply_text=inp.question, correction=True,
+                                earlier=[c for c in answered.get("chosen") or [] if c["kind"] != record["kind"]])
 
 
 def _related_reply(inp: TurnInput, request: resolve.Request | None) -> clarify.Continuation | None:
@@ -1625,12 +1645,16 @@ def _continuation_request(cont: clarify.Continuation, old: resolve.Request | Non
     """The request of a continuation (KTD4): the datum the clarifying turn resolved, with the chosen constraint applied - the unit(s) as the
     scope, no candidate lookup. ``old``: the relation call's request, whose diagnostics are kept."""
     base = cont.record.get("request") or {}
-    value = base.get("intent") if base.get("intent") in ("property", "mixed", "document") else "property"
+    # the intent the clarifying turn settled stands (professional, set and unknown included: the search pools follow it); a record that
+    # stored none continues as a property question, as before
+    value = base.get("intent") if base.get("intent") in get_args(intent_mod.Value) else "property"
     req = resolve.Request(
         "clarification_answer", base.get("standalone_question") or cont.original_question, metric_kind=base.get("metric_kind", "unknown"),
         unit=base.get("unit", "unknown"), period=base.get("period", "unknown"), area_basis=base.get("area_basis", ""),
         vat=base.get("vat", "unknown"), subject=base.get("subject", ""), relation="clarification_answer", by_choice=True,
         topic=base.get("topic", ""), intent=intent_mod.Intent(value=value, claimed=value, reference="clarification"))
+    if base.get("scope") in ("entity", "set"):
+        req.scope = base["scope"]
     if cont.mode != clarify.CANCEL:
         req.document_ids = [str(d) for d in base.get("document_ids") or []]
         req.located_unit = base.get("located_unit")

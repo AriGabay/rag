@@ -412,7 +412,7 @@ export function AssistantMessage({
   const timeNote = timePreferenceNote(message, answer);
   // round 26 U5: a clarification with options is a block of buttons that replaces the "נדרשת הבהרה" lead line; with none (the text
   // fallback) the old line stays
-  const clarify = shown === undefined ? message.clarify ?? null : shown;
+  const clarify = shown === undefined ? message.answer?.clarify ?? null : shown;
   const buttons = clarify !== null && clarify.options.length > 0 ? clarify : null;
   const renderMarkdown = (markdown: string) => (
     <Markdown

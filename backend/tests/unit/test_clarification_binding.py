@@ -145,3 +145,28 @@ def test_a_reply_among_offered_candidates_still_picks_the_unit_options_it_fits()
     offered = [{"document_id": "d3", "title": "x"}, {"document_id": "d1", "title": "y"}]
     assert engine._picked_options(options, _request(offered=offered)) == ["unit1", "unit3"]
     assert engine._picked_options(options, _request()) == []  # nothing offered: nothing picked
+
+
+# --- the continuation starts from the intent and scope the clarifying turn settled (review #8) ------------------------------------------------
+
+
+def _continuing(request: dict | None):
+    from app.chat import engine
+
+    record = UNITS | {"original_question": "מה שטח המגרש בהרימון 14?", "request": clarify.request_summary(request)}
+    return engine._continuation_request(clarify.Continuation(record, clarify.CHOICE, [UNITS["options"][0]]), None)
+
+
+@pytest.mark.parametrize("intent", ["professional", "property", "mixed", "document", "set", "unknown"])
+def test_a_continuation_keeps_the_intent_the_clarifying_turn_settled(intent):
+    assert _continuing({"intent": {"value": intent}}).intent.value == intent
+
+
+@pytest.mark.parametrize("request_", [None, {}, {"intent": {}}, {"intent": {"value": "banana"}}, {"intent": {"value": ""}}])
+def test_a_record_with_no_valid_intent_continues_as_a_property_question(request_):
+    assert _continuing(request_).intent.value == "property"
+
+
+@pytest.mark.parametrize("scope, expected", [("set", "set"), ("entity", "entity"), (None, "entity"), ("galaxy", "entity")])
+def test_a_continuation_carries_the_stored_scope(scope, expected):
+    assert _continuing({"scope": scope, "intent": {"value": "set" if scope == "set" else "property"}}).scope == expected

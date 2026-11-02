@@ -794,9 +794,9 @@ def candidates_of(record: dict) -> list[dict]:
 
 def request_summary(request: dict | None) -> dict:
     """The part of the clarifying turn's resolved request that the continuation starts from (KTD4): the datum asked for, the subject and
-    the scope, no more."""
+    the scope (the documents, the unit and ``scope`` entity or set), no more."""
     r = request or {}
-    keep = ("standalone_question", "metric_kind", "unit", "period", "area_basis", "vat", "subject", "topic", "document_ids", "located_unit")
+    keep = ("standalone_question", "metric_kind", "unit", "period", "area_basis", "vat", "subject", "topic", "document_ids", "located_unit", "scope")
     out = {k: r[k] for k in keep if r.get(k) not in (None, "")}
     if (r.get("intent") or {}).get("value"):
         out["intent"] = r["intent"]["value"]

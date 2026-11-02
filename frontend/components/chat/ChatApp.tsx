@@ -93,7 +93,7 @@ function shownClarify(
   lastAssistantId: string | null,
   local: ClarifyLocal | undefined,
 ): { clarify: ChatClarify; note: string | null } | null {
-  const c = m.clarify;
+  const c = m.answer?.clarify;
   if (!c) return null;
   const note = local?.note ?? null;
   if (c.state !== "open") return { clarify: c, note };
@@ -392,18 +392,19 @@ export default function ChatApp() {
     async (conversation: string) => {
       // nothing loaded holds a clarification: nothing to refresh, so no fetch (the render's view of the thread is enough: a clarification
       // that arrives with the message being finished carries the state its own response computed)
-      if (!threadsRef.current[conversation]?.messages.some((m) => m.clarify)) return;
+      if (!threadsRef.current[conversation]?.messages.some((m) => m.answer?.clarify)) return;
       try {
         const res = await chatApi.messages(conversation);
-        const fresh = new Map(res.messages.filter((m) => m.clarify).map((m) => [m.id, m.clarify as ChatClarify]));
+        const fresh = new Map(res.messages.filter((m) => m.answer?.clarify).map((m) => [m.id, m.answer?.clarify as ChatClarify]));
         if (fresh.size === 0) return;
         updateThread(conversation, (t) => {
           let changed = false;
           const messages = t.messages.map((m) => {
-            const next = m.clarify ? fresh.get(m.id) : undefined;
-            if (!m.clarify || !next || (next.state === m.clarify.state && (next.chosen ?? null) === (m.clarify.chosen ?? null))) return m;
+            const held = m.answer?.clarify;
+            const next = held ? fresh.get(m.id) : undefined;
+            if (!m.answer || !held || !next || (next.state === held.state && (next.chosen ?? null) === (held.chosen ?? null))) return m;
             changed = true;
-            return { ...m, clarify: next };
+            return { ...m, answer: { ...m.answer, clarify: next } };
           });
           return changed ? { ...t, messages } : t; // the same thread (no render) when no clarification's state or choice moved
         });
@@ -1246,7 +1247,7 @@ function ThreadView({
           )}
           {thread?.error && <div className="alert alert-error">{thread.error}</div>}
           {messages.map((m, i) => {
-            const shown = m.role === "assistant" ? shownClarify(m, lastAssistantId, thread?.clarifyLocal[m.clarify?.id ?? ""]) : null;
+            const shown = m.role === "assistant" ? shownClarify(m, lastAssistantId, thread?.clarifyLocal[m.answer?.clarify?.id ?? ""]) : null;
             return m.role === "user" ? (
               <UserMessage
                 key={m.id}
