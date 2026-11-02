@@ -221,3 +221,16 @@ def test_stale_refusal_and_5xx_are_handled_without_a_server():
         cd.send(C(R(502)), "c", cd.Reply("x"), None)
     with pytest.raises(cd.StepFailed):
         cd.send(C(R(409, "busy")), "c", cd.Reply("x"), None)
+
+
+def test_a_case_without_its_own_split_takes_the_split_named_by_the_file(tmp_path):
+    f = tmp_path / "cases.yaml"
+    f.write_text("set: clarify_v1_heldout\ncases:\n  - {id: H1, kind: clear, turns: [{ask: 'מה שטח המגרש?'}]}\n", encoding="utf-8")
+    assert cd.load_cases(f)[0]["split"] == "heldout"
+
+
+def test_a_file_that_names_no_split_still_requires_one_per_case(tmp_path):
+    f = tmp_path / "cases.yaml"
+    f.write_text("set: other\ncases:\n  - {id: X1, kind: clear, turns: [{ask: 'שאלה'}]}\n", encoding="utf-8")
+    with pytest.raises(cd.CaseError):
+        cd.load_cases(f)

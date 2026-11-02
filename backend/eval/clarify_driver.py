@@ -232,6 +232,13 @@ def load_cases(path: str | Path) -> list[dict]:
     cases = data.get("cases") if isinstance(data, dict) else data
     if not isinstance(cases, list):
         raise CaseError(f"{path}: expected a list of cases or a mapping with `cases`")
+    # a case without its own split takes the file's: the frozen case files name the split in `set` (clarify_v1_dev,
+    # clarify_v1_heldout), and adding the field to each case would change a file whose hash is committed
+    set_name = str(data.get("set", "")) if isinstance(data, dict) else ""
+    default = next((s for s in SPLITS if set_name.endswith(f"_{s}")), None)
+    for c in cases:
+        if default and isinstance(c, dict) and "split" not in c:
+            c["split"] = default
     return validate_cases(cases)
 
 
