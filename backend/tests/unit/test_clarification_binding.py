@@ -106,3 +106,42 @@ def test_the_public_form_hides_the_references_and_a_clarification_without_option
 def test_a_help_reply_reemits_the_options_under_a_new_id_with_the_help_counted():
     again = clarify.reemit({**UNITS, "question": "מי?", "reason": "", "help_count": 0})
     assert again["id"] != "c1" and [o["id"] for o in again["options"]] == ["opt1", "opt2", "opt3"] and again["help_count"] == 1
+
+
+# --- the options the older candidate binder picks (``engine._picked_options``) ------------------------------------------------------------
+
+
+def _request(**kw):
+    from app.chat import resolve
+
+    return resolve.Request("clarification_answer", "?", **kw)
+
+
+def _period_option(n: int, start: str, end: str) -> dict:
+    return {"id": f"per{n}", "label": f"תקופה {n}", "detail": "", "ref": {"start": start, "end": end, "precision": "day"}}
+
+
+def _unit_option(n: int, document_id: str) -> dict:
+    return {"id": f"unit{n}", "label": f"נכס {n}", "detail": "", "ref": {"document_id": document_id, "title": f"נכס {n}"}}
+
+
+@pytest.mark.parametrize("offered", [
+    [{"document_id": "d9", "title": "שומה אחרת"}],
+    [{"document_id": "d1", "title": "שומה"}, {"document_id": "d2", "title": "שומה נוספת"}],
+])
+def test_a_reply_among_offered_candidates_picks_nothing_of_a_clarification_whose_options_are_not_units(offered):
+    from app.chat import engine
+
+    options = [_period_option(1, "2022-03-01", "2022-03-31"), _period_option(2, "2023-09-01", "2023-09-30")]
+    assert engine._picked_options(options, _request(offered=offered)) == []  # a period option never matches a candidate; no KeyError
+    phrases = [{"id": "ph1", "label": "שטח עיקרי", "detail": "", "ref": {"phrase": "שטח עיקרי"}}]
+    assert engine._picked_options(phrases, _request(offered=offered)) == []
+
+
+def test_a_reply_among_offered_candidates_still_picks_the_unit_options_it_fits():
+    from app.chat import engine
+
+    options = [_unit_option(1, "d1"), _unit_option(2, "d2"), _unit_option(3, "d3")]
+    offered = [{"document_id": "d3", "title": "x"}, {"document_id": "d1", "title": "y"}]
+    assert engine._picked_options(options, _request(offered=offered)) == ["unit1", "unit3"]
+    assert engine._picked_options(options, _request()) == []  # nothing offered: nothing picked

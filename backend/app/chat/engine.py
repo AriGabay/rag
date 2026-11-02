@@ -932,7 +932,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
                 options=(asked or {}).get("options") or None, answered=inp.clarification is None and asked is not None)
         if cancelled():
             raise TurnCancelled
-        if cont is None and asked is not None and (inp.reply or {}).get("outcome") != "abandoned":
+        if cont is None and asked is not None and (inp.reply or {}).get("outcome") != clarify.OUT_ABANDONED:
             # the relation call read the reply against the clarification's options: it may be help, a cancel, a choice or a
             # correction of the earlier choice (round 26 U3, KTD3)
             cont = _related_reply(inp, request)
@@ -1067,7 +1067,7 @@ def _run_turn(ctx: TenantContext, provider: LLMProvider, inp: TurnInput, progres
             offered = clarify.candidates_of(clarification)
             shown_documents = sorted(set(shown_documents) | {d for o in clarification["options"] if (d := clarify.option_document(o))})
         reply_record = (cont.outcome() if cont is not None else
-                        {"clarification_id": inp.clarification["id"], "option_id": None, "outcome": "abandoned"}
+                        {"clarification_id": inp.clarification["id"], "option_id": None, "outcome": clarify.OUT_ABANDONED}
                         if inp.clarification is not None else None)
         report.completeness = coverage.completeness(outcomes, report.unbound_data())
         try:  # round 23 U0 (KTD11): the read cursors the turn was given and never followed, in the timing (diagnostics only)
@@ -1529,27 +1529,26 @@ def _bound_reply(inp: TurnInput) -> clarify.Continuation | None:
     if record is None or not record.get("options"):
         return None
     options = {o["id"]: o for o in record["options"]}
-    helped = int(record.get("help_count") or 0) >= 1
     text = inp.question
     stored = inp.reply if inp.reply and inp.reply.get("clarification_id") == record["id"] else None
     if stored is not None:
         outcome, oid = stored.get("outcome"), stored.get("option_id")
-        if outcome == "answered" and oid == clarify.ALL_ID and record.get("allow_all"):
+        if outcome == clarify.OUT_ANSWERED and oid == clarify.ALL_ID and record.get("allow_all"):
             return clarify.Continuation(record, clarify.ALL, list(options.values()), reply_text=text)
-        if outcome == "answered" and oid in options:
+        if outcome == clarify.OUT_ANSWERED and oid in options:
             return clarify.Continuation(record, clarify.CHOICE, [options[oid]], reply_text=text)
-        if outcome == "answered" and oid is None:
+        if outcome == clarify.OUT_ANSWERED and oid is None:
             return clarify.Continuation(record, clarify.FREE, free_text=text, reply_text=text)
-        if outcome == "narrowed":
+        if outcome == clarify.OUT_NARROWED:
             return clarify.Continuation(record, clarify.NARROW, [options[i] for i in stored.get("option_ids") or [] if i in options],
                                         reply_text=text)
-        if outcome in ("help", "cancelled"):
-            return clarify.Continuation(record, clarify.CANCEL if outcome == "cancelled" else
-                                        clarify.ASSUMPTIONS if helped else clarify.HELP, reply_text=text)
+        if outcome in (clarify.OUT_HELP, clarify.OUT_CANCELLED):
+            return clarify.Continuation(record, clarify.CANCEL if outcome == clarify.OUT_CANCELLED else clarify.help_mode(record),
+                                        reply_text=text)
         return None
     m = clarify.match_reply(record, text)
     mode = {"one": clarify.CHOICE, "several": clarify.NARROW, "all": clarify.ALL, "cancel": clarify.CANCEL,
-            "help": clarify.ASSUMPTIONS if helped else clarify.HELP}.get(m.kind)
+            "help": clarify.help_mode(record)}.get(m.kind)
     return clarify.Continuation(record, mode, m.options, reply_text=text) if mode else None
 
 
@@ -1574,9 +1573,8 @@ def _related_reply(inp: TurnInput, request: resolve.Request | None) -> clarify.C
         return clarify.Continuation(record, clarify.CHOICE, [option], reply_text=text, correction=True,
                                     earlier=[c for c in standing if c["kind"] != record["kind"]])
     record = inp.clarification
-    helped = int(record.get("help_count") or 0) >= 1
     if rel == "clarification_help":
-        return clarify.Continuation(record, clarify.ASSUMPTIONS if helped else clarify.HELP, reply_text=text)
+        return clarify.Continuation(record, clarify.help_mode(record), reply_text=text)
     if rel == "cancel":
         return clarify.Continuation(record, clarify.CANCEL, reply_text=text)
     if rel != "clarification_answer":
@@ -1601,7 +1599,9 @@ def _picked_options(options: list[dict], request: resolve.Request) -> list[str]:
     if len(request.document_ids) == 1:
         return [o["id"] for o in options if not ref(o).get("unit") and str(ref(o).get("document_id")) == request.document_ids[0]]
     offered = {json.dumps(clarify.ref_identity(d), sort_keys=True) for d in request.offered}
-    return [o["id"] for o in options if offered and json.dumps(clarify.ref_identity(ref(o)), sort_keys=True) in offered]
+    # only a unit or document option has a document to compare; a period, area basis or method option never matches a candidate
+    return [o["id"] for o in options if offered and "document_id" in ref(o)
+            and json.dumps(clarify.ref_identity(ref(o)), sort_keys=True) in offered]
 
 
 def _continue(ctx: TenantContext, ws: T.Workspace, inp: TurnInput, cont: clarify.Continuation) -> TurnInput:

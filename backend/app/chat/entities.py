@@ -507,6 +507,12 @@ def _named_by_phrase(cands: list[Candidate], reply: str) -> list[Candidate]:
             if not any(o != n and x <= a and b <= y and (y - x) > (b - a) for o, (x, y) in spans.items())]
 
 
+def _authorized_candidates(candidates: list[dict], authorized: set[str]) -> list[Candidate]:
+    """The candidates (as a clarification's ``as_dict`` gives them) of the documents the user may still see, in order."""
+    return [Candidate(str(c["document_id"]), c["title"], unit=c.get("unit"), file_title=c.get("file_title") or "")
+            for c in candidates if str(c["document_id"]) in authorized]
+
+
 def stated_in(candidates: list[dict], question: str) -> list[int]:
     """The positions of the candidates whose complete title or alias the question states as a whole phrase (``_named_by_phrase``):
     the unit a lookup could not tell from its siblings by the words it searches with (the one letter that tells "מתחם הגפן ב"
@@ -521,8 +527,7 @@ def named_unit(candidates: list[dict], reply: str, authorized: set[str]) -> Outc
     """The one candidate (a document or a unit, as a clarification's ``as_dict`` or ``unit_candidate`` gives it) whose
     complete title or alias the reply states as a whole phrase, as a resolved outcome; None when the reply states none
     of them or several (the words of a name that several share name none)."""
-    cands = [Candidate(str(c["document_id"]), c["title"], unit=c.get("unit"), file_title=c.get("file_title") or "")
-             for c in candidates if str(c["document_id"]) in authorized]
+    cands = _authorized_candidates(candidates, authorized)
     named = _named_by_phrase(cands, reply)
     return Outcome("resolved", named, reply) if len(named) == 1 else None
 
@@ -531,8 +536,7 @@ def among(candidates: list[dict], reply: str, authorized: set[str]) -> Outcome:
     """A reply to a clarification that named ``candidates``: the one candidate the reply names (by an ordinal word, by
     its complete title or alias, by a word of its name or identifiers that the other candidates lack, or by its number
     in the list), else the clarification again."""
-    cands = [Candidate(str(c["document_id"]), c["title"], unit=c.get("unit"), file_title=c.get("file_title") or "")
-             for c in candidates if str(c["document_id"]) in authorized]
+    cands = _authorized_candidates(candidates, authorized)
     if not cands:
         return Outcome("not_found", query=reply)
     words = [w.strip("-'״׳\"?.!,") for w in base_normalize(reply).split()]
@@ -577,8 +581,7 @@ def names_several(candidates: list[dict], reply: str, authorized: set[str]) -> b
     """Whether a reply that picked no single candidate still names two or more of them — by a word of its own that
     several candidates hold ("הגפן" for "מתחם הגפן א" and "מתחם הגפן ב"). Only such a reply, called an answer by the model,
     is asked about again; a reply that names none ("כולן") is a new question (round 10 KTD5)."""
-    cands = [Candidate(str(c["document_id"]), c["title"], unit=c.get("unit"), file_title=c.get("file_title") or "")
-             for c in candidates if str(c["document_id"]) in authorized]
+    cands = _authorized_candidates(candidates, authorized)
     if not cands or among(candidates, reply, authorized).kind == "resolved":
         return False
     vocab = [_candidate_words(c) for c in cands]
@@ -588,8 +591,7 @@ def names_several(candidates: list[dict], reply: str, authorized: set[str]) -> b
 def narrowed(candidates: list[dict], reply: str, authorized: set[str]) -> Outcome | None:
     """The candidates a reply that names several of them fits, as an ambiguous outcome of exactly those (round 26 U3, cause 4: the offer
     narrows, it is never the whole list again); None when the reply fits none, or all of them (it tells nothing more than the list)."""
-    cands = [Candidate(str(c["document_id"]), c["title"], unit=c.get("unit"), file_title=c.get("file_title") or "")
-             for c in candidates if str(c["document_id"]) in authorized]
+    cands = _authorized_candidates(candidates, authorized)
     vocab = {id(c): _candidate_words(c) for c in cands}
     forms = [set(f) for f in _scope_terms(reply)]
     telling = [f for f in forms if 0 < sum(1 for v in vocab.values() if v & f) < len(cands)]
@@ -1060,6 +1062,8 @@ def candidate_details(ctx: TenantContext, places: list[tuple[str, str | None, in
     is not readable now, is one unit, or was read again since). A candidate carries ``details`` (round 26 U2, KTD2, R6): what tells
     the unit apart for a person, from the sources - its title (or None), the name, address, city, parcel and type its identity card
     quotes, the valuation date it states (else the card's date as written), its pages and its file's title."""
+    if not places:
+        return []
     found: list[tuple[dict, str] | None] = []
     with tenant_tx(ctx) as conn:
         current = _current_by_doc(conn)
@@ -1099,6 +1103,8 @@ def document_candidates(ctx: TenantContext, ids: list[str]) -> list[dict | None]
     """The documents a clarification offered between (round 26 U2, KTD2): one slot per id, in order - ``{"document_id", "title",
     "details"}`` (the title and the valuation date the document states), or None when it is not readable now, is no appraisal, or is
     a file of several appraisals (there the unit is the option, never the file)."""
+    if not ids:
+        return []
     out: list[dict | None] = []
     with tenant_tx(ctx) as conn:
         current = _current_by_doc(conn)

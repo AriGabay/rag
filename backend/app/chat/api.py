@@ -480,8 +480,8 @@ def _clarify_states(conn: Connection, rows) -> dict[str, dict]:
                                     " AND (created_at, id) > (:t, :i) LIMIT 1"), key).first() is None
         in_flight = False
         if nxt is not None:
-            turn = conn.execute(text("SELECT status FROM messages WHERE reply_to = :u AND role = 'assistant'"
-                                     " ORDER BY created_at DESC LIMIT 1"), {"u": nxt.id}).first()
+            turn = conn.execute(text("SELECT status FROM messages WHERE conversation_id = :c AND reply_to = :u AND role = 'assistant'"
+                                     " ORDER BY created_at DESC LIMIT 1"), {"c": r.conversation_id, "u": nxt.id}).first()
             in_flight = turn is not None and turn.status in IN_FLIGHT
         out[str(r.id)] = clarify.state_of(clar["id"], next_user=nxt is not None,
                                           reply=(nxt.answer or {}).get("clarification_reply") if nxt is not None else None,
@@ -587,8 +587,9 @@ def send_message(conversation_id: str, body: SendBody, ctx: TenantContext = Depe
         # the state this message is produced with: the body's value, else the conversation's (KTD1)
         prefer_recent = conv.prefer_recent if body.prefer_recent is None or choice is not None else body.prefer_recent
         time_state = (choice.record.get("time_mode") if choice is not None else None) or _time_state(prefer_recent)
-        reply = ({"clarification_reply": {"clarification_id": choice.record["id"], "option_id": clarify.ALL_ID if choice.option is None
-                                          else choice.option["id"], "outcome": "answered"}} if choice is not None else None)
+        # (``_open_choice`` checked the click: ``option_id`` is ``all`` or the id of the option it found, so it is the option's)
+        reply = ({"clarification_reply": {"clarification_id": choice.record["id"], "option_id": body.clarification.option_id,
+                                          "outcome": clarify.OUT_ANSWERED}} if choice is not None else None)
         user = conn.execute(text(
             "INSERT INTO messages (office_id, conversation_id, user_id, role, content, status, client_id, created_at,"
             " time_preference, answer) VALUES (app_office(), :c, :u, 'user', :t, 'done', :k, clock_timestamp(),"
@@ -906,15 +907,9 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
                 continue
             pid = f"P{len(prior) + 1}"
             prior_ids[s.get("id")] = pid
-            prior[pid] = {"version_id": s["version_id"], "block_start": s.get("block_start"),
-                          "block_end": s.get("block_end"), "table_index": s.get("table_index"),
-                          "chunk_id": s.get("chunk_id"), "title": s.get("title"), "location": s.get("location"),
-                          "excerpt": " ".join((s.get("text") or "").split())[:160],
-                          # the reading it was read from; an answer from before reading ids has none (KTD7)
-                          "reading_id": s.get("reading_id"),
-                          # where a source read only in part continues (``tools._target_json``): reopening it
-                          # offers the continuation, checked against the same reading
-                          "resume": s.get("more") if isinstance(s.get("more"), dict) else None}
+            # the reading it was read from (an answer from before reading ids has none, KTD7) and where a source read only in part
+            # continues (``tools._target_json``; reopening it offers the continuation, checked against the same reading)
+            prior[pid] = _read_entry(s)
     # the conversation's slots as the last answer left them: the focus is its property and parameters, the candidates and
     # the pending parameter the clarification it asked (its message is in ``rows`` only while every document it names is
     # visible); the property slot is checked again here, under the user's permissions as they are now
@@ -948,7 +943,7 @@ def _turn_input(conn: Connection, ctx: TenantContext, conversation_id: UUID,
             answered = done | {"record": _visible_record(conn, done["record"])}
         listing = _listing(conn, last.answer)
     reply = (user.answer or {}).get("clarification_reply") if isinstance(user.answer, dict) else None
-    if (isinstance(reply, dict) and reply.get("outcome") == "answered" and reply.get("option_id")
+    if (isinstance(reply, dict) and reply.get("outcome") == clarify.OUT_ANSWERED and reply.get("option_id")
             and not _choice_available(conn, clarification, reply)):
         raise _ChoiceGone  # the user chose, and the clarification or a document of the choice is no longer theirs to use
     return engine.TurnInput(question=user.content, history=history, summary=summary, focus=slots.join_focus(context),
@@ -1321,11 +1316,12 @@ def _context(outcome: engine.TurnOutcome, payload: dict, previous: dict | None, 
             cited.append({"document_id": src["document_id"], "source_kind": src.get("source_kind") or "appraisal",
                           "standard": src.get("standard"), "section": src.get("section")})
     asked = None
-    record = getattr(outcome, "clarification", None)  # (a test's outcome may be a stand-in without it)
+    record = outcome.clarification
     if record is not None or a.status == "clarification":
         # the reply binds to the options of the structured clarification (round 26 U3), whose units are the candidates it offered
         # (``focus.units`` or the options, validated; round 15 U6, KTD1), or to the candidates of a server clarification. A clarification
-        # that offered no options stores the files its turn touched, where a reply that states a unit's complete name is looked up
+        # that offered no options stores the files its turn touched, where a reply that states a unit's complete name is looked up (round
+        # 26 U3, R9: this replaces round 15's "one that declared none binds nothing", under which a typed full name was asked about again)
         if record is not None:
             reads = _reads_of(ws)
             record = record | {"reads": [*reads, *[r for r in record.get("reads") or [] if r not in reads]][:clarify.MAX_READS]}
@@ -1335,7 +1331,7 @@ def _context(outcome: engine.TurnOutcome, payload: dict, previous: dict | None, 
     if prop is not None and (date_field := _date_field(payload)):
         params = (params or {}) | {"date_field": date_field}  # what "ומה לגבי המועד" refers to: the date of this datum
     return slots.carry(previous, intent=intent, property=prop, params=params, topic=topic, lists=lists,
-                       message_id=message_id, sources=cited, pending=asked, period=period, answered=getattr(outcome, "continued", None))
+                       message_id=message_id, sources=cited, pending=asked, period=period, answered=outcome.continued)
 
 
 def _read_entry(src: dict) -> dict:

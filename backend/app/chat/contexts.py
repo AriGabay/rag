@@ -705,16 +705,17 @@ def card_details(fields: Iterable[dict]) -> dict[str, str]:
     return out
 
 
+def place_text(details: dict) -> str:
+    """A unit's address with its city, when the address does not already say it; "" when it has no address."""
+    address, city = details.get("address"), details.get("city")
+    return f"{address}, {city}" if address and city and city not in address else address or ""
+
+
 def untitled_label(details: dict) -> str:
     """What names a unit that has no title (round 26 U2, cause 2 of the repeated candidate list): its card's name, else its address
     (with the city, when the address does not say it), else its block and parcel; "" when the card holds none of them. Never the
     words «ללא כותרת», which tell two such units apart from nothing."""
-    if details.get("name"):
-        return details["name"]
-    if details.get("address"):
-        city = details.get("city")
-        return f"{details['address']}, {city}" if city and city not in details["address"] else details["address"]
-    return details.get("block_parcel") or ""
+    return details.get("name") or place_text(details) or details.get("block_parcel") or ""
 
 
 def unit_row(u, document_id, version_id, reading_id: str | None, tag: str | None, **extra) -> dict:

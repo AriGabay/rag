@@ -48,7 +48,6 @@ from app.providers.llm import prompt_text
 
 UNIT, PERIOD, AREA_BASIS, METHOD = "unit", "period", "area_basis", "method"
 TEXT = "text"  # a clarification with no options: the model's question alone (the kind of a record that offers none)
-KINDS = (UNIT, PERIOD, AREA_BASIS, METHOD)
 MIN_OPTIONS, MAX_OPTIONS = 2, 4
 MAX_CONSECUTIVE = 2  # clarifications in a row for one question; the next is answered with stated assumptions (R10)
 DETAIL_CHARS = 120
@@ -61,7 +60,7 @@ TOO_FEW, NO_OFFER = "too_few_options", "no_offer"
 TIME_DECIDES, UNIT_PINNED = "time_preference_decides", "unit_pinned"
 REPEAT, CAP = "repeat", "cap"
 # a clarification the question did not need (R2, R3) is never shown as a text question: like a repeat, it gets the one re-prompt
-NOT_NEEDED = (TIME_DECIDES, UNIT_PINNED, PHRASE_NOT_IN_SOURCES)
+# (the reasons of ``MSG_NOT_NEEDED``)
 
 KIND_WORDS = {UNIT: "הנכס", PERIOD: "המועד או התקופה", AREA_BASIS: "בסיס השטח", METHOD: "שיטת החישוב", TEXT: "העניין"}
 MSG_REPEAT = ("המשתמש כבר הכריע בשאלה הזו לגבי {what}: «{chosen}». אל תשאל שוב על אותו עניין — ענה עכשיו על השאלה המקורית עם הבחירה "
@@ -128,7 +127,7 @@ class Verdict:
     ``{id, question, reason, kind, options[{id, label, detail, ref}], allow_all}``, with no options when none survived (a text
     question) - or None when the answer is no clarification. ``check``: ``{"fallback", "dropped", "violation"}``, for the
     diagnostics (no content). ``offered_units``: the candidates of the surviving options, in order, as a reply is resolved among
-    them. ``shown_documents``: every document the question may name. ``violation``: ``repeat`` or ``cap`` (R10), or one of ``NOT_NEEDED`` (the
+    them. ``shown_documents``: every document the question may name. ``violation``: ``repeat`` or ``cap`` (R10), or one of the keys of ``MSG_NOT_NEEDED`` (the
     time preference or the question's date decides, the unit is pinned, no source writes the phrases), when the clarification should not reach the user. ``question_override``: the server's neutral question, when the model's listed an option that was dropped."""
 
     record: dict | None
@@ -284,11 +283,6 @@ def label_problem(kind: str, label: str) -> str | None:
 # --- how an option reads ----------------------------------------------------------------------------------------------
 
 
-def _place(details: dict) -> str:
-    address, city = details.get("address"), details.get("city")
-    return f"{address}, {city}" if address and city and city not in address else address or ""
-
-
 def option_texts(candidate: dict) -> tuple[str, str] | None:
     """The label and the detail an option shows, from its candidate's grounded details (``entities.candidate_details``,
     ``entities.document_candidates``), or None when it has nothing that tells it from another. A unit is named by its title, else by
@@ -306,7 +300,7 @@ def option_texts(candidate: dict) -> tuple[str, str] | None:
         label, pages = pages, ""  # nothing but its pages names it
     if not label:
         return None
-    parts = [p for p in (_place(d), d.get("date"), pages, d.get("parcel")) if p and p not in label]
+    parts = [p for p in (contexts.place_text(d), d.get("date"), pages, d.get("parcel")) if p and p not in label]
     if d.get("file_title"):
         parts.append(f"בקובץ «{d['file_title']}»")
     return label, " · ".join(parts)
@@ -435,8 +429,7 @@ def new_id() -> str:
 
 
 def validate(ctx: TenantContext, ws, offer: ClarifyOffer | None, *, question: str, state: ClarificationState | None = None,
-             pinned_unit: bool = False, extra_documents: Iterable[str] = (), parameter: bool = False, refuse: bool = False,
-             record_id: str | None = None) -> Verdict:
+             pinned_unit: bool = False, extra_documents: Iterable[str] = (), parameter: bool = False, refuse: bool = False) -> Verdict:
     """The record of a clarification answer, validated and grounded (KTD2); the function the pending slot's writer calls.
 
     ``offer``: the answer's ``clarify`` (None: a text question, recorded with no options). ``question``: the text the user reads.
@@ -508,7 +501,7 @@ def validate(ctx: TenantContext, ws, offer: ClarifyOffer | None, *, question: st
         override = MSG_NEUTRAL.get(kind)  # the question must not list what was dropped (R6)
         text = override or text
     reason = (offer.reason.strip() if offer is not None else "")
-    record = {"id": record_id or new_id(), "question": text if override else question.strip(),
+    record = {"id": new_id(), "question": text if override else question.strip(),
               "reason": "" if _VALUE.search(reason) else reason, "kind": kind, "options": options,
               "allow_all": bool(offer is not None and offer.allow_all and len(options) >= MIN_OPTIONS)}
     return Verdict(record, check, offered, sorted(documents), why, offer, question, override)
@@ -519,6 +512,8 @@ def validate(ctx: TenantContext, ws, offer: ClarifyOffer | None, *, question: st
 CHOICE, ALL, NARROW, FREE, HELP, ASSUMPTIONS, CANCEL = "choice", "all", "narrow", "free", "help", "assumptions", "cancel"
 ALL_ID = "all"  # the reserved option id of "all of them": valid only when the record's ``allow_all`` is true
 MAX_READS = 6  # the clarifying turn's reads that a continuation reopens (by recency)
+# the outcome words of a reply record (``Continuation.outcome``, the user row's ``clarification_reply``): persisted, so the values never change
+OUT_ANSWERED, OUT_HELP, OUT_CANCELLED, OUT_NARROWED, OUT_ABANDONED = "answered", "help", "cancelled", "narrowed", "abandoned"
 
 MSG_CONTINUE_HEAD = "המשך לשאלה המקורית (המשתמש ענה לשאלת ההבהרה שלך):"
 MSG_PROGRESS_CONTINUE = "ממשיך את הבקשה המקורית"
@@ -567,10 +562,15 @@ def state_of(clarification_id: str, *, next_user: bool, reply: dict | None, in_f
     if not next_user:
         return {"state": "open" if current else "stale", "chosen": None}
     if reply is not None and reply.get("clarification_id") == clarification_id:
-        if reply.get("outcome") == "answered":
+        if reply.get("outcome") == OUT_ANSWERED:
             return {"state": "answered", "chosen": reply.get("option_id")}
         return {"state": "closed", "chosen": None}
     return {"state": "closed" if in_flight else "stale", "chosen": None}
+
+
+def help_mode(record: dict) -> str:
+    """The mode of a help reply: the explanation the first time, the answer with stated assumptions once the help was already given (KTD3)."""
+    return ASSUMPTIONS if int(record.get("help_count") or 0) >= 1 else HELP
 
 
 def reemit(record: dict) -> dict:
@@ -722,12 +722,12 @@ class Continuation:
 
     def outcome(self) -> dict:
         """The reply as the user's row records it (the state function reads it back)."""
-        base = {"clarification_id": self.record["id"], "option_id": None, "outcome": "answered"}
+        base = {"clarification_id": self.record["id"], "option_id": None, "outcome": OUT_ANSWERED}
         if self.mode in (CHOICE, ALL):
             return base | {"option_id": ALL_ID if self.mode == ALL else self.options[0]["id"]}
         if self.mode == FREE:
             return base
-        return base | {"outcome": {HELP: "help", ASSUMPTIONS: "help", CANCEL: "cancelled", NARROW: "narrowed"}[self.mode],
+        return base | {"outcome": {HELP: OUT_HELP, ASSUMPTIONS: OUT_HELP, CANCEL: OUT_CANCELLED, NARROW: OUT_NARROWED}[self.mode],
                        **({"option_ids": [o["id"] for o in self.options]} if self.mode == NARROW else {})}
 
     def option_documents(self) -> set[str]:

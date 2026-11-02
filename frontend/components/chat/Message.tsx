@@ -216,7 +216,7 @@ interface AssistantProps {
   /** The inline text next to the buttons (the 409 "השאלה כבר לא פתוחה"). */
   clarifyNote?: string | null;
   /** A click on an option of the clarification (`optionId` and the label the send carries as its text). */
-  onChoose?: (message: ChatMessage, clarify: ChatClarify, optionId: string, label: string) => void;
+  onChoose?: (clarify: ChatClarify, optionId: string, label: string) => void;
 }
 
 /** "דווח על תשובה" (round 25 U5): on a finished, failed or cancelled answer, whether or not it is the last. Never on a running one. */
@@ -272,7 +272,7 @@ export function AssistantMessage({
   onOpenSource,
   report,
   onReport,
-  clarify: shownClarify,
+  clarify: shown,
   clarifyBusy = false,
   clarifyNote = null,
   onChoose,
@@ -412,8 +412,8 @@ export function AssistantMessage({
   const timeNote = timePreferenceNote(message, answer);
   // round 26 U5: a clarification with options is a block of buttons that replaces the "נדרשת הבהרה" lead line; with none (the text
   // fallback) the old line stays
-  const clarify = shownClarify === undefined ? message.clarify ?? null : shownClarify;
-  const clarifyButtons = clarify !== null && clarify.options.length > 0;
+  const clarify = shown === undefined ? message.clarify ?? null : shown;
+  const buttons = clarify !== null && clarify.options.length > 0 ? clarify : null;
   const renderMarkdown = (markdown: string) => (
     <Markdown
       markdown={markdown}
@@ -468,16 +468,16 @@ export function AssistantMessage({
           renderMarkdown(linked?.whole ?? "")
         )}
       </div>
-      {clarify && clarifyButtons && (
+      {buttons && (
         <ClarifyOptions
-          clarify={clarify}
+          clarify={buttons}
           busy={clarifyBusy}
-          showQuestion={!sameText(answer.markdown, clarify.question)}
+          showQuestion={!sameText(answer.markdown, buttons.question)}
           note={clarifyNote}
-          onChoose={(optionId, label) => onChoose?.(message, clarify, optionId, label)}
+          onChoose={(optionId, label) => onChoose?.(buttons, optionId, label)}
         />
       )}
-      <AnswerQuality answer={answer} hideClarificationLead={clarifyButtons} />
+      <AnswerQuality answer={answer} hideClarificationLead={buttons !== null} />
       <Timeline groups={answer.time?.timeline} onCite={cite} />
       <Breakdown blocks={answer.time?.breakdown} onCite={cite} onOpenContext={onOpenSource ? openContext : undefined} />
       <CoverageNote coverage={answer.time?.coverage} />

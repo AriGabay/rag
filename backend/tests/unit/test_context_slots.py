@@ -700,7 +700,8 @@ def _outcome(intent: str = "property", status: str = "answered", period=None):
     from app.chat import timeframe
 
     ws = SimpleNamespace(intent=intent, user_messages=[{"text": "ומה לגבי השווי?", "current": True}], time=period or timeframe.TimeMode())
-    return SimpleNamespace(workspace=ws, answer=SimpleNamespace(status=status), resolution={}, server_asked=False, lists=[])
+    return SimpleNamespace(workspace=ws, answer=SimpleNamespace(status=status), resolution={}, server_asked=False, lists=[],
+                           clarification=None, continued=None)
 
 
 def _payload(focus, entity_changed=False):

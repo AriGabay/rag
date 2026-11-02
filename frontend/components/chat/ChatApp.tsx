@@ -159,6 +159,8 @@ export default function ChatApp() {
   const [archived, setArchived] = useState(false);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [threads, setThreads] = useState<Record<string, Thread>>({});
+  const threadsRef = useRef<Record<string, Thread>>({});
+  threadsRef.current = threads;
   const [draftThread, setDraftThread] = useState<ChatMessage[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   // the panel stack: each level is one browser-history entry, so Back, Esc and close pop only the top one
@@ -259,7 +261,11 @@ export default function ChatApp() {
 
   // --- active conversation's messages ------------------------------------------------------------------------
   const updateThread = useCallback((id: string, f: (t: Thread) => Thread) => {
-    setThreads((cur) => ({ ...cur, [id]: f(cur[id] ?? EMPTY_THREAD) }));
+    setThreads((cur) => {
+      const was = cur[id];
+      const next = f(was ?? EMPTY_THREAD);
+      return was !== undefined && next === was ? cur : { ...cur, [id]: next }; // an update that changes nothing renders nothing
+    });
   }, []);
 
   const loadMessages = useCallback(
@@ -384,14 +390,23 @@ export default function ChatApp() {
    * later rows), after a send or a finished answer. Only the clarification of a message already shown is replaced. */
   const refreshClarifications = useCallback(
     async (conversation: string) => {
+      // nothing loaded holds a clarification: nothing to refresh, so no fetch (the render's view of the thread is enough: a clarification
+      // that arrives with the message being finished carries the state its own response computed)
+      if (!threadsRef.current[conversation]?.messages.some((m) => m.clarify)) return;
       try {
         const res = await chatApi.messages(conversation);
         const fresh = new Map(res.messages.filter((m) => m.clarify).map((m) => [m.id, m.clarify as ChatClarify]));
         if (fresh.size === 0) return;
-        updateThread(conversation, (t) => ({
-          ...t,
-          messages: t.messages.map((m) => (m.clarify && fresh.has(m.id) ? { ...m, clarify: fresh.get(m.id) } : m)),
-        }));
+        updateThread(conversation, (t) => {
+          let changed = false;
+          const messages = t.messages.map((m) => {
+            const next = m.clarify ? fresh.get(m.id) : undefined;
+            if (!m.clarify || !next || (next.state === m.clarify.state && (next.chosen ?? null) === (m.clarify.chosen ?? null))) return m;
+            changed = true;
+            return { ...m, clarify: next };
+          });
+          return changed ? { ...t, messages } : t; // the same thread (no render) when no clarification's state or choice moved
+        });
       } catch {
         // a convenience: the next list or a 409 on a click says the same
       }
@@ -513,7 +528,7 @@ export default function ChatApp() {
 
   /** A click on an option of a clarification: the option's label is the message, the ids are the choice; focus goes to the message box. */
   const choose = useCallback(
-    (_m: ChatMessage, clarify: ChatClarify, optionId: string, label: string) => {
+    (clarify: ChatClarify, optionId: string, label: string) => {
       void send(label, undefined, { id: clarify.id, option_id: optionId });
       composerRef.current?.focus();
     },
@@ -1165,7 +1180,7 @@ function ThreadView({
   onRetry: (m: ChatMessage) => void;
   onStop: (m: ChatMessage) => void;
   onResend: (m: ChatMessage) => void;
-  onChoose: (m: ChatMessage, clarify: ChatClarify, optionId: string, label: string) => void;
+  onChoose: (clarify: ChatClarify, optionId: string, label: string) => void;
   /** A turn runs or a send is in flight: the clarifications' buttons wait. */
   busy: boolean;
   reports: Record<string, AnswerReport>;

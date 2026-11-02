@@ -250,4 +250,4 @@ def test_a_clarification_the_question_did_not_need_gets_a_reason_specific_reprom
     assert "הנתונים העדכניים ביותר קודם" in clarify.reprompt("time_preference_decides", "period", None)
     assert "היחידה כבר נקבעה" in clarify.reprompt("unit_pinned", "unit", None)
     assert "שתי הקריאות בקצרה" in clarify.reprompt("phrase_not_in_sources", "area_basis", None)
-    assert set(clarify.NOT_NEEDED) == {"time_preference_decides", "unit_pinned", "phrase_not_in_sources"}
+    assert set(clarify.MSG_NOT_NEEDED) == {"time_preference_decides", "unit_pinned", "phrase_not_in_sources"}
